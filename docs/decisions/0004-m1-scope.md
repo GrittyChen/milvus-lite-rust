@@ -77,7 +77,7 @@ M1 的对外行为与 3.x 有阶段性差异，本文按 [AGENTS.md](../../AGENT
 
 ### 不支持
 
-下列功能都返回明确错误，绝不静默成功（不变量 15）。这些功能 3.x 都支持，M1 如果忽略相应参数，就会在不自知的情况下返回与 3.x 不同的结果，所以同样报错。错误形式与 3.x 的 `_unimplemented`（[servicer.py:1563](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/milvus_lite/adapter/grpc/servicer.py#L1563)）相同：gRPC 状态码 `UNIMPLEMENTED`；对返回 `Status` 的 RPC，`Status.code` 固定为 1；原因写成 `MilvusLite does not support <功能>: <说明>`，说明中注明当前阶段尚未实现。pymilvus 收到 `UNIMPLEMENTED` 时不重试。
+下列功能都返回明确错误，绝不静默成功（不变量 15）。这些功能 3.x 都支持，M1 如果忽略相应参数，就会在不自知的情况下返回与 3.x 不同的结果，所以同样报错。错误形式与 3.x 的 `_unimplemented`（[servicer.py:1563](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/milvus_lite/adapter/grpc/servicer.py#L1563)）相同：gRPC 状态码 `UNIMPLEMENTED`，details 写成 `MilvusLite does not support <功能>: <说明>`，说明中注明当前阶段尚未实现。gRPC 状态非 OK 时响应体会被丢弃，3.x 在响应体里另放的 `Status` 客户端看不到（实测 pymilvus 只得到状态码与 details），因此不必复现。pymilvus 收到 `UNIMPLEMENTED` 时不重试。
 
 - **持久化**：见下文「阶段性差异」。
 - **过滤**：除上面两种 `Query` 形式外，不支持任何 `filter` / `expr`，包括 `text_match`、JSON 路径与几何谓词。
@@ -129,7 +129,7 @@ M1 的对外行为与 3.x 有阶段性差异，本文按 [AGENTS.md](../../AGENT
    - **同口径对照**：在同一台机器上，用同一口径重跑 2.5.1、3.x 和 Rust 三组。空 `expr` 的 `count(*)` 在 3.x 中走行数快路径，与 0001 中带过滤的计数不可比。
    - **定位与处理**：这组结果是对 0001 推断的**部分**验证，只覆盖内存路径；主体验证在 M2 做，包括冷启动、reopen 和按 segment 的有效位图。不设硬性通过门槛，结果与 0001 的推断对照后汇报负责人；如果 FLAT 检索或写入明显落后 2.5.1，先分析原因，由负责人决定是否在进入 M2 前先优化。
 5. **构建与静态检查**：
-   - `cargo tree -e build` 中没有 C++ 构建与 `protoc`；
+   - `cargo tree --workspace -e all` 中没有 C++ 构建与 `protoc`；
    - `cargo fmt --check`、`cargo clippy -- -D warnings` 与 Rust 单测通过；
    - maturin 能在本机构建 abi3 wheel，并用它跑通第 1–3 项。
 

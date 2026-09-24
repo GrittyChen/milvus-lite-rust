@@ -1,0 +1,19 @@
+[build-system]
+requires = ["maturin>=1.15,<2"]
+build-backend = "maturin"
+
+[project]
+name = "milvus-lite-rust"
+dynamic = ["version"]
+description = "Unofficial Rust implementation of milvus-lite; not affiliated with Milvus or Zilliz."
+requires-python = ">=3.10"
+license = "Apache-2.0"
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+]
+
+[tool.maturin]
+python-source = "python"
+module-name = "milvus_lite._native"
+exclude = ["**/__pycache__/**"]

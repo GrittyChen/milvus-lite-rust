@@ -1,0 +1,31 @@
+[workspace]
+resolver = "3"
+members = ["crates/core", "crates/grpc", "crates/py"]
+
+[workspace.package]
+version = "0.1.0-dev.0"
+edition = "2024"
+# File::try_lock 自 1.89 起稳定，LOCK 的 flock 语义依赖它。
+rust-version = "1.89"
+license = "Apache-2.0"
+publish = false
+
+[workspace.dependencies]
+milvus-lite-core = { path = "crates/core" }
+milvus-lite-grpc = { path = "crates/grpc" }
+prost = "0.14.4"
+prost-types = "0.14.4"
+protox = "0.9.1"
+pyo3 = "0.29.2"
+thiserror = "2.0.21"
+tokio = "1.53.1"
+tonic = "0.14.6"
+tonic-prost = "0.14.6"
+tonic-prost-build = "0.14.6"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"

@@ -14,7 +14,7 @@
 
 重构基线已定：**以 3.x 为基础，不以 2.5.1（C++）为基础**。3.x 的性能损失主要来自 Python 实现，架构内只有一处需要修正的设计；2.5.1 反而有冷启动全量重放、索引不落盘等架构级瓶颈；决策、数据与由此得出的实现约束见 [0001-重构基线选择](docs/decisions/0001-refactor-baseline.md)。
 
-当前状态：仓库有 README / LICENSE（Apache-2.0）、设计决策（[docs/decisions/](docs/decisions/)）与基线基准脚本（[benchmarks/baseline/](benchmarks/baseline/)），尚无引擎代码。首次落地 crate 布局、依赖版本、命令时同步更新本文的[架构地图](#架构地图跨文件心智)、[技术栈](#技术栈)与[常用命令](#常用命令)，在此之前这几节中标注「待定」的内容不得当作事实引用。
+当前状态：仓库有 README / LICENSE（Apache-2.0）、设计决策（[docs/decisions/](docs/decisions/)）与基线基准脚本（[benchmarks/baseline/](benchmarks/baseline/)），以及 M1（[0004](docs/decisions/0004-m1-scope.md)）进行中的工程骨架：三个 crate 与进程内服务的生命周期已落地，引擎尚在开发。新增 module、依赖或命令时同步更新本文的[架构地图](#架构地图跨文件心智)、[技术栈](#技术栈)与[常用命令](#常用命令)；这几节中标注「待定」的内容不得当作事实引用。
 
 ## 核心业务术语
 
@@ -71,7 +71,7 @@ pymilvus ──server_manager──▶ adapter/grpc ──▶ db（多 collectio
                                                                                   └─ schema/   类型系统 · 校验 · 持久化
 ```
 
-本实现沿用这套**职责边界**，按 cargo workspace 拆成三个 crate（划分已定，尚未落地；crate 内的 module 划分首次落地时补在这里）：
+本实现沿用这套**职责边界**，按 cargo workspace 拆成三个 crate（crate 内的 module 随实现补在这里）：
 
 | crate | 对应参照实现 | 职责 |
 | --- | --- | --- |
@@ -79,7 +79,12 @@ pymilvus ──server_manager──▶ adapter/grpc ──▶ db（多 collectio
 | `crates/grpc` | [adapter/grpc/](references/milvus-lite/milvus_lite/adapter/grpc/) | proto 代码生成（protox）、协议翻译与错误映射；作为服务宿主，负责服务实例（runtime、检索线程池、引擎、端口）的启动与停止，检索线程池注入引擎 |
 | `crates/py` | [server_manager.py](references/milvus-lite/milvus_lite/server_manager.py) | PyO3 扩展，加上 Python 包 `milvus_lite`：`server_manager.py` 维护路径表，导入时检测官方发行包。CLI 放在哪里待定 |
 
-服务实例的所有权、同路径复用、进程退出与 fork 的处理见 [0003](docs/decisions/0003-in-process-server-lifecycle.md)。已确定的边界约束：
+服务实例的所有权、同路径复用、进程退出与 fork 的处理见 [0003](docs/decisions/0003-in-process-server-lifecycle.md)。跨文件的隐含约定：
+
+- **已实现 RPC 的唯一清单**在 [crates/grpc/build.rs](crates/grpc/build.rs) 的 `IMPLEMENTED_METHODS`：只为清单中的方法生成 trait 方法（编译器保证都有实现），其余 RPC 与其他 service 由 [guard.rs](crates/grpc/src/guard.rs) 统一返回 `UNIMPLEMENTED`。新增 RPC 只改这份清单。
+- **fork 安全由两层共同保证**：[server_manager.py](crates/py/python/milvus_lite/server_manager.py) 按进程号跳过继承来的服务；Rust 的 [Server](crates/grpc/src/server.rs) 在非创建者进程中拒绝 `stop`、析构时直接泄漏。
+
+已确定的边界约束：
 
 - **Python 绑定层只做胶水**：提供 [pymilvus 接入点](#核心业务术语)要求的模块与入口，启动 Rust gRPC 服务并返回 URI；不在 Python 侧实现任何引擎逻辑。
 - **gRPC 层只翻译**：除服务宿主职责（runtime、线程池、端口、启停）外，只做协议解码 / 编码与错误映射，业务语义全部在引擎层。
@@ -87,9 +92,9 @@ pymilvus ──server_manager──▶ adapter/grpc ──▶ db（多 collectio
 
 ## 技术栈
 
-方向已定，具体依赖的版本在首次引入时补在这里，并说明理由。
+方向已定，具体依赖的版本在首次引入时补在这里，并说明理由；确切版本以 [Cargo.toml](Cargo.toml) 与 [Cargo.lock](Cargo.lock) 为准。
 
-- **依赖边界：不引入 C++、CMake 或系统库依赖**（不绑定 FAISS 等），允许经 `cc` crate 编译、不需要额外安装任何东西的纯 C 代码，优先选纯 Rust。官方 3.x 删除了整套 C++ 构建（见 [0001](docs/decisions/0001-refactor-baseline.md)），本项目同样避免这类构建与分发负担：wheel 与 sdist 必须能在各目标平台只靠 cargo 构建。引入依赖时用 `cargo tree -e build` 核对。
+- **依赖边界：不引入 C++、CMake 或系统库依赖**（不绑定 FAISS 等），允许经 `cc` crate 编译、不需要额外安装任何东西的纯 C 代码，优先选纯 Rust。官方 3.x 删除了整套 C++ 构建（见 [0001](docs/decisions/0001-refactor-baseline.md)），本项目同样避免这类构建与分发负担：wheel 与 sdist 必须能在各目标平台只靠 cargo 构建。引入依赖时用 `cargo tree --workspace -e all` 核对完整依赖图（`-e build` 只列出根 crate 的直接构建依赖，看不到依赖自身的构建脚本）。
 - **gRPC / protobuf**：用 tonic + prost。prost-build 默认依赖系统 `protoc`（C++ 程序），因此改用纯 Rust 的 protox 解析 proto，再经 `compile_fds` 交给 prost / tonic 生成代码。proto 源取与 pymilvus 3.0.2 对应的 milvus-proto commit（3.0 的 `MilvusService` 是 2.6 的超集，2.6 的消息与字段在 3.0 中都保留），随仓库固定（离线构建与 sdist 都需要），引入时记录 commit 并核对其许可、注明来源；生成物不入库。参照实现运行期直接用 `pymilvus.grpc_gen`，CI 也不钉 pymilvus 版本，Rust 侧没有这条捷径。背景：3.0 在 2.6 的 117 个 RPC 之上只增不改地新增 27 个（snapshot、namespace、`AlterCollectionSchema` 等），另新增独立的 `ClientTelemetryService`（4 个 RPC）；3.0 客户端的 `add_collection_field` 会先调 `AlterCollectionSchema`，失败再回退旧 RPC。
 - **支持的 pymilvus 版本**：2.6.x 与 3.0.x 两条线都支持，兼容测试各跑一个最新版。
 - **Python 打包**：PyO3 + maturin，产出 abi3 wheel，Python 下限与 3.x 一致（`abi3-py310`）。abi3 wheel 不能在 free-threaded 版 CPython 上加载，这一点作为已知限制。服务端在 Python 进程内的后台线程上运行多线程 tokio runtime，CPU 密集的检索交给专用线程池，调用时释放 GIL，形态与 3.x 相同（进程内服务、返回 `http://127.0.0.1:<port>`）。同路径复用、atexit 时的停止顺序与持久化语义、fork 后子进程中 runtime 的处理见 [0003](docs/decisions/0003-in-process-server-lifecycle.md)；WAL 的 fsync 时机在 WAL 设计中确定。PyPI 元数据与 README 都要声明非官方、与 Milvus / Zilliz 无隶属关系。发行包名为 `milvus-lite-rust`，包内提供 `milvus_lite` 模块（见 [pymilvus 接入点](#核心业务术语)）。目标平台与 3.x 一致：Linux / macOS / Windows（3.x 的 CI 覆盖 Linux 上的 Python 3.10–3.13、macOS 上的 3.12、Windows 上的 3.10）。
@@ -97,10 +102,36 @@ pymilvus ──server_manager──▶ adapter/grpc ──▶ db（多 collectio
 - **向量索引**：第一阶段只做 SIMD 优化的暴力检索（FLAT），同时作为召回与距离口径的正确性基准；HNSW 等 ANN 索引后期补齐，优先纯 Rust（依赖边界见上），届时再定具体方案。第一阶段对各类索引定义的处理见 [0002 «结论»](docs/decisions/0002-data-dir-compat.md#结论)。
 - **分词与 BM25**：在全文检索阶段定具体实现，但因为数据目录互通，必须与 3.x 逐位一致（范围与约束见 [0002](docs/decisions/0002-data-dir-compat.md#共享状态的语义约束) 约束 8）。
 - **CLI**：先提供 `milvus-lite server`，参数与 3.x 一致（见 [CLI](#核心业务术语)）；`dump` 后续再做。
+- **已引入的依赖**：
+  - tonic 0.14（含 tonic-prost、tonic-prost-build）、prost / prost-types 0.14、protox 0.9：gRPC 与 proto 代码生成，全部纯 Rust（见上）。
+  - tokio 1：tonic 的运行时，每个服务实例独占一个 runtime（[0003](docs/decisions/0003-in-process-server-lifecycle.md)）。
+  - pyo3 0.29（`abi3-py310`）：Python 绑定。
+  - thiserror 2：错误类型。tempfile 3：仅用于测试。
+  - LOCK 用 std 的 `File::try_lock`：它在 Unix 上用 flock、在 Windows 上用覆盖第 0 字节的 LockFileEx，满足 [0002](docs/decisions/0002-data-dir-compat.md) 约束 10，因此不引入 fs2 一类依赖，`rust-version` 相应定为 1.89。
+  - 构建工具 maturin 1.15，用 uv 装在开发 venv 中，不是项目依赖。
 
 ## 常用命令
 
-本实现的命令**待定**，工程骨架落地后补全。预期覆盖：构建、lint（`cargo clippy`）、格式化（`cargo fmt`）、Rust 单测、Python wheel 构建、以本实现为后端跑参照实现的 `tests/adapter` 与 `tests/compatibility`、差分测试、基准对比。
+本实现（在仓库根目录执行；差分测试与基准对比随 M1 后续步骤补充）：
+
+| 任务 | 命令 |
+| --- | --- |
+| 建开发环境 | `uv venv -p 3.12 .venv && uv pip install -p .venv/bin/python maturin==1.15.0 pymilvus pytest` |
+| 构建并以可编辑方式安装扩展（改 Rust 后重跑） | `.venv/bin/maturin develop -m crates/py/Cargo.toml --release` |
+| 格式化 | `cargo fmt --all` |
+| lint | `cargo clippy --workspace --all-targets -- -D warnings` |
+| Rust 单测 | `cargo test --workspace` |
+| 端到端测试（真实 pymilvus） | `.venv/bin/python -m pytest tests/python` |
+| 构建 wheel / sdist | `.venv/bin/maturin build --release -m crates/py/Cargo.toml` / `.venv/bin/maturin sdist -m crates/py/Cargo.toml` |
+| 核对依赖图中没有 C++ 构建与 protoc | `cargo tree --workspace -e all` |
+
+pymilvus 两条线都要测。2.6.x 线用单独的 venv 安装构建出的 wheel，再运行同一套用例（在仓库外的目录执行，避免从源码目录导入）：
+
+```bash
+.venv/bin/maturin build --release -m crates/py/Cargo.toml -o <work_dir>/wheels
+uv venv -p 3.10 <work_dir>/v26 && uv pip install -p <work_dir>/v26/bin/python "pymilvus>=2.6,<2.7" pytest <work_dir>/wheels/milvus_lite_rust-*.whl
+cd <work_dir> && v26/bin/python -m pytest <repo>/tests/python
+```
 
 性能基线（2.5.1 与 3.x 对照，工作目录须在仓库外；完整步骤见 [benchmarks/baseline/README.md](benchmarks/baseline/README.md)）：
 

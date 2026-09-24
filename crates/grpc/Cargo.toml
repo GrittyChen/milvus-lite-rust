@@ -1,0 +1,27 @@
+[package]
+name = "milvus-lite-grpc"
+description = "milvus-lite-rust 的 gRPC 层：Milvus 协议翻译与服务宿主"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+milvus-lite-core.workspace = true
+prost.workspace = true
+prost-types.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "sync", "time"] }
+tonic.workspace = true
+tonic-prost.workspace = true
+
+[build-dependencies]
+protox.workspace = true
+tonic-prost-build.workspace = true
+
+[dev-dependencies]
+tempfile = "3.27.0"
+
+[lints]
+workspace = true
