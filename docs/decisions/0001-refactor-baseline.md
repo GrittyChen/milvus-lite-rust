@@ -23,7 +23,7 @@
 
 2.5.1 与 3.x 同为**性能基线**：在 2.5.1 占优的指标上，Rust 实现要追平 2.5.1；在 3.x 架构占优的指标上，要保持优势。
 
-「3.x 架构在 Rust 下能达到 2.5.1 水平」这一点，目前是根据 profile 与微基准**推断**出来的，还没有经过实现验证。Rust 实现的第一个里程碑应该用 [benchmarks/baseline/](../../benchmarks/baseline/README.md) 验证它。
+「3.x 架构在 Rust 下能达到 2.5.1 水平」这一点，目前是根据 profile 与微基准**推断**出来的，还没有经过实现验证。Rust 实现要用 [benchmarks/baseline/](../../benchmarks/baseline/README.md) 验证它：第一个里程碑（M1）只有内存数据，只能验证内存中的写入与检索；主体验证放在引入持久化的 M2，覆盖冷启动、reopen 和按 segment 的有效位图（见 [0004](0004-m1-scope.md)）。
 
 ## 两个版本的架构
 

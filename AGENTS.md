@@ -29,7 +29,7 @@
 | **index（向量 / 标量 / 稀疏）** | 与 segment 1:1 绑定、生命周期严格对齐、不可变；距离归一化在索引内部完成，上层看到的距离与 brute force 一致。见参照实现 [index-design.md](references/milvus-lite/docs/index-design.md) |
 | **filter 表达式** | Milvus 风格标量 / JSON / 动态字段 / 数组 / `text_match` / 几何谓词。语法与语义见参照实现 [filter-design.md](references/milvus-lite/docs/filter-design.md) |
 | **function chain** | BM25、text embedding、hybrid 合并、rerank（boost / decay / model）等检索函数链。见参照实现 [funcchain-design.md](references/milvus-lite/docs/funcchain-design.md) 与 [fts-design.md](references/milvus-lite/docs/fts-design.md) |
-| **差分测试** | 同一输入分别喂给参照实现与本实现，断言对外结果一致（允许的数值误差须显式声明）。这是本项目「行为对齐」的主要证据，不是可选项 |
+| **差分测试** | 同一输入分别喂给参照实现与本实现，断言对外结果一致（允许的数值误差须显式声明；距离类的默认误差见 [0004「决策」](docs/decisions/0004-m1-scope.md#决策)）。这是本项目「行为对齐」的主要证据，不是可选项 |
 
 ## 知识索引（动手前主动查阅，勿凭记忆）
 
@@ -53,6 +53,7 @@
 | 为什么以 3.x 而非 2.5.1 为基础 / 两代架构对比 / 3.x 的耗时归属 / Rust 实现的性能约束 | [docs/decisions/0001-refactor-baseline.md](docs/decisions/0001-refactor-baseline.md) |
 | 数据目录与 3.x 互通的范围 / 共享文件的约束 / 索引文件共存规则 / 跨实现验证矩阵 | [docs/decisions/0002-data-dir-compat.md](docs/decisions/0002-data-dir-compat.md) |
 | 进程内服务的生命周期：同路径复用 / 进程退出时的停止与持久化 / fork 后的处理 / 与 3.x 在这些点上的差异 | [docs/decisions/0003-in-process-server-lifecycle.md](docs/decisions/0003-in-process-server-lifecycle.md) |
+| 第一个里程碑（M1）做什么、不做什么 / 阶段性对外差异 / 验收标准 | [docs/decisions/0004-m1-scope.md](docs/decisions/0004-m1-scope.md) |
 | 性能基线怎么测 / 口径 / 注意事项 | [benchmarks/baseline/README.md](benchmarks/baseline/README.md) |
 | 代码审查 / 修复复审（冻结合同、完整调用链、同类全域清扫、分级与证据门槛、二三阶影响矩阵） | [code-review-rules](.agents/skills/code-review-rules/SKILL.md)（Claude Code 经 `.claude/skills` 软链读取同一份） |
 
