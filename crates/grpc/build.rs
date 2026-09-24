@@ -10,7 +10,24 @@ use std::path::PathBuf;
 
 const MILVUS_SERVICE: &str = "MilvusService";
 
-const IMPLEMENTED_METHODS: &[&str] = &["Connect", "GetVersion"];
+const IMPLEMENTED_METHODS: &[&str] = &[
+    "Connect",
+    "GetVersion",
+    "CreateCollection",
+    "DropCollection",
+    "DescribeCollection",
+    "ShowCollections",
+    "GetCollectionStatistics",
+    "CreateIndex",
+    "DescribeIndex",
+    "LoadCollection",
+    "ReleaseCollection",
+    "GetLoadingProgress",
+    "GetLoadState",
+    "Insert",
+    "Query",
+    "Search",
+];
 
 fn main() -> Result<(), Box<dyn Error>> {
     println!("cargo:rerun-if-changed=proto");

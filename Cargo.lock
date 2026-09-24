@@ -519,6 +519,7 @@ dependencies = [
  "prost",
  "prost-types",
  "protox",
+ "serde_json",
  "tempfile",
  "thiserror",
  "tokio",

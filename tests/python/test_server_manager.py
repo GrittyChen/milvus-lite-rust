@@ -11,6 +11,7 @@ import subprocess
 import sys
 import textwrap
 import threading
+import time
 from pathlib import Path
 
 import grpc
@@ -202,14 +203,100 @@ def test_normal_exit_releases_lock_without_hanging(tmp_path):
     assert can_open_in_other_process(path)
 
 
+def _slow_search_env(tmp_path, seconds):
+    """起一个服务，建好使一次检索耗时约 ``seconds`` 秒的 collection，返回 (manager, path, 发起检索的函数)。"""
+    from pymilvus.grpc_gen import common_pb2, milvus_pb2, milvus_pb2_grpc, schema_pb2
+    from rawproto import raw_insert
+
+    manager = ServerManager()
+    path = tmp_path / "slow.db"
+    uri = manager.start_and_get_uri(str(path))
+    channel = grpc.insecure_channel(uri.removeprefix("http://"))
+    stub = milvus_pb2_grpc.MilvusServiceStub(channel)
+    dim, rows = 128, 50_000
+    schema = schema_pb2.CollectionSchema(fields=[
+        schema_pb2.FieldSchema(name="id", data_type=5, is_primary_key=True),
+        schema_pb2.FieldSchema(name="v", data_type=101,
+                               type_params=[common_pb2.KeyValuePair(key="dim", value=str(dim))]),
+    ])
+    stub.CreateCollection(milvus_pb2.CreateCollectionRequest(collection_name="s", schema=schema.SerializeToString()))
+    raw = channel.unary_unary("/milvus.proto.milvus.MilvusService/Insert",
+                              response_deserializer=milvus_pb2.MutationResult.FromString)
+    assert raw(raw_insert("s", range(rows), dim)).status.code == 0
+
+    def search(nq):
+        pg = common_pb2.PlaceholderGroup()
+        pg.placeholders.add(tag="$0", type=101, values=[bytes(4 * dim)] * nq)
+        return stub.Search(milvus_pb2.SearchRequest(
+            collection_name="s", placeholder_group=pg.SerializeToString(),
+            search_params=[common_pb2.KeyValuePair(key="topk", value="1")]))
+
+    start = time.monotonic()
+    search(8)
+    per_query = (time.monotonic() - start) / 8
+    nq = max(1, int(seconds / per_query))
+    return manager, path, lambda: search(nq)
+
+
+def _run_in_thread(fn):
+    result = {}
+
+    def target():
+        try:
+            result["value"] = fn()
+        except grpc.RpcError as e:
+            result["error"] = e.code()
+        result["done_at"] = time.monotonic()
+
+    t = threading.Thread(target=target)
+    t.start()
+    return t, result
+
+
+def test_stop_lets_short_in_flight_request_finish(tmp_path):
+    # 0003「验证」正常退出：宽限期内能完成的在途请求照常返回结果。
+    manager, path, search = _slow_search_env(tmp_path, seconds=0.5)
+    t, result = _run_in_thread(search)
+    time.sleep(0.3)
+    manager.release_server(str(path))
+    t.join()
+    assert "value" in result and result["value"].status.code == 0, result
+    assert lock_is_free(path)
+
+
+def test_stop_waits_for_engine_task_before_releasing_lock(tmp_path):
+    # 0003「进程退出」：宽限期（2 秒）过后请求被取消，客户端随即收到错误；但已经开始的引擎任务
+    # 不可取消，停止要等它结束才释放 LOCK。检索约 5 秒，明显长于宽限期。
+    manager, path, search = _slow_search_env(tmp_path, seconds=5.0)
+    # 先完整跑一次同样的检索，得到它的实际耗时，下限不依赖粗略的估算。检索须明显长于
+    # 「宽限期 + 下限余量」，否则不等引擎任务就返回的实现（约 2 秒）也能满足下限。
+    started = time.monotonic()
+    search()
+    seconds = time.monotonic() - started
+    assert seconds > 3.5, seconds
+    t, result = _run_in_thread(search)
+    time.sleep(0.3)
+    start = time.monotonic()
+    manager.release_server(str(path))
+    elapsed = time.monotonic() - start
+    assert lock_is_free(path)
+    t.join()
+    assert "error" in result, result
+    # 请求在宽限期满时被取消，不等引擎任务结束。
+    assert result["done_at"] - start <= 2 + 1, result["done_at"] - start
+    # 检索还剩约 seconds - 0.3 秒；停止不得早于它结束（留 1 秒余量吸收耗时波动），也不应远超它。
+    assert elapsed >= seconds - 0.3 - 1, (elapsed, seconds)
+    assert elapsed <= 2 * seconds + 2, elapsed
+
+
 def test_unimplemented_rpc_reason(manager, tmp_path):
     uri = manager.start_and_get_uri(str(tmp_path / "u.db"))
     channel = grpc.insecure_channel(uri.removeprefix("http://"))
     stage = "not implemented in this build of milvus-lite-rust yet"
     for path, details in [
         (
-            "/milvus.proto.milvus.MilvusService/ShowCollections",
-            f"MilvusLite does not support ShowCollections: {stage}",
+            "/milvus.proto.milvus.MilvusService/Delete",
+            f"MilvusLite does not support Delete: {stage}",
         ),
         # 3.x 自身也拒绝的 RPC，说明文字与 3.x 一致。
         (

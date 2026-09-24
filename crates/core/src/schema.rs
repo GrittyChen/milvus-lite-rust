@@ -71,10 +71,13 @@ impl FieldSchema {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct CollectionSchema {
     pub fields: Vec<FieldSchema>,
     pub enable_dynamic_field: bool,
+    /// collection properties，按 Python dict 的语义：key 唯一、保持首次出现的位置。
+    /// 3.x 原样保存与回显，只有 `timezone` 有语义（见 [`CollectionSchema::validate`]）。
+    pub properties: Vec<(String, String)>,
 }
 
 /// 3.x 的保留字段名；`iso` 与 `interval` 不区分大小写。
@@ -92,6 +95,13 @@ impl CollectionSchema {
     pub fn validate(&self) -> Result<()> {
         if self.fields.is_empty() {
             return Err(EngineError::schema("schema has no fields"));
+        }
+        // 3.x 在这里校验并规范化 timezone；它只作用于 TIMESTAMPTZ，M1 不支持（0004「决策」）。
+        if self.properties.iter().any(|(k, _)| k == "timezone") {
+            return Err(EngineError::unsupported(
+                "timezone property",
+                "collection timezone is not supported in this build of milvus-lite-rust yet",
+            ));
         }
         let mut seen = HashSet::new();
         for f in &self.fields {
@@ -207,6 +217,7 @@ mod tests {
         CollectionSchema {
             fields,
             enable_dynamic_field: false,
+            properties: Vec::new(),
         }
     }
 

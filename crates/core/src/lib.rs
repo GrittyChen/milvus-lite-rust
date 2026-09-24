@@ -5,15 +5,19 @@ pub mod data;
 pub mod data_dir;
 pub mod db;
 pub mod error;
+pub mod filter;
 mod flat;
 pub mod index;
 pub mod projection;
+pub mod pyjson;
 pub mod schema;
 
-pub use collection::{Collection, Hits, LoadState, QueryResult, SearchRequest, SearchResult};
+pub use collection::{
+    Collection, Hits, LoadState, QueryResult, QueryVectors, SearchRequest, SearchResult,
+};
 pub use data::{ColumnData, InputValues, InsertBatch, META_FIELD, Pk, Rows};
 pub use data_dir::{DataDir, DataDirError};
-pub use db::{CollectionHandle, Db};
+pub use db::{CollectionHandle, DEFAULT_DATABASE, Db, InFlight};
 pub use error::{EngineError, Result};
 pub use index::{IndexRequest, IndexSpec, Metric};
 pub use projection::{ApiKind, Projection};

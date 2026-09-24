@@ -5,8 +5,11 @@ use std::collections::HashMap;
 
 use serde_json::{Map, Value};
 
-use crate::data::{ColumnData, InputValues, InsertBatch, META_FIELD, Pk, Rows, field_dim};
-use crate::error::{EngineError, Result, py_float_repr, py_repr, py_repr_list};
+use crate::data::{
+    ColumnData, InputValues, InsertBatch, META_FIELD, Pk, Rows, check_column_len, field_dim,
+};
+use crate::error::{EngineError, Result, py_float_repr, py_json_repr, py_repr, py_repr_list};
+use crate::filter::PkLiteral;
 use crate::flat;
 use crate::index::{IndexRequest, IndexSpec, Metric, build_spec};
 use crate::projection::{ApiKind, Projection};
@@ -18,11 +21,20 @@ pub enum LoadState {
     Released,
 }
 
+/// 查询向量。M1 的 collection 只有稠密向量字段，稀疏与文本查询在 3.x 中同样报错，
+/// 这里保留它们的种类，以便在与 3.x 相同的位置报出相同的错误。
+#[derive(Debug, Clone, PartialEq)]
+pub enum QueryVectors {
+    Dense(Vec<Vec<f32>>),
+    Sparse,
+    Text,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct SearchRequest {
     /// 为空时取第一个 FLOAT_VECTOR 字段。
     pub anns_field: Option<String>,
-    pub vectors: Vec<Vec<f32>>,
+    pub vectors: QueryVectors,
     /// 为空时用向量字段索引的度量；没有索引时用 COSINE（与 3.x 相同）。
     pub metric_type: Option<String>,
     pub limit: usize,
@@ -40,6 +52,8 @@ pub struct Hits {
 #[derive(Debug, Clone, PartialEq)]
 pub struct SearchResult {
     pub projection: Projection,
+    /// 实际使用的度量；没有查询向量时为 None。
+    pub metric: Option<Metric>,
     /// 每个查询向量一组结果。
     pub hits: Vec<Hits>,
 }
@@ -147,6 +161,26 @@ impl Collection {
         self.indexes.iter().find(|s| s.field_name == field_name)
     }
 
+    /// 3.x DescribeIndex：collection 没有任何索引时先报错；指定字段时只返回该字段的索引。
+    pub fn describe_indexes(&self, field_name: Option<&str>) -> Result<Vec<&IndexSpec>> {
+        if self.indexes.is_empty() {
+            return Err(EngineError::IndexNotFound(format!(
+                "no index on collection {}",
+                py_repr(&self.name)
+            )));
+        }
+        match field_name {
+            None => Ok(self.indexes.iter().collect()),
+            Some(f) => self.index(f).map(|spec| vec![spec]).ok_or_else(|| {
+                EngineError::IndexNotFound(format!(
+                    "no index on field {} of collection {}",
+                    py_repr(f),
+                    py_repr(&self.name)
+                ))
+            }),
+        }
+    }
+
     /// 保存索引定义，不改变 load 状态（3.x 的 Milvus 语义）。
     pub fn create_index(&mut self, field_name: &str, req: IndexRequest) -> Result<()> {
         if self.index(field_name).is_some() {
@@ -175,6 +209,24 @@ impl Collection {
         }
         for (name, values) in &batch.columns {
             check_column_len(name, values, n)?;
+        }
+
+        // 与 validate_row 对第 0 行最先做的两项检查相同。提前做，避免在缺列时仍按 num_rows
+        // 为动态字段分配内存（num_rows 由请求给出，没有列时不受列长度检查的约束）。
+        let has_column = |name: &str| batch.columns.iter().any(|(n, _)| n == name);
+        let pk = &self.schema.fields[self.pk_pos];
+        if !pk.auto_id && !has_column(&pk.name) {
+            return Err(EngineError::schema(format!(
+                "primary key {} missing or None",
+                py_repr(&pk.name)
+            )));
+        }
+        let vector = &self.schema.fields[self.vector_pos];
+        if !has_column(&vector.name) {
+            return Err(EngineError::schema(format!(
+                "vector field {} missing or None",
+                py_repr(&vector.name)
+            )));
         }
 
         let dynamic = self.decode_dynamic(&batch);
@@ -213,6 +265,7 @@ impl Collection {
             };
             columns.push(column);
         }
+        // 从这里开始修改状态，之后的步骤都不会失败或 panic：锁没有中毒语义，中途失败会留下半写的 collection。
         self.next_seq += n as u64;
 
         let meta = self.schema.enable_dynamic_field.then_some(dynamic.maps);
@@ -255,25 +308,60 @@ impl Collection {
         Ok(QueryResult { projection, rows })
     }
 
+    /// 按 `<主键> in [...]` 中的字面量读取。与主键类型不符或超出 int64 的字面量查不到，不报错（3.x 相同）。
+    pub fn get_literals(
+        &self,
+        literals: &[PkLiteral],
+        output_fields: &[String],
+    ) -> Result<QueryResult> {
+        let int_pk = self.schema.fields[self.pk_pos].data_type == DataType::Int64;
+        let pks: Vec<Pk> = literals
+            .iter()
+            .filter_map(|lit| match lit {
+                PkLiteral::Int(v) if int_pk => Some(Pk::Int64(*v)),
+                PkLiteral::Str(v) if !int_pk => Some(Pk::VarChar(v.clone())),
+                _ => None,
+            })
+            .collect();
+        self.get(&pks, output_fields)
+    }
+
     pub fn search(&self, req: SearchRequest) -> Result<SearchResult> {
         let projection = Projection::new(&self.schema, &req.output_fields, ApiKind::Search);
         // 3.x：没有查询向量时在一切检查之前返回空结果。
-        if req.vectors.is_empty() {
+        if matches!(&req.vectors, QueryVectors::Dense(v) if v.is_empty()) {
             return Ok(SearchResult {
                 projection,
+                metric: None,
                 hits: Vec::new(),
             });
         }
         self.require_loaded()?;
         let field_pos = self.resolve_anns_field(req.anns_field.as_deref())?;
         let field = &self.schema.fields[field_pos];
+        let vectors = match &req.vectors {
+            QueryVectors::Dense(v) => v,
+            // 3.x `_maybe_embed_queries`：字段上没有 TEXT_EMBEDDING function（M1 不支持 function）。
+            QueryVectors::Text => {
+                return Err(EngineError::schema(format!(
+                    "Text query on field {} requires a TEXT_EMBEDDING function targeting that field",
+                    py_repr(&field.name)
+                )));
+            }
+            // 3.x 把稀疏向量（dict）交给 numpy 转成稠密数组时的 TypeError。
+            QueryVectors::Sparse => {
+                return Err(EngineError::invalid(
+                    "float() argument must be a string or a real number, not 'dict'",
+                ));
+            }
+        };
         let metric = match &req.metric_type {
             Some(m) => Metric::parse(m)?,
             None => self.default_metric(&field.name)?,
         };
         let dim = field_dim(field);
         // 3.x 不校验，维度不符时报 numpy 的原始错误，空 collection 上反而成功（0004「决策」）。
-        for v in &req.vectors {
+        for v in vectors {
             if v.len() != dim {
                 return Err(EngineError::invalid(format!(
                     "query vector has dim {}, but field {} expects dim {dim}",
@@ -283,8 +371,7 @@ impl Collection {
             }
         }
         let take = req.limit.saturating_add(req.offset);
-        let hits = req
-            .vectors
+        let hits = vectors
             .iter()
             .map(|v| {
                 let query = flat::Query::new(metric, v);
@@ -309,10 +396,15 @@ impl Collection {
                 }
             })
             .collect();
-        Ok(SearchResult { projection, hits })
+        Ok(SearchResult {
+            projection,
+            metric: Some(metric),
+            hits,
+        })
     }
 
-    fn require_loaded(&self) -> Result<()> {
+    /// 3.x `_require_loaded`：检索与按主键读取之前的 load 状态检查。
+    pub fn require_loaded(&self) -> Result<()> {
         match self.load_state {
             LoadState::Loaded => Ok(()),
             LoadState::Released => Err(EngineError::CollectionNotLoaded(self.name.clone())),
@@ -430,7 +522,7 @@ impl Collection {
                 py_repr(META_FIELD)
             )));
         };
-        let Value::Object(obj) = parse_json(META_FIELD, &texts[row])? else {
+        let Value::Object(obj) = parse_dynamic_json(META_FIELD, &texts[row])? else {
             return Err(EngineError::schema(format!(
                 "dynamic field {} value must be a JSON object",
                 py_repr(META_FIELD)
@@ -520,29 +612,6 @@ struct Dynamic {
     errors: Vec<Option<String>>,
 }
 
-/// 3.x 在解码 FieldData 时的行数检查（`translators/records.py`）。
-fn check_column_len(name: &str, values: &InputValues, n: usize) -> Result<()> {
-    if let InputValues::FloatVector { dim, values } = values {
-        let expected = n.saturating_mul(*dim);
-        if *dim == 0 || values.len() != expected {
-            return Err(EngineError::schema(format!(
-                "FieldData {} float_vector data has {} elements, expected num_rows({n}) * dim({dim}) = {expected}",
-                py_repr(name),
-                values.len()
-            )));
-        }
-        return Ok(());
-    }
-    if values.len() != n {
-        return Err(EngineError::schema(format!(
-            "FieldData {} has {} rows, expected {n}",
-            py_repr(name),
-            values.len()
-        )));
-    }
-    Ok(())
-}
-
 fn vector_values(column: &ColumnData) -> (usize, &[f32]) {
     match column {
         ColumnData::FloatVector { dim, values } => (*dim, values),
@@ -558,6 +627,57 @@ fn pk_at(column: &ColumnData, row: usize) -> Pk {
         // schema 校验保证主键列只能是 INT64 或 VARCHAR。
         _ => unreachable!("primary key column must be INT64 or VARCHAR"),
     }
+}
+
+/// 动态字段的 JSON。serde_json 会把超出 64 位的整数静默转成浮点数，而 3.x 原样保存；
+/// 这类值只能由手写请求构造（pymilvus 在客户端拒绝），明确报错（0004「决策」）。
+fn parse_dynamic_json(field: &str, text: &[u8]) -> Result<Value> {
+    let value = parse_json(field, text)?;
+    if has_wide_integer(text) {
+        return Err(EngineError::schema(format!(
+            "field {} value contains an integer that does not fit in 64 bits",
+            py_repr(field)
+        )));
+    }
+    Ok(value)
+}
+
+/// 在已通过解析的 JSON 文本中找超出 i64 / u64 的整数字面量（字符串之外、不带小数点与指数）。
+fn has_wide_integer(text: &[u8]) -> bool {
+    let mut i = 0;
+    while i < text.len() {
+        match text[i] {
+            b'"' => {
+                i += 1;
+                while i < text.len() && text[i] != b'"' {
+                    i += if text[i] == b'\\' { 2 } else { 1 };
+                }
+                i += 1;
+            }
+            b'-' | b'0'..=b'9' => {
+                let start = i;
+                i += 1;
+                while i < text.len() && text[i].is_ascii_digit() {
+                    i += 1;
+                }
+                let float = matches!(text.get(i), Some(b'.' | b'e' | b'E'));
+                if !float {
+                    // 解析过的 JSON 中数字只含 ASCII，切片必为合法 UTF-8。
+                    let literal = std::str::from_utf8(&text[start..i]).unwrap_or("");
+                    if literal.parse::<i64>().is_err() && literal.parse::<u64>().is_err() {
+                        return true;
+                    }
+                }
+                while i < text.len()
+                    && matches!(text[i], b'0'..=b'9' | b'.' | b'e' | b'E' | b'+' | b'-')
+                {
+                    i += 1;
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    false
 }
 
 fn parse_json(field: &str, text: &[u8]) -> Result<Value> {
@@ -576,7 +696,7 @@ fn to_json(name: &str, values: &InputValues, row: usize) -> Result<Value> {
         InputValues::Int(v) => Value::from(v[row]),
         InputValues::Float(v) => json_number(name, v[row])?,
         InputValues::Str(v) => Value::String(v[row].clone()),
-        InputValues::Json(v) => parse_json(name, &v[row])?,
+        InputValues::Json(v) => parse_dynamic_json(name, &v[row])?,
         InputValues::FloatVector { dim, values } => Value::Array(
             values[row * dim..(row + 1) * dim]
                 .iter()
@@ -738,33 +858,8 @@ fn py_value_repr(values: &InputValues, row: usize) -> String {
             format!("[{}]", items.join(", "))
         }
         InputValues::Json(v) => match serde_json::from_slice::<Value>(&v[row]) {
-            Ok(value) => json_py_repr(&value),
+            Ok(value) => py_json_repr(&value),
             Err(_) => py_repr(&String::from_utf8_lossy(&v[row])),
         },
-    }
-}
-
-fn json_py_repr(value: &Value) -> String {
-    match value {
-        Value::Null => "None".to_owned(),
-        Value::Bool(b) => if *b { "True" } else { "False" }.to_owned(),
-        Value::Number(n) => match (n.as_i64(), n.as_u64(), n.as_f64()) {
-            (Some(i), _, _) => i.to_string(),
-            (None, Some(u), _) => u.to_string(),
-            (None, None, Some(f)) => py_float_repr(f),
-            (None, None, None) => n.to_string(),
-        },
-        Value::String(s) => py_repr(s),
-        Value::Array(items) => {
-            let parts: Vec<String> = items.iter().map(json_py_repr).collect();
-            format!("[{}]", parts.join(", "))
-        }
-        Value::Object(obj) => {
-            let parts: Vec<String> = obj
-                .iter()
-                .map(|(k, v)| format!("{}: {}", py_repr(k), json_py_repr(v)))
-                .collect();
-            format!("{{{}}}", parts.join(", "))
-        }
     }
 }

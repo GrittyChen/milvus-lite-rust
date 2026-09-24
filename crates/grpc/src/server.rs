@@ -4,18 +4,17 @@ use std::net::TcpListener;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use milvus_lite_core::{DataDir, DataDirError};
+use std::sync::Arc;
+
+use milvus_lite_core::{DataDir, DataDirError, Db};
 use tokio::runtime::Runtime;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tonic::transport::server::TcpIncoming;
 
-use crate::guard;
 use crate::pb::service::milvus_service_server::MilvusServiceServer;
 use crate::service::MilvusService;
-
-/// 与 3.x（及 Milvus Standalone）一致的消息大小上限；tonic 默认解码上限只有 4 MB。
-const MAX_MESSAGE_SIZE: usize = 256 * 1024 * 1024;
+use crate::{MAX_MESSAGE_SIZE, guard};
 
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
@@ -59,12 +58,13 @@ struct Running {
     runtime: Runtime,
     shutdown: oneshot::Sender<()>,
     serve: JoinHandle<Result<(), tonic::transport::Error>>,
-    data_dir: DataDir,
+    /// 引擎；它持有数据目录的 LOCK，关闭时在所有在途任务结束后释放。
+    db: Arc<Db>,
 }
 
 impl Server {
     pub fn start(config: ServerConfig) -> Result<Self, ServerError> {
-        let data_dir = DataDir::open(&config.data_dir)?;
+        let db = Arc::new(Db::new(DataDir::open(&config.data_dir)?));
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .thread_name("milvus-lite-rt")
@@ -87,7 +87,7 @@ impl Server {
         // 避免小响应受 Nagle 与延迟 ACK 叠加影响。
         let incoming = TcpIncoming::from(listener).with_nodelay(Some(true));
 
-        let service = MilvusServiceServer::new(MilvusService::new(config.version))
+        let service = MilvusServiceServer::new(MilvusService::new(config.version, Arc::clone(&db)))
             .max_decoding_message_size(MAX_MESSAGE_SIZE)
             .max_encoding_message_size(MAX_MESSAGE_SIZE);
         let (shutdown, shutdown_rx) = oneshot::channel::<()>();
@@ -109,7 +109,7 @@ impl Server {
                 runtime,
                 shutdown,
                 serve,
-                data_dir,
+                db,
             }),
         })
     }
@@ -118,7 +118,8 @@ impl Server {
         self.port
     }
 
-    /// 停止接受新请求，最多等 `grace` 让在途请求结束，超时后取消；最后释放 LOCK。
+    /// 按 0003「进程退出」的顺序停止：停止接受新请求，最多等 `grace` 让在途请求结束，超时后取消；
+    /// 再关闭引擎，等仍在执行的引擎任务结束（任务不可取消，但有界）；最后释放 LOCK。
     /// 重复调用是空操作。只能由创建者进程调用（见 0003「fork」）。
     pub fn stop(&mut self, grace: Duration) -> Result<(), ServerError> {
         let current = std::process::id();
@@ -132,7 +133,7 @@ impl Server {
             runtime,
             shutdown,
             mut serve,
-            data_dir,
+            db,
         }) = self.running.take()
         else {
             return Ok(());
@@ -150,8 +151,12 @@ impl Server {
                 }
             }
         });
-        runtime.shutdown_timeout(grace);
-        drop(data_dir);
+        // 宽限已在上面用完。tonic 为每条连接单独 spawn 任务，中止 serve 不会关闭已建立的连接，
+        // 因此立即关闭 runtime：丢弃连接与请求的任务，客户端随即收到错误。已经开始的阻塞任务
+        // （引擎调用）不可取消，会在阻塞线程上继续运行到结束。
+        runtime.shutdown_timeout(Duration::ZERO);
+        // 关闭引擎：等上述引擎任务结束后才释放 LOCK；尚未开始的任务进入闸门时会被拒绝。
+        db.close();
         match result {
             Some(Ok(Ok(()))) | None => Ok(()),
             Some(Ok(Err(e))) => Err(ServerError::Serve(e)),
@@ -175,8 +180,9 @@ impl Drop for Server {
         match running.shutdown.send(()) {
             Ok(()) | Err(()) => {}
         }
+        // 没有在途任务时 LOCK 立即释放，否则由最后一个任务结束时释放，不会早于引擎任务。
+        running.db.close_nowait();
         running.runtime.shutdown_background();
-        drop(running.data_dir);
     }
 }
 

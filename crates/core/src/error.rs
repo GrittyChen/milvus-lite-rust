@@ -1,5 +1,7 @@
 //! 引擎错误。各变体与 3.x 的异常类一一对应，错误信息沿用 3.x 原文；错误码由 gRPC 层映射。
 
+use serde_json::Value;
+
 use crate::data_dir::DataDirError;
 
 #[derive(Debug, thiserror::Error)]
@@ -19,6 +21,15 @@ pub enum EngineError {
     /// 3.x `IndexAlreadyExistsError`。
     #[error("index already exists for field {}; call drop_index first", py_repr(.0))]
     IndexAlreadyExists(String),
+    /// 3.x `IndexNotFoundError`，信息随场景不同，原样保存。
+    #[error("{0}")]
+    IndexNotFound(String),
+    /// 3.x `DatabaseNotFoundError`。
+    #[error("database {} does not exist", py_repr(.0))]
+    DatabaseNotFound(String),
+    /// 引擎已关闭（3.x `_check_open` 抛出的 RuntimeError）。
+    #[error("MilvusLite is closed")]
+    Closed,
     /// 3.x `SchemaValidationError`：schema、写入数据与请求参数的校验失败。
     #[error("{0}")]
     SchemaValidation(String),
@@ -111,7 +122,7 @@ pub(crate) fn py_repr_list<'a>(items: impl IntoIterator<Item = &'a str>) -> Stri
 }
 
 /// Python `repr(float)`：最短往返表示，整数值带 `.0`，指数形式为 `1e-05`。
-pub(crate) fn py_float_repr(v: f64) -> String {
+pub fn py_float_repr(v: f64) -> String {
     if v.is_nan() {
         return "nan".to_owned();
     }
@@ -132,6 +143,32 @@ pub(crate) fn py_float_repr(v: f64) -> String {
         s
     } else {
         format!("{s}.0")
+    }
+}
+
+/// `json.loads` 解出的值在 Python 中的 `repr()`。
+pub fn py_json_repr(value: &Value) -> String {
+    match value {
+        Value::Null => "None".to_owned(),
+        Value::Bool(b) => if *b { "True" } else { "False" }.to_owned(),
+        Value::Number(n) => match (n.as_i64(), n.as_u64(), n.as_f64()) {
+            (Some(i), _, _) => i.to_string(),
+            (None, Some(u), _) => u.to_string(),
+            (None, None, Some(f)) => py_float_repr(f),
+            (None, None, None) => n.to_string(),
+        },
+        Value::String(s) => py_repr(s),
+        Value::Array(items) => {
+            let parts: Vec<String> = items.iter().map(py_json_repr).collect();
+            format!("[{}]", parts.join(", "))
+        }
+        Value::Object(obj) => {
+            let parts: Vec<String> = obj
+                .iter()
+                .map(|(k, v)| format!("{}: {}", py_repr(k), py_json_repr(v)))
+                .collect();
+            format!("{{{}}}", parts.join(", "))
+        }
     }
 }
 

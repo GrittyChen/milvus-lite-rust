@@ -4,9 +4,10 @@
 // 辅助函数不带 #[test]，clippy 的 allow-unwrap-in-tests 覆盖不到；测试中失败即应 panic。
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+use milvus_lite_core::filter::PkLiteral;
 use milvus_lite_core::{
     Collection, CollectionSchema, ColumnData, DataType, EngineError, FieldSchema, IndexRequest,
-    InputValues, InsertBatch, LoadState, Pk, SearchRequest,
+    InputValues, InsertBatch, LoadState, Pk, QueryVectors, SearchRequest,
 };
 use serde_json::json;
 
@@ -37,6 +38,7 @@ fn basic(dynamic: bool, auto_id: bool) -> Collection {
             },
         ],
         enable_dynamic_field: dynamic,
+        properties: Vec::new(),
     };
     Collection::new("c", schema).unwrap()
 }
@@ -88,7 +90,7 @@ fn search(c: &Collection, q: [f32; 2], limit: usize, metric: Option<&str>) -> (V
     let r = c
         .search(SearchRequest {
             anns_field: None,
-            vectors: vec![q.to_vec()],
+            vectors: QueryVectors::Dense(vec![q.to_vec()]),
             metric_type: metric.map(str::to_owned),
             limit,
             offset: 0,
@@ -270,6 +272,7 @@ fn scalar_type_checks_match_3x() {
             FieldSchema::new("f", DataType::Float),
         ],
         enable_dynamic_field: false,
+        properties: Vec::new(),
     };
     let mut c = Collection::new("s", schema).unwrap();
     let row = |b: InputValues, i8: InputValues, f: InputValues| {
@@ -339,6 +342,7 @@ fn row_major_check_order_matches_3x() {
             },
         ],
         enable_dynamic_field: false,
+        properties: Vec::new(),
     };
     let mut c = Collection::new("o", schema).unwrap();
     // 第 0 行只有 t 超长，第 1 行在更靠前的 i8 上越界：报第 0 行的错误。
@@ -424,6 +428,7 @@ fn integers_into_float_fields_must_be_exact() {
             FieldSchema::new("d", DataType::Double),
         ],
         enable_dynamic_field: false,
+        properties: Vec::new(),
     };
     let mut c = Collection::new("f", schema).unwrap();
     let row = |id: i64, f: i64, d: i64| {
@@ -458,6 +463,7 @@ fn non_json_values_for_json_fields_are_rejected() {
             FieldSchema::new("j", DataType::Json),
         ],
         enable_dynamic_field: false,
+        properties: Vec::new(),
     };
     let mut c = Collection::new("j", schema).unwrap();
     let b = batch(vec![
@@ -480,7 +486,7 @@ fn no_query_vectors_returns_before_any_check() {
     let r = c
         .search(SearchRequest {
             anns_field: Some("nope".into()),
-            vectors: vec![],
+            vectors: QueryVectors::Dense(vec![]),
             metric_type: Some("bad".into()),
             limit: 1,
             offset: 0,
@@ -543,6 +549,7 @@ fn malformed_json_and_meta_are_rejected() {
             FieldSchema::new("j", DataType::Json),
         ],
         enable_dynamic_field: false,
+        properties: Vec::new(),
     };
     let mut j = Collection::new("j", schema).unwrap();
     let json_row = |text: &[u8]| {
@@ -617,7 +624,7 @@ fn limit_offset_and_multiple_queries() {
     .unwrap();
     let req = |offset, limit| SearchRequest {
         anns_field: Some("v".into()),
-        vectors: vec![vec![0.0, 0.0], vec![5.0, 0.0]],
+        vectors: QueryVectors::Dense(vec![vec![0.0, 0.0], vec![5.0, 0.0]]),
         metric_type: Some("L2".into()),
         limit,
         offset,
@@ -640,7 +647,7 @@ fn search_default_output_includes_vector_and_meta_but_not_pk_field() {
     let r = c
         .search(SearchRequest {
             anns_field: None,
-            vectors: vec![vec![1.0, 0.0]],
+            vectors: QueryVectors::Dense(vec![vec![1.0, 0.0]]),
             metric_type: None,
             limit: 1,
             offset: 0,
@@ -666,7 +673,7 @@ fn search_argument_errors() {
     let mut c = basic(false, false);
     let req = |anns: Option<&str>, metric: Option<&str>, q: Vec<f32>| SearchRequest {
         anns_field: anns.map(str::to_owned),
-        vectors: vec![q],
+        vectors: QueryVectors::Dense(vec![q]),
         metric_type: metric.map(str::to_owned),
         limit: 1,
         offset: 0,
@@ -712,7 +719,7 @@ fn load_state_semantics_match_3x() {
     let e = c
         .search(SearchRequest {
             anns_field: None,
-            vectors: vec![vec![1.0, 0.0]],
+            vectors: QueryVectors::Dense(vec![vec![1.0, 0.0]]),
             metric_type: None,
             limit: 1,
             offset: 0,
@@ -762,6 +769,7 @@ fn varchar_primary_key() {
             vec_field("v", 2),
         ],
         enable_dynamic_field: false,
+        properties: Vec::new(),
     };
     let mut c = Collection::new("s", schema).unwrap();
     let ids = c
@@ -833,6 +841,7 @@ fn json_nesting_depth_is_limited() {
             FieldSchema::new("j", DataType::Json),
         ],
         enable_dynamic_field: false,
+        properties: Vec::new(),
     };
     let mut c = Collection::new("j", schema).unwrap();
     let nested = |depth: usize| format!("{}{}", "[".repeat(depth), "]".repeat(depth)).into_bytes();
@@ -861,6 +870,7 @@ fn more_scalar_type_checks_match_3x() {
             FieldSchema::new("d", DataType::Double),
         ],
         enable_dynamic_field: false,
+        properties: Vec::new(),
     };
     let mut c = Collection::new("s", schema).unwrap();
     let row = |i16: i64, i32: i64, d: InputValues| {
@@ -915,7 +925,7 @@ fn search_on_empty_collection_returns_empty_hits() {
     let r = c
         .search(SearchRequest {
             anns_field: None,
-            vectors: vec![vec![1.0, 0.0], vec![0.0, 1.0]],
+            vectors: QueryVectors::Dense(vec![vec![1.0, 0.0], vec![0.0, 1.0]]),
             metric_type: None,
             limit: 3,
             offset: 0,
@@ -928,4 +938,209 @@ fn search_on_empty_collection_returns_empty_hits() {
             .iter()
             .all(|h| h.rows.is_empty() && h.scores.is_empty())
     );
+}
+
+fn search_with(c: &Collection, anns: Option<&str>, vectors: QueryVectors) -> EngineError {
+    c.search(SearchRequest {
+        anns_field: anns.map(str::to_owned),
+        vectors,
+        metric_type: None,
+        limit: 1,
+        offset: 0,
+        output_fields: vec![],
+    })
+    .unwrap_err()
+}
+
+#[test]
+fn sparse_and_text_queries_fail_where_3x_fails() {
+    let mut c = basic(false, false);
+    let text = search_with(&c, None, QueryVectors::Text);
+    assert!(matches!(text, EngineError::SchemaValidation(_)));
+    assert_eq!(
+        text.to_string(),
+        "Text query on field 'v' requires a TEXT_EMBEDDING function targeting that field"
+    );
+    let sparse = search_with(&c, None, QueryVectors::Sparse);
+    assert!(matches!(sparse, EngineError::InvalidArgument(_)));
+    assert_eq!(
+        sparse.to_string(),
+        "float() argument must be a string or a real number, not 'dict'"
+    );
+    // 3.x 先解析 anns_field，再看查询向量的种类；更早的是 load 状态。
+    assert_eq!(
+        search_with(&c, Some("nope"), QueryVectors::Text).to_string(),
+        "anns_field 'nope' not found in schema"
+    );
+    flat_index(&mut c, "L2");
+    c.release();
+    assert!(matches!(
+        search_with(&c, Some("nope"), QueryVectors::Sparse),
+        EngineError::CollectionNotLoaded(_)
+    ));
+}
+
+#[test]
+fn describe_indexes_matches_3x() {
+    let mut c = basic(false, false);
+    let e = c.describe_indexes(Some("v")).unwrap_err();
+    assert!(matches!(e, EngineError::IndexNotFound(_)));
+    assert_eq!(e.to_string(), "no index on collection 'c'");
+    assert!(c.describe_indexes(None).is_err());
+    flat_index(&mut c, "IP");
+    assert_eq!(c.describe_indexes(None).unwrap().len(), 1);
+    assert_eq!(c.describe_indexes(Some("v")).unwrap()[0].metric_type, "IP");
+    assert_eq!(
+        c.describe_indexes(Some("t")).unwrap_err().to_string(),
+        "no index on field 't' of collection 'c'"
+    );
+}
+
+#[test]
+fn get_literals_skips_literals_of_the_wrong_type() {
+    let mut c = basic(false, false);
+    c.insert(rows(&[1, 2], &[[1.0, 0.0], [0.0, 1.0]], &["a", "b"]))
+        .unwrap();
+    let lits = [
+        PkLiteral::Str("1".into()),
+        PkLiteral::Int(2),
+        PkLiteral::IntOutOfRange,
+        PkLiteral::Int(2),
+    ];
+    assert_eq!(ints(&c.get_literals(&lits, &[]).unwrap().rows.pks), [2, 2]);
+
+    let schema = CollectionSchema {
+        fields: vec![
+            FieldSchema {
+                is_primary: true,
+                ..FieldSchema::new("pk", DataType::VarChar)
+            },
+            vec_field("v", 2),
+        ],
+        ..CollectionSchema::default()
+    };
+    let mut s = Collection::new("s", schema).unwrap();
+    s.insert(batch(vec![
+        ("pk", strs(&["1", "a"])),
+        ("v", vectors(&[[1.0, 0.0], [0.0, 1.0]])),
+    ]))
+    .unwrap();
+    let got = s
+        .get_literals(&[PkLiteral::Int(1), PkLiteral::Str("a".into())], &[])
+        .unwrap();
+    assert_eq!(got.rows.pks, [Pk::VarChar("a".into())]);
+}
+
+#[test]
+fn json_fields_accept_top_level_scalars_and_strings() {
+    // 0004「决策」：3.x 对顶层数字与布尔报 pyarrow 的错，字符串值读回时丢了引号；本实现都按 JSON 原样保存。
+    let schema = CollectionSchema {
+        fields: vec![
+            pk_field("id", false),
+            vec_field("v", 2),
+            FieldSchema::new("j", DataType::Json),
+        ],
+        ..CollectionSchema::default()
+    };
+    let mut c = Collection::new("j", schema).unwrap();
+    let values: [&[u8]; 4] = [b"1", b"1.5", b"true", b"\"abc\""];
+    c.insert(batch(vec![
+        ("id", InputValues::Int(vec![1, 2, 3, 4])),
+        ("v", vectors(&[[1.0, 0.0]; 4])),
+        (
+            "j",
+            InputValues::Json(values.iter().map(|v| v.to_vec()).collect()),
+        ),
+    ]))
+    .unwrap();
+    let got = c
+        .get(&[Pk::Int64(4), Pk::Int64(1)], &["j".to_owned()])
+        .unwrap();
+    assert_eq!(
+        got.rows.fields[0].1,
+        ColumnData::Json(vec![b"\"abc\"".to_vec(), b"1".to_vec()])
+    );
+}
+
+#[test]
+fn wide_integers_in_dynamic_fields_are_rejected() {
+    // 0004「决策」：serde_json 会把超出 64 位的整数转成浮点数，3.x 原样保存；本实现明确报错。
+    let mut c = basic(true, false);
+    let meta = |text: &str| {
+        batch(vec![
+            ("id", InputValues::Int(vec![1])),
+            ("v", vectors(&[[1.0, 0.0]])),
+            ("t", strs(&["a"])),
+            ("$meta", InputValues::Json(vec![text.as_bytes().to_vec()])),
+        ])
+    };
+    for text in [
+        r#"{"q": 123456789012345678901234567890}"#,
+        r#"{"q": [1, -9223372036854775809]}"#,
+        r#"{"q": {"r": 18446744073709551616}}"#,
+    ] {
+        assert_eq!(
+            insert_err(&mut c, meta(text)),
+            "field '$meta' value contains an integer that does not fit in 64 bits",
+            "{text}"
+        );
+    }
+    // 64 位以内的整数、浮点数、字符串中的长数字都照常保存。
+    c.insert(meta(
+        r#"{"a": 18446744073709551615, "b": -9223372036854775808, "c": 1.5e300, "d": "123456789012345678901234567890", "e": "x\"1e999"}"#,
+    ))
+    .unwrap();
+    let wide = batch(vec![
+        ("id", InputValues::Int(vec![2])),
+        ("v", vectors(&[[1.0, 0.0]])),
+        ("t", strs(&["a"])),
+        (
+            "extra",
+            InputValues::Json(vec![b"99999999999999999999".to_vec()]),
+        ),
+    ]);
+    assert_eq!(
+        insert_err(&mut c, wide),
+        "field 'extra' value contains an integer that does not fit in 64 bits"
+    );
+}
+
+#[test]
+fn missing_key_columns_are_reported_before_allocating_per_row_state() {
+    let mut c = basic(true, false);
+    // num_rows 由请求给出；没有任何列时不应先按它分配内存。
+    let empty = InsertBatch {
+        num_rows: usize::MAX,
+        columns: vec![],
+    };
+    assert_eq!(
+        insert_err(&mut c, empty),
+        "primary key 'id' missing or None"
+    );
+    let mut auto = basic(true, true);
+    let empty = InsertBatch {
+        num_rows: usize::MAX,
+        columns: vec![],
+    };
+    assert_eq!(
+        insert_err(&mut auto, empty),
+        "vector field 'v' missing or None"
+    );
+}
+
+#[test]
+fn scalar_index_with_empty_metric_is_none() {
+    // 3.x：标量索引的 metric_type 为空串时按 `or "NONE"` 处理，随后才是 FLAT 阶段的限制。
+    let mut c = basic(false, false);
+    let e = c
+        .create_index(
+            "t",
+            IndexRequest {
+                index_type: "INVERTED".to_owned(),
+                metric_type: Some(String::new()),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+    assert!(matches!(e, EngineError::Unsupported { .. }), "{e}");
 }

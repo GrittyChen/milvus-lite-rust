@@ -6,13 +6,15 @@
 use std::convert::Infallible;
 use std::task::{Context, Poll};
 
-use tonic::Status;
 use tonic::body::Body;
 use tonic::codegen::{BoxFuture, Service, http};
 use tonic::server::NamedService;
 use tonic::service::Routes;
+use tonic::{Code, Status};
 
 include!(concat!(env!("OUT_DIR"), "/implemented_methods.rs"));
+
+use crate::MAX_MESSAGE_SIZE;
 
 const REASON: &str = "not implemented in this build of milvus-lite-rust yet";
 
@@ -54,7 +56,8 @@ where
     fn call(&mut self, req: http::Request<B>) -> Self::Future {
         let method = method_name(req.uri().path());
         if IMPLEMENTED_METHODS.contains(&method) {
-            Box::pin(self.inner.call(req))
+            let call = self.inner.call(req);
+            Box::pin(async move { call.await.map(rewrite_oversized_request) })
         } else {
             let resp = unimplemented(method);
             Box::pin(async move { Ok(resp) })
@@ -78,6 +81,31 @@ where
     *routes.axum_router_mut() =
         router.fallback(|uri: http::Uri| async move { unimplemented(method_name(uri.path())) });
     routes
+}
+
+/// tonic 对超过上限的请求在读完消息头时就返回 OUT_OF_RANGE（trailers-only 响应，状态在响应头中）；
+/// 3.x（grpcio）返回 RESOURCE_EXHAUSTED。pymilvus 不重试后者，却会重试前者。
+/// 这里依赖 tonic 0.14 `codec/decode.rs` 的错误原文，升级 tonic 时由 256MB 的端到端用例把关。
+const DECODE_TOO_LARGE: &str = "Error, decoded message length too large: found ";
+
+fn rewrite_oversized_request(resp: http::Response<Body>) -> http::Response<Body> {
+    let Some(status) = Status::from_header_map(resp.headers()) else {
+        return resp;
+    };
+    if status.code() != Code::OutOfRange {
+        return resp;
+    }
+    let Some(len) = status
+        .message()
+        .strip_prefix(DECODE_TOO_LARGE)
+        .and_then(|rest| rest.split(' ').next())
+    else {
+        return resp;
+    };
+    Status::resource_exhausted(format!(
+        "SERVER: Received message larger than max ({len} vs. {MAX_MESSAGE_SIZE})"
+    ))
+    .into_http()
 }
 
 fn method_name(path: &str) -> &str {

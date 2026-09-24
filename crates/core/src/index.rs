@@ -35,6 +35,20 @@ impl Metric {
         }
     }
 
+    /// 3.x 在 float64 中得到的对外分数，`round_decimal` 作用在这个值上。3.x 的内部距离是 float32：
+    /// L2 为开方后的距离，COSINE 为 `max(1 - sim, 0)`，IP 为点积的相反数；换算为对外分数时才转为
+    /// float64（`collection.py` 的 `_internal_distance_to_milvus_distance`）。`score` 是本实现的对外分数。
+    pub fn public_f64(self, score: f32) -> f64 {
+        match self {
+            Self::L2 => {
+                let d = f64::from(score.sqrt());
+                d * d
+            }
+            Self::Cosine => 1.0 - f64::from(1.0 - score),
+            Self::Ip => f64::from(score),
+        }
+    }
+
     /// 对外分数是否越大越相似（COSINE / IP 返回相似度，L2 返回平方距离）。
     pub fn higher_is_better(self) -> bool {
         !matches!(self, Self::L2)
@@ -97,7 +111,10 @@ pub(crate) fn build_spec(field: &FieldSchema, req: IndexRequest) -> Result<Index
             )));
         }
         validate_scalar_request(field.data_type, &index_type)?;
-        req.metric_type.unwrap_or_else(|| "NONE".to_owned())
+        // 3.x：`metric_type or "NONE"`，空串同样视为没有。
+        req.metric_type
+            .filter(|m| !m.is_empty())
+            .unwrap_or_else(|| "NONE".to_owned())
     };
     if !SPEC_METRICS.contains(&metric_type.as_str()) {
         return Err(EngineError::invalid(format!(
@@ -181,6 +198,16 @@ mod tests {
 
     fn err(field: &FieldSchema, r: IndexRequest) -> EngineError {
         build_spec(field, r).unwrap_err()
+    }
+
+    #[test]
+    fn public_f64_follows_3x_float64_conversion() {
+        // 3.x 实测：L2 平方距离 1.25（向量 [1, 0.5] 到原点）在 float64 中是 1.250000036705515。
+        assert_eq!(Metric::L2.public_f64(1.25), 1.250_000_036_705_515);
+        assert_eq!(Metric::Ip.public_f64(0.1), f64::from(0.1f32));
+        // COSINE：3.x 的内部距离 float32(1 - sim)，对外 1.0 - 距离在 float64 中计算。
+        let sim = 0.982_710_54_f32;
+        assert_eq!(Metric::Cosine.public_f64(sim), 1.0 - f64::from(1.0 - sim));
     }
 
     #[test]

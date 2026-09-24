@@ -77,6 +77,26 @@ impl Projection {
     }
 }
 
+impl Projection {
+    /// 响应中的 output_fields 列表，与 3.x 的 `projection_output_fields` 相同：schema 字段按 schema 顺序，
+    /// 然后是 `$meta`（输出完整动态字段时）或显式请求的动态 key。
+    pub fn output_fields(&self, schema: &CollectionSchema, include_primary: bool) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .schema_fields
+            .iter()
+            .map(|&i| &schema.fields[i])
+            .filter(|f| include_primary || !f.is_primary)
+            .map(|f| f.name.clone())
+            .collect();
+        if self.all_dynamic {
+            names.push(META_FIELD.to_owned());
+        } else {
+            names.extend(self.dynamic_keys.iter().cloned());
+        }
+        names
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -96,6 +116,7 @@ mod tests {
                 FieldSchema::new("t", DataType::VarChar),
             ],
             enable_dynamic_field: dynamic,
+            properties: Vec::new(),
         }
     }
 
@@ -130,6 +151,32 @@ mod tests {
         assert!(star.all_dynamic && star.dynamic_keys.is_empty());
         let meta = p(true, &["$meta"], ApiKind::Query);
         assert!(meta.schema_fields.is_empty() && meta.all_dynamic);
+    }
+
+    #[test]
+    fn output_fields_match_3x() {
+        let s = schema(true);
+        let names = |fields: &[&str], kind, pk| {
+            let fields: Vec<String> = fields.iter().map(|f| (*f).to_owned()).collect();
+            Projection::new(&s, &fields, kind).output_fields(&s, pk)
+        };
+        assert_eq!(
+            names(&["*"], ApiKind::Query, true),
+            ["id", "v", "t", "$meta"]
+        );
+        assert_eq!(
+            names(&["aa", "t", "zz"], ApiKind::Query, true),
+            ["t", "aa", "zz"]
+        );
+        assert_eq!(names(&["t", "id", "v"], ApiKind::Search, false), ["v", "t"]);
+        assert_eq!(names(&[], ApiKind::Search, false), ["v", "t", "$meta"]);
+        let nd = schema(false);
+        let fields = vec!["$meta".to_owned(), "zz".to_owned()];
+        assert!(
+            Projection::new(&nd, &fields, ApiKind::Query)
+                .output_fields(&nd, true)
+                .is_empty()
+        );
     }
 
     #[test]

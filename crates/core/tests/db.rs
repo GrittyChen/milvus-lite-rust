@@ -3,7 +3,12 @@
 // 辅助函数不带 #[test]，clippy 的 allow-unwrap-in-tests 覆盖不到；测试中失败即应 panic。
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use milvus_lite_core::{CollectionSchema, DataDir, DataType, Db, EngineError, FieldSchema};
+use std::sync::Arc;
+use std::time::Duration;
+
+use milvus_lite_core::{
+    CollectionSchema, DataDir, DataDirError, DataType, Db, EngineError, FieldSchema, LoadState,
+};
 
 fn schema() -> CollectionSchema {
     CollectionSchema {
@@ -18,6 +23,7 @@ fn schema() -> CollectionSchema {
             },
         ],
         enable_dynamic_field: false,
+        properties: Vec::new(),
     }
 }
 
@@ -31,40 +37,49 @@ fn db() -> (tempfile::TempDir, Db) {
 fn lifecycle() {
     let (_root, db) = db();
     for name in ["qc", "_x", "C", "a", "1z", "中文"] {
-        db.create_collection(name, schema()).unwrap();
+        db.create_collection("", name, schema()).unwrap();
     }
     // 码点序，与 3.x 的 sorted(names) 相同。
-    assert_eq!(db.list_collections(), ["1z", "C", "_x", "a", "qc", "中文"]);
-    assert!(db.has_collection("qc"));
-    let e = db.create_collection("qc", schema()).unwrap_err();
+    let names: Vec<String> = db
+        .list_collections("")
+        .unwrap()
+        .into_iter()
+        .map(|(n, state)| {
+            assert_eq!(state, LoadState::Loaded);
+            n
+        })
+        .collect();
+    assert_eq!(names, ["1z", "C", "_x", "a", "qc", "中文"]);
+    assert!(db.collection("", "qc").is_ok());
+    let e = db.create_collection("", "qc", schema()).unwrap_err();
     assert!(matches!(e, EngineError::CollectionAlreadyExists(_)));
     assert_eq!(e.to_string(), "collection 'qc' already exists");
 
-    db.drop_collection("qc");
-    db.drop_collection("qc");
-    db.drop_collection("");
-    assert!(!db.has_collection("qc"));
-    let e = db.collection("qc").unwrap_err();
+    db.drop_collection("", "qc").unwrap();
+    db.drop_collection("", "qc").unwrap();
+    db.drop_collection("", "").unwrap();
+    assert!(db.collection("", "qc").is_err());
+    let e = db.collection("", "qc").unwrap_err();
     assert!(matches!(e, EngineError::CollectionNotFound(_)));
     assert_eq!(e.to_string(), "collection 'qc' does not exist");
     // 同名重建得到全新的 collection。
-    db.create_collection("qc", schema()).unwrap();
-    assert_eq!(db.collection("qc").unwrap().read().count(), 0);
+    db.create_collection("", "qc", schema()).unwrap();
+    assert_eq!(db.collection("", "qc").unwrap().read().count(), 0);
 }
 
 #[test]
 fn names_are_case_sensitive() {
     // 0004「决策」：3.x 在 macOS 上因文件系统不区分大小写而冲突，本实现按原样区分。
     let (_root, db) = db();
-    db.create_collection("Case", schema()).unwrap();
-    db.create_collection("case", schema()).unwrap();
-    assert!(!db.has_collection("CASE"));
+    db.create_collection("", "Case", schema()).unwrap();
+    db.create_collection("default", "case", schema()).unwrap();
+    assert!(db.collection("", "CASE").is_err());
 }
 
 #[test]
 fn name_validation_matches_3x() {
     let (_root, db) = db();
-    let err = |name: &str| db.create_collection(name, schema()).unwrap_err();
+    let err = |name: &str| db.create_collection("", name, schema()).unwrap_err();
     let e = err("");
     assert!(matches!(e, EngineError::InvalidArgument(_)));
     assert_eq!(e.to_string(), "collection name must not be empty");
@@ -74,19 +89,133 @@ fn name_validation_matches_3x() {
         err(&"x".repeat(256)).to_string(),
         "collection name too long (256 bytes, max 255)"
     );
-    db.create_collection(&"x".repeat(255), schema()).unwrap();
+    db.create_collection("", &"x".repeat(255), schema())
+        .unwrap();
 }
 
 #[test]
 fn schema_errors_take_precedence_over_duplicate_names() {
     let (_root, db) = db();
-    db.create_collection("c", schema()).unwrap();
+    db.create_collection("", "c", schema()).unwrap();
     let bad = CollectionSchema {
         fields: vec![],
         enable_dynamic_field: false,
+        properties: Vec::new(),
     };
     assert_eq!(
-        db.create_collection("c", bad).unwrap_err().to_string(),
+        db.create_collection("", "c", bad).unwrap_err().to_string(),
         "schema has no fields"
     );
+}
+
+#[test]
+fn only_the_default_database_exists() {
+    let (_root, db) = db();
+    let e = db.create_collection("foo", "c", schema()).unwrap_err();
+    assert!(matches!(e, EngineError::DatabaseNotFound(_)));
+    assert_eq!(e.to_string(), "database 'foo' does not exist");
+    // 3.x 先校验库名，非法库名是 ValueError。
+    for (name, msg) in [
+        ("a/b", "invalid database name: 'a/b'".to_owned()),
+        ("a\0b", "invalid database name: 'a\\x00b'".to_owned()),
+        (
+            &"d".repeat(256),
+            "database name too long (256 bytes, max 255)".to_owned(),
+        ),
+    ] {
+        let e = db.collection(name, "c").unwrap_err();
+        assert!(matches!(e, EngineError::InvalidArgument(_)), "{e}");
+        assert_eq!(e.to_string(), msg);
+    }
+    // 数据库先于 collection 名检查。
+    assert!(matches!(
+        db.create_collection("foo", "", schema()).unwrap_err(),
+        EngineError::DatabaseNotFound(_)
+    ));
+    assert!(db.drop_collection("foo", "c").is_err());
+    assert!(db.list_collections("foo").is_err());
+}
+
+#[test]
+fn timezone_property_is_unsupported() {
+    let (_root, db) = db();
+    let mut s = schema();
+    s.properties = vec![
+        ("a".to_owned(), "1".to_owned()),
+        ("timezone".to_owned(), "UTC".to_owned()),
+    ];
+    let e = db.create_collection("", "c", s).unwrap_err();
+    assert!(matches!(e, EngineError::Unsupported { .. }), "{e}");
+    // 3.x 先报「没有字段」，再看 timezone。
+    let empty = CollectionSchema {
+        properties: vec![("timezone".to_owned(), "UTC".to_owned())],
+        ..CollectionSchema::default()
+    };
+    assert_eq!(
+        db.create_collection("", "c", empty)
+            .unwrap_err()
+            .to_string(),
+        "schema has no fields"
+    );
+}
+
+fn lock_is_free(path: &std::path::Path) -> bool {
+    match DataDir::open(path) {
+        Ok(_) => true,
+        Err(DataDirError::Locked { .. }) => false,
+        Err(e) => panic!("{e}"),
+    }
+}
+
+#[test]
+fn close_waits_for_in_flight_tasks_before_releasing_the_lock() {
+    let root = tempfile::tempdir().unwrap();
+    let db = Arc::new(Db::new(DataDir::open(root.path()).unwrap()));
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (finish_tx, finish_rx) = std::sync::mpsc::channel::<()>();
+    let task = {
+        let db = Arc::clone(&db);
+        std::thread::spawn(move || {
+            let _task = db.enter().unwrap();
+            started_tx.send(()).unwrap();
+            finish_rx.recv().unwrap();
+        })
+    };
+    started_rx.recv().unwrap();
+    let closer = {
+        let db = Arc::clone(&db);
+        std::thread::spawn(move || db.close())
+    };
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(
+        !closer.is_finished(),
+        "close must wait for the in-flight task"
+    );
+    assert!(!lock_is_free(root.path()));
+    assert!(matches!(db.enter().map(|_| ()), Err(EngineError::Closed)));
+    finish_tx.send(()).unwrap();
+    task.join().unwrap();
+    closer.join().unwrap();
+    assert!(lock_is_free(root.path()));
+    db.close();
+}
+
+#[test]
+fn close_nowait_releases_the_lock_with_the_last_task() {
+    let root = tempfile::tempdir().unwrap();
+    let db = Db::new(DataDir::open(root.path()).unwrap());
+    let task = db.enter().unwrap();
+    db.close_nowait();
+    assert!(!lock_is_free(root.path()));
+    assert_eq!(
+        db.enter().err().map(|e| e.to_string()).as_deref(),
+        Some("MilvusLite is closed")
+    );
+    drop(task);
+    assert!(lock_is_free(root.path()));
+
+    let root = tempfile::tempdir().unwrap();
+    let db = Db::new(DataDir::open(root.path()).unwrap());
+    db.close_nowait();
+    assert!(lock_is_free(root.path()));
 }

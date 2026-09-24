@@ -2,6 +2,7 @@
 
 use serde_json::{Map, Value};
 
+use crate::error::{EngineError, Result, py_repr};
 use crate::schema::{DataType, FieldSchema};
 
 /// 主键值。
@@ -156,4 +157,27 @@ impl Rows {
     pub fn is_empty(&self) -> bool {
         self.pks.is_empty()
     }
+}
+
+/// 3.x 在解码 FieldData 时的行数检查（`translators/records.py`）。
+pub fn check_column_len(name: &str, values: &InputValues, n: usize) -> Result<()> {
+    if let InputValues::FloatVector { dim, values } = values {
+        let expected = n.saturating_mul(*dim);
+        if *dim == 0 || values.len() != expected {
+            return Err(EngineError::schema(format!(
+                "FieldData {} float_vector data has {} elements, expected num_rows({n}) * dim({dim}) = {expected}",
+                py_repr(name),
+                values.len()
+            )));
+        }
+        return Ok(());
+    }
+    if values.len() != n {
+        return Err(EngineError::schema(format!(
+            "FieldData {} has {} rows, expected {n}",
+            py_repr(name),
+            values.len()
+        )));
+    }
+    Ok(())
 }
