@@ -13,10 +13,13 @@ publish = false
 [workspace.dependencies]
 milvus-lite-core = { path = "crates/core" }
 milvus-lite-grpc = { path = "crates/grpc" }
+parking_lot = "0.12.5"
 prost = "0.14.4"
 prost-types = "0.14.4"
 protox = "0.9.1"
 pyo3 = "0.29.2"
+# float_roundtrip：动态字段中的浮点数须逐位往返，与 3.x 的 json 模块一致。
+serde_json = { version = "1.0.151", features = ["float_roundtrip"] }
 thiserror = "2.0.21"
 tokio = "1.53.1"
 tonic = "0.14.6"

@@ -53,7 +53,7 @@ M1 的对外行为与 3.x 有阶段性差异，本文按 [AGENTS.md](../../AGENT
   - 有索引的 collection 被 release 后，状态为 NotLoad，search 和 get 报 code 101（不变量 13）；空 `expr` 的 `count(*)` 与 insert 照常可用。
 - **schema**：
   - 主键：INT64 或 VARCHAR；`auto_id` 只允许 INT64 主键，VARCHAR 主键设 `auto_id` 时与 3.x 一样报错。
-  - 向量：只能有一个 FLOAT_VECTOR 字段。
+  - 向量：只能有一个 FLOAT_VECTOR 字段。这是 M1 的限制：3.x 的 `validate_schema` 并不限制个数（其 docstring 所说的「at most one」没有对应的检查）。
   - 标量：BOOL、INT8、INT16、INT32、INT64、FLOAT、DOUBLE、VARCHAR、JSON。
   - 动态字段 `$meta`。
 - **索引**：稠密向量字段上的 `CreateIndex` 与 `DescribeIndex`，按 [0002「结论」](0002-data-dir-compat.md#结论)中 FLAT 阶段的规则处理：
@@ -63,7 +63,7 @@ M1 的对外行为与 3.x 有阶段性差异，本文按 [AGENTS.md](../../AGENT
   - 度量为 L2、IP、COSINE。没有索引时按 COSINE 检索，与 3.x 一致。
 - **写入**：`Insert`，包括 `auto_id` 和动态字段。
   - 主键重复时以后写者为准，同一批内、跨批次都如此，`count(*)` 与检索都只看到最新值。
-  - `auto_id` 的生成规则与 3.x 一致：每个 collection 从 1 开始，由 `_seq` 派生（见 [0002](0002-data-dir-compat.md#共享状态的语义约束) 约束 4）。差分测试逐项比较生成的主键。
+  - `auto_id` 的生成规则除下文「决策」登记的情形外与 3.x 一致：每个 collection 从 1 开始，由 `_seq` 派生（见 [0002](0002-data-dir-compat.md#共享状态的语义约束) 约束 4）。差分测试逐项比较生成的主键。
 - **检索**：`Search`，支持以下参数：
   - `nq ≥ 1`、`limit`、`offset`；
   - `output_fields`，包括动态字段；
@@ -135,7 +135,7 @@ M1 的对外行为与 3.x 有阶段性差异，本文按 [AGENTS.md](../../AGENT
 
 ## 决策
 
-以下两项由负责人确认，适用于 M1 及之后的所有里程碑。
+以下各项由负责人确认，适用于 M1 及之后的所有里程碑。与 3.x 不同的地方在此登记为已知差异（[AGENTS.md](../../AGENTS.md) 规则 2）。
 
 - **`metric_type` 与索引度量不一致时，一律按请求的度量计算。**
   - 3.x 在 memtable 上按请求的度量计算，结果正确；数据 flush 成 segment 后，FLAT 与 HNSW 按索引的度量排序，再按请求的度量换算距离，结果错误。实测例子：FLAT/L2 索引、IP 请求，flush 前返回正确的 IP top-3；flush 后返回的是按 L2 排序得到的另一组主键，距离为负数。这是 3.x 的 bug，违反不变量 14。
@@ -145,6 +145,11 @@ M1 的对外行为与 3.x 有阶段性差异，本文按 [AGENTS.md](../../AGENT
   - 每个距离满足 `|a − b| ≤ max(1e-5 × |b|, 1e-6)`；绝对误差下限用于距离接近 0 的情形，例如 L2 精确命中。
   - 距离差在误差以内的相邻结果允许互换顺序。截断位置上出现并列时，允许主键集合只在这些并列结果之间不同。
   - 这是后续所有距离类差分测试的默认规则；某个测试需要放宽时，须在该测试中说明理由并经负责人确认。
+
+- **检索请求的维度与度量总是校验。** 3.x 不校验查询向量的维度，维度不符时返回 numpy 的原始报错（code 1），collection 为空时反而成功；非法度量也要到计算距离时才报错，空 collection 上同样成功。本实现在检索前校验：维度不符报 `query vector has dim <n>, but field '<f>' expects dim <d>`，非法度量报与 3.x 相同的信息，两者都是 code 1，空 collection 上也报错。影响：维度或度量有误、且 collection 为空的检索。
+- **auto_id 取该行的 `_seq`。** 3.x 的 auto_id 与 `_seq` 是两个计数器：校验失败的 insert 也会消耗 auto_id，于是 auto_id 会超过该行的 `_seq`，违反 [0002](0002-data-dir-compat.md#共享状态的语义约束) 约束 4（0002「继承的 3.x 已知风险」）。本实现令 auto_id 等于所在行的 `_seq`，失败的 insert 不消耗任何编号。3.x 的 delete 每次消耗一个 `_seq` 而不消耗 auto_id（实测删除一次后下一个 auto_id 仍是 2），所以只有在同一会话内既没有失败的 insert、也没有 delete 这类只消耗 `_seq` 的操作时，生成的主键才与 3.x 相同。影响：失败的 insert 或 delete 之后再写入时生成的 auto_id；M1 没有 delete，引入 delete 时差分测试要按此处理。
+- **畸形的 JSON 与动态字段明确报错。** 3.x 把无法解析的 JSON 字段值原样存下（之后 pymilvus 读取时崩溃），静默丢弃不是 JSON 对象的 `$meta`，并让 `$meta` 中与 schema 字段同名的 key 覆盖该字段（实测主键被改写）。本实现对这三种输入都报 code 6 的校验错误；JSON 字段收到的不是 json_data（3.x 接受并存下读取时会出错的值）同样报类型不符。另外，JSON 的嵌套深度上限为 127 层（serde_json 的递归上限，用来防止恶意输入导致栈溢出），更深报 code 6；3.x 受 Python 递归限制，约 1000 层以内都能写入。这类输入只能由手写的 proto 请求构造，pymilvus 不会发出。M2 读取 3.x 写出的目录时，要能容忍 3.x 已存下的畸形值。
+- **collection 名区分大小写。** 3.x 在 macOS 默认的文件系统上把 `Case` 与 `case` 视为同一个 collection，这是文件系统不区分大小写的副作用，Linux 上没有。M1 的数据在内存中，按原样区分大小写。M2 落盘后在 macOS 上会自然出现同样的冲突。
 
 ## 跨平台
 

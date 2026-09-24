@@ -75,7 +75,7 @@ pymilvus ──server_manager──▶ adapter/grpc ──▶ db（多 collectio
 
 | crate | 对应参照实现 | 职责 |
 | --- | --- | --- |
-| `crates/core` | [db.py](references/milvus-lite/milvus_lite/db.py) 及其下各层 | 引擎：多 collection 生命周期、LOCK、存储、检索、索引、schema。不依赖 protobuf 与 Python |
+| `crates/core` | [db.py](references/milvus-lite/milvus_lite/db.py) 及其下各层 | 引擎：多 collection 生命周期、LOCK、存储、检索、索引、schema。不依赖 protobuf 与 Python。module：`db`（collection 生命周期）、`collection`（内存数据、写入校验、get / count / 检索、load 状态）、`schema`、`data`（列式数据）、`index`（索引定义与度量）、`projection`（output_fields 展开）、`flat`（暴力检索的距离）、`data_dir`（LOCK 与已有数据检查）、`error`（与 3.x 异常一一对应的错误及 Python repr 格式化） |
 | `crates/grpc` | [adapter/grpc/](references/milvus-lite/milvus_lite/adapter/grpc/) | proto 代码生成（protox）、协议翻译与错误映射；作为服务宿主，负责服务实例（runtime、检索线程池、引擎、端口）的启动与停止，检索线程池注入引擎 |
 | `crates/py` | [server_manager.py](references/milvus-lite/milvus_lite/server_manager.py) | PyO3 扩展，加上 Python 包 `milvus_lite`：`server_manager.py` 维护路径表，导入时检测官方发行包。CLI 放在哪里待定 |
 
@@ -107,6 +107,8 @@ pymilvus ──server_manager──▶ adapter/grpc ──▶ db（多 collectio
   - tokio 1：tonic 的运行时，每个服务实例独占一个 runtime（[0003](docs/decisions/0003-in-process-server-lifecycle.md)）。
   - pyo3 0.29（`abi3-py310`）：Python 绑定。
   - thiserror 2：错误类型。tempfile 3：仅用于测试。
+  - serde_json 1：JSON 字段与动态字段的校验与存储；它的 Map 按 key 排序，与 3.x 存 `$meta` 时的 `sort_keys=True` 一致。
+  - parking_lot 0.12：collection 表与每个 collection 的读写锁。它的锁没有中毒语义，不需要为 std 锁中毒另写兜底。
   - LOCK 用 std 的 `File::try_lock`：它在 Unix 上用 flock、在 Windows 上用覆盖第 0 字节的 LockFileEx，满足 [0002](docs/decisions/0002-data-dir-compat.md) 约束 10，因此不引入 fs2 一类依赖，`rust-version` 相应定为 1.89。
   - 构建工具 maturin 1.15，用 uv 装在开发 venv 中，不是项目依赖。
 
