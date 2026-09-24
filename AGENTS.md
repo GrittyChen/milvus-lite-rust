@@ -12,13 +12,15 @@
 
 参照实现是**行为真值**，不是代码模板：对外可观察的行为（RPC 语义、结果与排序、距离数值、错误码与错误信息、过滤表达式语义）以它为准；内部结构按 Rust 惯用法重新设计，不逐文件翻译。
 
-当前状态：仓库只有 README / LICENSE（Apache-2.0），尚无代码。首次落地 crate 布局、工具链、命令时同步更新本文的[架构地图](#架构地图跨文件心智)、[技术栈](#技术栈)与[常用命令](#常用命令)，在此之前这几节中标注「待定」的内容不得当作事实引用。
+重构基线已定：**以 3.x 为基础，不以 2.5.1（C++）为基础**。3.x 的性能损失主要来自 Python 实现，架构内只有一处需要修正的设计；2.5.1 反而有冷启动全量重放、索引不落盘等架构级瓶颈；决策、数据与由此得出的实现约束见 [0001-重构基线选择](docs/decisions/0001-refactor-baseline.md)。
+
+当前状态：仓库有 README / LICENSE（Apache-2.0）、设计决策（[docs/decisions/](docs/decisions/)）与基线基准脚本（[benchmarks/baseline/](benchmarks/baseline/)），尚无引擎代码。首次落地 crate 布局、工具链、命令时同步更新本文的[架构地图](#架构地图跨文件心智)、[技术栈](#技术栈)与[常用命令](#常用命令)，在此之前这几节中标注「待定」的内容不得当作事实引用。
 
 ## 核心业务术语
 
 | 术语 | 含义 |
 | --- | --- |
-| **参照实现** | [references/milvus-lite/](references/milvus-lite/)，被 `.gitignore` 忽略、不随本仓提交的本地 checkout。当前对照基线为 v3.2.1（`43d1257`），基线升级时同步改这里；记录对照结论时写明所依据的 commit（`git -C references/milvus-lite log -1`） |
+| **参照实现** | [references/milvus-lite/](references/milvus-lite/)，被 `.gitignore` 忽略、不随本仓提交的本地 checkout。当前对照版本为 v3.2.1（`43d1257`），升级时同步改这里；记录对照结论时写明所依据的 commit（`git -C references/milvus-lite log -1`） |
 | **pymilvus 接入点** | `pymilvus` 遇到以 `.db` 结尾的 URI 时，先检查父目录存在，再执行 `from milvus_lite.server_manager import server_manager_instance` 并调用 `start_and_get_uri(uri)`；返回 `None` 即报 “Open local milvus failed”，否则按返回的 `http://127.0.0.1:<port>` 走普通 Milvus gRPC（参照实现 [server_manager.py](references/milvus-lite/milvus_lite/server_manager.py)）。pymilvus 的 `milvus-lite` extra 依赖发行包名 `milvus-lite`（`>=2.4.0`，非 Windows）。以上在 pymilvus 2.6.15 / 2.6.17 / 3.0.2 中逐行一致；pymilvus 升级时重新核对。**模块路径、实例名、方法签名、返回约定、发行包名都是对外契约**，任何一项变化都会让 `pip install "pymilvus[milvus-lite]"` 用户失效 |
 | **CLI** | 参照实现提供 `milvus-lite server --data-dir <dir> --port <port>` 与 `milvus-lite dump`（[cmdline.py](references/milvus-lite/milvus_lite/cmdline.py)）。本实现是否提供、参数是否保持一致属于[待定决策](#技术栈)；一旦提供即按对外契约对待 |
 | **gRPC adapter** | Milvus 协议 → 引擎 API 的翻译层。**只翻译、不加能力**：引擎不支持的 RPC 返回 `UNIMPLEMENTED` + 明确信息，绝不静默成功（参照实现架构不变量 15） |
@@ -48,6 +50,8 @@
 | 参照实现的演进顺序（可借鉴的垂直切片划分） | 参照实现 [docs/roadmap.md](references/milvus-lite/docs/roadmap.md) |
 | 某行为的真值 / 边界用例 | 参照实现 [tests/](references/milvus-lite/tests/)。`adapter/` 与 `compatibility/` 经 pymilvus 走 gRPC，是复用价值最高的一批，但它们用 `milvus_lite.adapter.grpc.server.start_server_in_thread` 在进程内起服务、部分用例还直接引用参照实现内部模块，**复用时须替换起服务的 fixture，不能直接指向本实现** |
 | 上游 Milvus client 用例子集 | 参照实现 [tools/run_upstream_milvus_client_supported.sh](references/milvus-lite/tools/run_upstream_milvus_client_supported.sh)（依赖 Milvus 源码中的 `tests/python_client`，路径由 `MILVUS_CLIENT_TEST_DIR` 指定） |
+| 为什么以 3.x 而非 2.5.1 为基础 / 两代架构对比 / 3.x 的耗时归属 / Rust 实现的性能约束 | [docs/decisions/0001-refactor-baseline.md](docs/decisions/0001-refactor-baseline.md) |
+| 性能基线怎么测 / 口径 / 注意事项 | [benchmarks/baseline/README.md](benchmarks/baseline/README.md) |
 | 代码审查 / 修复复审（冻结合同、完整调用链、同类全域清扫、分级与证据门槛、二三阶影响矩阵） | [code-review-rules](.agents/skills/code-review-rules/SKILL.md)（Claude Code 经 `.claude/skills` 软链读取同一份） |
 
 ## 架构地图（跨文件心智）
@@ -74,7 +78,7 @@ pymilvus ──server_manager──▶ adapter/grpc ──▶ db（多 collectio
 
 **待定**，首次引入时在此写明版本并说明理由。落地前需要做出并记录的决定：
 
-- **gRPC / protobuf**：生成方案与 proto 来源。参照实现运行期直接使用 `pymilvus.grpc_gen`，自身不持有 proto，CI 也不钉 pymilvus 版本（装的是最新版）；Rust 侧没有这条捷径，须从 Milvus proto 源钉住与目标 pymilvus 版本匹配的 commit，生成物是否入库一并记录。pymilvus 目前 2.6.x 与 3.0.x 两条线并行发布，3.0 的 `MilvusService` 在 2.6 的 116 个 RPC 之上只增不改地新增 31 个（snapshot、namespace、`AlterCollectionSchema` 等），且 3.0 客户端的 `add_collection_field` 会先调 `AlterCollectionSchema`、失败再回退旧 RPC。支持哪几条 pymilvus 线、兼容测试跑哪些版本须一并决定。
+- **gRPC / protobuf**：生成方案与 proto 来源。参照实现运行期直接使用 `pymilvus.grpc_gen`，自身不持有 proto，CI 也不钉 pymilvus 版本（装的是最新版）；Rust 侧没有这条捷径，须从 Milvus proto 源钉住与目标 pymilvus 版本匹配的 commit，生成物是否入库一并记录。pymilvus 目前 2.6.x 与 3.0.x 两条线并行发布，3.0 的 `MilvusService` 在 2.6 的 117 个 RPC 之上只增不改地新增 27 个（snapshot、namespace、`AlterCollectionSchema` 等），另新增独立的 `ClientTelemetryService`（4 个 RPC），且 3.0 客户端的 `add_collection_field` 会先调 `AlterCollectionSchema`、失败再回退旧 RPC。支持哪几条 pymilvus 线、兼容测试跑哪些版本须一并决定。
 - **Python 打包**：绑定与构建方案（例如 PyO3 + maturin 产出 wheel）、发行包名（见 [pymilvus 接入点](#核心业务术语)）、与 pymilvus 版本的兼容矩阵、目标平台（参照实现覆盖 Linux / macOS / Windows，而 pymilvus 的 `milvus-lite` extra 在 Windows 上不安装）。
 - **持久化格式**：参照实现用 Arrow IPC stream 做 WAL、Parquet 做 segment 与 delta、JSON 做 manifest。**是否与参照实现的数据目录格式互通**决定能否让两个实现读写同一目录做差分测试，是最先要定的一项。
 - **向量索引后端**：参照实现用 FAISS（HNSW / HNSW_SQ / IVF_FLAT / IVF_SQ8，缺失时降级 brute force）；Rust 侧是绑定 FAISS 还是纯 Rust 实现，以及必须保持一致的距离口径。
@@ -83,19 +87,29 @@ pymilvus ──server_manager──▶ adapter/grpc ──▶ db（多 collectio
 
 ## 常用命令
 
-**待定**，工程骨架落地后补全。预期覆盖：构建、lint（`cargo clippy`）、格式化（`cargo fmt`）、Rust 单测、Python wheel 构建、以本实现为后端跑参照实现的 `tests/adapter` 与 `tests/compatibility`、差分测试、基准对比。
+本实现的命令**待定**，工程骨架落地后补全。预期覆盖：构建、lint（`cargo clippy`）、格式化（`cargo fmt`）、Rust 单测、Python wheel 构建、以本实现为后端跑参照实现的 `tests/adapter` 与 `tests/compatibility`、差分测试、基准对比。
 
-参照实现侧（生成真值与基线时用，在 [references/milvus-lite/](references/milvus-lite/) 内执行）：
+性能基线（2.5.1 与 3.x 对照，工作目录须在仓库外；完整步骤见 [benchmarks/baseline/README.md](benchmarks/baseline/README.md)）：
+
+| 任务 | 命令 |
+| --- | --- |
+| 建两套对照环境 | `benchmarks/baseline/setup.sh <work_dir>` |
+| 跑一组配置 | `benchmarks/baseline/run.sh <work_dir> <N> <dim> <out.jsonl> v2:FLAT:inproc v3:HNSW:server ...`（须顺序执行） |
+| 汇总 | `<work_dir>/v3/bin/python benchmarks/baseline/summarize.py <work_dir>/<out.jsonl>` |
+| 并发吞吐 | `<work_dir>/{v2,v3}/bin/python benchmarks/baseline/concurrency.py <work_dir>/r_<env>_<idx>_inproc_<N>_<dim>.db <dim> 1,2,4,8`（用与库对应版本的 python） |
+| 3.x 耗时归属 | `<work_dir>/v3/bin/python benchmarks/baseline/profile_v3.py <3.x 的库>` |
+
+参照实现侧（生成真值时用，在 [references/milvus-lite/](references/milvus-lite/) 内执行）：
 
 | 任务 | 命令 |
 | --- | --- |
 | 安装开发环境 | `make dev`，再 `.venv/bin/pip install pymilvus`（dev extra 不含 pymilvus；缺了它 `tests/adapter` 会被 `importorskip` **整目录静默跳过**，`tests/compatibility` 则直接导入失败） |
 | 常规功能测试 | `make test` |
 | gRPC / pymilvus 兼容测试 | `make test-compat` |
-| 性能基准 | `make benchmark` |
+| 参照实现自带的性能基准（不作为规则 7 的基线） | `make benchmark` |
 | 起本地 gRPC 服务 | `make serve`（端口 19530，数据目录 `./data`） |
 
-**改了什么就跑什么**：改存储 / 恢复 → 崩溃注入与恢复测试；改索引或距离计算 → 与 brute force 及参照实现的差分测试；改 filter → 解析与求值的差分测试；改 gRPC 层 → 参照实现的 `adapter` / `compatibility` 套件以本实现为后端运行；改 Python 绑定 → 用真实 `pymilvus` 走 `MilvusClient("./x.db")` 的端到端测试；声称性能提升 → 同机同数据集与参照实现的基准对比。
+**改了什么就跑什么**：改存储 / 恢复 → 崩溃注入与恢复测试；改索引或距离计算 → 与 brute force 及参照实现的差分测试；改 filter → 解析与求值的差分测试；改 gRPC 层 → 参照实现的 `adapter` / `compatibility` 套件以本实现为后端运行；改 Python 绑定 → 用真实 `pymilvus` 走 `MilvusClient("./x.db")` 的端到端测试；声称性能提升 → 用 [benchmarks/baseline/](benchmarks/baseline/) 同机同数据集对照 2.5.1 与 3.x。
 
 ## 核心心智
 
@@ -112,13 +126,14 @@ pymilvus ──server_manager──▶ adapter/grpc ──▶ db（多 collectio
 
 1. **语言**：对话回复跟随用户当次需求描述的主体语言，不被个别英文专名带偏。落库产物（commit message、文档、必要注释）固定中文；代码标识符英文。
 2. **参照实现是行为真值**：对外可观察行为（RPC 语义、结果与排序、距离数值、错误码与信息、过滤语义）与参照实现不一致即为 bug，除非该差异已在本仓文档中**显式登记**（差异内容、理由、影响的用例）。不得为了“更合理”悄悄改变对外行为。
-3. **继承参照实现的架构不变量**（[modules.md «Architecture Invariants»](references/milvus-lite/docs/modules.md)），按性质分两类：
+3. **继承参照实现的架构不变量**（[modules.md «Architecture Invariants»](references/milvus-lite/docs/modules.md)），按性质分两类，另有一条由 0001 引入的 Rust 侧约束：
    - **正确性不变量，必须保持**：1–5（`_seq` 全序、MemTable 互清 seq-aware、tombstone GC 规则、文件不可变、manifest 唯一真值且原子更新）、8（单进程独占 data_dir）、9（schema 不可变）、11–15（索引与 segment 1:1 且不可变、未 load 禁止检索、距离归一化在索引内、adapter 只翻译）。持久化保证不得弱于 10（WAL 关闭前 fsync）。
    - **Python 时代的实现选择，可重新设计**：6（同步 flush）、7（单 collection 单写者、无内部锁）是 Rust 版提升性能的主要空间，但改动前须先写设计说明（锁 / 快照边界、与正确性不变量的关系、测试矩阵）并与用户确认，不在实现里顺手突破；16（proto 生成物入库）已与参照实现代码不符，proto 方案见[技术栈](#技术栈)。
+   - **Rust 侧的性能约束**：查询路径不得做 O(总行数) 的逐行有效性判定、计算保持列式、检索可并行，细节与理由见 [0001 «对 Rust 实现的约束»](docs/decisions/0001-refactor-baseline.md#对-rust-实现的约束)；涉及并发的方案仍按上一条先写设计说明。
 4. **测试是 ship 门槛**：改条件分支 / 状态流转 / 协议或持久化格式 / 修过的 bug 必须补或更新测试；提交前按“改了什么就跑什么”跑齐对应套件并全绿；不用 `#[ignore]`、skip 或放宽断言掩盖失败，也要确认套件没有因缺依赖被静默跳过。涉及对外行为的改动必须有差分测试或复用参照实现测试作证。测试不得依赖真实付费外部服务（OpenAI embedding、Cohere rerank 等）。
 5. **根源修复，禁止伪修复**：不吞错误（不 `let _ =` 丢弃 `Result`、不用 `unwrap_or_default` 兜底真实缺失）、不改宽断言迁就坏代码、不用 retry / fallback 掩盖错误原因。持久化路径尤其警惕：I/O 与校验失败必须向上传递，不得“尽力而为”地继续写。
 6. **`unsafe` 与 panic 纪律**：`unsafe` 块必须附 `// SAFETY:` 说明成立条件并有覆盖测试；库代码与服务路径不得因可预期的错误输入 panic，`unwrap` / `expect` 只用于能证明不会失败的地方。跨 FFI 边界的 panic 必须被捕获并转成错误。
-7. **性能声明要有证据**：宣称提升必须附同机、同数据集、同参数下与参照实现（或上一版本）的基准对比；不得通过降低召回、跳过校验或弱化持久化保证换取数字。
+7. **性能声明要有证据**：宣称提升必须附同机、同数据集、同参数下的基准对比，基线**同时包括 2.5.1 与 3.x**，用 [benchmarks/baseline/](benchmarks/baseline/) 测量并遵守其口径（2.5.1 没有 HNSW，按 FLAT 对 FLAT 及与召回无关的操作比较），迭代优化另附与上一版本的对比；目标见 [0001 «对 Rust 实现的约束»](docs/decisions/0001-refactor-baseline.md#对-rust-实现的约束)；不得通过降低召回、跳过校验或弱化持久化保证换取数字。
 8. **持久化格式变更要显式**：WAL / segment / manifest / 索引文件格式的任何变更都要记录格式版本与兼容性影响，并说明旧数据目录如何处理；不得静默产生新旧实现都读不了的数据目录。
 9. **参照实现只读**：[references/milvus-lite/](references/milvus-lite/) 不修改、不提交（已被 `.gitignore` 忽略）；需要改它来辅助对照时先告诉用户。从中借用的代码或测试数据须遵守其 Apache-2.0 许可并注明来源。
 10. **文档与代码同源，禁止双源**：机制细节的权威源是本仓 README / docs 与参照实现的代码和设计文档；本文及代码他处需提及时**链接**，不拷贝。改代码同步更新被影响的文档（对外行为差异、CLI 参数、持久化格式、支持矩阵）。
