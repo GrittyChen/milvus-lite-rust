@@ -8,21 +8,21 @@
 
 ## 项目定位
 
-以官方 [milvus-lite](references/milvus-lite/)（纯 Python 重写的 v3 代，下称**参照实现**）为行为规范，用 **Rust** 重写一个更高效的 milvus-lite。目标是**对 `pymilvus` 用户无感替换**：同样的 `MilvusClient("./demo.db")`、同样的 gRPC 语义与错误码，服务端不再受 GIL 与 Python 解释器开销限制，更快、更省内存。
+以官方 [milvus-lite](references/milvus-lite/)（纯 Python 重写的 v3 代，下称**参照实现**）为行为规范，用 **Rust** 重写一个更高效的 milvus-lite。目标是**让 `pymilvus` 用户的代码无需修改**：同样的 `MilvusClient("./demo.db")`、同样的 gRPC 语义与错误码，3.x 的存量数据目录也能直接打开（安装方式见 [pymilvus 接入点](#核心业务术语)）；服务端不再受 GIL 与 Python 解释器开销限制，更快、更省内存。
 
 参照实现是**行为真值**，不是代码模板：对外可观察的行为（RPC 语义、结果与排序、距离数值、错误码与错误信息、过滤表达式语义）以它为准；内部结构按 Rust 惯用法重新设计，不逐文件翻译。
 
 重构基线已定：**以 3.x 为基础，不以 2.5.1（C++）为基础**。3.x 的性能损失主要来自 Python 实现，架构内只有一处需要修正的设计；2.5.1 反而有冷启动全量重放、索引不落盘等架构级瓶颈；决策、数据与由此得出的实现约束见 [0001-重构基线选择](docs/decisions/0001-refactor-baseline.md)。
 
-当前状态：仓库有 README / LICENSE（Apache-2.0）、设计决策（[docs/decisions/](docs/decisions/)）与基线基准脚本（[benchmarks/baseline/](benchmarks/baseline/)），尚无引擎代码。首次落地 crate 布局、工具链、命令时同步更新本文的[架构地图](#架构地图跨文件心智)、[技术栈](#技术栈)与[常用命令](#常用命令)，在此之前这几节中标注「待定」的内容不得当作事实引用。
+当前状态：仓库有 README / LICENSE（Apache-2.0）、设计决策（[docs/decisions/](docs/decisions/)）与基线基准脚本（[benchmarks/baseline/](benchmarks/baseline/)），尚无引擎代码。首次落地 crate 布局、依赖版本、命令时同步更新本文的[架构地图](#架构地图跨文件心智)、[技术栈](#技术栈)与[常用命令](#常用命令)，在此之前这几节中标注「待定」的内容不得当作事实引用。
 
 ## 核心业务术语
 
 | 术语 | 含义 |
 | --- | --- |
 | **参照实现** | [references/milvus-lite/](references/milvus-lite/)，被 `.gitignore` 忽略、不随本仓提交的本地 checkout。当前对照版本为 v3.2.1（`43d1257`），升级时同步改这里；记录对照结论时写明所依据的 commit（`git -C references/milvus-lite log -1`） |
-| **pymilvus 接入点** | `pymilvus` 遇到以 `.db` 结尾的 URI 时，先检查父目录存在，再执行 `from milvus_lite.server_manager import server_manager_instance` 并调用 `start_and_get_uri(uri)`；返回 `None` 即报 “Open local milvus failed”，否则按返回的 `http://127.0.0.1:<port>` 走普通 Milvus gRPC（参照实现 [server_manager.py](references/milvus-lite/milvus_lite/server_manager.py)）。pymilvus 的 `milvus-lite` extra 依赖发行包名 `milvus-lite`（`>=2.4.0`，非 Windows）。以上在 pymilvus 2.6.15 / 2.6.17 / 3.0.2 中逐行一致；pymilvus 升级时重新核对。**模块路径、实例名、方法签名、返回约定、发行包名都是对外契约**，任何一项变化都会让 `pip install "pymilvus[milvus-lite]"` 用户失效 |
-| **CLI** | 参照实现提供 `milvus-lite server --data-dir <dir> --port <port>` 与 `milvus-lite dump`（[cmdline.py](references/milvus-lite/milvus_lite/cmdline.py)）。本实现是否提供、参数是否保持一致属于[待定决策](#技术栈)；一旦提供即按对外契约对待 |
+| **pymilvus 接入点** | `pymilvus` 遇到以 `.db` 结尾的 URI 时，先检查父目录存在，再执行 `from milvus_lite.server_manager import server_manager_instance` 并调用 `start_and_get_uri(uri)`；返回 `None` 即报 “Open local milvus failed”，否则按返回的 `http://127.0.0.1:<port>` 走普通 Milvus gRPC（参照实现 [server_manager.py](references/milvus-lite/milvus_lite/server_manager.py)）。以上在 pymilvus 2.6.15 / 2.6.17 / 3.0.2 中逐行一致；pymilvus 升级时重新核对。**模块路径、实例名、方法签名、返回约定都是对外契约**。pymilvus 的 `milvus-lite` extra 依赖 PyPI 上的 `milvus-lite`（`>=2.4.0`，非 Windows），这个名字归官方所有，因此本项目以 `milvus-lite-rust` 发布：用户安装 `pymilvus` 与 `milvus-lite-rust`，不用 `pymilvus[milvus-lite]`。它与官方 `milvus-lite` 争用同一个 `milvus_lite` 模块与 `milvus-lite` 命令，**不得同时安装**：pip 不会阻止，后装者覆盖同名文件，卸载任一方都会弄坏另一方；pymilvus 导入失败时的提示还会把用户引向官方包。因此绑定层导入时须检测已安装的官方发行包 `milvus-lite` 并明确报错，README 的安装说明须先 `pip uninstall milvus-lite`。官方包后装覆盖本包的情形检测不到，只能靠文档说明 |
+| **CLI** | 参照实现提供 `milvus-lite server --data-dir <dir> [--host] [--port] [--max-workers]` 与 `milvus-lite dump`（[cmdline.py](references/milvus-lite/milvus_lite/cmdline.py)）。本实现先提供 `server`，参数与之一致，按对外契约对待（`--max-workers` 原本控制 grpcio 线程池，在本实现中的对应含义待定义）；`dump` 后续再做（见[技术栈](#技术栈)） |
 | **gRPC adapter** | Milvus 协议 → 引擎 API 的翻译层。**只翻译、不加能力**：引擎不支持的 RPC 返回 `UNIMPLEMENTED` + 明确信息，绝不静默成功（参照实现架构不变量 15） |
 | **`_seq`** | 操作全序号。一切覆盖 / 丢弃 / 去重判断只比较 `_seq`，不依赖调用顺序或文件物理顺序 |
 | **WAL / MemTable / segment / delta / manifest** | LSM 式存储：写入先落 WAL 与 MemTable，flush 生成不可变 segment，删除写 delta（tombstone），compaction 合并并回收 tombstone；manifest 是唯一真值、原子更新；`data_dir/LOCK` 保证单进程独占。机制见参照实现 [wal-design.md](references/milvus-lite/docs/wal-design.md) 与 [modules.md](references/milvus-lite/docs/modules.md) |
@@ -51,6 +51,7 @@
 | 某行为的真值 / 边界用例 | 参照实现 [tests/](references/milvus-lite/tests/)。`adapter/` 与 `compatibility/` 经 pymilvus 走 gRPC，是复用价值最高的一批，但它们用 `milvus_lite.adapter.grpc.server.start_server_in_thread` 在进程内起服务、部分用例还直接引用参照实现内部模块，**复用时须替换起服务的 fixture，不能直接指向本实现** |
 | 上游 Milvus client 用例子集 | 参照实现 [tools/run_upstream_milvus_client_supported.sh](references/milvus-lite/tools/run_upstream_milvus_client_supported.sh)（依赖 Milvus 源码中的 `tests/python_client`，路径由 `MILVUS_CLIENT_TEST_DIR` 指定） |
 | 为什么以 3.x 而非 2.5.1 为基础 / 两代架构对比 / 3.x 的耗时归属 / Rust 实现的性能约束 | [docs/decisions/0001-refactor-baseline.md](docs/decisions/0001-refactor-baseline.md) |
+| 数据目录与 3.x 互通的范围 / 共享文件的约束 / 索引文件共存规则 / 跨实现验证矩阵 | [docs/decisions/0002-data-dir-compat.md](docs/decisions/0002-data-dir-compat.md) |
 | 性能基线怎么测 / 口径 / 注意事项 | [benchmarks/baseline/README.md](benchmarks/baseline/README.md) |
 | 代码审查 / 修复复审（冻结合同、完整调用链、同类全域清扫、分级与证据门槛、二三阶影响矩阵） | [code-review-rules](.agents/skills/code-review-rules/SKILL.md)（Claude Code 经 `.claude/skills` 软链读取同一份） |
 
@@ -76,14 +77,16 @@ pymilvus ──server_manager──▶ adapter/grpc ──▶ db（多 collectio
 
 ## 技术栈
 
-**待定**，首次引入时在此写明版本并说明理由。落地前需要做出并记录的决定：
+方向已定，具体依赖的版本在首次引入时补在这里，并说明理由。
 
-- **gRPC / protobuf**：生成方案与 proto 来源。参照实现运行期直接使用 `pymilvus.grpc_gen`，自身不持有 proto，CI 也不钉 pymilvus 版本（装的是最新版）；Rust 侧没有这条捷径，须从 Milvus proto 源钉住与目标 pymilvus 版本匹配的 commit，生成物是否入库一并记录。pymilvus 目前 2.6.x 与 3.0.x 两条线并行发布，3.0 的 `MilvusService` 在 2.6 的 117 个 RPC 之上只增不改地新增 27 个（snapshot、namespace、`AlterCollectionSchema` 等），另新增独立的 `ClientTelemetryService`（4 个 RPC），且 3.0 客户端的 `add_collection_field` 会先调 `AlterCollectionSchema`、失败再回退旧 RPC。支持哪几条 pymilvus 线、兼容测试跑哪些版本须一并决定。
-- **Python 打包**：绑定与构建方案（例如 PyO3 + maturin 产出 wheel）、发行包名（见 [pymilvus 接入点](#核心业务术语)）、与 pymilvus 版本的兼容矩阵、目标平台（参照实现覆盖 Linux / macOS / Windows，而 pymilvus 的 `milvus-lite` extra 在 Windows 上不安装）。
-- **持久化格式**：参照实现用 Arrow IPC stream 做 WAL、Parquet 做 segment 与 delta、JSON 做 manifest。**是否与参照实现的数据目录格式互通**决定能否让两个实现读写同一目录做差分测试，是最先要定的一项。
-- **向量索引后端**：参照实现用 FAISS（HNSW / HNSW_SQ / IVF_FLAT / IVF_SQ8，缺失时降级 brute force）；Rust 侧是绑定 FAISS 还是纯 Rust 实现，以及必须保持一致的距离口径。
-- **分词与 BM25**：standard / jieba 分词器的 Rust 等价物，以及 BM25 term hash 是否需要与参照实现逐位一致（数据目录互通时必须一致）。
-- **CLI**：是否提供 `milvus-lite server` / `dump`，参数是否与参照实现一致。
+- **依赖边界：不引入 C++、CMake 或系统库依赖**（不绑定 FAISS 等），允许经 `cc` crate 编译、不需要额外安装任何东西的纯 C 代码，优先选纯 Rust。官方 3.x 删除了整套 C++ 构建（见 [0001](docs/decisions/0001-refactor-baseline.md)），本项目同样避免这类构建与分发负担：wheel 与 sdist 必须能在各目标平台只靠 cargo 构建。引入依赖时用 `cargo tree -e build` 核对。
+- **gRPC / protobuf**：用 tonic + prost。prost-build 默认依赖系统 `protoc`（C++ 程序），因此改用纯 Rust 的 protox 解析 proto，再经 `compile_fds` 交给 prost / tonic 生成代码。proto 源取与 pymilvus 3.0.2 对应的 milvus-proto commit（3.0 的 `MilvusService` 是 2.6 的超集，2.6 的消息与字段在 3.0 中都保留），随仓库固定（离线构建与 sdist 都需要），引入时记录 commit 并核对其许可、注明来源；生成物不入库。参照实现运行期直接用 `pymilvus.grpc_gen`，CI 也不钉 pymilvus 版本，Rust 侧没有这条捷径。背景：3.0 在 2.6 的 117 个 RPC 之上只增不改地新增 27 个（snapshot、namespace、`AlterCollectionSchema` 等），另新增独立的 `ClientTelemetryService`（4 个 RPC）；3.0 客户端的 `add_collection_field` 会先调 `AlterCollectionSchema`，失败再回退旧 RPC。
+- **支持的 pymilvus 版本**：2.6.x 与 3.0.x 两条线都支持，兼容测试各跑一个最新版。
+- **Python 打包**：PyO3 + maturin，产出 abi3 wheel，Python 下限与 3.x 一致（`abi3-py310`）。abi3 wheel 不能在 free-threaded 版 CPython 上加载，这一点作为已知限制。服务端在 Python 进程内的后台线程上运行多线程 tokio runtime，CPU 密集的检索交给专用线程池，调用时释放 GIL，形态与 3.x 相同（进程内服务、返回 `http://127.0.0.1:<port>`）。fork 后子进程中 runtime 的处理与 atexit 时的停止、WAL fsync 语义，落地前先写设计说明。PyPI 元数据与 README 都要声明非官方、与 Milvus / Zilliz 无隶属关系。发行包名为 `milvus-lite-rust`，包内提供 `milvus_lite` 模块（见 [pymilvus 接入点](#核心业务术语)）。目标平台与 3.x 一致：Linux / macOS / Windows。
+- **持久化格式**：数据文件与 3.x **双向互通**，索引文件各自独立。范围、约束与验证方式见 [0002](docs/decisions/0002-data-dir-compat.md)。
+- **向量索引**：第一阶段只做 SIMD 优化的暴力检索（FLAT），同时作为召回与距离口径的正确性基准；HNSW 等 ANN 索引后期补齐，优先纯 Rust（依赖边界见上），届时再定具体方案。第一阶段对各类索引定义的处理见 [0002 «结论»](docs/decisions/0002-data-dir-compat.md#结论)。
+- **分词与 BM25**：在全文检索阶段定具体实现，但因为数据目录互通，必须与 3.x 逐位一致（范围与约束见 [0002](docs/decisions/0002-data-dir-compat.md#共享状态的语义约束) 约束 8）。
+- **CLI**：先提供 `milvus-lite server`，参数与 3.x 一致（见 [CLI](#核心业务术语)）；`dump` 后续再做。
 
 ## 常用命令
 
@@ -138,7 +141,7 @@ pymilvus ──server_manager──▶ adapter/grpc ──▶ db（多 collectio
 9. **参照实现只读**：[references/milvus-lite/](references/milvus-lite/) 不修改、不提交（已被 `.gitignore` 忽略）；需要改它来辅助对照时先告诉用户。从中借用的代码或测试数据须遵守其 Apache-2.0 许可并注明来源。
 10. **文档与代码同源，禁止双源**：机制细节的权威源是本仓 README / docs 与参照实现的代码和设计文档；本文及代码他处需提及时**链接**，不拷贝。改代码同步更新被影响的文档（对外行为差异、CLI 参数、持久化格式、支持矩阵）。
 11. **变更范围最小化**：不扩展用户给的任务边界；顺手能改的小问题报告而不动手；一次发现 N 个独立问题列出来让用户挑。
-12. **探索性问题给 2-3 句 + tradeoff**：用户问“该怎么做 / 你觉得呢”时先给推荐方向与主要取舍，等确认再实现。[技术栈](#技术栈)中的待定决策尤其如此。
+12. **探索性问题给 2-3 句 + tradeoff**：用户问“该怎么做 / 你觉得呢”时先给推荐方向与主要取舍，等确认再实现。[技术栈](#技术栈)中尚未细化的选型（如 HNSW 实现、分词器）尤其如此。
 13. **不轻易 commit + 线性历史**：默认不主动 commit，仅用户明确要求时提交；一次 commit 一件事。拉远端用 `git pull --rebase` 或 `--ff-only`，不产生 merge commit；不 amend / force-push 已 push 的 commit。
 14. **面向开源的落库卫生**：项目将对外开放。不提交 `.db` 数据目录、基准原始输出、API Key、`.env`；文档不引用个人绝对路径或内部链接；commit message、PR 描述、代码注释与文档中**不留 AI 协作痕迹**（不加 `Co-Authored-By` AI 署名、“Generated with …” 尾注或「由 AI 生成」类措辞）。发现机密已入库立即报告用户，不自行改写历史。
 15. **路径用 markdown link 而非 backtick**：引用文件 / 目录 / 行号写 `[name](path#L42)`，IDE 里可点击。
