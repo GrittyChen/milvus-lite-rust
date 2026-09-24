@@ -193,6 +193,9 @@ cython_debug/
 # Rust
 /target/
 
+# milvus-lite data (2.5.1: SQLite file; 3.x: directory)
+*.db
+
 # macOS
 .DS_Store
 
