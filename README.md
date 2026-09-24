@@ -9,7 +9,7 @@ The unofficial milvus-lite developed with Rust.
 | 内容 | 位置 |
 | --- | --- |
 | 项目上下文、术语与全局规则（人与 coding agent 共用） | [AGENTS.md](AGENTS.md) |
-| 设计决策 | [docs/decisions/](docs/decisions/)：[0001 重构基线选择](docs/decisions/0001-refactor-baseline.md)、[0002 数据目录格式](docs/decisions/0002-data-dir-compat.md) |
+| 设计决策 | [docs/decisions/](docs/decisions/)：[0001 重构基线选择](docs/decisions/0001-refactor-baseline.md)、[0002 数据目录格式](docs/decisions/0002-data-dir-compat.md)、[0003 进程内服务的生命周期](docs/decisions/0003-in-process-server-lifecycle.md) |
 | 与官方 2.5.1 / 3.x 对照的基线基准 | [benchmarks/baseline/](benchmarks/baseline/README.md) |
 
 ## 许可

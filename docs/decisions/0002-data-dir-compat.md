@@ -94,7 +94,7 @@
     - 3.x 在 Unix 上用 `fcntl.flock(LOCK_EX | LOCK_NB)`，在 Windows 上用 `msvcrt.locking(fd, LK_NBLCK, 1)`，后者是锁住第 0 字节的强制字节范围锁。
     - Rust 在 Unix 上必须用 flock，不能用 `fcntl` / `lockf` 锁：两者在 Linux 上互不感知。在 Windows 上，锁定区间必须覆盖第 0 字节。
     - 永远不删除、不重建 `LOCK` 文件，否则两个进程会锁在不同的 inode 上，互斥失效。
-    - 3.x 在加锁之前就会创建 `collections/` 与 `databases/`，即使开库失败，这两个目录也可能出现。
+    - 3.x 在加锁之前就会创建 `collections/` 与 `databases/`，即使开库失败，这两个目录也可能出现；加锁之后还会创建 `.database-staging/`，关闭时只清空、不删除（[db.py:102](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/milvus_lite/db.py#L102)），因此被 3.x 成功打开过的目录都有它。
 11. **版本与内容都要 fail-closed。**
     - 3.x 不校验 `manifest_format_version`、`schema_format_version`、`snapshot_format_version` 这三个版本号，重写 manifest 与 schema 时还会把版本号改回 2；snapshot 元数据只在创建时写入一次，从不重写。v3.0.0 到 v3.2.1 之间新增了 GEOMETRY、TIMESTAMPTZ、schema properties、snapshot、标量索引 `.sidx`、多数据库布局等内容，版本号却没有变。
     - 所以 Rust 除了只接受已知的版本号，遇到未知的 dtype、function 类型、metric 也要明确报错，不能宽松读取。未知的 index_type 是例外：3.x 自己就会写出这类目录（约束 1），因此与 3.x 保持同样的粒度，目录照常打开，只在该 collection build 索引时报错。

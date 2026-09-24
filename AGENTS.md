@@ -52,6 +52,7 @@
 | 上游 Milvus client 用例子集 | 参照实现 [tools/run_upstream_milvus_client_supported.sh](references/milvus-lite/tools/run_upstream_milvus_client_supported.sh)（依赖 Milvus 源码中的 `tests/python_client`，路径由 `MILVUS_CLIENT_TEST_DIR` 指定） |
 | 为什么以 3.x 而非 2.5.1 为基础 / 两代架构对比 / 3.x 的耗时归属 / Rust 实现的性能约束 | [docs/decisions/0001-refactor-baseline.md](docs/decisions/0001-refactor-baseline.md) |
 | 数据目录与 3.x 互通的范围 / 共享文件的约束 / 索引文件共存规则 / 跨实现验证矩阵 | [docs/decisions/0002-data-dir-compat.md](docs/decisions/0002-data-dir-compat.md) |
+| 进程内服务的生命周期：同路径复用 / 进程退出时的停止与持久化 / fork 后的处理 / 与 3.x 在这些点上的差异 | [docs/decisions/0003-in-process-server-lifecycle.md](docs/decisions/0003-in-process-server-lifecycle.md) |
 | 性能基线怎么测 / 口径 / 注意事项 | [benchmarks/baseline/README.md](benchmarks/baseline/README.md) |
 | 代码审查 / 修复复审（冻结合同、完整调用链、同类全域清扫、分级与证据门槛、二三阶影响矩阵） | [code-review-rules](.agents/skills/code-review-rules/SKILL.md)（Claude Code 经 `.claude/skills` 软链读取同一份） |
 
@@ -69,10 +70,18 @@ pymilvus ──server_manager──▶ adapter/grpc ──▶ db（多 collectio
                                                                                   └─ schema/   类型系统 · 校验 · 持久化
 ```
 
-本实现沿用这套**职责边界**，crate / module 划分**待定**（首次落地时在此记录，并说明与参照实现分层的对应关系）。已确定的边界约束：
+本实现沿用这套**职责边界**，按 cargo workspace 拆成三个 crate（划分已定，尚未落地；crate 内的 module 划分首次落地时补在这里）：
+
+| crate | 对应参照实现 | 职责 |
+| --- | --- | --- |
+| `crates/core` | [db.py](references/milvus-lite/milvus_lite/db.py) 及其下各层 | 引擎：多 collection 生命周期、LOCK、存储、检索、索引、schema。不依赖 protobuf 与 Python |
+| `crates/grpc` | [adapter/grpc/](references/milvus-lite/milvus_lite/adapter/grpc/) | proto 代码生成（protox）、协议翻译与错误映射；作为服务宿主，负责服务实例（runtime、检索线程池、引擎、端口）的启动与停止，检索线程池注入引擎 |
+| `crates/py` | [server_manager.py](references/milvus-lite/milvus_lite/server_manager.py) | PyO3 扩展，加上 Python 包 `milvus_lite`：`server_manager.py` 维护路径表，导入时检测官方发行包。CLI 放在哪里待定 |
+
+服务实例的所有权、同路径复用、进程退出与 fork 的处理见 [0003](docs/decisions/0003-in-process-server-lifecycle.md)。已确定的边界约束：
 
 - **Python 绑定层只做胶水**：提供 [pymilvus 接入点](#核心业务术语)要求的模块与入口，启动 Rust gRPC 服务并返回 URI；不在 Python 侧实现任何引擎逻辑。
-- **gRPC 层只翻译**：协议解码 / 编码与错误映射，业务语义全部在引擎层。
+- **gRPC 层只翻译**：除服务宿主职责（runtime、线程池、端口、启停）外，只做协议解码 / 编码与错误映射，业务语义全部在引擎层。
 - **引擎层与协议无关**：不引用 protobuf 生成类型，便于独立测试与基准。
 
 ## 技术栈
@@ -82,7 +91,7 @@ pymilvus ──server_manager──▶ adapter/grpc ──▶ db（多 collectio
 - **依赖边界：不引入 C++、CMake 或系统库依赖**（不绑定 FAISS 等），允许经 `cc` crate 编译、不需要额外安装任何东西的纯 C 代码，优先选纯 Rust。官方 3.x 删除了整套 C++ 构建（见 [0001](docs/decisions/0001-refactor-baseline.md)），本项目同样避免这类构建与分发负担：wheel 与 sdist 必须能在各目标平台只靠 cargo 构建。引入依赖时用 `cargo tree -e build` 核对。
 - **gRPC / protobuf**：用 tonic + prost。prost-build 默认依赖系统 `protoc`（C++ 程序），因此改用纯 Rust 的 protox 解析 proto，再经 `compile_fds` 交给 prost / tonic 生成代码。proto 源取与 pymilvus 3.0.2 对应的 milvus-proto commit（3.0 的 `MilvusService` 是 2.6 的超集，2.6 的消息与字段在 3.0 中都保留），随仓库固定（离线构建与 sdist 都需要），引入时记录 commit 并核对其许可、注明来源；生成物不入库。参照实现运行期直接用 `pymilvus.grpc_gen`，CI 也不钉 pymilvus 版本，Rust 侧没有这条捷径。背景：3.0 在 2.6 的 117 个 RPC 之上只增不改地新增 27 个（snapshot、namespace、`AlterCollectionSchema` 等），另新增独立的 `ClientTelemetryService`（4 个 RPC）；3.0 客户端的 `add_collection_field` 会先调 `AlterCollectionSchema`，失败再回退旧 RPC。
 - **支持的 pymilvus 版本**：2.6.x 与 3.0.x 两条线都支持，兼容测试各跑一个最新版。
-- **Python 打包**：PyO3 + maturin，产出 abi3 wheel，Python 下限与 3.x 一致（`abi3-py310`）。abi3 wheel 不能在 free-threaded 版 CPython 上加载，这一点作为已知限制。服务端在 Python 进程内的后台线程上运行多线程 tokio runtime，CPU 密集的检索交给专用线程池，调用时释放 GIL，形态与 3.x 相同（进程内服务、返回 `http://127.0.0.1:<port>`）。fork 后子进程中 runtime 的处理与 atexit 时的停止、WAL fsync 语义，落地前先写设计说明。PyPI 元数据与 README 都要声明非官方、与 Milvus / Zilliz 无隶属关系。发行包名为 `milvus-lite-rust`，包内提供 `milvus_lite` 模块（见 [pymilvus 接入点](#核心业务术语)）。目标平台与 3.x 一致：Linux / macOS / Windows（3.x 的 CI 覆盖 Linux 上的 Python 3.10–3.13、macOS 上的 3.12、Windows 上的 3.10）。
+- **Python 打包**：PyO3 + maturin，产出 abi3 wheel，Python 下限与 3.x 一致（`abi3-py310`）。abi3 wheel 不能在 free-threaded 版 CPython 上加载，这一点作为已知限制。服务端在 Python 进程内的后台线程上运行多线程 tokio runtime，CPU 密集的检索交给专用线程池，调用时释放 GIL，形态与 3.x 相同（进程内服务、返回 `http://127.0.0.1:<port>`）。同路径复用、atexit 时的停止顺序与持久化语义、fork 后子进程中 runtime 的处理见 [0003](docs/decisions/0003-in-process-server-lifecycle.md)；WAL 的 fsync 时机在 WAL 设计中确定。PyPI 元数据与 README 都要声明非官方、与 Milvus / Zilliz 无隶属关系。发行包名为 `milvus-lite-rust`，包内提供 `milvus_lite` 模块（见 [pymilvus 接入点](#核心业务术语)）。目标平台与 3.x 一致：Linux / macOS / Windows（3.x 的 CI 覆盖 Linux 上的 Python 3.10–3.13、macOS 上的 3.12、Windows 上的 3.10）。
 - **持久化格式**：数据文件与 3.x **双向互通**，索引文件各自独立。范围、约束与验证方式见 [0002](docs/decisions/0002-data-dir-compat.md)。
 - **向量索引**：第一阶段只做 SIMD 优化的暴力检索（FLAT），同时作为召回与距离口径的正确性基准；HNSW 等 ANN 索引后期补齐，优先纯 Rust（依赖边界见上），届时再定具体方案。第一阶段对各类索引定义的处理见 [0002 «结论»](docs/decisions/0002-data-dir-compat.md#结论)。
 - **分词与 BM25**：在全文检索阶段定具体实现，但因为数据目录互通，必须与 3.x 逐位一致（范围与约束见 [0002](docs/decisions/0002-data-dir-compat.md#共享状态的语义约束) 约束 8）。
