@@ -190,3 +190,23 @@ cython_debug/
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 
+# Rust
+/target/
+
+# macOS
+.DS_Store
+
+# reference repo, e.g., milvus-lite
+/references/
+
+# claude code
+.claude/*
+!.claude/agents
+!.claude/commands
+!.claude/hooks
+!.claude/rules
+!.claude/skills
+
+# general code agents
+.agents/*
+!.agents/skills
