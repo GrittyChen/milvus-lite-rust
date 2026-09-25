@@ -7,8 +7,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use milvus_lite_core::{
-    CollectionSchema, DataDir, DataDirError, DataType, Db, EngineError, FieldSchema, LoadState,
+    CollectionSchema, Compute, DataDir, DataDirError, DataType, Db, EngineError, FieldSchema,
+    LoadState,
 };
+
+fn compute() -> Compute {
+    Compute::new(std::num::NonZeroUsize::new(2).unwrap()).unwrap()
+}
 
 fn schema() -> CollectionSchema {
     CollectionSchema {
@@ -30,7 +35,7 @@ fn schema() -> CollectionSchema {
 fn db() -> (tempfile::TempDir, Db) {
     let root = tempfile::tempdir().unwrap();
     let dir = DataDir::open(root.path()).unwrap();
-    (root, Db::new(dir))
+    (root, Db::new(dir, compute()))
 }
 
 #[test]
@@ -170,7 +175,7 @@ fn lock_is_free(path: &std::path::Path) -> bool {
 #[test]
 fn close_waits_for_in_flight_tasks_before_releasing_the_lock() {
     let root = tempfile::tempdir().unwrap();
-    let db = Arc::new(Db::new(DataDir::open(root.path()).unwrap()));
+    let db = Arc::new(Db::new(DataDir::open(root.path()).unwrap(), compute()));
     let (started_tx, started_rx) = std::sync::mpsc::channel();
     let (finish_tx, finish_rx) = std::sync::mpsc::channel::<()>();
     let task = {
@@ -203,7 +208,7 @@ fn close_waits_for_in_flight_tasks_before_releasing_the_lock() {
 #[test]
 fn close_nowait_releases_the_lock_with_the_last_task() {
     let root = tempfile::tempdir().unwrap();
-    let db = Db::new(DataDir::open(root.path()).unwrap());
+    let db = Db::new(DataDir::open(root.path()).unwrap(), compute());
     let task = db.enter().unwrap();
     db.close_nowait();
     assert!(!lock_is_free(root.path()));
@@ -215,7 +220,94 @@ fn close_nowait_releases_the_lock_with_the_last_task() {
     assert!(lock_is_free(root.path()));
 
     let root = tempfile::tempdir().unwrap();
-    let db = Db::new(DataDir::open(root.path()).unwrap());
+    let db = Db::new(DataDir::open(root.path()).unwrap(), compute());
     db.close_nowait();
     assert!(lock_is_free(root.path()));
+}
+
+/// 0005「验证」：检索持有读锁并行计算时，排队的写入与其后的检索都能完成，不死锁。
+/// 计算任务不拿锁，所以即使写入排在读锁之后、又挡住后到的读者，持锁的检索也能算完并放锁。
+#[test]
+fn search_with_a_queued_writer_does_not_deadlock() {
+    use milvus_lite_core::{InputValues, InsertBatch, QueryVectors, SearchRequest};
+
+    let (_root, db) = db();
+    let dim = 64;
+    let schema = CollectionSchema {
+        fields: vec![
+            FieldSchema {
+                is_primary: true,
+                ..FieldSchema::new("id", DataType::Int64)
+            },
+            FieldSchema {
+                dim: Some(dim),
+                ..FieldSchema::new("v", DataType::FloatVector)
+            },
+        ],
+        enable_dynamic_field: false,
+        properties: Vec::new(),
+    };
+    db.create_collection("", "c", schema).unwrap();
+    let rows = |start: i64, n: usize| InsertBatch {
+        num_rows: n,
+        columns: vec![
+            (
+                "id".to_owned(),
+                InputValues::Int((start..start + n as i64).collect()),
+            ),
+            (
+                "v".to_owned(),
+                InputValues::FloatVector {
+                    dim: dim as usize,
+                    values: (0..n * dim as usize).map(|i| (i % 7) as f32).collect(),
+                },
+            ),
+        ],
+    };
+    let handle = db.collection("", "c").unwrap();
+    handle.write().insert(rows(0, 20_000)).unwrap();
+    let search = |nq: usize| SearchRequest {
+        anns_field: None,
+        vectors: QueryVectors::Dense(vec![vec![1.0; dim as usize]; nq]),
+        metric_type: Some("L2".to_owned()),
+        limit: 10,
+        offset: 0,
+        output_fields: Vec::new(),
+    };
+    let db = Arc::new(db);
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let (held_tx, held_rx) = std::sync::mpsc::channel();
+    let (db, handle) = (&db, &handle);
+    std::thread::scope(|s| {
+        let done = done_tx.clone();
+        s.spawn(move || {
+            let c = handle.read();
+            held_tx.send(()).unwrap();
+            c.search(search(64), db.compute()).unwrap();
+            drop(c);
+            done.send("long search").unwrap();
+        });
+        held_rx.recv().unwrap();
+        let done = done_tx.clone();
+        s.spawn(move || {
+            handle.write().insert(rows(20_000, 10)).unwrap();
+            done.send("insert").unwrap();
+        });
+        std::thread::sleep(Duration::from_millis(20));
+        let done = done_tx;
+        s.spawn(move || {
+            handle.read().search(search(1), db.compute()).unwrap();
+            done.send("later search").unwrap();
+        });
+        let mut finished: Vec<&str> = (0..3)
+            .map(|_| {
+                done_rx
+                    .recv_timeout(Duration::from_secs(60))
+                    .expect("deadlock")
+            })
+            .collect();
+        finished.sort_unstable();
+        assert_eq!(finished, ["insert", "later search", "long search"]);
+    });
+    assert_eq!(handle.read().count(), 20_010);
 }

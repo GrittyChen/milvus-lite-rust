@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use std::sync::Arc;
 
-use milvus_lite_core::{DataDir, DataDirError, Db};
+use milvus_lite_core::{Compute, ComputeError, DataDir, DataDirError, Db};
 use tokio::runtime::Runtime;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -30,6 +30,8 @@ pub struct ServerConfig {
 pub enum ServerError {
     #[error(transparent)]
     DataDir(#[from] DataDirError),
+    #[error(transparent)]
+    Compute(#[from] ComputeError),
     #[error("failed to start runtime: {0}")]
     Runtime(#[source] std::io::Error),
     #[error("failed to bind {addr}: {source}")]
@@ -64,7 +66,10 @@ struct Running {
 
 impl Server {
     pub fn start(config: ServerConfig) -> Result<Self, ServerError> {
-        let db = Arc::new(Db::new(DataDir::open(&config.data_dir)?));
+        let db = Arc::new(Db::new(
+            DataDir::open(&config.data_dir)?,
+            Compute::for_host()?,
+        ));
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .thread_name("milvus-lite-rt")

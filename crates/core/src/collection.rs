@@ -5,6 +5,7 @@ use std::collections::HashMap;
 
 use serde_json::{Map, Value};
 
+use crate::compute::Compute;
 use crate::data::{
     ColumnData, InputValues, InsertBatch, META_FIELD, Pk, Rows, check_column_len, field_dim,
 };
@@ -73,9 +74,12 @@ struct Chunk {
     meta: Option<Vec<Map<String, Value>>>,
     /// 该行是否仍是其主键的最新版本。被覆盖时增量清除，查询时无需逐行去重（0001 约束）。
     live: Vec<bool>,
+    /// 向量字段每行的范数，写入时算好供 COSINE 使用（与检索时现算逐位相同），不落盘。
+    norms: Vec<f32>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// 行的位置。派生的全序即扫描顺序：先按 chunk、再按行。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct RowRef {
     chunk: usize,
     row: usize,
@@ -265,6 +269,9 @@ impl Collection {
             };
             columns.push(column);
         }
+        // schema 校验保证 dim > 0。
+        let (dim, values) = vector_values(&columns[self.vector_pos]);
+        let norms = values.chunks_exact(dim).map(flat::norm).collect();
         // 从这里开始修改状态，之后的步骤都不会失败或 panic：锁没有中毒语义，中途失败会留下半写的 collection。
         self.next_seq += n as u64;
 
@@ -274,6 +281,7 @@ impl Collection {
             columns,
             meta,
             live: vec![true; n],
+            norms,
         };
         let mut ids = Vec::with_capacity(n);
         for row in 0..n {
@@ -326,7 +334,19 @@ impl Collection {
         self.get(&pks, output_fields)
     }
 
-    pub fn search(&self, req: SearchRequest) -> Result<SearchResult> {
+    /// 在 `compute` 上并行计算（[0005](../../../docs/decisions/0005-search-thread-model.md)），
+    /// 结果与串行计算逐位相同。
+    pub fn search(&self, req: SearchRequest, compute: &Compute) -> Result<SearchResult> {
+        let rows_per_block = (BLOCK_ELEMS / field_dim(&self.schema.fields[self.vector_pos])).max(1);
+        self.search_in_blocks(req, compute, rows_per_block)
+    }
+
+    fn search_in_blocks(
+        &self,
+        req: SearchRequest,
+        compute: &Compute,
+        rows_per_block: usize,
+    ) -> Result<SearchResult> {
         let projection = Projection::new(&self.schema, &req.output_fields, ApiKind::Search);
         // 3.x：没有查询向量时在一切检查之前返回空结果。
         if matches!(&req.vectors, QueryVectors::Dense(v) if v.is_empty()) {
@@ -370,25 +390,46 @@ impl Collection {
                 )));
             }
         }
+        // M1 只允许一个 FLOAT_VECTOR 字段，范数只为它计算。
+        debug_assert_eq!(field_pos, self.vector_pos);
         let take = req.limit.saturating_add(req.offset);
-        let hits = vectors
+        let queries: Vec<flat::Query> = vectors
             .iter()
-            .map(|v| {
-                let query = flat::Query::new(metric, v);
-                let mut scored: Vec<(f32, RowRef)> = Vec::new();
-                for (ci, chunk) in self.chunks.iter().enumerate() {
-                    let (dim, values) = vector_values(&chunk.columns[field_pos]);
-                    for (row, live) in chunk.live.iter().enumerate() {
-                        if *live {
-                            let score = query.score(&values[row * dim..(row + 1) * dim]);
-                            scored.push((score, RowRef { chunk: ci, row }));
-                        }
+            .map(|v| flat::Query::new(metric, v))
+            .collect();
+        let mut tops: Vec<TopK> = queries.iter().map(|_| TopK::new(metric, take)).collect();
+        let blocks = row_blocks(&self.chunks, rows_per_block);
+        if take > 0 && !blocks.is_empty() {
+            let groups: Vec<&[flat::Query]> = queries.chunks(flat::BATCH).collect();
+            let per_wave = groups_per_wave(compute.threads(), blocks.len());
+            for wave in (0..groups.len()).step_by(per_wave) {
+                let mut leaves: Vec<Leaf> = (wave..groups.len().min(wave + per_wave))
+                    .flat_map(|group| {
+                        blocks.iter().map(move |block| Leaf {
+                            group,
+                            block,
+                            tops: Vec::new(),
+                        })
+                    })
+                    .collect();
+                compute.for_each(&mut leaves, |leaf| {
+                    let queries = groups[leaf.group];
+                    leaf.tops = queries.iter().map(|_| TopK::new(metric, take)).collect();
+                    scan(&self.chunks, leaf.block, field_pos, queries, &mut leaf.tops);
+                    leaf.tops.iter_mut().for_each(TopK::shrink);
+                });
+                for leaf in leaves {
+                    for (i, top) in leaf.tops.into_iter().enumerate() {
+                        tops[leaf.group * flat::BATCH + i].absorb(top);
                     }
                 }
-                // 稳定排序：分数相同时保持扫描顺序。
-                scored.sort_by(|a, b| query.rank(a.0, b.0));
-                scored.truncate(take);
-                let kept = scored.get(req.offset..).unwrap_or(&[]);
+            }
+        }
+        let hits = tops
+            .into_iter()
+            .map(|top| {
+                let ranked = top.finish();
+                let kept = ranked.get(req.offset..).unwrap_or(&[]);
                 let refs: Vec<RowRef> = kept.iter().map(|(_, r)| *r).collect();
                 Hits {
                     scores: kept.iter().map(|(s, _)| *s).collect(),
@@ -610,6 +651,166 @@ struct Dynamic {
     maps: Vec<Map<String, Value>>,
     /// 每行解码动态字段时遇到的第一个错误。
     errors: Vec<Option<String>>,
+}
+
+/// 每个行块的计算量约为这么多个浮点数（0005，初值，由基准调整）。
+const BLOCK_ELEMS: usize = 1 << 20;
+
+/// 扫描顺序上连续的一段行。
+struct Segment {
+    chunk: usize,
+    rows: std::ops::Range<usize>,
+}
+
+/// 按扫描顺序把全部行切成每块 `rows_per_block` 行（最后一块可以更少）；块可以跨 chunk，
+/// 也可以落在 chunk 内部，一次大批量写入的 chunk 同样能并行。
+fn row_blocks(chunks: &[Chunk], rows_per_block: usize) -> Vec<Vec<Segment>> {
+    let mut blocks = Vec::new();
+    let mut current = Vec::new();
+    let mut filled = 0;
+    for (chunk, c) in chunks.iter().enumerate() {
+        let mut start = 0;
+        while start < c.live.len() {
+            let end = c.live.len().min(start + rows_per_block - filled);
+            current.push(Segment {
+                chunk,
+                rows: start..end,
+            });
+            filled += end - start;
+            start = end;
+            if filled == rows_per_block {
+                blocks.push(std::mem::take(&mut current));
+                filled = 0;
+            }
+        }
+    }
+    if !current.is_empty() {
+        blocks.push(current);
+    }
+    blocks
+}
+
+/// 每波提交的查询组数：刚好填满计算池（0005「查询组分波提交」）。同时存活的候选数因此与查询条数无关。
+fn groups_per_wave(threads: usize, blocks: usize) -> usize {
+    threads.div_ceil(blocks.max(1)).max(1)
+}
+
+/// 一个叶子任务：一个查询组在一个行块上的前 k 名。
+struct Leaf<'a> {
+    group: usize,
+    block: &'a [Segment],
+    tops: Vec<TopK>,
+}
+
+/// 为一个查询组（至多 [`flat::BATCH`] 条）扫描一个行块中的存活行，候选交给各自的 [`TopK`]。
+/// 组满 [`flat::BATCH`] 条时一起打分，共用读入的候选向量。
+fn scan(
+    chunks: &[Chunk],
+    block: &[Segment],
+    field_pos: usize,
+    queries: &[flat::Query],
+    tops: &mut [TopK],
+) {
+    for seg in block {
+        let chunk = &chunks[seg.chunk];
+        let (dim, values) = vector_values(&chunk.columns[field_pos]);
+        let live_rows = || {
+            seg.rows
+                .clone()
+                .filter(|row| chunk.live[*row])
+                .map(|row| (row, &values[row * dim..(row + 1) * dim], chunk.norms[row]))
+        };
+        let at = |row| RowRef {
+            chunk: seg.chunk,
+            row,
+        };
+        if let Ok(batch) = <&[flat::Query; flat::BATCH]>::try_from(queries) {
+            for (row, candidate, norm) in live_rows() {
+                let scores = flat::score_batch(batch, candidate, norm);
+                for (top, score) in tops.iter_mut().zip(scores) {
+                    top.push(score, at(row));
+                }
+            }
+        } else {
+            for (query, top) in queries.iter().zip(tops.iter_mut()) {
+                for (row, candidate, norm) in live_rows() {
+                    top.push(query.score(candidate, norm), at(row));
+                }
+            }
+        }
+    }
+}
+
+/// 一条查询的前 `take` 个结果，按 (分数的名次, 行的位置) 这一全序排列。
+///
+/// 与对全部分数按名次做稳定排序的结果完全相同：扫描按位置递增进行，稳定排序在名次相同时保持扫描顺序，
+/// 即按位置排序。只保留可能进入前 `take` 个的候选，不收集全部分数。
+struct TopK {
+    metric: Metric,
+    take: usize,
+    candidates: Vec<(f32, RowRef)>,
+    /// 已确定的第 `take` 名；不排在它前面的候选不可能进入结果。
+    bound: Option<(f32, RowRef)>,
+}
+
+impl TopK {
+    fn new(metric: Metric, take: usize) -> Self {
+        Self {
+            metric,
+            take,
+            candidates: Vec::new(),
+            bound: None,
+        }
+    }
+
+    fn push(&mut self, score: f32, pos: RowRef) {
+        let candidate = (score, pos);
+        if self.take == 0
+            || self
+                .bound
+                .is_some_and(|b| order(self.metric, &candidate, &b).is_ge())
+        {
+            return;
+        }
+        self.candidates.push(candidate);
+        // 攒够一批再筛，均摊每个候选的筛选代价。
+        if self.candidates.len() >= self.take.saturating_mul(2).max(64) {
+            self.shrink();
+        }
+    }
+
+    /// 只留前 `take` 个，并记下第 `take` 名。
+    fn shrink(&mut self) {
+        let k = self.take;
+        if k == 0 {
+            self.candidates.clear();
+        } else if self.candidates.len() > k {
+            let metric = self.metric;
+            self.candidates
+                .select_nth_unstable_by(k - 1, |a, b| order(metric, a, b));
+            self.candidates.truncate(k);
+            self.bound = Some(self.candidates[k - 1]);
+        }
+    }
+
+    /// 并入另一部分行的前 `take` 名。结果与推入的先后无关：被跳过的候选前面总有至少 `take` 个更好的。
+    fn absorb(&mut self, other: TopK) {
+        for (score, pos) in other.candidates {
+            self.push(score, pos);
+        }
+    }
+
+    fn finish(mut self) -> Vec<(f32, RowRef)> {
+        self.shrink();
+        let metric = self.metric;
+        // 位置各不相同，全序下没有相等的元素，不稳定排序即可。
+        self.candidates.sort_unstable_by(|a, b| order(metric, a, b));
+        self.candidates
+    }
+}
+
+fn order(metric: Metric, a: &(f32, RowRef), b: &(f32, RowRef)) -> std::cmp::Ordering {
+    flat::rank(metric, a.0, b.0).then(a.1.cmp(&b.1))
 }
 
 fn vector_values(column: &ColumnData) -> (usize, &[f32]) {
@@ -861,5 +1062,226 @@ fn py_value_repr(values: &InputValues, row: usize) -> String {
             Ok(value) => py_json_repr(&value),
             Err(_) => py_repr(&String::from_utf8_lossy(&v[row])),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::num::NonZeroUsize;
+
+    use crate::data::{InputValues, InsertBatch};
+    use crate::schema::FieldSchema;
+
+    struct Rng(u32);
+
+    impl Rng {
+        fn next(&mut self) -> u32 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 17;
+            self.0 ^= self.0 << 5;
+            self.0
+        }
+
+        fn below(&mut self, n: usize) -> usize {
+            self.next() as usize % n
+        }
+    }
+
+    fn collection(rng: &mut Rng, dim: usize) -> Collection {
+        let schema = CollectionSchema {
+            fields: vec![
+                FieldSchema {
+                    is_primary: true,
+                    ..FieldSchema::new("id", DataType::Int64)
+                },
+                FieldSchema {
+                    dim: Some(dim as i64),
+                    ..FieldSchema::new("v", DataType::FloatVector)
+                },
+            ],
+            enable_dynamic_field: false,
+            properties: Vec::new(),
+        };
+        let mut c = Collection::new("c", schema).unwrap();
+        let insert = |c: &mut Collection, rng: &mut Rng, pks: Vec<i64>| {
+            // 取值很少的分量制造大量并列，偶尔插入 NaN 行。
+            let values = (0..pks.len() * dim)
+                .map(|_| match rng.below(40) {
+                    0 => f32::NAN,
+                    r => (r % 4) as f32 - 1.5,
+                })
+                .collect();
+            c.insert(InsertBatch {
+                num_rows: pks.len(),
+                columns: vec![
+                    ("id".to_owned(), InputValues::Int(pks)),
+                    ("v".to_owned(), InputValues::FloatVector { dim, values }),
+                ],
+            })
+            .unwrap();
+        };
+        // 第一批随后被整批覆盖：行块中可能没有任何存活行。
+        insert(&mut c, rng, (0..20).collect());
+        insert(&mut c, rng, (0..20).collect());
+        for _ in 0..rng.below(8) {
+            let n = rng.below(40);
+            let pks = (0..n).map(|_| rng.below(200) as i64).collect::<Vec<_>>();
+            let mut seen = std::collections::HashSet::new();
+            let pks = pks.into_iter().filter(|p| seen.insert(*p)).collect();
+            insert(&mut c, rng, pks);
+        }
+        c
+    }
+
+    /// 独立的参照：每个存活行逐个打分，按名次稳定排序（扫描顺序即位置顺序）。
+    fn reference(c: &Collection, req: &SearchRequest, metric: Metric) -> Vec<Vec<(u32, Pk)>> {
+        let QueryVectors::Dense(vectors) = &req.vectors else {
+            unreachable!()
+        };
+        vectors
+            .iter()
+            .map(|v| {
+                let q = flat::Query::new(metric, v);
+                let mut scored = Vec::new();
+                for chunk in &c.chunks {
+                    let (dim, values) = vector_values(&chunk.columns[c.vector_pos]);
+                    for row in 0..chunk.live.len() {
+                        if chunk.live[row] {
+                            let cand = &values[row * dim..(row + 1) * dim];
+                            let pk = pk_at(&chunk.columns[c.pk_pos], row);
+                            scored.push((q.score(cand, flat::norm(cand)), pk));
+                        }
+                    }
+                }
+                scored.sort_by(|a, b| flat::rank(metric, a.0, b.0));
+                scored
+                    .into_iter()
+                    .take(req.limit.saturating_add(req.offset))
+                    .skip(req.offset)
+                    .map(|(s, pk)| (s.to_bits(), pk))
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// 0005「验证」：行块边界落在 chunk 内部、行块中没有存活行、各种查询条数与 limit / offset、
+    /// 并列与 NaN 下，并行结果与串行参照逐位相同。
+    #[test]
+    fn parallel_search_matches_serial_reference() {
+        let mut rng = Rng(0x1234_5678);
+        let pools = [1, 3].map(|n| Compute::new(NonZeroUsize::new(n).unwrap()).unwrap());
+        for case in 0..400 {
+            let dim = [1, 3, 17][case % 3];
+            let c = collection(&mut rng, dim);
+            let metric = [Metric::L2, Metric::Ip, Metric::Cosine][rng.below(3)];
+            let nq = [1, 3, 4, 5, 9][rng.below(5)];
+            let (limit, offset) =
+                [(0, 0), (1, 0), (5, 2), (10, 0), (3, 40), (500, 0), (7, 500)][rng.below(7)];
+            let vectors = (0..nq)
+                .map(|_| (0..dim).map(|_| (rng.below(4) as f32) - 1.5).collect())
+                .collect();
+            let req = SearchRequest {
+                anns_field: None,
+                vectors: QueryVectors::Dense(vectors),
+                metric_type: Some(metric.as_str().to_owned()),
+                limit,
+                offset,
+                output_fields: Vec::new(),
+            };
+            let expected = reference(&c, &req, metric);
+            for rows_per_block in [1, 2, 7, 64, 10_000] {
+                for pool in &pools {
+                    let got = c
+                        .search_in_blocks(req.clone(), pool, rows_per_block)
+                        .unwrap();
+                    let got: Vec<Vec<(u32, Pk)>> = got
+                        .hits
+                        .iter()
+                        .map(|h| {
+                            h.scores
+                                .iter()
+                                .map(|s| s.to_bits())
+                                .zip(h.rows.pks.iter().cloned())
+                                .collect()
+                        })
+                        .collect();
+                    assert_eq!(got, expected, "case {case}, block {rows_per_block}");
+                }
+            }
+        }
+    }
+
+    /// 0005「查询组分波提交」：每波的查询组数只由线程数与块数决定，同时存活的候选数与查询条数无关。
+    #[test]
+    fn groups_per_wave_fills_the_pool_without_depending_on_nq() {
+        assert_eq!(groups_per_wave(10, 123), 1);
+        assert_eq!(groups_per_wave(10, 13), 1);
+        assert_eq!(groups_per_wave(10, 3), 4);
+        assert_eq!(groups_per_wave(10, 1), 10);
+        assert_eq!(groups_per_wave(1, 0), 1);
+    }
+
+    /// TopK 与「对全部分数按名次稳定排序、取前 take 个」逐位相同：并列、±0、±inf、NaN（含负 NaN）都覆盖。
+    #[test]
+    fn top_k_matches_stable_sort() {
+        let mut x = 0x9e37_79b9_u32;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            x
+        };
+        let palette = [
+            0.0,
+            -0.0,
+            1.0,
+            1.0,
+            2.5,
+            -3.0,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NAN,
+            -f32::NAN,
+        ];
+        for case in 0..3000 {
+            let metric = [Metric::L2, Metric::Ip, Metric::Cosine][case % 3];
+            let n = (next() % 300) as usize;
+            let scored: Vec<(f32, RowRef)> = (0..n)
+                .map(|i| {
+                    let r = next();
+                    let score = if r % 4 == 0 {
+                        palette[(r / 4) as usize % palette.len()]
+                    } else {
+                        (r % 17) as f32 / 4.0
+                    };
+                    (
+                        score,
+                        RowRef {
+                            chunk: i / 50,
+                            row: i % 50,
+                        },
+                    )
+                })
+                .collect();
+            let take = match case % 5 {
+                0 => 0,
+                1 => n,
+                2 => n + 3,
+                _ => (next() % 80) as usize,
+            };
+            let mut expected = scored.clone();
+            expected.sort_by(|a, b| flat::rank(metric, a.0, b.0));
+            expected.truncate(take);
+            let mut top = TopK::new(metric, take);
+            for (s, pos) in &scored {
+                top.push(*s, *pos);
+            }
+            let got = top.finish();
+            let bits =
+                |v: &[(f32, RowRef)]| v.iter().map(|(s, p)| (s.to_bits(), *p)).collect::<Vec<_>>();
+            assert_eq!(bits(&got), bits(&expected), "case {case}");
+        }
     }
 }

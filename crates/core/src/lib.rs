@@ -1,6 +1,7 @@
 //! milvus-lite-rust 的引擎层。不依赖 protobuf 与 Python（见 AGENTS.md「架构地图」）。
 
 pub mod collection;
+pub mod compute;
 pub mod data;
 pub mod data_dir;
 pub mod db;
@@ -15,6 +16,7 @@ pub mod schema;
 pub use collection::{
     Collection, Hits, LoadState, QueryResult, QueryVectors, SearchRequest, SearchResult,
 };
+pub use compute::{Compute, ComputeError};
 pub use data::{ColumnData, InputValues, InsertBatch, META_FIELD, Pk, Rows};
 pub use data_dir::{DataDir, DataDirError};
 pub use db::{CollectionHandle, DEFAULT_DATABASE, Db, InFlight};

@@ -376,9 +376,45 @@ impl Service for MilvusService {
         let req = request.into_inner();
         self.run(Branch::Engine, move |db| {
             let handle = db.collection(&database, &req.collection_name)?;
+            // 解析（包括解码查询向量）不需要 collection 的状态，放在取读锁之前以缩短持锁时间；
+            // collection 不存在的错误仍然最先报出（3.x 相同）。
+            let parsed = search::parse(&req)?;
             let c = handle.read();
-            search::search(&c, req)
+            search::search(&c, db.compute(), parsed, req.output_fields)
         })
         .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use milvus_lite_core::{Compute, DataDir};
+
+    use super::*;
+
+    /// 0005「验证」叶子任务 panic 的后半段：处理体中的 panic（包括计算池从叶子任务传回的 panic，
+    /// 见 core 的 compute 用例）映射成 code 1、error_code 0，之后服务照常可用。
+    #[test]
+    // error_code 在 proto 中已废弃，但 3.x 与 pymilvus 仍读取它（status.rs）。
+    #[allow(deprecated)]
+    fn a_panic_in_the_body_maps_to_code_1_and_the_service_keeps_working() {
+        let root = tempfile::tempdir().unwrap();
+        let compute = Compute::new(std::num::NonZeroUsize::MIN).unwrap();
+        let db = Arc::new(Db::new(DataDir::open(root.path()).unwrap(), compute));
+        let service = MilvusService::new("test".to_owned(), db);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let reply = rt
+            .block_on(service.run::<common::Status, _>(Branch::Engine, |_| panic!("leaf 17")))
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            (reply.code, reply.error_code, reply.reason.as_str()),
+            (1, 0, "internal error: leaf 17")
+        );
+        let reply = rt
+            .block_on(service.run(Branch::Engine, |_| Ok(success())))
+            .unwrap()
+            .into_inner();
+        assert_eq!(reply.code, 0);
     }
 }

@@ -2,7 +2,7 @@
 
 对照 milvus-lite **2.5.1**（C++，内嵌 Milvus segcore + knowhere）与 **3.x**（纯 Python，LSM + Parquet + FAISS）的同负载基准。两者都由同一版本的 `pymilvus` 驱动，指标口径一致。重构基线的决策与数据解读见 [0001-重构基线选择](../../docs/decisions/0001-refactor-baseline.md)。
 
-Rust 实现落地后，在这里接入第三个对照臂，性能声明以本目录的测量结果为准（见 [AGENTS.md](../../AGENTS.md) 规则 7）。
+本仓的 Rust 实现作为第三个对照臂接入（M1 口径，见下文），性能声明以本目录的测量结果为准（见 [AGENTS.md](../../AGENTS.md) 规则 7）。
 
 ## 前置条件
 
@@ -42,16 +42,32 @@ $W/dedup_microbench 100000 1000000
 
 `setup.sh` 可用第 2、3 个参数换 3.x 与 pymilvus 版本。
 
+M1 口径（[0004「验收」第 4 项](../../docs/decisions/0004-m1-scope.md#验收)）：Rust 实现在 M1 只在内存中，只跑 `m1` 阶段，三个实现同口径对照。结果汇总进 [0001「M1 部分验证」](../../docs/decisions/0001-refactor-baseline.md)。
+
+```bash
+# 8. 为本仓的 Rust 实现建第三套环境 $W/rs（用仓库开发环境里的 maturin 构建 wheel）
+benchmarks/baseline/setup_rs.sh $W
+
+# 9. 3 轮，每轮 10 万与 100 万行，各实现的先后顺序每轮轮换，结果追加到 $W/m1.jsonl
+for order in "rs v2 v3" "v2 v3 rs" "v3 rs v2"; do
+  for n in 100000 1000000; do
+    benchmarks/baseline/run.sh $W $n 128 m1.jsonl $(for e in $order; do echo "$e:FLAT:inproc:m1"; done)
+  done
+done
+$W/v3/bin/python benchmarks/baseline/summarize.py $W/m1.jsonl
+```
+
 ## 文件
 
 | 文件 | 作用 |
 | --- | --- |
 | [setup.sh](setup.sh) | 建 v2 / v3 两套 venv |
-| [run.sh](run.sh) | 顺序执行每个配置的 `build` + `reopen` 两个阶段 |
-| [bench.py](bench.py) | 单个配置的基准：写入、建索引、检索（含过滤 / 批量）、查询、`count(*)`、点查、召回、删除、upsert、冷启动、服务端内存 |
-| [concurrency.py](concurrency.py) | 服务端独立进程 + 多客户端进程的检索吞吐 |
+| [setup_rs.sh](setup_rs.sh) | 用本仓构建的 wheel 建 rs 环境，并记下构建所用的 commit（工作区有未提交改动时附改动内容的指纹） |
+| [run.sh](run.sh) | 顺序执行每个配置的各阶段：默认 `build` + `reopen`，配置可用第 4 段指定阶段（如 `rs:FLAT:inproc:m1`） |
+| [bench.py](bench.py) | 单个配置的基准：写入、建索引、检索（含过滤 / 批量）、查询、`count(*)`、点查、召回、删除、upsert、冷启动、服务端内存；`m1` 阶段只测 M1 口径 |
+| [concurrency.py](concurrency.py) | 服务端独立进程 + 多客户端进程的检索吞吐（0001 并发表所用，口径早于 `m1` 阶段，差别见 [0001](../../docs/decisions/0001-refactor-baseline.md) 该表的说明） |
 | [profile_v3.py](profile_v3.py) | 3.x 嵌入式引擎的 cProfile，拆分计算与 Python 胶水的耗时 |
-| [summarize.py](summarize.py) | jsonl → markdown 表 |
+| [summarize.py](summarize.py) | jsonl → markdown 表；`m1` 阶段按配置汇总各轮的中位数与最小–最大 |
 | [sqlite_delete.py](sqlite_delete.py) | 在 2.5.1 库的副本上对比有无 `milvus_id` 索引时的删除耗时 |
 | [dedup_microbench.rs](dedup_microbench.rs) | Rust 单线程微基准：每次查询逐行重算跨源去重的代价 |
 
@@ -69,3 +85,22 @@ $W/dedup_microbench 100000 1000000
 - **配置校验**：`mode` 不是 `inproc` / `server`、索引类型不在上述范围内、或服务端登记的索引类型与请求不一致时，`bench.py` 直接报错，不输出结果行。
 - **失败处理**：`run.sh` 把每个阶段的 stderr 写入 `<work_dir>/logs/`。单个配置失败时打印出来并继续执行后面的配置，最后以非零码退出。
 - 必须顺序执行，不要并行跑多组配置。
+
+### M1 口径（`m1` 阶段）
+
+- **与 build 相同的部分**：schema（含 `cat` / `tag` 两个标量字段）、随机数的消耗顺序、每批 1000 行的写入、FLAT 索引与 load、各项的采样次数，因此写入吞吐可以与 0001 的表对照。
+- **只测 M1 支持的操作**：无过滤检索（nq=1 与 nq=100）、空 expr 的 `count(*)`、按主键 get 100 条，以及并发检索；不测过滤、删除、upsert 与 reopen。
+- **空 expr 的 `count(*)`**（`query_count_empty_expr`）与 build 的 `query_count`（带过滤，0001 的口径）不是同一个操作：3.x 前者走 `num_entities`，不能与 0001 的 `count(*)` 放在同一行比较。
+- **写入吞吐不是同口径**：2.5.1 与 3.x 每次写入都要落盘（SQLite、WAL），Rust 实现在 M1 不落盘，写入目标要到 M2 才能验证。
+- **预热**：每项先调用一次再计时。
+- **recall@10 必须为 1**：三个实现都是暴力检索，否则 `bench.py` 报错，不输出结果行。
+- **并发**：
+  - 同一进程内 1 / 2 / 4 / 8 个线程（0004 的口径）与 1 / 2 / 4 / 8 个进程（每个客户端一个进程，与 0001 并发表的客户端形态相同，作为补充），每档 8 秒，报吞吐与 p50 / p99。
+  - 每个客户端用 `dedicated=True` 自建连接。连接建好后在栅栏上等齐，一起起跑，进程启动与建连的耗时不计入。
+  - 吞吐 = 完成的请求数 ÷ 从放行到最后一次返回的实际时长：截止前发出、截止后才返回的请求也计入，分母不用固定的 8 秒，否则单次越慢吞吐越被高估。
+  - 任何一个客户端失败，`bench.py` 即报错退出，这个配置不输出结果行。
+  - 客户端连接的是进程内服务的 URI，由 `server_manager_instance.start_and_get_uri` 取得。
+  - 单个 Python 进程内的多线程受客户端自身限制，在极小的 collection 上约 6000–7000 QPS 封顶，接近这个量级时测到的是客户端上限。
+- **轮次与顺序**：各跑 3 轮，每轮轮换各实现的先后，汇总报中位数与最小–最大；每行结果记录 load average、版本号与 Rust 实现的构建 commit。
+- **代理环境变量**：grpc 对 127.0.0.1 也遵守 `http_proxy` 等变量（未设 `no_proxy` 时），经 TCP 连接的 3.x 与 Rust 实现会多一跳代理，2.5.1 走 Unix socket 则不会；`bench.py` 启动时清掉这些变量，客户端子进程继承清过的环境。
+- **2.5.1 的 socket 路径**：2.5.1 在临时目录下创建 UDS socket，macOS 限制 socket 路径不超过 104 字节，`TMPDIR` 过长时 2.5.1 无法启动，保持默认的 `TMPDIR`。

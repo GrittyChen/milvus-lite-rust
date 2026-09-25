@@ -1,10 +1,23 @@
 //! 暴力检索的距离计算，口径与 3.x `search/distance.py` 及对外换算一致：
 //! COSINE 返回相似度（上限 1，零向量为 0），IP 返回点积，L2 返回平方距离。
-//! 标量实现，同时作为后续 SIMD 版本的正确性基准。
+//!
+//! 求和分 16 路累加，再两两归约，最后按顺序加上不足 16 个的尾部元素。求和顺序只由源码决定：
+//! Rust 不会把乘加合并成 FMA，也不会重排浮点运算，所以同一输入在各平台、各指令集上结果逐位相同。
+//! 顺序累加的误差在 dim 32768 时超出 0004「决策」的允许误差，分路累加后回到界内。
+//! L2 必须逐元素相减再平方（0004「决策」），不能展开成 ‖q‖² + ‖v‖² − 2q·v。
+//!
+//! 累加函数单独成函数、不内联：与归约和尾部写在一起时，LLVM 在 aarch64 上只生成 2 路的向量代码，
+//! 慢近一倍。改动这里的写法时要用基准确认没有退化。
 
 use std::cmp::Ordering;
 
 use crate::index::Metric;
+
+const LANES: usize = 16;
+type Lanes = [f32; LANES];
+
+/// 同时打分的查询条数：候选向量读入一次，供这几条查询共用。
+pub(crate) const BATCH: usize = 4;
 
 pub(crate) struct Query<'a> {
     metric: Metric,
@@ -23,102 +36,279 @@ impl<'a> Query<'a> {
         }
     }
 
-    pub(crate) fn score(&self, candidate: &[f32]) -> f32 {
-        match self.metric {
-            Metric::Ip => dot(self.vector, candidate),
-            Metric::L2 => self
-                .vector
-                .iter()
-                .zip(candidate)
-                .map(|(a, b)| (a - b) * (a - b))
-                .sum(),
-            Metric::Cosine => {
-                let c_norm = norm(candidate);
-                let sim = if c_norm == 0.0 {
-                    0.0
-                } else {
-                    dot(self.vector, candidate) * self.inv_norm / c_norm
-                };
-                // 3.x：内部距离 np.maximum(1 - sim, 0)，对外 1 - 距离。np.maximum 传播 NaN，
-                // 而 f32::max 会丢掉 NaN，因此单独处理。
-                if sim.is_nan() {
-                    sim
-                } else {
-                    1.0 - (1.0 - sim).max(0.0)
-                }
-            }
-        }
+    /// `candidate_norm` 是候选向量的范数（[`norm`]），只有 COSINE 使用。
+    pub(crate) fn score(&self, candidate: &[f32], candidate_norm: f32) -> f32 {
+        let raw = match self.metric {
+            Metric::L2 => finish(
+                diff_sq_lanes(self.vector, candidate),
+                self.vector,
+                candidate,
+                diff_sq,
+            ),
+            Metric::Ip | Metric::Cosine => finish(
+                product_lanes(self.vector, candidate),
+                self.vector,
+                candidate,
+                product,
+            ),
+        };
+        self.to_score(raw, candidate_norm)
     }
 
-    /// 排序：越相似越靠前，NaN 一律排在最后（与 3.x 相同）。是全序，可用于 sort_by。
-    pub(crate) fn rank(&self, a: f32, b: f32) -> Ordering {
-        match (a.is_nan(), b.is_nan()) {
-            (true, true) => Ordering::Equal,
-            (true, false) => Ordering::Greater,
-            (false, true) => Ordering::Less,
-            (false, false) => {
-                // 两者都不是 NaN，partial_cmp 必有结果。
-                let ord = a.partial_cmp(&b).unwrap_or(Ordering::Equal);
-                if self.metric.higher_is_better() {
-                    ord.reverse()
-                } else {
-                    ord
-                }
+    /// L2 与 IP 原样返回；COSINE 由点积换算成相似度。
+    fn to_score(&self, raw: f32, candidate_norm: f32) -> f32 {
+        if self.metric != Metric::Cosine {
+            return raw;
+        }
+        let sim = if candidate_norm == 0.0 {
+            0.0
+        } else {
+            raw * self.inv_norm / candidate_norm
+        };
+        // 3.x：内部距离 np.maximum(1 - sim, 0)，对外 1 - 距离。np.maximum 传播 NaN，
+        // 而 f32::max 会丢掉 NaN，因此单独处理。
+        if sim.is_nan() {
+            sim
+        } else {
+            1.0 - (1.0 - sim).max(0.0)
+        }
+    }
+}
+
+/// 排序：越相似越靠前，NaN 一律排在最后（与 3.x 相同）。是全序，可用于 sort_by。
+pub(crate) fn rank(metric: Metric, a: f32, b: f32) -> Ordering {
+    match (a.is_nan(), b.is_nan()) {
+        (true, true) => Ordering::Equal,
+        (true, false) => Ordering::Greater,
+        (false, true) => Ordering::Less,
+        (false, false) => {
+            // 两者都不是 NaN，partial_cmp 必有结果。
+            let ord = a.partial_cmp(&b).unwrap_or(Ordering::Equal);
+            if metric.higher_is_better() {
+                ord.reverse()
+            } else {
+                ord
             }
         }
     }
 }
 
-fn dot(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b).map(|(x, y)| x * y).sum()
+/// [`BATCH`] 条同一度量的查询对同一个候选打分，结果与逐条调用 [`Query::score`] 逐位相同：
+/// 每条查询的每一路做同样顺序的运算，只是共用读入的候选向量。
+pub(crate) fn score_batch(
+    queries: &[Query; BATCH],
+    candidate: &[f32],
+    candidate_norm: f32,
+) -> [f32; BATCH] {
+    let vectors = queries.each_ref().map(|q| q.vector);
+    let (lanes, op): (_, fn(f32, f32) -> f32) = match queries[0].metric {
+        Metric::L2 => (diff_sq_lanes_batch(&vectors, candidate), diff_sq),
+        Metric::Ip | Metric::Cosine => (product_lanes_batch(&vectors, candidate), product),
+    };
+    std::array::from_fn(|i| {
+        let raw = finish(lanes[i], vectors[i], candidate, op);
+        queries[i].to_score(raw, candidate_norm)
+    })
 }
 
-fn norm(v: &[f32]) -> f32 {
-    dot(v, v).sqrt()
+/// 向量的范数，与 COSINE 打分中的点积同一算法。
+pub(crate) fn norm(v: &[f32]) -> f32 {
+    finish(product_lanes(v, v), v, v, product).sqrt()
+}
+
+fn diff_sq(a: f32, b: f32) -> f32 {
+    (a - b) * (a - b)
+}
+
+fn product(a: f32, b: f32) -> f32 {
+    a * b
+}
+
+/// 把 16 路两两归约，再按顺序加上尾部元素。
+fn finish(lanes: Lanes, a: &[f32], b: &[f32], op: fn(f32, f32) -> f32) -> f32 {
+    let mut width = LANES;
+    let mut l = lanes;
+    while width > 1 {
+        width /= 2;
+        for i in 0..width {
+            l[i] += l[i + width];
+        }
+    }
+    let body = a.len() / LANES * LANES;
+    a[body..]
+        .iter()
+        .zip(&b[body..])
+        .fold(l[0], |s, (x, y)| s + op(*x, *y))
+}
+
+#[inline(never)]
+fn diff_sq_lanes(a: &[f32], b: &[f32]) -> Lanes {
+    let mut acc = [0.0; LANES];
+    for (x, y) in a
+        .as_chunks::<LANES>()
+        .0
+        .iter()
+        .zip(b.as_chunks::<LANES>().0)
+    {
+        for i in 0..LANES {
+            let d = x[i] - y[i];
+            acc[i] += d * d;
+        }
+    }
+    acc
+}
+
+#[inline(never)]
+fn product_lanes(a: &[f32], b: &[f32]) -> Lanes {
+    let mut acc = [0.0; LANES];
+    for (x, y) in a
+        .as_chunks::<LANES>()
+        .0
+        .iter()
+        .zip(b.as_chunks::<LANES>().0)
+    {
+        for i in 0..LANES {
+            acc[i] += x[i] * y[i];
+        }
+    }
+    acc
+}
+
+#[inline(never)]
+fn diff_sq_lanes_batch(qs: &[&[f32]; BATCH], b: &[f32]) -> [Lanes; BATCH] {
+    let mut acc = [[0.0; LANES]; BATCH];
+    let qs = qs.map(|q| q.as_chunks::<LANES>().0);
+    for (k, y) in b.as_chunks::<LANES>().0.iter().enumerate() {
+        for j in 0..BATCH {
+            let x = &qs[j][k];
+            for i in 0..LANES {
+                let d = x[i] - y[i];
+                acc[j][i] += d * d;
+            }
+        }
+    }
+    acc
+}
+
+#[inline(never)]
+fn product_lanes_batch(qs: &[&[f32]; BATCH], b: &[f32]) -> [Lanes; BATCH] {
+    let mut acc = [[0.0; LANES]; BATCH];
+    let qs = qs.map(|q| q.as_chunks::<LANES>().0);
+    for (k, y) in b.as_chunks::<LANES>().0.iter().enumerate() {
+        for j in 0..BATCH {
+            let x = &qs[j][k];
+            for i in 0..LANES {
+                acc[j][i] += x[i] * y[i];
+            }
+        }
+    }
+    acc
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn score(metric: Metric, q: &[f32], c: &[f32]) -> f32 {
+        Query::new(metric, q).score(c, norm(c))
+    }
+
     #[test]
     fn scores_match_3x_conventions() {
         let q = [1.0, 2.0];
         let c = [3.0, -1.0];
-        assert_eq!(Query::new(Metric::Ip, &q).score(&c), 1.0);
-        assert_eq!(Query::new(Metric::L2, &q).score(&c), 13.0);
-        let cos = Query::new(Metric::Cosine, &q).score(&c);
+        assert_eq!(score(Metric::Ip, &q, &c), 1.0);
+        assert_eq!(score(Metric::L2, &q, &c), 13.0);
+        let cos = score(Metric::Cosine, &q, &c);
         assert!((cos - 1.0 / (5.0f32.sqrt() * 10.0f32.sqrt())).abs() < 1e-6);
     }
 
     #[test]
     fn cosine_edge_cases() {
-        let q = Query::new(Metric::Cosine, &[1.0, 0.0]);
-        assert_eq!(q.score(&[0.0, 0.0]), 0.0);
-        assert!(q.score(&[2.0, 0.0]) <= 1.0);
-        assert_eq!(
-            Query::new(Metric::Cosine, &[0.0, 0.0]).score(&[1.0, 0.0]),
-            0.0
-        );
-        assert!((q.score(&[-1.0, 0.0]) + 1.0).abs() < 1e-6);
+        let q = [1.0, 0.0];
+        assert_eq!(score(Metric::Cosine, &q, &[0.0, 0.0]), 0.0);
+        assert!(score(Metric::Cosine, &q, &[2.0, 0.0]) <= 1.0);
+        assert_eq!(score(Metric::Cosine, &[0.0, 0.0], &[1.0, 0.0]), 0.0);
+        assert!((score(Metric::Cosine, &q, &[-1.0, 0.0]) + 1.0).abs() < 1e-6);
     }
 
     #[test]
     fn ordering_direction_and_nan_last() {
-        let l2 = Query::new(Metric::L2, &[0.0]);
-        let ip = Query::new(Metric::Ip, &[0.0]);
-        assert_eq!(l2.rank(1.0, 2.0), Ordering::Less);
-        assert_eq!(ip.rank(2.0, 1.0), Ordering::Less);
-        assert_eq!(ip.rank(1.0, 1.0), Ordering::Equal);
-        for q in [&l2, &ip] {
-            assert_eq!(q.rank(f32::NAN, f32::INFINITY), Ordering::Greater);
-            assert_eq!(q.rank(f32::NEG_INFINITY, -f32::NAN), Ordering::Less);
-            assert_eq!(q.rank(f32::NAN, -f32::NAN), Ordering::Equal);
+        assert_eq!(rank(Metric::L2, 1.0, 2.0), Ordering::Less);
+        assert_eq!(rank(Metric::Ip, 2.0, 1.0), Ordering::Less);
+        assert_eq!(rank(Metric::Ip, 1.0, 1.0), Ordering::Equal);
+        for m in [Metric::L2, Metric::Ip] {
+            assert_eq!(rank(m, f32::NAN, f32::INFINITY), Ordering::Greater);
+            assert_eq!(rank(m, f32::NEG_INFINITY, -f32::NAN), Ordering::Less);
+            assert_eq!(rank(m, f32::NAN, -f32::NAN), Ordering::Equal);
         }
-        assert!(
-            Query::new(Metric::Cosine, &[1.0, 0.0])
-                .score(&[f32::NAN, 0.0])
-                .is_nan()
-        );
+        assert!(score(Metric::Cosine, &[1.0, 0.0], &[f32::NAN, 0.0]).is_nan());
+    }
+
+    /// 求和顺序决定结果的末位，是对外可观察的：第 i 个元素累加到第 i % 16 路，
+    /// 16 路按 l[i] += l[i + w]（w = 8, 4, 2, 1）两两归约，最后按顺序加上尾部。
+    #[test]
+    fn summation_order_is_fixed() {
+        fn reference(v: &[f32]) -> f32 {
+            let body = v.len() / 16 * 16;
+            let mut l = [0.0f32; 16];
+            for (k, x) in v[..body].iter().enumerate() {
+                l[k % 16] += x;
+            }
+            for w in [8, 4, 2, 1] {
+                for i in 0..w {
+                    l[i] += l[i + w];
+                }
+            }
+            v[body..].iter().fold(l[0], |s, x| s + x)
+        }
+        // 第 0 路与第 8 路的大数先相互抵消，第 1 路的 1 才保得住：相邻两两配对或顺序累加时，
+        // 1e8 + 1 先被舍入掉，结果是 0.875 而不是 1.875。
+        let mut c = vec![0.0f32; 19];
+        c[0] = 1e8;
+        c[1] = 1.0;
+        c[8] = -1e8;
+        c[16..].copy_from_slice(&[0.5, 0.25, 0.125]);
+        assert_eq!(score(Metric::Ip, &[1.0; 19], &c), 1.875);
+        // 大数与小数交错的一般情形。
+        let mixed: Vec<f32> = (0..70)
+            .map(|i| {
+                if i % 3 == 0 {
+                    1e7 + i as f32
+                } else {
+                    0.37 * i as f32
+                }
+            })
+            .collect();
+        for v in [&c, &mixed] {
+            let got = score(Metric::Ip, &vec![1.0; v.len()], v);
+            assert_eq!(got.to_bits(), reference(v).to_bits());
+            let sequential: f32 = v.iter().sum();
+            assert_ne!(got.to_bits(), sequential.to_bits());
+        }
+    }
+
+    #[test]
+    fn batch_scores_are_bit_identical_to_single_scores() {
+        let mut x = 0x2545_f491_u32;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            (x as f32 / u32::MAX as f32) * 2.0 - 1.0
+        };
+        for dim in [1, 15, 16, 17, 33, 128, 257] {
+            let qs: Vec<Vec<f32>> = (0..BATCH)
+                .map(|_| (0..dim).map(|_| next()).collect())
+                .collect();
+            let c: Vec<f32> = (0..dim).map(|_| next()).collect();
+            for metric in [Metric::L2, Metric::Ip, Metric::Cosine] {
+                let queries: [Query; BATCH] = std::array::from_fn(|i| Query::new(metric, &qs[i]));
+                let batch = score_batch(&queries, &c, norm(&c));
+                for i in 0..BATCH {
+                    assert_eq!(batch[i].to_bits(), queries[i].score(&c, norm(&c)).to_bits());
+                }
+            }
+        }
     }
 }

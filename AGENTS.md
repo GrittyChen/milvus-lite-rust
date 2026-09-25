@@ -54,6 +54,7 @@
 | 数据目录与 3.x 互通的范围 / 共享文件的约束 / 索引文件共存规则 / 跨实现验证矩阵 | [docs/decisions/0002-data-dir-compat.md](docs/decisions/0002-data-dir-compat.md) |
 | 进程内服务的生命周期：同路径复用 / 进程退出时的停止与持久化 / fork 后的处理 / 与 3.x 在这些点上的差异 | [docs/decisions/0003-in-process-server-lifecycle.md](docs/decisions/0003-in-process-server-lifecycle.md) |
 | 第一个里程碑（M1）做什么、不做什么 / 阶段性对外差异 / 验收标准 | [docs/decisions/0004-m1-scope.md](docs/decisions/0004-m1-scope.md) |
+| 检索的线程模型：RPC 与计算池的分工、计算任务的约束、锁的边界、停服与 fork 下的计算池 | [docs/decisions/0005-search-thread-model.md](docs/decisions/0005-search-thread-model.md) |
 | 性能基线怎么测 / 口径 / 注意事项 | [benchmarks/baseline/README.md](benchmarks/baseline/README.md) |
 | 代码审查 / 修复复审（冻结合同、完整调用链、同类全域清扫、分级与证据门槛、二三阶影响矩阵） | [code-review-rules](.agents/skills/code-review-rules/SKILL.md)（Claude Code 经 `.claude/skills` 软链读取同一份） |
 
@@ -75,14 +76,15 @@ pymilvus ──server_manager──▶ adapter/grpc ──▶ db（多 collectio
 
 | crate | 对应参照实现 | 职责 |
 | --- | --- | --- |
-| `crates/core` | [db.py](references/milvus-lite/milvus_lite/db.py) 及其下各层 | 引擎：多 collection 生命周期、LOCK、存储、检索、索引、schema。不依赖 protobuf 与 Python。module：`db`（数据库与 collection 生命周期、引擎的关闭闸门）、`collection`（内存数据、写入校验、get / count / 检索、load 状态）、`schema`、`data`（列式数据）、`index`（索引定义与度量）、`projection`（output_fields 展开）、`filter`（过滤表达式，M1 只识别 `<主键> in [...]`）、`flat`（暴力检索的距离）、`data_dir`（LOCK 与已有数据检查）、`error`（与 3.x 异常一一对应的错误及 Python repr 格式化）、`pyjson`（按 Python `json.dumps` 的格式输出 JSON） |
-| `crates/grpc` | [adapter/grpc/](references/milvus-lite/milvus_lite/adapter/grpc/) | proto 代码生成（protox）、协议翻译与错误映射；作为服务宿主，负责服务实例（runtime、检索线程池、引擎、端口）的启动与停止，检索线程池注入引擎。module：`service`（各 RPC 的实现）、`schema` / `insert` / `search` / `query` / `index` / `output`（请求解码与响应编码）、`status`（错误映射）、`pyint`（按 Python `int()` / `float()` 解析参数）、`guard`（未实现的 RPC 与超限请求）、`server`（服务宿主）。M1 的 RPC 在 tokio 的阻塞线程池中执行，之后换成上述注入引擎的检索线程池 |
+| `crates/core` | [db.py](references/milvus-lite/milvus_lite/db.py) 及其下各层 | 引擎：多 collection 生命周期、LOCK、存储、检索、索引、schema。不依赖 protobuf 与 Python。module：`db`（数据库与 collection 生命周期、引擎的关闭闸门）、`collection`（内存数据、写入校验、get / count / 检索、load 状态）、`compute`（服务的计算池，rayon-core 只在这里调用）、`schema`、`data`（列式数据）、`index`（索引定义与度量）、`projection`（output_fields 展开）、`filter`（过滤表达式，M1 只识别 `<主键> in [...]`）、`flat`（暴力检索的距离）、`data_dir`（LOCK 与已有数据检查）、`error`（与 3.x 异常一一对应的错误及 Python repr 格式化）、`pyjson`（按 Python `json.dumps` 的格式输出 JSON） |
+| `crates/grpc` | [adapter/grpc/](references/milvus-lite/milvus_lite/adapter/grpc/) | proto 代码生成（protox）、协议翻译与错误映射；作为服务宿主，负责服务实例（runtime、计算池、引擎、端口）的启动与停止，计算池交给引擎。module：`service`（各 RPC 的实现）、`schema` / `insert` / `search` / `query` / `index` / `output`（请求解码与响应编码）、`status`（错误映射）、`pyint`（按 Python `int()` / `float()` 解析参数）、`guard`（未实现的 RPC 与超限请求）、`server`（服务宿主）。RPC 的处理体在 tokio 的阻塞线程池中执行，检索在其中经计算池并行（[0005](docs/decisions/0005-search-thread-model.md)） |
 | `crates/py` | [server_manager.py](references/milvus-lite/milvus_lite/server_manager.py) | PyO3 扩展，加上 Python 包 `milvus_lite`：`server_manager.py` 维护路径表，导入时检测官方发行包。CLI 放在哪里待定 |
 
 服务实例的所有权、同路径复用、进程退出与 fork 的处理见 [0003](docs/decisions/0003-in-process-server-lifecycle.md)。跨文件的隐含约定：
 
 - **已实现 RPC 的唯一清单**在 [crates/grpc/build.rs](crates/grpc/build.rs) 的 `IMPLEMENTED_METHODS`：只为清单中的方法生成 trait 方法（编译器保证都有实现），其余 RPC 与其他 service 由 [guard.rs](crates/grpc/src/guard.rs) 统一返回 `UNIMPLEMENTED`。新增 RPC 只改这份清单。
 - **引擎的每次使用都经过关闭闸门**：[service.rs](crates/grpc/src/service.rs) 中每个使用引擎的 RPC 处理体先调用 `Db::enter`，[Server](crates/grpc/src/server.rs) 停止时 `Db::close` 等所有在途任务结束才释放 LOCK（0003「进程退出」）。绕过它直接使用引擎，停止时 LOCK 可能先于引擎任务释放。
+- **检索的计算任务不拿锁、不阻塞**：[compute.rs](crates/core/src/compute.rs) 的 `Compute::for_each` 只能从计算池之外的线程（RPC 所在的阻塞线程）调用，叶子任务只写自己独占的数据；rayon-core 其余提交任务的接口由 [clippy.toml](clippy.toml) 禁止。违反时会死锁或优先级反转（[0005](docs/decisions/0005-search-thread-model.md)）。
 - **fork 安全由两层共同保证**：[server_manager.py](crates/py/python/milvus_lite/server_manager.py) 按进程号跳过继承来的服务；Rust 的 [Server](crates/grpc/src/server.rs) 在非创建者进程中拒绝 `stop`、析构时直接泄漏。
 
 已确定的边界约束：
@@ -110,6 +112,7 @@ pymilvus ──server_manager──▶ adapter/grpc ──▶ db（多 collectio
   - thiserror 2：错误类型。tempfile 3：仅用于测试。
   - serde_json 1：JSON 字段与动态字段的校验与存储，以及 gRPC 层解析 search_params、索引参数等 JSON 文本；它的 Map 按 key 排序，与 3.x 存 `$meta` 时的 `sort_keys=True` 一致。
   - parking_lot 0.12：collection 表与每个 collection 的读写锁。它的锁没有中毒语义，不需要为 std 锁中毒另写兜底。
+  - rayon-core 1.13：服务的计算池（[0005](docs/decisions/0005-search-thread-model.md)）。只用线程池部分，不引入 rayon 的并行迭代器；依赖只有 crossbeam-deque / epoch / utils，都是纯 Rust，构建脚本只做 cfg 探测（`cargo tree --workspace -e all` 核对）。可以使用的接口由 [clippy.toml](clippy.toml) 的 `disallowed-methods` 限定。
   - LOCK 用 std 的 `File::try_lock`：它在 Unix 上用 flock、在 Windows 上用覆盖第 0 字节的 LockFileEx，满足 [0002](docs/decisions/0002-data-dir-compat.md) 约束 10，因此不引入 fs2 一类依赖，`rust-version` 相应定为 1.89。
   - 构建工具 maturin 1.15，用 uv 装在开发 venv 中，不是项目依赖。
 
@@ -138,7 +141,7 @@ cd <work_dir> && v26/bin/python -m pytest <repo>/tests/python
 cd <work_dir> && MILVUS_LITE_3X_PYTHON=<3.x 的 venv>/bin/python v26/bin/python -m pytest <repo>/tests/differential
 ```
 
-性能基线（2.5.1 与 3.x 对照，工作目录须在仓库外；完整步骤见 [benchmarks/baseline/README.md](benchmarks/baseline/README.md)）：
+性能基线（2.5.1、3.x 与本仓的 Rust 实现对照，工作目录须在仓库外；完整步骤见 [benchmarks/baseline/README.md](benchmarks/baseline/README.md)）：
 
 | 任务 | 命令 |
 | --- | --- |
@@ -147,6 +150,8 @@ cd <work_dir> && MILVUS_LITE_3X_PYTHON=<3.x 的 venv>/bin/python v26/bin/python 
 | 汇总 | `<work_dir>/v3/bin/python benchmarks/baseline/summarize.py <work_dir>/<out.jsonl>` |
 | 并发吞吐 | `<work_dir>/{v2,v3}/bin/python benchmarks/baseline/concurrency.py <work_dir>/r_<env>_<idx>_inproc_<N>_<dim>.db <dim> 1,2,4,8`（用与库对应版本的 python） |
 | 3.x 耗时归属 | `<work_dir>/v3/bin/python benchmarks/baseline/profile_v3.py <3.x 的库>` |
+| 为本仓的 Rust 实现建第三套环境 | `benchmarks/baseline/setup_rs.sh <work_dir>` |
+| M1 口径三方对照（每轮轮换顺序，跑 3 轮后汇总；完整命令见基准 README） | `benchmarks/baseline/run.sh <work_dir> <N> 128 m1.jsonl rs:FLAT:inproc:m1 v2:FLAT:inproc:m1 v3:FLAT:inproc:m1` |
 
 参照实现侧（生成真值时用，在 [references/milvus-lite/](references/milvus-lite/) 内执行）：
 

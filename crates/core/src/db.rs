@@ -6,6 +6,7 @@ use std::sync::Arc;
 use parking_lot::{Condvar, Mutex, RwLock};
 
 use crate::collection::{Collection, LoadState};
+use crate::compute::Compute;
 use crate::data_dir::DataDir;
 use crate::error::{EngineError, Result, py_repr};
 use crate::schema::CollectionSchema;
@@ -21,6 +22,9 @@ pub struct Db {
     collections: RwLock<BTreeMap<String, CollectionHandle>>,
     gate: Mutex<Gate>,
     idle: Condvar,
+    /// 服务的计算池（0005）。服务的运行状态与每个在途的 RPC 都持有 `Arc<Db>`，
+    /// 所以它在最后一个在途任务结束之后才析构。
+    compute: Compute,
 }
 
 /// 关闭闸门（0003「进程退出」第 2、3 步）：关闭后不再接受新任务，在途任务全部结束后才释放 LOCK，
@@ -51,7 +55,7 @@ impl Drop for InFlight<'_> {
 }
 
 impl Db {
-    pub fn new(data_dir: DataDir) -> Self {
+    pub fn new(data_dir: DataDir, compute: Compute) -> Self {
         Self {
             collections: RwLock::new(BTreeMap::new()),
             gate: Mutex::new(Gate {
@@ -60,7 +64,12 @@ impl Db {
                 data_dir: Some(data_dir),
             }),
             idle: Condvar::new(),
+            compute,
         }
+    }
+
+    pub fn compute(&self) -> &Compute {
+        &self.compute
     }
 
     /// 开始一个任务；引擎已关闭时报错（3.x 关闭后的调用同样报 `MilvusLite is closed`）。

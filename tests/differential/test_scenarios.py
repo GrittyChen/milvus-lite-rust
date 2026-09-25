@@ -3,7 +3,7 @@
 在 3.x README 的 Quick Start 基础上去掉过滤与删除，补上显式 schema、auto_id、IP 与 L2、VARCHAR 主键、
 先建表后建索引、release 后再 load，以及常见的错误。约束：
 - 每个 collection 累计写入少于 1 万行：3.x 满 1 万行才 flush，之前都在 memtable 上暴力检索；
-- 维度不超过 16384，超过时 0004 的距离误差不成立；
+- 维度最高到 32768（Milvus 的上限）：0004 的距离误差依赖本实现的分路累加，顺序累加时 dim 32768 会超界；
 - 0004「决策」已登记的差异不放进来，它们各有单独的用例；
 - 3.x 写入失败也会消耗 auto_id（0004「决策」），所以出错的步骤不与比较 auto_id 的步骤共用 collection。
 """
@@ -200,7 +200,8 @@ def test_index_after_create_and_release_then_load(diff):
 
 
 @pytest.mark.parametrize("metric", ["L2", "IP", "COSINE"])
-@pytest.mark.parametrize("dim, n, dist", [(1536, 2000, "normal"), (1536, 2000, "uniform"), (16384, 300, "uniform")])
+@pytest.mark.parametrize("dim, n, dist", [(1536, 2000, "normal"), (1536, 2000, "uniform"), (16384, 300, "uniform"),
+                                          (32768, 300, "uniform")])
 def test_distances_high_dim(diff, metric, dim, n, dist):
     rng = np.random.default_rng(dim + n)
     draw = rng.standard_normal if dist == "normal" else rng.random

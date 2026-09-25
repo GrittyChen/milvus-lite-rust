@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 
 use milvus_lite_core::error::py_json_repr;
-use milvus_lite_core::{Collection, EngineError, Metric, QueryVectors, SearchRequest};
+use milvus_lite_core::{Collection, Compute, EngineError, Metric, QueryVectors, SearchRequest};
 use prost::Message;
 use serde_json::Value;
 
@@ -22,7 +22,7 @@ const PLACEHOLDER_SPARSE_FLOAT_VECTOR: i32 = 104;
 const PLACEHOLDER_VARCHAR: i32 = 21;
 
 /// 解析出的请求。M1 不支持的参数只记录是否出现，在 load 状态检查之后才报告（0004「决策」）。
-struct Parsed {
+pub(crate) struct Parsed {
     vectors: QueryVectors,
     top_k: i64,
     metric_type: Option<String>,
@@ -32,11 +32,13 @@ struct Parsed {
     unsupported: Option<&'static str>,
 }
 
+/// `parsed` 由 [`parse`] 在取 collection 读锁之前得到。
 pub(crate) fn search(
     c: &Collection,
-    req: svc::SearchRequest,
+    compute: &Compute,
+    parsed: Parsed,
+    output_fields: Vec<String>,
 ) -> Result<svc::SearchResults, EngineError> {
-    let parsed = parse(&req)?;
     c.require_loaded()?;
     if let Some(feature) = parsed.unsupported {
         return Err(unsupported(feature));
@@ -46,14 +48,17 @@ pub(crate) fn search(
     let end = parsed.top_k.saturating_add(parsed.offset).max(0);
     let skip = parsed.offset.max(0);
     let limit = usize::try_from(end.saturating_sub(skip).max(0)).unwrap_or(usize::MAX);
-    let result = c.search(SearchRequest {
-        anns_field: parsed.anns_field,
-        vectors: parsed.vectors,
-        metric_type: parsed.metric_type,
-        limit,
-        offset: usize::try_from(skip).unwrap_or(usize::MAX),
-        output_fields: req.output_fields,
-    })?;
+    let result = c.search(
+        SearchRequest {
+            anns_field: parsed.anns_field,
+            vectors: parsed.vectors,
+            metric_type: parsed.metric_type,
+            limit,
+            offset: usize::try_from(skip).unwrap_or(usize::MAX),
+            output_fields,
+        },
+        compute,
+    )?;
 
     let schema = c.schema();
     let pk = schema.fields.iter().find(|f| f.is_primary).ok_or_else(|| {
@@ -111,7 +116,7 @@ fn py_round(x: f64, ndigits: i64) -> f64 {
     format!("{x:.digits$}").parse().unwrap_or(x)
 }
 
-fn parse(req: &svc::SearchRequest) -> Result<Parsed, EngineError> {
+pub(crate) fn parse(req: &svc::SearchRequest) -> Result<Parsed, EngineError> {
     let vectors = placeholders(req)?;
     // 每个值先按 JSON 解析，失败时保留原字符串；同名 key 以后出现者为准。
     let raw: HashMap<&str, Value> = req

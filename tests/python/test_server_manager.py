@@ -227,14 +227,22 @@ def _slow_search_env(tmp_path, seconds):
     def search(nq):
         pg = common_pb2.PlaceholderGroup()
         pg.placeholders.add(tag="$0", type=101, values=[bytes(4 * dim)] * nq)
+        # 只取 id：默认会带回向量字段，查询条数多时响应会超过客户端 4MB 的接收上限。
         return stub.Search(milvus_pb2.SearchRequest(
-            collection_name="s", placeholder_group=pg.SerializeToString(),
+            collection_name="s", placeholder_group=pg.SerializeToString(), output_fields=["id"],
             search_params=[common_pb2.KeyValuePair(key="topk", value="1")]))
 
-    start = time.monotonic()
-    search(8)
-    per_query = (time.monotonic() - start) / 8
-    nq = max(1, int(seconds / per_query))
+    # 检索并行、多条查询一起打分，条数少时单条摊到的开销偏大；放大条数直到一次检索足够长，
+    # 用它反推的单条耗时才接近目标条数下的实际值。
+    nq = 8
+    while True:
+        start = time.monotonic()
+        search(nq)
+        took = time.monotonic() - start
+        if took >= 0.3:
+            break
+        nq *= 4
+    nq = max(1, int(seconds * nq / took))
     return manager, path, lambda: search(nq)
 
 
@@ -440,6 +448,57 @@ print("OUT child-lock-released", other_process_can_open("c.db"))
     assert "child-exit 0" in out
     assert "child-new-ok True" in out
     assert "child-lock-released True" in out
+
+
+@needs_fork
+def test_fork_during_parallel_search(tmp_path):
+    # 0005「验证」：父进程的计算池正在并行检索时 fork。子进程为新路径启动自己的服务与计算池并检索；
+    # 父进程的检索照常完成。行数足够多，使每次检索主要是服务端的计算；第一次检索返回后才开始 fork，
+    # 并连续 fork 几次，每次都落在检索进行之中。子进程设 alarm，死锁时被 SIGALRM 杀掉而不是挂住测试。
+    out = run_script(
+        FORK_PRELUDE
+        + """
+import signal, threading
+import numpy as np
+dim = 128
+rng = np.random.default_rng(7)
+parent = MilvusClient(sm.start_and_get_uri("p.db"))
+parent.create_collection("c", dimension=dim)
+data = rng.random((100_000, dim), dtype=np.float32)
+for i in range(0, len(data), 10_000):
+    parent.insert("c", [{"id": j, "vector": data[j].tolist()} for j in range(i, i + 10_000)])
+queries = rng.random((200, dim), dtype=np.float32).tolist()
+searching, stop, results = threading.Event(), threading.Event(), []
+
+def search_loop():
+    while not stop.is_set():
+        results.append(len(parent.search("c", data=queries, limit=3)))
+        searching.set()
+
+t = threading.Thread(target=search_loop)
+t.start()
+searching.wait()
+
+def child():
+    signal.alarm(20)
+    c = MilvusClient(sm.start_and_get_uri("c.db"))
+    c.create_collection("k", dimension=4, metric_type="L2")
+    c.insert("k", [{"id": i, "vector": [i, 1, 0, 0]} for i in range(100)])
+    print("OUT child-search", [h["id"] for h in c.search("k", data=[[99, 1, 0, 0]], limit=2)[0]], flush=True)
+    sm.release_server("c.db")
+
+for _ in range(3):
+    fork_and_wait(child)
+stop.set()
+t.join()
+print("OUT parent-searches-ok", len(results) >= 2 and all(n == 200 for n in results), flush=True)
+""",
+        tmp_path,
+        timeout=180,
+    )
+    assert out.count("child-exit 0") == 3
+    assert out.count("child-search [99, 98]") == 3
+    assert "parent-searches-ok True" in out
 
 
 @needs_fork

@@ -6,10 +6,15 @@
 
 use milvus_lite_core::filter::PkLiteral;
 use milvus_lite_core::{
-    Collection, CollectionSchema, ColumnData, DataType, EngineError, FieldSchema, IndexRequest,
-    InputValues, InsertBatch, LoadState, Pk, QueryVectors, SearchRequest,
+    Collection, CollectionSchema, ColumnData, Compute, DataType, EngineError, FieldSchema,
+    IndexRequest, InputValues, InsertBatch, LoadState, Pk, QueryVectors, SearchRequest,
 };
 use serde_json::json;
+
+/// 检索用的计算池：2 个线程，覆盖并行路径。
+fn compute() -> Compute {
+    Compute::new(std::num::NonZeroUsize::new(2).unwrap()).unwrap()
+}
 
 fn pk_field(name: &str, auto_id: bool) -> FieldSchema {
     FieldSchema {
@@ -88,14 +93,17 @@ fn insert_err(c: &mut Collection, b: InsertBatch) -> String {
 
 fn search(c: &Collection, q: [f32; 2], limit: usize, metric: Option<&str>) -> (Vec<i64>, Vec<f32>) {
     let r = c
-        .search(SearchRequest {
-            anns_field: None,
-            vectors: QueryVectors::Dense(vec![q.to_vec()]),
-            metric_type: metric.map(str::to_owned),
-            limit,
-            offset: 0,
-            output_fields: vec![],
-        })
+        .search(
+            SearchRequest {
+                anns_field: None,
+                vectors: QueryVectors::Dense(vec![q.to_vec()]),
+                metric_type: metric.map(str::to_owned),
+                limit,
+                offset: 0,
+                output_fields: vec![],
+            },
+            &compute(),
+        )
         .unwrap();
     let hits = &r.hits[0];
     (ints(&hits.rows.pks), hits.scores.clone())
@@ -484,14 +492,17 @@ fn no_query_vectors_returns_before_any_check() {
     flat_index(&mut c, "L2");
     c.release();
     let r = c
-        .search(SearchRequest {
-            anns_field: Some("nope".into()),
-            vectors: QueryVectors::Dense(vec![]),
-            metric_type: Some("bad".into()),
-            limit: 1,
-            offset: 0,
-            output_fields: vec![],
-        })
+        .search(
+            SearchRequest {
+                anns_field: Some("nope".into()),
+                vectors: QueryVectors::Dense(vec![]),
+                metric_type: Some("bad".into()),
+                limit: 1,
+                offset: 0,
+                output_fields: vec![],
+            },
+            &compute(),
+        )
         .unwrap();
     assert!(r.hits.is_empty());
 }
@@ -630,12 +641,23 @@ fn limit_offset_and_multiple_queries() {
         offset,
         output_fields: vec![],
     };
-    let r = c.search(req(1, 2)).unwrap();
+    let r = c.search(req(1, 2), &compute()).unwrap();
     assert_eq!(ints(&r.hits[0].rows.pks), [2, 3]);
     assert_eq!(ints(&r.hits[1].rows.pks), [3, 2]);
-    assert_eq!(ints(&c.search(req(3, 5)).unwrap().hits[0].rows.pks), [4]);
-    assert!(c.search(req(10, 5)).unwrap().hits[0].rows.is_empty());
-    assert!(c.search(req(0, 0)).unwrap().hits[0].rows.is_empty());
+    assert_eq!(
+        ints(&c.search(req(3, 5), &compute()).unwrap().hits[0].rows.pks),
+        [4]
+    );
+    assert!(
+        c.search(req(10, 5), &compute()).unwrap().hits[0]
+            .rows
+            .is_empty()
+    );
+    assert!(
+        c.search(req(0, 0), &compute()).unwrap().hits[0]
+            .rows
+            .is_empty()
+    );
 }
 
 #[test]
@@ -645,14 +667,17 @@ fn search_default_output_includes_vector_and_meta_but_not_pk_field() {
     b.columns.push(("k".into(), InputValues::Int(vec![1])));
     c.insert(b).unwrap();
     let r = c
-        .search(SearchRequest {
-            anns_field: None,
-            vectors: QueryVectors::Dense(vec![vec![1.0, 0.0]]),
-            metric_type: None,
-            limit: 1,
-            offset: 0,
-            output_fields: vec![],
-        })
+        .search(
+            SearchRequest {
+                anns_field: None,
+                vectors: QueryVectors::Dense(vec![vec![1.0, 0.0]]),
+                metric_type: None,
+                limit: 1,
+                offset: 0,
+                output_fields: vec![],
+            },
+            &compute(),
+        )
         .unwrap();
     let names: Vec<&str> = r.hits[0]
         .rows
@@ -679,7 +704,7 @@ fn search_argument_errors() {
         offset: 0,
         output_fields: vec![],
     };
-    let err = |r| c.search(r).unwrap_err();
+    let err = |r| c.search(r, &compute()).unwrap_err();
     // 0004「决策」：维度不符与非法度量在空 collection 上同样报错。
     let e = err(req(None, None, vec![1.0, 0.0, 0.0]));
     assert!(matches!(e, EngineError::InvalidArgument(_)));
@@ -717,14 +742,17 @@ fn load_state_semantics_match_3x() {
     let msg = "Collection 'c' is in state 'released'; call load() before search/get/query";
     assert_eq!(c.get(&[Pk::Int64(1)], &[]).unwrap_err().to_string(), msg);
     let e = c
-        .search(SearchRequest {
-            anns_field: None,
-            vectors: QueryVectors::Dense(vec![vec![1.0, 0.0]]),
-            metric_type: None,
-            limit: 1,
-            offset: 0,
-            output_fields: vec![],
-        })
+        .search(
+            SearchRequest {
+                anns_field: None,
+                vectors: QueryVectors::Dense(vec![vec![1.0, 0.0]]),
+                metric_type: None,
+                limit: 1,
+                offset: 0,
+                output_fields: vec![],
+            },
+            &compute(),
+        )
         .unwrap_err();
     assert_eq!(e.to_string(), msg);
     // count 与 insert 不受 load 状态影响。
@@ -923,14 +951,17 @@ fn empty_meta_in_static_schema_is_accepted() {
 fn search_on_empty_collection_returns_empty_hits() {
     let c = basic(false, false);
     let r = c
-        .search(SearchRequest {
-            anns_field: None,
-            vectors: QueryVectors::Dense(vec![vec![1.0, 0.0], vec![0.0, 1.0]]),
-            metric_type: None,
-            limit: 3,
-            offset: 0,
-            output_fields: vec![],
-        })
+        .search(
+            SearchRequest {
+                anns_field: None,
+                vectors: QueryVectors::Dense(vec![vec![1.0, 0.0], vec![0.0, 1.0]]),
+                metric_type: None,
+                limit: 3,
+                offset: 0,
+                output_fields: vec![],
+            },
+            &compute(),
+        )
         .unwrap();
     assert_eq!(r.hits.len(), 2);
     assert!(
@@ -941,14 +972,17 @@ fn search_on_empty_collection_returns_empty_hits() {
 }
 
 fn search_with(c: &Collection, anns: Option<&str>, vectors: QueryVectors) -> EngineError {
-    c.search(SearchRequest {
-        anns_field: anns.map(str::to_owned),
-        vectors,
-        metric_type: None,
-        limit: 1,
-        offset: 0,
-        output_fields: vec![],
-    })
+    c.search(
+        SearchRequest {
+            anns_field: anns.map(str::to_owned),
+            vectors,
+            metric_type: None,
+            limit: 1,
+            offset: 0,
+            output_fields: vec![],
+        },
+        &compute(),
+    )
     .unwrap_err()
 }
 

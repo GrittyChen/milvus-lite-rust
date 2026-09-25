@@ -1,2 +1,39 @@
 allow-unwrap-in-tests = true
 allow-expect-in-tests = true
+
+# 0005「计算任务的约束」：除 ThreadPool::in_place_scope 与 Scope::spawn 之外，rayon-core 提交任务的接口一律禁止；
+# 会用到或初始化进程级全局池的接口同样禁止（0003「所有权」）。依赖的是 rayon-core，本就没有并行迭代器。
+disallowed-methods = [
+  { path = "rayon_core::join", reason = "global pool (0003, 0005)" },
+  { path = "rayon_core::join_context", reason = "global pool (0003, 0005)" },
+  { path = "rayon_core::scope", reason = "global pool (0003, 0005)" },
+  { path = "rayon_core::scope_fifo", reason = "global pool (0003, 0005)" },
+  { path = "rayon_core::in_place_scope", reason = "global pool (0003, 0005)" },
+  { path = "rayon_core::in_place_scope_fifo", reason = "global pool (0003, 0005)" },
+  { path = "rayon_core::spawn", reason = "global pool (0003, 0005)" },
+  { path = "rayon_core::spawn_fifo", reason = "global pool (0003, 0005)" },
+  { path = "rayon_core::broadcast", reason = "global pool (0003, 0005)" },
+  { path = "rayon_core::spawn_broadcast", reason = "global pool (0003, 0005)" },
+  { path = "rayon_core::yield_now", reason = "global pool (0003, 0005)" },
+  { path = "rayon_core::yield_local", reason = "global pool (0003, 0005)" },
+  { path = "rayon_core::current_num_threads", reason = "initializes the global pool; use Compute::threads (0003, 0005)" },
+  { path = "rayon_core::initialize", reason = "global pool (0003, 0005)" },
+  { path = "rayon_core::ThreadPoolBuilder::build_global", reason = "global pool (0003, 0005)" },
+  { path = "rayon_core::ThreadPoolBuilder::use_current_thread", reason = "makes the caller a pool worker; for_each must run outside the pool (0005)" },
+  { path = "rayon_core::ThreadPoolBuilder::build_scoped", reason = "workers must be the pool's own threads (0005)" },
+  { path = "rayon_core::ThreadPoolBuilder::spawn_handler", reason = "workers must be the pool's own threads (0005)" },
+  { path = "rayon_core::ThreadPool::install", reason = "priority inversion and deadlock with nested work (0005)" },
+  { path = "rayon_core::ThreadPool::spawn", reason = "a panic aborts the process (0005)" },
+  { path = "rayon_core::ThreadPool::spawn_fifo", reason = "a panic aborts the process (0005)" },
+  { path = "rayon_core::ThreadPool::spawn_broadcast", reason = "a panic aborts the process (0005)" },
+  { path = "rayon_core::ThreadPool::broadcast", reason = "use Compute::for_each (0005)" },
+  { path = "rayon_core::ThreadPool::join", reason = "use Compute::for_each (0005)" },
+  { path = "rayon_core::ThreadPool::scope", reason = "use Compute::for_each (0005)" },
+  { path = "rayon_core::ThreadPool::scope_fifo", reason = "use Compute::for_each (0005)" },
+  { path = "rayon_core::ThreadPool::in_place_scope_fifo", reason = "use Compute::for_each (0005)" },
+  { path = "rayon_core::ThreadPool::yield_now", reason = "use Compute::for_each (0005)" },
+  { path = "rayon_core::ThreadPool::yield_local", reason = "use Compute::for_each (0005)" },
+  { path = "rayon_core::Scope::spawn_broadcast", reason = "use Compute::for_each (0005)" },
+  { path = "rayon_core::ScopeFifo::spawn_fifo", reason = "use Compute::for_each (0005)" },
+  { path = "rayon_core::ScopeFifo::spawn_broadcast", reason = "use Compute::for_each (0005)" },
+]
