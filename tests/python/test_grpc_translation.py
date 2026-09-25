@@ -474,9 +474,11 @@ def test_search_round_decimal_uses_3x_float64_distance(env):
 @pytest.mark.parametrize("metric,expected", [
     # 3.x 实测：查询向量 [0.6, 0.8]，三行 [0.3, 0.7]、[1.0, 0.1]、[-0.4, 0.9]。
     ("COSINE", {"4": [0.9717000126838684, 0.6765999794006348, 0.48739999532699585],
-                "2": [0.9700000286102295, 0.6800000071525574, 0.49000000953674316]}),
+                "2": [0.9700000286102295, 0.6800000071525574, 0.49000000953674316],
+                "0": [1.0, 1.0, 0.0]}),
     ("IP", {"4": [0.7400000095367432, 0.6800000071525574, 0.47999998927116394],
-            "2": [0.7400000095367432, 0.6800000071525574, 0.47999998927116394]}),
+            "2": [0.7400000095367432, 0.6800000071525574, 0.47999998927116394],
+            "0": [1.0, 1.0, 0.0]}),
 ])
 def test_search_round_decimal_cosine_and_ip(env, metric, expected):
     _, stub, _ = env
@@ -710,3 +712,72 @@ def test_messages_over_256mb_are_resource_exhausted(env):
     assert info.value.details().endswith(f" vs. {MAX})")
     # 连接不受影响。
     assert status_of(stub.Query(query_req("big", output_fields=["count(*)"])))[0] == 0
+
+
+# ── M1 范围外的功能 ──────────────────────────────────────────
+
+
+def test_pymilvus_entry_points_m1_unsupported(env):
+    """0004「不支持」的每类功能各取 pymilvus 的一个入口：pymilvus 不吞掉 UNIMPLEMENTED，用户得到明确报错。"""
+    from pymilvus import AnnSearchRequest, Function, FunctionType, RRFRanker
+
+    client, _, _ = env
+    client.create_collection("q", dimension=2)
+    client.insert("q", [{"id": i, "vector": [1.0, i / 50]} for i in range(30)])
+
+    def with_field(*args, **kwargs):
+        schema = MilvusClient.create_schema()
+        schema.add_field("id", DataType.INT64, is_primary=True)
+        schema.add_field("v", DataType.FLOAT_VECTOR, dim=2)
+        schema.add_field(*args, **kwargs)
+        return lambda: client.create_collection("n", schema=schema)
+
+    rpc = "not implemented in this build of milvus-lite-rust yet"
+    feature = "not supported in this build of milvus-lite-rust yet"
+    decay = Function(name="r", function_type=FunctionType.RERANK, input_field_names=["id"],
+                     params={"reranker": "decay", "function": "gauss", "origin": 0, "scale": 1})
+    cases = [
+        (lambda: client.upsert("q", [{"id": 1, "vector": [1, 0]}]), f"Upsert: {rpc}"),
+        (lambda: client.delete("q", ids=[1]), f"Delete: {rpc}"),
+        (lambda: client.create_partition("q", "p"), f"CreatePartition: {rpc}"),
+        (lambda: client.list_partitions("q"), f"ShowPartitions: {rpc}"),
+        (with_field("k", DataType.INT64, is_partition_key=True), f"partition key: {feature}"),
+        (lambda: client.create_database("d"), f"CreateDatabase: {rpc}"),
+        (lambda: client.list_databases(), f"ListDatabases: {rpc}"),
+        (lambda: client.using_database("default"), f"DescribeDatabase: {rpc}"),
+        (lambda: client.create_alias("q", "a"), f"CreateAlias: {rpc}"),
+        (with_field("n", DataType.INT64, default_value=1), f"default values: {feature}"),
+        (with_field("v2", DataType.FLOAT_VECTOR, dim=2), "multiple vector fields: "),
+        (with_field("s", DataType.SPARSE_FLOAT_VECTOR), f"SPARSE_FLOAT_VECTOR fields: {feature}"),
+        (with_field("g", DataType.GEOMETRY), f"GEOMETRY fields: {feature}"),
+        (with_field("ts", DataType.TIMESTAMPTZ), f"TIMESTAMPTZ fields: {feature}"),
+        (lambda: client.alter_collection_properties("q", {"mmap.enabled": True}), f"AlterCollection: {rpc}"),
+        # pymilvus 3.0 先发 AlterCollectionSchema，收到 UNIMPLEMENTED 后回退到 AddCollectionField。
+        (lambda: client.add_collection_field("q", "x", DataType.INT64, nullable=True), f"AddCollectionField: {rpc}"),
+        (lambda: client.rename_collection("q", "q2"), f"RenameCollection: {rpc}"),
+        (lambda: client.hybrid_search("q", [AnnSearchRequest([[1, 0]], "vector", {}, 2)], RRFRanker(), limit=2),
+         f"HybridSearch: {rpc}"),
+        (lambda: client.search("q", [[1, 0]], filter="id > 1"), f"filter expressions: {feature}"),
+        (lambda: client.search("q", [[1, 0]], ranker=decay), f"rerank and function chains: {feature}"),
+        (lambda: client.query_iterator("q", batch_size=2).next(), f"query iterators: {feature}"),
+        (lambda: client.flush("q"), f"Flush: {rpc}"),
+        (lambda: client.compact("q"), f"ManualCompaction: {rpc}"),
+        (lambda: client.drop_index("q", "vector"), f"DropIndex: {rpc}"),
+    ]
+    for call, details in cases:
+        with pytest.raises(grpc.RpcError) as info:
+            call()
+        assert info.value.code() == grpc.StatusCode.UNIMPLEMENTED, details
+        assert info.value.details().startswith(f"MilvusLite does not support {details}"), info.value.details()
+
+    # search_iterator 的第一批是普通检索（3.x 同样忽略 iterator 参数），结果与 3.x 相同；
+    # 之后各批要用 range search 与过滤表达式，返回 UNIMPLEMENTED。
+    it = client.search_iterator("q", data=[[1.0, 0.0]], batch_size=10, limit=3)
+    assert [h["id"] for h in it.next()] == [0, 1, 2]
+    assert len(it.next()) == 0
+    it = client.search_iterator("q", data=[[1.0, 0.0]], batch_size=10, limit=25)
+    assert [h["id"] for h in it.next()] == list(range(10))
+    with pytest.raises(grpc.RpcError) as info:
+        it.next()
+    assert info.value.code() == grpc.StatusCode.UNIMPLEMENTED
+    assert info.value.details().startswith(f"MilvusLite does not support range search: {feature}")

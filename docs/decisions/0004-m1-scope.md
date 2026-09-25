@@ -92,7 +92,8 @@ M1 的对外行为与 3.x 有阶段性差异，本文按 [AGENTS.md](../../AGENT
   - nullable、default value、function（BM25、embedding）、多向量字段；
   - 修改 schema 与 collection properties；
   - properties 中的 `timezone`，以及 Search 与 Query 请求中非空的 `timezone`：它们只作用于 TIMESTAMPTZ 字段。
-- **检索**：`HybridSearch`、range search（`params` 中的 `radius` / `range_filter`）、`group_by`、iterator、rerank。
+- **检索**：`HybridSearch`、range search（`params` 中的 `radius` / `range_filter`）、`group_by`、rerank。
+  - search iterator 没有专门的请求：pymilvus 先按 v2 探测，服务端不支持时退回 v1，而 v1 的第一批是普通检索，之后各批才带 range search 与过滤表达式。3.x 的 Search 同样忽略 `iterator` 等参数，所以只需要第一批时（`limit` 不超过 `batch_size`）结果与 3.x 相同，需要后续批次时返回 `UNIMPLEMENTED`。
 - **其他**：snapshot、compaction 与 flush 相关 RPC；CLI 与 `milvus-lite dump`。其余未列出的 RPC 一律返回 `UNIMPLEMENTED`。
 
 ## 阶段性差异（登记）
@@ -112,19 +113,28 @@ M1 的对外行为与 3.x 有阶段性差异，本文按 [AGENTS.md](../../AGENT
 
 1. **端到端差分**：
    - **场景**：在 3.x README 的 Quick Start 基础上，去掉过滤与删除，再补上几种用法：显式 schema、`auto_id`、IP 与 L2 度量、VARCHAR 主键、先建表后建索引、release 后再 load。
-   - **版本与运行方式**：在 pymilvus 2.6.17 与 3.0.2 下各跑一遍。本包与官方包占用同一个 `milvus_lite` 模块，不能装在一起，因此 3.x 装在另一个 venv 里，以 `milvus-lite server` 独立进程运行；差分脚本用 URI 分别连接两边。
+   - **版本与运行方式**：在 pymilvus 2.6.17 与 3.0.2 下各跑一遍。本包与官方包占用同一个 `milvus_lite` 模块，不能装在一起，因此 3.x 装在另一个 venv 里，在独立进程中运行它的 gRPC 服务；差分脚本用 URI 分别连接两边。
+     - 独立进程不用 `milvus-lite server`，而是在 3.x 的 venv 里运行一个辅助脚本，由它调用 `start_server_in_thread(port=0)`。二者经同一个 `_build_server` 构造服务，servicer、256MB 消息上限与线程数都相同。
+     - 改用脚本的原因：CLI 的 `--port 0` 不回报实际端口；gRPC 在端口上设了 SO_REUSEPORT，两个 CLI 服务绑同一端口时都不报错，请求全落在先启动的那个上，所以先挑空闲端口再启动存在察觉不到的竞争；CLI 只在 KeyboardInterrupt 时关闭数据库。辅助脚本打印实际端口，stdin 关闭时关闭服务与数据库，日志写到文件。
    - **数据量**：每个 collection 少于 1 万行。3.x 满 1 万行才 flush，在此之前数据都在 memtable 中暴力检索，结果是精确的；AUTOINDEX 也不会建成 HNSW。
    - **比较口径**：主键集合（包括 `auto_id` 生成的主键）、输出字段、`count(*)`、load 状态、错误码与错误信息逐项相等；距离的允许误差见「决策」。
-2. **复用参照实现的用例**：候选文件大多只通过 [conftest.py](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/conftest.py#L57) 的 `grpc_server` fixture 起服务，不在顶层导入内部模块。阻碍只有两个：一是起服务的 fixture 要替换；二是同一个文件里混有范围外的用例，而规则 4 不允许用 skip 占位。
+2. **复用参照实现的用例**：候选文件大多只通过 [conftest.py](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/conftest.py#L57) 的 `grpc_server` fixture 起服务，不在顶层导入内部模块。阻碍有三个：
+   - 起服务的 fixture 要替换；
+   - conftest 在每个用例后的清理也要替换：它先调用 `using_database`，pymilvus 为此发出的 DescribeDatabase 在 M1 返回 `UNIMPLEMENTED`，清理于是跳过，一个 collection 都不删，后续用例因重名而失败；
+   - 同一个文件里混有范围外的用例，而规则 4 不允许用 skip 占位。
    - **复用方式**：M1 把范围内的用例复制到本仓，fixture 换成本实现的起服务方式，并注明来源与 Apache-2.0 许可（[AGENTS.md](../../AGENTS.md) 规则 9）。复制出来的用例与上游脱钩，对照版本升级时要手工同步。某个文件涉及的功能全部进入范围后，改为替换 fixture、原样运行整个文件，不再复制。
-   - **用例清单**：随 M1 代码入库，逐条列出候选文件中的每个用例，标注「已复制」「范围外」或「依赖内部模块」，后两类注明原因；「依赖内部模块」要写出具体行号。
-   - **范围外用例**：不复制，也不用 skip 或 xfail 占位；为每类不支持的功能另写用例，断言返回 `UNIMPLEMENTED` 且原因正确。
-   - **候选文件**（都在 [tests/adapter/](https://github.com/milvus-io/milvus-lite/tree/v3.2.1/tests/adapter)，每个文件都混有范围外的用例）：
+   - **复用范围**：整个 [tests/adapter/](https://github.com/milvus-io/milvus-lite/tree/v3.2.1/tests/adapter)，47 个文件共 637 条用例。其中 72 条在 M1 范围内，分布在 19 个文件里；`test_milvus_lite_compat.py` 另有 4 条只用 `server_manager` 的公开接口，它是 pymilvus 接入点的契约、本仓同样提供，也复用。下面的 7 个候选文件是最初按文件名挑出的，只含 72 条中的 34 条。
+   - **改后复制**：只允许两种替换，改后的副本须先在 3.x 上通过：
+     - 显式的 HNSW 等 ANN 索引换成 FLAT，前提是用例写入少于 1 万行、不断言索引类型与参数。3.x 满 1 万行（`>=`，按 memtable 中的主键数加 tombstone 数计）才 flush，在此之前总在 memtable 上暴力检索，索引类型不影响结果：实测 9999 行时 FLAT、HNSW、AUTOINDEX 的主键与距离逐位相同，1 万行时才不同。
+     - `<pk> == N` 换成 `<pk> in [N]`，前提是只有一个主键、没有 `offset`、字面量类型与主键相符。这三个条件下 3.x 两条路径的结果逐行相同；否则不同，例如 `offset=1` 时 `id == 3` 返回空而 `id in [3]` 返回该行，INT64 主键上 `id == '3'` 报 code 6 而 `id in ['3']` 返回空。
+   - **用例清单**：[tests/python/adapter/INVENTORY.md](../../tests/python/adapter/INVENTORY.md)，随 M1 代码入库。7 个候选文件以及含范围内用例的文件逐条列出，其余文件整个记一行原因。状态为「已复制」「改后复制」「范围外」「依赖内部模块」，后两类注明原因；「依赖内部模块」要写出具体行号。
+   - **范围外用例**：不复制，也不用 skip 或 xfail 占位；为每类不支持的功能另写用例，断言返回 `UNIMPLEMENTED` 且原因正确。只断言抛出异常的范围外用例同样不复制，因为 `UNIMPLEMENTED` 也会让它通过。
+   - **候选文件**（每个文件都混有范围外的用例）：
      - `test_grpc_collection_lifecycle.py`、`test_grpc_crud.py`、`test_grpc_search.py`：不导入内部模块；
-     - `test_grpc_server_startup.py`：只有 `test_server_data_dir_lock_held` 在函数体内导入内部模块（L34–35），其余用例不导入；
-     - `test_auto_id.py`：12 条中有 8 条是引擎内部用例，内部模块都在函数体内导入，另外 4 条经 pymilvus；
-     - `test_grpc_quickstart.py`：顶层导入 `milvus_lite.index.factory`（L19），整个文件被 `skipif` 包住，只能复制用例本体；
-     - `test_grpc_error_mapping.py`：顶层导入内部模块（L14–21），只能复制其中经 pymilvus 的用例。
+     - `test_grpc_server_startup.py`：`test_server_data_dir_lock_held` 在函数体内导入内部模块（L34–35），`test_server_starts_and_binds_port` 断言 fixture 返回的 3.x 内部对象（L26–28），其余用例不依赖内部模块；
+     - `test_auto_id.py`：12 条中有 8 条是引擎内部用例，内部模块都在函数体内导入；另外 4 条经 pymilvus，其中 `test_grpc_auto_id_query` 带过滤；
+     - `test_grpc_quickstart.py`：顶层导入 `milvus_lite.index.factory`（L19），整个文件被 `skipif` 包住；两条用例都在范围外，`test_quickstart_multi_query_search` 只因 HNSW 在范围外，可按上文改后复制；
+     - `test_grpc_error_mapping.py`：顶层导入内部模块（L14–25），`test_hybrid_search_unimplemented` 还在函数体内导入（L104），只能复制其中经 pymilvus 的用例。
    - **`tests/compatibility`**：9 个文件共约 240 条用例，以范围外的功能为主，包括过滤、分区与 partition key、多数据库、function、delete / upsert。每个文件还各自用 `start_server_in_thread` 定义起服务的 fixture。M1 不复用，理由写进用例清单；复用的时机与方式同 adapter，也就是文件涉及的功能进入范围后，替换 fixture 整文件运行。
    - **防止静默跳过**：确认 pymilvus 已安装，套件没有被 `importorskip` 整目录跳过。
 3. **生命周期**：[0003「验证」](0003-in-process-server-lifecycle.md#验证)中与持久化无关的用例全部通过，但 M1 只在本机平台上跑，Linux 与 Windows 另见「跨平台」。这收窄了 0003 的平台矩阵，要在 M2 发布前补齐。
@@ -146,10 +156,15 @@ M1 的对外行为与 3.x 有阶段性差异，本文按 [AGENTS.md](../../AGENT
   - M1 只有内存数据，与 3.x 完全一致。从 M2 起，flush 过的数据也返回正确结果，与 3.x 的错误行为不同，这一点在此登记为已知差异（[AGENTS.md](../../AGENTS.md) 规则 2），影响 segment 上度量不一致的检索。
   - 放弃的做法：像 Milvus 一样拒绝不一致的度量，这会让 3.x 在 memtable 上本来能正确返回的请求变成报错；照抄 3.x，则会明知故犯地返回错误结果。
 - **距离类差分测试的允许误差**：3.x 的暴力检索用 numpy 在 float32 下计算，L2 先开方再平方，与 Rust 的 SIMD 求和顺序不同，结果不会逐位相同。
-  - 每个距离满足 `|a − b| ≤ max(1e-5 × |b|, 1e-6)`；绝对误差下限用于距离接近 0 的情形，例如 L2 精确命中。
-  - 距离差在误差以内的相邻结果允许互换顺序。截断位置上出现并列时，允许主键集合只在这些并列结果之间不同。
+  - 每个距离按度量满足下列条件，`a` 与 `b` 分别是两边的距离，`q` 是查询向量，`v` 是命中行的向量：
+    - L2：`|a − b| ≤ max(1e-5 × |b|, 1e-6)`；绝对误差下限用于距离接近 0 的情形，例如精确命中。
+    - IP：`|a − b| ≤ max(1e-5 × ‖q‖ × ‖v‖, 1e-6)`。float32 求和的误差与 `‖q‖ × ‖v‖` 成正比，而正负项相消时 `|b|` 可以远小于它，按 `|b|` 定误差会误报：负责人实测 dim 1536 时 300 行中有 12 行超出 `1e-5 × |b|`，最大差 3.2e-5，L2 与 COSINE 都没有超出。求和顺序取决于 numpy 所用的 BLAS 库，不同平台不同，因此不模拟。
+    - COSINE：`|a − b| ≤ 1e-5`，即 IP 的规则作用在归一化后的向量上；相似度接近 0 时与 IP 同理。
+    - 适用的维度：误差余量随 √dim 缩小。实测（各 300 行、每个度量 600 个距离）dim 16384 以内都在界内，最大用到误差的 0.68；dim 32768（Milvus 的维度上限）时 L2 有 3 个、COSINE 有 1 个超界，最大 1.09 倍。超界来自本实现：L2 逐元素顺序累加 float32，与 float64 真值相比用掉误差的 101%，而 numpy 分组求和只用掉 2%。因此 M1 的差分测试维度不超过 16384；第 5 步的 SIMD 距离改为多路累加，并以 dim 32768 的差分作为验收。
+    - L2 必须先逐元素相减再平方求和，不得展开成 `‖q‖² + ‖v‖² − 2q·v`：距离很小而向量模长很大时，展开式相消会丢掉全部有效位，上面按 `|b|` 定的 L2 误差就不再成立。
+  - 两个结果 x、y 在两边的先后相反时，只要 3.x 的距离之差不超过两者的允许误差之和（`|b_x − b_y| ≤ t_x + t_y`），就算一致；这样的两个结果不必相邻。同理，截断位置两侧的结果满足这一条件时，允许主键集合只在这些结果之间不同。
   - 这是后续所有距离类差分测试的默认规则；某个测试需要放宽时，须在该测试中说明理由并经负责人确认。
-  - 带 `round_decimal` 的检索：3.x 对 float64 的对外距离舍入（L2 在 float32 开方后于 float64 平方，COSINE 为 `1 − float64(距离)`），本实现按同样的口径换算后再舍入。舍入前的值在上述误差之内时，允许舍入结果相差 `max(10^-round_decimal, 上述误差)`：`round_decimal` 较大时 float32 的精度比 `10^-round_decimal` 更粗。
+  - 带 `round_decimal` 的检索：3.x 对 float64 的对外距离舍入（L2 在 float32 开方后于 float64 平方，COSINE 为 `1 − float64(距离)`），本实现按同样的口径换算后再舍入。舍入前的值在上述误差之内时，允许舍入结果相差 `max(10^-round_decimal, 上述误差)`：`round_decimal` 较大时 float32 的精度比 `10^-round_decimal` 更粗。经 pymilvus 比较时要注意：pymilvus 在 `round_decimal > 0` 时会在客户端对收到的值再 `round` 一次，只有 `round_decimal = 0` 时看到的是服务端的舍入结果；因此差分测试另检查本实现的值再舍入一次不变，服务端的舍入另由手写请求的用例对照 3.x。
 
 - **检索请求的维度与度量总是校验。** 3.x 不校验查询向量的维度，维度不符时返回 numpy 的原始报错（code 1），collection 为空时反而成功；非法度量也要到计算距离时才报错，空 collection 上同样成功。本实现在检索前校验：维度不符报 `query vector has dim <n>, but field '<f>' expects dim <d>`，非法度量报与 3.x 相同的信息，两者都是 code 1，空 collection 上也报错。影响：维度或度量有误、且 collection 为空的检索。
 - **auto_id 取该行的 `_seq`。** 3.x 的 auto_id 与 `_seq` 是两个计数器：校验失败的 insert 也会消耗 auto_id，于是 auto_id 会超过该行的 `_seq`，违反 [0002](0002-data-dir-compat.md#共享状态的语义约束) 约束 4（0002「继承的 3.x 已知风险」）。本实现令 auto_id 等于所在行的 `_seq`，失败的 insert 不消耗任何编号。3.x 的 delete 每次消耗一个 `_seq` 而不消耗 auto_id（实测删除一次后下一个 auto_id 仍是 2），所以只有在同一会话内既没有失败的 insert、也没有 delete 这类只消耗 `_seq` 的操作时，生成的主键才与 3.x 相同。影响：失败的 insert 或 delete 之后再写入时生成的 auto_id；M1 没有 delete，引入 delete 时差分测试要按此处理。

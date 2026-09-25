@@ -14,13 +14,13 @@
 
 重构基线已定：**以 3.x 为基础，不以 2.5.1（C++）为基础**。3.x 的性能损失主要来自 Python 实现，架构内只有一处需要修正的设计；2.5.1 反而有冷启动全量重放、索引不落盘等架构级瓶颈；决策、数据与由此得出的实现约束见 [0001-重构基线选择](docs/decisions/0001-refactor-baseline.md)。
 
-当前状态：仓库有 README / LICENSE（Apache-2.0）、设计决策（[docs/decisions/](docs/decisions/)）与基线基准脚本（[benchmarks/baseline/](benchmarks/baseline/)），以及 M1（[0004](docs/decisions/0004-m1-scope.md)）进行中的工程骨架：三个 crate、进程内服务的生命周期、内存引擎与 gRPC 翻译已落地，差分测试与基准尚在进行。新增 module、依赖或命令时同步更新本文的[架构地图](#架构地图跨文件心智)、[技术栈](#技术栈)与[常用命令](#常用命令)；这几节中标注「待定」的内容不得当作事实引用。
+当前状态：仓库有 README / LICENSE（Apache-2.0）、设计决策（[docs/decisions/](docs/decisions/)）与基线基准脚本（[benchmarks/baseline/](benchmarks/baseline/)），以及 M1（[0004](docs/decisions/0004-m1-scope.md)）进行中的工程骨架：三个 crate、进程内服务的生命周期、内存引擎、gRPC 翻译与差分测试已落地，基准尚在进行。新增 module、依赖或命令时同步更新本文的[架构地图](#架构地图跨文件心智)、[技术栈](#技术栈)与[常用命令](#常用命令)；这几节中标注「待定」的内容不得当作事实引用。
 
 ## 核心业务术语
 
 | 术语 | 含义 |
 | --- | --- |
-| **参照实现** | [references/milvus-lite/](references/milvus-lite/)，被 `.gitignore` 忽略、不随本仓提交的本地 checkout。当前对照版本为 v3.2.1（`43d1257`），升级时同步改这里；记录对照结论时写明所依据的 commit（`git -C references/milvus-lite log -1`） |
+| **参照实现** | [references/milvus-lite/](references/milvus-lite/)，被 `.gitignore` 忽略、不随本仓提交的本地 checkout。当前对照版本为 v3.2.1（`43d1257`），升级时同步改这里与差分测试的版本守卫（[tests/differential/conftest.py](tests/differential/conftest.py) 的 `REF_VERSION`）；记录对照结论时写明所依据的 commit（`git -C references/milvus-lite log -1`） |
 | **pymilvus 接入点** | `pymilvus` 遇到以 `.db` 结尾的 URI 时，先检查父目录存在，再执行 `from milvus_lite.server_manager import server_manager_instance` 并调用 `start_and_get_uri(uri)`（3.x 的签名为 `start_and_get_uri(path, args=None)`）；返回 `None` 即报 “Open local milvus failed”，否则按返回的 `http://127.0.0.1:<port>` 走普通 Milvus gRPC（参照实现 [server_manager.py](references/milvus-lite/milvus_lite/server_manager.py)）。以上在 pymilvus 2.6.15 / 2.6.17 / 3.0.2 中逐行一致；pymilvus 升级时重新核对。**模块路径、实例名、方法签名、返回约定都是对外契约**。pymilvus 的 `milvus-lite` extra 依赖 PyPI 上的 `milvus-lite`（`>=2.4.0`，非 Windows），这个名字归官方所有，因此本项目以 `milvus-lite-rust` 发布：用户安装 `pymilvus` 与 `milvus-lite-rust`，不用 `pymilvus[milvus-lite]`。它与官方 `milvus-lite` 争用同一个 `milvus_lite` 模块与 `milvus-lite` 命令，**不得同时安装**：pip 不会阻止，后装者覆盖同名文件，卸载任一方都会弄坏另一方；pymilvus 导入失败时的提示还会把用户引向官方包。因此绑定层导入时须检测已安装的官方发行包 `milvus-lite` 并明确报错，README 的安装说明须先 `pip uninstall milvus-lite`。官方包后装覆盖本包的情形检测不到，只能靠文档说明 |
 | **CLI** | 参照实现提供 `milvus-lite server --data-dir <dir> [--host] [--port] [--max-workers]` 与 `milvus-lite dump`（[cmdline.py](references/milvus-lite/milvus_lite/cmdline.py)）。本实现先提供 `server`，参数与之一致，按对外契约对待（`--max-workers` 原本控制 grpcio 线程池，在本实现中的对应含义待定义）；`dump` 后续再做（见[技术栈](#技术栈)） |
 | **gRPC adapter** | Milvus 协议 → 引擎 API 的翻译层。**只翻译、不加能力**：引擎不支持的 RPC 返回 `UNIMPLEMENTED` + 明确信息，绝不静默成功（参照实现架构不变量 15） |
@@ -115,7 +115,7 @@ pymilvus ──server_manager──▶ adapter/grpc ──▶ db（多 collectio
 
 ## 常用命令
 
-本实现（在仓库根目录执行；差分测试与基准对比随 M1 后续步骤补充）：
+本实现（在仓库根目录执行；基准对比随 M1 第 5 步补充）：
 
 | 任务 | 命令 |
 | --- | --- |
@@ -124,7 +124,8 @@ pymilvus ──server_manager──▶ adapter/grpc ──▶ db（多 collectio
 | 格式化 | `cargo fmt --all` |
 | lint | `cargo clippy --workspace --all-targets -- -D warnings` |
 | Rust 单测 | `cargo test --workspace` |
-| 端到端测试（真实 pymilvus） | `.venv/bin/python -m pytest tests/python` |
+| 端到端测试（真实 pymilvus；含 [tests/python/adapter/](tests/python/adapter/) 中复制自参照实现的用例，逐条状态见其 INVENTORY.md） | `.venv/bin/python -m pytest tests/python` |
+| 与 3.x 的差分测试（3.x 的 venv 可用 `benchmarks/baseline/setup.sh <work_dir>` 建出的 `<work_dir>/v3`；不设环境变量时报错，不跳过；上一行的命令不包含它） | `MILVUS_LITE_3X_PYTHON=<3.x 的 venv>/bin/python .venv/bin/python -m pytest tests/differential` |
 | 构建 wheel / sdist | `.venv/bin/maturin build --release -m crates/py/Cargo.toml` / `.venv/bin/maturin sdist -m crates/py/Cargo.toml` |
 | 核对依赖图中没有 C++ 构建与 protoc | `cargo tree --workspace -e all` |
 
@@ -134,6 +135,7 @@ pymilvus 两条线都要测。2.6.x 线用单独的 venv 安装构建出的 whee
 .venv/bin/maturin build --release -m crates/py/Cargo.toml -o <work_dir>/wheels
 uv venv -p 3.10 <work_dir>/v26 && uv pip install -p <work_dir>/v26/bin/python "pymilvus>=2.6,<2.7" pytest <work_dir>/wheels/milvus_lite_rust-*.whl
 cd <work_dir> && v26/bin/python -m pytest <repo>/tests/python
+cd <work_dir> && MILVUS_LITE_3X_PYTHON=<3.x 的 venv>/bin/python v26/bin/python -m pytest <repo>/tests/differential
 ```
 
 性能基线（2.5.1 与 3.x 对照，工作目录须在仓库外；完整步骤见 [benchmarks/baseline/README.md](benchmarks/baseline/README.md)）：
@@ -156,7 +158,7 @@ cd <work_dir> && v26/bin/python -m pytest <repo>/tests/python
 | 参照实现自带的性能基准（不作为规则 7 的基线） | `make benchmark` |
 | 起本地 gRPC 服务 | `make serve`（端口 19530，数据目录 `./data`） |
 
-**改了什么就跑什么**：改存储 / 恢复 → 崩溃注入与恢复测试；改索引或距离计算 → 与 brute force 及参照实现的差分测试；改 filter → 解析与求值的差分测试；改 gRPC 层 → 参照实现的 `adapter` / `compatibility` 套件以本实现为后端运行；改 Python 绑定 → 用真实 `pymilvus` 走 `MilvusClient("./x.db")` 的端到端测试；声称性能提升 → 用 [benchmarks/baseline/](benchmarks/baseline/) 同机同数据集对照 2.5.1 与 3.x。
+**改了什么就跑什么**：改存储 / 恢复 → 崩溃注入与恢复测试；改索引或距离计算 → 与 brute force 及参照实现的差分测试；改 filter → 解析与求值的差分测试；改 gRPC 层 → [tests/python/adapter/](tests/python/adapter/) 中复制自参照实现的用例与 [tests/differential/](tests/differential/) 的差分测试（`compatibility` 套件涉及的功能进入范围后再以本实现为后端运行）；改 Python 绑定 → 用真实 `pymilvus` 走 `MilvusClient("./x.db")` 的端到端测试；声称性能提升 → 用 [benchmarks/baseline/](benchmarks/baseline/) 同机同数据集对照 2.5.1 与 3.x。
 
 ## 核心心智
 
