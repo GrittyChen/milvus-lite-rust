@@ -185,7 +185,7 @@ impl Drop for Server {
         match running.shutdown.send(()) {
             Ok(()) | Err(()) => {}
         }
-        // 没有在途任务时 LOCK 立即释放，否则由最后一个任务结束时释放，不会早于引擎任务。
+        // 后台线程等在途任务结束、同步保留的 WAL，最后才释放 LOCK。
         running.db.close_nowait();
         running.runtime.shutdown_background();
     }
@@ -194,6 +194,7 @@ impl Drop for Server {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use milvus_lite_core::{EngineError, LoadState};
 
     fn config(data_dir: PathBuf, port: u16) -> ServerConfig {
         ServerConfig {
@@ -231,14 +232,24 @@ mod tests {
     }
 
     #[test]
-    fn existing_data_error_is_propagated() {
+    fn existing_data_is_checked_when_a_collection_is_accessed() {
         let root = tempfile::tempdir().unwrap();
-        std::fs::write(root.path().join("schema.json"), b"{}").unwrap();
-        let err = Server::start(config(root.path().to_path_buf(), 0)).unwrap_err();
-        assert!(
-            matches!(err, ServerError::DataDir(DataDirError::ExistingData { .. })),
-            "{err}"
+        let schema = root.path().join("collections/docs/schema.json");
+        std::fs::create_dir_all(schema.parent().unwrap()).unwrap();
+        std::fs::write(&schema, b"{").unwrap();
+        let mut server = Server::start(config(root.path().to_path_buf(), 0)).unwrap();
+        let db = &server.running.as_ref().unwrap().db;
+        assert_eq!(
+            db.list_collections("").unwrap(),
+            [("docs".to_owned(), LoadState::Released)]
         );
+        assert!(matches!(
+            db.collection("", "docs"),
+            Err(EngineError::Storage(_))
+        ));
+        assert_eq!(std::fs::read(&schema).unwrap(), b"{");
+        server.stop(Duration::from_secs(2)).unwrap();
+        DataDir::open(root.path()).unwrap();
     }
 
     #[test]
@@ -246,6 +257,15 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("x.db");
         drop(Server::start(config(path.clone(), 0)).unwrap());
-        DataDir::open(&path).unwrap();
+        let start = std::time::Instant::now();
+        loop {
+            match DataDir::open(&path) {
+                Ok(_) => break,
+                Err(DataDirError::Locked { .. }) if start.elapsed() < Duration::from_secs(2) => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("storage close did not release LOCK: {error}"),
+            }
+        }
     }
 }

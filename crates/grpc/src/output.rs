@@ -49,7 +49,7 @@ pub(crate) fn fields_data(
 /// （3.x 保存 `$meta` 时 `sort_keys=True`）。
 fn meta_json(projection: &Projection, meta: &Map<String, Value>) -> String {
     if projection.all_dynamic {
-        pyjson::dumps_object(meta.iter().map(|(k, v)| (k.as_str(), v)))
+        pyjson::dumps(&Value::Object(meta.clone()))
     } else {
         pyjson::dumps_object(
             projection

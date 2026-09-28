@@ -1,62 +1,97 @@
-//! 按 Python `json.dumps` 的默认参数输出 JSON 文本：分隔符 `", "` 与 `": "`、`ensure_ascii=True`、
-//! 浮点数用 `repr(float)`。3.x 以这种文本回显 `$meta` 与索引参数，其中 DescribeIndex 的
-//! `search_params` 会原样交给用户，因此要逐字符一致；M2 写数据文件时同样需要（0002「字段编码要点」）。
+//! 按 Python `json.dumps` 的分隔符、浮点与转义规则输出 JSON 文本。
+//! `$meta` 用 `sort_keys=True` / `ensure_ascii=True`，JSON 字段保留键序并用 `ensure_ascii=False`。
 
 use serde_json::Value;
 
 use crate::error::py_float_repr;
 
-/// `json.dumps(value)`。serde_json 的对象按 key 排序，因此嵌套对象的输出与 `sort_keys=True` 相同。
+/// `json.dumps(value, sort_keys=True)`；嵌套对象同样排序。
 pub fn dumps(value: &Value) -> String {
     let mut out = String::new();
-    write_value(&mut out, value);
+    write_value(&mut out, value, true, true);
     out
 }
 
-/// `json.dumps(dict)`，顶层 key 按给定顺序输出（例如按请求顺序输出的动态字段）。
+/// `json.dumps(dict)`，顶层 key 按给定顺序输出，嵌套对象排序（例如动态字段输出）。
 pub fn dumps_object<'a>(entries: impl IntoIterator<Item = (&'a str, &'a Value)>) -> String {
     let mut out = String::from("{");
     for (i, (key, value)) in entries.into_iter().enumerate() {
         if i > 0 {
             out.push_str(", ");
         }
-        write_str(&mut out, key);
+        write_str(&mut out, key, true);
         out.push_str(": ");
-        write_value(&mut out, value);
+        write_value(&mut out, value, true, true);
     }
     out.push('}');
     out
 }
 
-fn write_value(out: &mut String, value: &Value) {
+/// JSON 字段落盘：`json.dumps(value, ensure_ascii=False)`，保留输入对象的键序。
+pub fn dumps_unicode(value: &Value) -> String {
+    let mut out = String::new();
+    write_value(&mut out, value, false, false);
+    out
+}
+
+fn write_value(out: &mut String, value: &Value, ensure_ascii: bool, sort_keys: bool) {
     match value {
         Value::Null => out.push_str("null"),
         Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
-        Value::Number(n) => match (n.as_i64(), n.as_u64(), n.as_f64()) {
-            (Some(i), _, _) => out.push_str(&i.to_string()),
-            (None, Some(u), _) => out.push_str(&u.to_string()),
-            (None, None, Some(f)) => out.push_str(&py_float_repr(f)),
-            (None, None, None) => out.push_str(&n.to_string()),
-        },
-        Value::String(s) => write_str(out, s),
+        Value::Number(n) => {
+            let raw = n.to_string();
+            if raw.contains(['.', 'e', 'E']) {
+                if let Ok(value) = raw.parse::<f64>() {
+                    if value.is_infinite() {
+                        out.push_str(if value.is_sign_positive() {
+                            "Infinity"
+                        } else {
+                            "-Infinity"
+                        });
+                    } else {
+                        out.push_str(&py_float_repr(value));
+                    }
+                } else {
+                    out.push_str(&raw);
+                }
+            } else if raw == "-0" {
+                out.push('0');
+            } else {
+                out.push_str(&raw);
+            }
+        }
+        Value::String(s) => write_str(out, s, ensure_ascii),
         Value::Array(items) => {
             out.push('[');
             for (i, item) in items.iter().enumerate() {
                 if i > 0 {
                     out.push_str(", ");
                 }
-                write_value(out, item);
+                write_value(out, item, ensure_ascii, sort_keys);
             }
             out.push(']');
         }
         Value::Object(obj) => {
-            out.push_str(&dumps_object(obj.iter().map(|(k, v)| (k.as_str(), v))));
+            let mut entries: Vec<_> = obj.iter().collect();
+            if sort_keys {
+                entries.sort_by_key(|(key, _)| *key);
+            }
+            out.push('{');
+            for (i, (key, value)) in entries.into_iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                write_str(out, key, ensure_ascii);
+                out.push_str(": ");
+                write_value(out, value, ensure_ascii, sort_keys);
+            }
+            out.push('}');
         }
     }
 }
 
 /// Python `json` 的 `py_encode_basestring_ascii`。
-fn write_str(out: &mut String, s: &str) {
+fn write_str(out: &mut String, s: &str, ensure_ascii: bool) {
     out.push('"');
     for c in s.chars() {
         match c {
@@ -68,6 +103,7 @@ fn write_str(out: &mut String, s: &str) {
             '\u{8}' => out.push_str("\\b"),
             '\u{c}' => out.push_str("\\f"),
             ' '..='~' => out.push(c),
+            _ if !ensure_ascii && c >= ' ' => out.push(c),
             _ => {
                 let mut units = [0u16; 2];
                 for unit in c.encode_utf16(&mut units) {
@@ -103,6 +139,21 @@ mod tests {
         assert_eq!(
             dumps_object([("z", &z), ("a", &a)]),
             r#"{"z": "s", "a": 1}"#
+        );
+        let wide: Value =
+            serde_json::from_str(r#"{"z": 184467440737095516160, "a": {"b": 1E2, "a": -0}}"#)
+                .unwrap();
+        assert_eq!(
+            dumps(&wide),
+            r#"{"a": {"a": 0, "b": 100.0}, "z": 184467440737095516160}"#
+        );
+        assert_eq!(
+            dumps_unicode(&wide),
+            r#"{"z": 184467440737095516160, "a": {"b": 100.0, "a": 0}}"#
+        );
+        assert_eq!(
+            dumps_unicode(&json!({"name":"中文😀"})),
+            r#"{"name": "中文😀"}"#
         );
     }
 }

@@ -11,6 +11,9 @@ license = "Apache-2.0"
 publish = false
 
 [workspace.dependencies]
+arrow-array = "~60.0"
+arrow-ipc = "~60.0"
+arrow-schema = "~60.0"
 milvus-lite-core = { path = "crates/core" }
 milvus-lite-grpc = { path = "crates/grpc" }
 parking_lot = "0.12.5"
@@ -19,9 +22,11 @@ prost-types = "0.14.4"
 protox = "0.9.1"
 pyo3 = "0.29.2"
 rayon-core = "1.13.0"
-# float_roundtrip：动态字段中的浮点数须逐位往返，与 3.x 的 json 模块一致。
-serde_json = { version = "1.0.151", features = ["float_roundtrip"] }
+serde = { version = "1.0", features = ["derive"] }
+# 保留 JSON 字段的键序与任意精度整数；动态字段落盘时另按 Python sort_keys 排序。
+serde_json = { version = "1.0.151", features = ["float_roundtrip", "preserve_order", "arbitrary_precision"] }
 thiserror = "2.0.21"
+parquet = { version = "~60.0", default-features = false, features = ["arrow", "snap"] }
 tokio = "1.53.1"
 tonic = "0.14.6"
 tonic-prost = "0.14.6"

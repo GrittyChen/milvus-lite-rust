@@ -44,6 +44,9 @@ pub enum EngineError {
     },
     #[error(transparent)]
     DataDir(#[from] DataDirError),
+    /// 文件、格式或提交协议失败；不伪装成用户输入错误。
+    #[error("storage error: {0}")]
+    Storage(String),
 }
 
 impl EngineError {
@@ -122,6 +125,7 @@ pub(crate) fn py_repr_list<'a>(items: impl IntoIterator<Item = &'a str>) -> Stri
 }
 
 /// Python `repr(float)`：最短往返表示，整数值带 `.0`，指数形式为 `1e-05`。
+#[allow(clippy::expect_used)] // Rust 的科学计数格式必含可解析且处于 i32 范围内的指数。
 pub fn py_float_repr(v: f64) -> String {
     if v.is_nan() {
         return "nan".to_owned();
@@ -131,18 +135,31 @@ pub fn py_float_repr(v: f64) -> String {
     }
     let abs = v.abs();
     if abs != 0.0 && !(1e-4..1e16).contains(&abs) {
-        // Rust 的 `{:e}` 是最短往返的尾数；Python 的指数至少两位并带符号。
+        // `Debug` 的最短位数由 Rust 求出，再用精度格式化完成 CPython 的平局取偶。
         let s = format!("{v:e}");
-        let (mantissa, exp) = s.split_once('e').unwrap_or((&s, "0"));
-        let exp: i32 = exp.parse().unwrap_or(0);
+        let (mantissa, _) = s
+            .split_once('e')
+            .expect("scientific formatter includes exponent");
+        let places = mantissa
+            .split_once('.')
+            .map_or(0, |(_, fraction)| fraction.len());
+        let rounded = format!("{v:.places$e}");
+        let (mantissa, exp) = rounded
+            .split_once('e')
+            .expect("scientific formatter includes exponent");
+        let exp: i32 = exp
+            .parse()
+            .expect("scientific formatter emits numeric exponent");
         let sign = if exp < 0 { '-' } else { '+' };
         return format!("{mantissa}e{sign}{:02}", exp.abs());
     }
     let s = format!("{v:?}");
-    if s.contains('.') || s.contains('e') {
-        s
+    let places = s.split_once('.').map_or(0, |(_, fraction)| fraction.len());
+    let rounded = format!("{v:.places$}");
+    if rounded.contains('.') {
+        rounded
     } else {
-        format!("{s}.0")
+        format!("{rounded}.0")
     }
 }
 
@@ -208,5 +225,21 @@ mod tests {
         assert_eq!(py_float_repr(123456789.0), "123456789.0");
         assert_eq!(py_float_repr(0.0001), "0.0001");
         assert_eq!(py_float_repr(0.0), "0.0");
+        assert_eq!(
+            py_float_repr(f64::from(f32::from_bits(0x445146a9))),
+            "837.1040649414062"
+        );
+        assert_eq!(
+            py_float_repr(f64::from(f32::from_bits(0xc32e75da))),
+            "-174.46035766601562"
+        );
+        for (bits, expected) in [
+            (0x42934404, "73.63284301757812"),
+            (0xc4025191, "-521.2744750976562"),
+            (0x41072d90, "8.448623657226562"),
+            (0x42dd9b04, "110.80276489257812"),
+        ] {
+            assert_eq!(py_float_repr(f64::from(f32::from_bits(bits))), expected);
+        }
     }
 }

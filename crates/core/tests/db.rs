@@ -74,10 +74,13 @@ fn lifecycle() {
 
 #[test]
 fn names_are_case_sensitive() {
-    // 0004「决策」：3.x 在 macOS 上因文件系统不区分大小写而冲突，本实现按原样区分。
+    // 不区分大小写的文件系统上，同一物理目录不能创建第二个句柄。
     let (_root, db) = db();
     db.create_collection("", "Case", schema()).unwrap();
-    db.create_collection("default", "case", schema()).unwrap();
+    assert!(matches!(
+        db.create_collection("default", "case", schema()),
+        Err(EngineError::CollectionAlreadyExists(_))
+    ));
     assert!(db.collection("", "CASE").is_err());
 }
 
@@ -206,9 +209,9 @@ fn close_waits_for_in_flight_tasks_before_releasing_the_lock() {
 }
 
 #[test]
-fn close_nowait_releases_the_lock_with_the_last_task() {
+fn close_nowait_syncs_in_the_background_before_releasing_the_lock() {
     let root = tempfile::tempdir().unwrap();
-    let db = Db::new(DataDir::open(root.path()).unwrap(), compute());
+    let db = Arc::new(Db::new(DataDir::open(root.path()).unwrap(), compute()));
     let task = db.enter().unwrap();
     db.close_nowait();
     assert!(!lock_is_free(root.path()));
@@ -217,11 +220,13 @@ fn close_nowait_releases_the_lock_with_the_last_task() {
         Some("MilvusLite is closed")
     );
     drop(task);
+    db.close();
     assert!(lock_is_free(root.path()));
 
     let root = tempfile::tempdir().unwrap();
-    let db = Db::new(DataDir::open(root.path()).unwrap(), compute());
+    let db = Arc::new(Db::new(DataDir::open(root.path()).unwrap(), compute()));
     db.close_nowait();
+    db.close();
     assert!(lock_is_free(root.path()));
 }
 
@@ -265,7 +270,7 @@ fn search_with_a_queued_writer_does_not_deadlock() {
         ],
     };
     let handle = db.collection("", "c").unwrap();
-    handle.write().insert(rows(0, 20_000)).unwrap();
+    db.insert("", "c", rows(0, 20_000)).unwrap();
     let search = |nq: usize| SearchRequest {
         anns_field: None,
         vectors: QueryVectors::Dense(vec![vec![1.0; dim as usize]; nq]),
@@ -290,7 +295,7 @@ fn search_with_a_queued_writer_does_not_deadlock() {
         held_rx.recv().unwrap();
         let done = done_tx.clone();
         s.spawn(move || {
-            handle.write().insert(rows(20_000, 10)).unwrap();
+            db.insert("", "c", rows(20_000, 10)).unwrap();
             done.send("insert").unwrap();
         });
         std::thread::sleep(Duration::from_millis(20));

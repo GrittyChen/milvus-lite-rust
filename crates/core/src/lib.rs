@@ -12,6 +12,7 @@ pub mod index;
 pub mod projection;
 pub mod pyjson;
 pub mod schema;
+pub mod storage;
 
 pub use collection::{
     Collection, Hits, LoadState, QueryResult, QueryVectors, SearchRequest, SearchResult,

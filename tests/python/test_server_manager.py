@@ -17,6 +17,7 @@ from pathlib import Path
 import grpc
 import pytest
 from pymilvus import MilvusClient
+from pymilvus.exceptions import MilvusException
 
 from milvus_lite.server_manager import ServerManager
 
@@ -158,22 +159,57 @@ def test_empty_dir_left_by_3x_opens(manager, tmp_path):
     assert manager.start_and_get_uri(str(path)) is not None
 
 
-@pytest.mark.parametrize(
-    "leftover",
-    ["collections/docs/schema.json", ".database-staging/database-x/collections", "aliases.json"],
-)
-def test_existing_data_returns_none_with_reason(manager, tmp_path, caplog, leftover):
+def test_invalid_collection_schema_fails_closed_on_access(manager, tmp_path):
     path = tmp_path / "data.db"
     _make_empty_3x_layout(path)
-    target = path / leftover
-    target.parent.mkdir(parents=True, exist_ok=True)
-    if target.suffix:
-        target.touch()
-    else:
-        target.mkdir()
-    assert manager.start_and_get_uri(str(path)) is None
-    assert "contains existing data" in caplog.text
-    # 失败的启动不得残留 LOCK。
+    schema = path / "collections" / "docs" / "schema.json"
+    schema.parent.mkdir()
+    schema.write_bytes(b"{")
+    uri = manager.start_and_get_uri(str(path))
+    assert uri is not None
+    client = MilvusClient(uri)
+    assert client.list_collections() == ["docs"]
+    with pytest.raises(MilvusException) as error:
+        client.describe_collection("docs")
+    assert error.value.code == 1
+    assert schema.read_bytes() == b"{"
+    client.close()
+    manager.release_server(str(path))
+    assert lock_is_free(path)
+
+
+def test_staging_residue_is_removed_after_lock(manager, tmp_path):
+    path = tmp_path / "staging.db"
+    _make_empty_3x_layout(path)
+    residue = path / ".database-staging" / "database-x" / "collections"
+    residue.mkdir(parents=True)
+    assert residue.is_dir()
+    uri = manager.start_and_get_uri(str(path))
+    assert uri is not None
+    assert not residue.exists()
+    client = MilvusClient(uri)
+    assert client.list_collections() == []
+    client.close()
+    manager.release_server(str(path))
+    assert lock_is_free(path)
+
+
+def test_invalid_aliases_fail_create_without_rewriting_file(manager, tmp_path):
+    path = tmp_path / "aliases.db"
+    _make_empty_3x_layout(path)
+    aliases = path / "aliases.json"
+    aliases.write_bytes(b"")
+    uri = manager.start_and_get_uri(str(path))
+    assert uri is not None
+    client = MilvusClient(uri)
+    assert client.list_collections() == []
+    with pytest.raises(MilvusException) as error:
+        client.create_collection("c", dimension=2)
+    assert error.value.code == 1
+    assert aliases.read_bytes() == b""
+    assert not (path / "collections" / "c").exists()
+    client.close()
+    manager.release_server(str(path))
     assert lock_is_free(path)
 
 
@@ -479,16 +515,16 @@ t = threading.Thread(target=search_loop)
 t.start()
 searching.wait()
 
-def child():
+def child(iteration):
     signal.alarm(20)
-    c = MilvusClient(sm.start_and_get_uri("c.db"))
+    c = MilvusClient(sm.start_and_get_uri(f"c{iteration}.db"))
     c.create_collection("k", dimension=4, metric_type="L2")
     c.insert("k", [{"id": i, "vector": [i, 1, 0, 0]} for i in range(100)])
     print("OUT child-search", [h["id"] for h in c.search("k", data=[[99, 1, 0, 0]], limit=2)[0]], flush=True)
-    sm.release_server("c.db")
+    sm.release_server(f"c{iteration}.db")
 
-for _ in range(3):
-    fork_and_wait(child)
+for iteration in range(3):
+    fork_and_wait(lambda iteration=iteration: child(iteration))
 stop.set()
 t.join()
 print("OUT parent-searches-ok", len(results) >= 2 and all(n == 200 for n in results), flush=True)

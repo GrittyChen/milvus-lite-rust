@@ -15,6 +15,9 @@ use crate::flat;
 use crate::index::{IndexRequest, IndexSpec, Metric, build_spec};
 use crate::projection::{ApiKind, Projection};
 use crate::schema::{CollectionSchema, DataType, FieldSchema};
+use crate::storage::arrow_data::DecodedData;
+use crate::storage::recovery::RecoveredCollection;
+use crate::storage::runtime::PersistentCollection;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoadState {
@@ -76,11 +79,14 @@ struct Chunk {
     live: Vec<bool>,
     /// 向量字段每行的范数，写入时算好供 COSINE 使用（与检索时现算逐位相同），不落盘。
     norms: Vec<f32>,
+    generation: u64,
+    orders: Vec<u64>,
 }
 
 /// 行的位置。派生的全序即扫描顺序：先按 chunk、再按行。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct RowRef {
+    order: u64,
     chunk: usize,
     row: usize,
 }
@@ -98,6 +104,9 @@ pub struct Collection {
     /// 按创建顺序。
     indexes: Vec<IndexSpec>,
     load_state: LoadState,
+    next_order: u64,
+    persistent: Option<PersistentCollection>,
+    deleted: bool,
 }
 
 impl Collection {
@@ -126,7 +135,130 @@ impl Collection {
             indexes: Vec::new(),
             // 3.x：新建的 collection 没有索引定义，初始即为 loaded。
             load_state: LoadState::Loaded,
+            next_order: 0,
+            persistent: None,
+            deleted: false,
         })
+    }
+
+    pub(crate) fn attach_persistence(&mut self, persistent: PersistentCollection) {
+        self.persistent = Some(persistent);
+    }
+
+    pub(crate) fn persistent(&self) -> Option<&PersistentCollection> {
+        self.persistent.as_ref()
+    }
+
+    pub(crate) fn persistent_mut(&mut self) -> Option<&mut PersistentCollection> {
+        self.persistent.as_mut()
+    }
+
+    pub(crate) fn mark_deleted(&mut self, deleted: bool) {
+        self.deleted = deleted;
+    }
+
+    pub(crate) fn is_deleted(&self) -> bool {
+        self.deleted
+    }
+
+    pub(crate) fn from_recovered(
+        name: &str,
+        recovered: RecoveredCollection,
+        dir: std::path::PathBuf,
+    ) -> Result<Self> {
+        let mut collection = Self::new(name, recovered.schema.clone())?;
+        collection.next_seq = recovered.next_seq;
+        let snapshot = recovered.visibility.snapshot();
+        for segment in &recovered.segments {
+            let mut row = 0;
+            for batch in &segment.batches {
+                let live = (0..batch.seqs.len())
+                    .map(|offset| {
+                        snapshot
+                            .is_live(segment.source, row + offset)
+                            .ok_or_else(|| {
+                                EngineError::Storage(
+                                    "recovered segment visibility is incomplete".to_owned(),
+                                )
+                            })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                collection.append_recovered(batch, 0, live)?;
+                row += batch.seqs.len();
+            }
+        }
+        let active_source = recovered.active_memtable.source;
+        let materialized = recovered
+            .active_memtable
+            .materialize(&recovered.schema, &recovered.visibility)
+            .map_err(|error| EngineError::Storage(error.to_string()))?;
+        if let Some(batch) = materialized.data {
+            let decoded = crate::storage::arrow_data::decode_data_batch(&collection.schema, &batch)
+                .map_err(|error| EngineError::Storage(error.to_string()))?;
+            let mut live = vec![false; decoded.seqs.len()];
+            for (old, mapped) in materialized.mapping.iter().enumerate() {
+                if let Some(new_row) = mapped {
+                    live[*new_row] = snapshot.is_live(active_source, old).ok_or_else(|| {
+                        EngineError::Storage("recovered WAL visibility is incomplete".to_owned())
+                    })?;
+                }
+            }
+            collection.append_recovered(&decoded, recovered.next_wal_number, live)?;
+        }
+        for spec in recovered.manifest.index_specs.values() {
+            collection.indexes.push(crate::index::IndexSpec {
+                field_name: spec.field_name.clone(),
+                index_type: spec.index_type.clone(),
+                metric_type: spec.metric_type.clone(),
+                params: spec.build_params.clone(),
+                search_params: spec.search_params.clone(),
+            });
+        }
+        if !collection.indexes.is_empty() {
+            collection.load_state = LoadState::Released;
+        }
+        collection.persistent = Some(PersistentCollection::recovered(dir, recovered));
+        Ok(collection)
+    }
+
+    fn append_recovered(
+        &mut self,
+        decoded: &DecodedData,
+        generation: u64,
+        live: Vec<bool>,
+    ) -> Result<()> {
+        let n = decoded.seqs.len();
+        let (dim, vectors) = vector_values(&decoded.columns[self.vector_pos]);
+        let chunk_index = self.chunks.len();
+        let mut chunk = Chunk {
+            columns: decoded.columns.clone(),
+            meta: decoded.meta.clone(),
+            live,
+            norms: vectors.chunks_exact(dim).map(flat::norm).collect(),
+            generation,
+            orders: Vec::with_capacity(n),
+        };
+        for row in 0..n {
+            let order = self.next_order;
+            self.next_order = self
+                .next_order
+                .checked_add(1)
+                .ok_or_else(|| EngineError::Storage("row order space exhausted".to_owned()))?;
+            chunk.orders.push(order);
+            if chunk.live[row] {
+                let pk = pk_at(&chunk.columns[self.pk_pos], row);
+                self.pk_index.insert(
+                    pk,
+                    RowRef {
+                        order,
+                        chunk: chunk_index,
+                        row,
+                    },
+                );
+            }
+        }
+        self.chunks.push(chunk);
+        Ok(())
     }
 
     pub fn name(&self) -> &str {
@@ -187,6 +319,29 @@ impl Collection {
 
     /// 保存索引定义，不改变 load 状态（3.x 的 Milvus 语义）。
     pub fn create_index(&mut self, field_name: &str, req: IndexRequest) -> Result<()> {
+        if self.deleted {
+            return Err(EngineError::CollectionNotFound(self.name.clone()));
+        }
+        if self.persistent.is_some() {
+            return Err(EngineError::Storage(
+                "persisted index changes must enter through Db".to_owned(),
+            ));
+        }
+        self.create_index_inner(field_name, req)
+    }
+
+    pub(crate) fn create_index_from_db(
+        &mut self,
+        field_name: &str,
+        req: IndexRequest,
+    ) -> Result<()> {
+        self.create_index_inner(field_name, req)
+    }
+
+    fn create_index_inner(&mut self, field_name: &str, req: IndexRequest) -> Result<()> {
+        if self.deleted {
+            return Err(EngineError::CollectionNotFound(self.name.clone()));
+        }
         if self.index(field_name).is_some() {
             return Err(EngineError::IndexAlreadyExists(field_name.to_owned()));
         }
@@ -197,6 +352,11 @@ impl Collection {
             ))
         })?;
         let spec = build_spec(field, req)?;
+        if let Some(persistent) = self.persistent.as_mut() {
+            persistent
+                .commit_index(&spec)
+                .map_err(EngineError::Storage)?;
+        }
         self.indexes.push(spec);
         Ok(())
     }
@@ -206,6 +366,25 @@ impl Collection {
     /// 校验全部通过才写入；校验顺序与错误信息与 3.x 的 `validate_record` 一致，
     /// 畸形的 JSON 与动态字段按 0004「决策」明确报错。
     pub fn insert(&mut self, batch: InsertBatch) -> Result<Vec<Pk>> {
+        if self.deleted {
+            return Err(EngineError::CollectionNotFound(self.name.clone()));
+        }
+        if self.persistent.is_some() {
+            return Err(EngineError::Storage(
+                "persisted writes must enter through Db".to_owned(),
+            ));
+        }
+        self.insert_inner(batch)
+    }
+
+    pub(crate) fn insert_from_db(&mut self, batch: InsertBatch) -> Result<Vec<Pk>> {
+        self.insert_inner(batch)
+    }
+
+    fn insert_inner(&mut self, batch: InsertBatch) -> Result<Vec<Pk>> {
+        if self.deleted {
+            return Err(EngineError::CollectionNotFound(self.name.clone()));
+        }
         let n = batch.num_rows;
         // 3.x：num_rows 为 0 时不看列内容，直接返回空结果。
         if n == 0 {
@@ -248,7 +427,10 @@ impl Collection {
         let pk_field = &self.schema.fields[self.pk_pos];
         let auto_pk = pk_field.auto_id && !by_name.contains_key(pk_field.name.as_str());
         let first_seq = self.next_seq;
-        let seqs: Vec<u64> = (0..n as u64).map(|i| first_seq + i).collect();
+        let next_seq = first_seq
+            .checked_add(n as u64)
+            .ok_or_else(|| EngineError::invalid("_seq space exhausted"))?;
+        let seqs: Vec<u64> = (first_seq..next_seq).collect();
         let mut columns = Vec::with_capacity(self.schema.fields.len());
         for (i, field) in self.schema.fields.iter().enumerate() {
             let column = if i == self.pk_pos && auto_pk {
@@ -272,21 +454,40 @@ impl Collection {
         // schema 校验保证 dim > 0。
         let (dim, values) = vector_values(&columns[self.vector_pos]);
         let norms = values.chunks_exact(dim).map(flat::norm).collect();
-        // 从这里开始修改状态，之后的步骤都不会失败或 panic：锁没有中毒语义，中途失败会留下半写的 collection。
-        self.next_seq += n as u64;
-
         let meta = self.schema.enable_dynamic_field.then_some(dynamic.maps);
+        self.next_seq = next_seq;
+        if let Some(persistent) = self.persistent.as_mut() {
+            persistent
+                .append(&self.schema, &seqs, &columns, meta.as_deref())
+                .map_err(EngineError::Storage)?;
+        }
+        // WAL 已成功追加；后续内存更新必须保持不可失败。
         let chunk_idx = self.chunks.len();
+        let generation = self.persistent.as_ref().map_or(1, |p| p.generation);
         let mut chunk = Chunk {
             columns,
             meta,
             live: vec![true; n],
             norms,
+            generation,
+            orders: Vec::with_capacity(n),
         };
         let mut ids = Vec::with_capacity(n);
         for row in 0..n {
             let pk = pk_at(&chunk.columns[self.pk_pos], row);
+            let previous = self.pk_index.get(&pk).copied();
+            let order = match previous {
+                Some(old) if old.chunk == chunk_idx => old.order,
+                Some(old) if self.chunks[old.chunk].generation == generation => old.order,
+                _ => {
+                    let order = self.next_order;
+                    self.next_order += 1;
+                    order
+                }
+            };
+            chunk.orders.push(order);
             let new_ref = RowRef {
+                order,
                 chunk: chunk_idx,
                 row,
             };
@@ -446,6 +647,9 @@ impl Collection {
 
     /// 3.x `_require_loaded`：检索与按主键读取之前的 load 状态检查。
     pub fn require_loaded(&self) -> Result<()> {
+        if self.deleted {
+            return Err(EngineError::CollectionNotFound(self.name.clone()));
+        }
         match self.load_state {
             LoadState::Loaded => Ok(()),
             LoadState::Released => Err(EngineError::CollectionNotLoaded(self.name.clone())),
@@ -647,7 +851,7 @@ impl Collection {
 }
 
 struct Dynamic {
-    /// 每行合并后的动态字段；serde_json 的 Map 按 key 排序，与 3.x `json.dumps(sort_keys=True)` 一致。
+    /// 每行合并后的动态字段；落盘时由 pyjson 显式按 key 排序。
     maps: Vec<Map<String, Value>>,
     /// 每行解码动态字段时遇到的第一个错误。
     errors: Vec<Option<String>>,
@@ -721,6 +925,7 @@ fn scan(
                 .map(|row| (row, &values[row * dim..(row + 1) * dim], chunk.norms[row]))
         };
         let at = |row| RowRef {
+            order: chunk.orders[row],
             chunk: seg.chunk,
             row,
         };
@@ -830,55 +1035,8 @@ fn pk_at(column: &ColumnData, row: usize) -> Pk {
     }
 }
 
-/// 动态字段的 JSON。serde_json 会把超出 64 位的整数静默转成浮点数，而 3.x 原样保存；
-/// 这类值只能由手写请求构造（pymilvus 在客户端拒绝），明确报错（0004「决策」）。
 fn parse_dynamic_json(field: &str, text: &[u8]) -> Result<Value> {
-    let value = parse_json(field, text)?;
-    if has_wide_integer(text) {
-        return Err(EngineError::schema(format!(
-            "field {} value contains an integer that does not fit in 64 bits",
-            py_repr(field)
-        )));
-    }
-    Ok(value)
-}
-
-/// 在已通过解析的 JSON 文本中找超出 i64 / u64 的整数字面量（字符串之外、不带小数点与指数）。
-fn has_wide_integer(text: &[u8]) -> bool {
-    let mut i = 0;
-    while i < text.len() {
-        match text[i] {
-            b'"' => {
-                i += 1;
-                while i < text.len() && text[i] != b'"' {
-                    i += if text[i] == b'\\' { 2 } else { 1 };
-                }
-                i += 1;
-            }
-            b'-' | b'0'..=b'9' => {
-                let start = i;
-                i += 1;
-                while i < text.len() && text[i].is_ascii_digit() {
-                    i += 1;
-                }
-                let float = matches!(text.get(i), Some(b'.' | b'e' | b'E'));
-                if !float {
-                    // 解析过的 JSON 中数字只含 ASCII，切片必为合法 UTF-8。
-                    let literal = std::str::from_utf8(&text[start..i]).unwrap_or("");
-                    if literal.parse::<i64>().is_err() && literal.parse::<u64>().is_err() {
-                        return true;
-                    }
-                }
-                while i < text.len()
-                    && matches!(text[i], b'0'..=b'9' | b'.' | b'e' | b'E' | b'+' | b'-')
-                {
-                    i += 1;
-                }
-            }
-            _ => i += 1,
-        }
-    }
-    false
+    parse_json(field, text)
 }
 
 fn parse_json(field: &str, text: &[u8]) -> Result<Value> {
@@ -1151,16 +1309,16 @@ mod tests {
                         if chunk.live[row] {
                             let cand = &values[row * dim..(row + 1) * dim];
                             let pk = pk_at(&chunk.columns[c.pk_pos], row);
-                            scored.push((q.score(cand, flat::norm(cand)), pk));
+                            scored.push((q.score(cand, flat::norm(cand)), chunk.orders[row], pk));
                         }
                     }
                 }
-                scored.sort_by(|a, b| flat::rank(metric, a.0, b.0));
+                scored.sort_by(|a, b| flat::rank(metric, a.0, b.0).then(a.1.cmp(&b.1)));
                 scored
                     .into_iter()
                     .take(req.limit.saturating_add(req.offset))
                     .skip(req.offset)
-                    .map(|(s, pk)| (s.to_bits(), pk))
+                    .map(|(s, _, pk)| (s.to_bits(), pk))
                     .collect()
             })
             .collect()
@@ -1259,6 +1417,7 @@ mod tests {
                     (
                         score,
                         RowRef {
+                            order: i as u64,
                             chunk: i / 50,
                             row: i % 50,
                         },

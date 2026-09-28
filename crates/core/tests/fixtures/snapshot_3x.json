@@ -1,0 +1,23 @@
+{
+  "collection_name": "c",
+  "created_at": "2026-09-28T07:00:51.624268+00:00",
+  "created_seq": 3,
+  "data_files": {
+    "_default": [
+      "data/data_000001_000002.parquet"
+    ]
+  },
+  "delta_files": {
+    "_default": [
+      "delta/delta_000003_000003.parquet"
+    ]
+  },
+  "description": "",
+  "id": "d807645448264fa7888d56d11d7057f0",
+  "index_files": {},
+  "manifest_file": "snapshots/manifests/s1/manifest.json",
+  "manifest_version": 2,
+  "name": "s1",
+  "schema_file": "snapshots/manifests/s1/schema.json",
+  "snapshot_format_version": 1
+}

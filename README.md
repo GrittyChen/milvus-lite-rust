@@ -2,14 +2,14 @@
 
 The unofficial milvus-lite developed with Rust.
 
-以官方 [milvus-lite](https://github.com/milvus-io/milvus-lite) 为行为规范，用 Rust 重写一个更高效的 milvus-lite：`pymilvus` 用户的代码无需修改，官方 3.x 的数据目录也能直接打开。本项目非官方，与 Milvus / Zilliz 无隶属关系。目前处于第一个里程碑（M1）的开发中，尚不可用，也未发布到 PyPI。
+以官方 [milvus-lite](https://github.com/milvus-io/milvus-lite) 为行为规范，用 Rust 重写一个更高效的 milvus-lite：`pymilvus` 用户的代码无需修改，官方 3.x 的数据目录也能直接打开。本项目非官方，与 Milvus / Zilliz 无隶属关系。M1 工程骨架已完成；M2 的首个真实数据库切片已接通建表、insert、Flush、关闭、重开与基础读取，完整 M2 验收仍在进行。目前尚不可用于生产，也未发布到 PyPI。
 
 ## 文档
 
 | 内容 | 位置 |
 | --- | --- |
 | 项目上下文、术语与全局规则（人与 coding agent 共用） | [AGENTS.md](AGENTS.md) |
-| 设计决策 | [docs/decisions/](docs/decisions/)：[0001 重构基线选择](docs/decisions/0001-refactor-baseline.md)、[0002 数据目录格式](docs/decisions/0002-data-dir-compat.md)、[0003 进程内服务的生命周期](docs/decisions/0003-in-process-server-lifecycle.md)、[0004 M1 范围与验收](docs/decisions/0004-m1-scope.md) |
+| 设计决策 | [docs/decisions/](docs/decisions/)：[0001 重构基线选择](docs/decisions/0001-refactor-baseline.md)、[0002 数据目录格式](docs/decisions/0002-data-dir-compat.md)、[0003 进程内服务的生命周期](docs/decisions/0003-in-process-server-lifecycle.md)、[0004 M1 范围与验收](docs/decisions/0004-m1-scope.md)、[0005 检索线程模型](docs/decisions/0005-search-thread-model.md)、[0006 M2 范围与验收](docs/decisions/0006-m2-scope.md)、[0007 M2 存储引擎](docs/decisions/0007-m2-storage-engine.md) |
 | 与官方 2.5.1 / 3.x 对照的基线基准 | [benchmarks/baseline/](benchmarks/baseline/README.md) |
 
 ## 许可

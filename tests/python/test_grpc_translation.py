@@ -760,7 +760,6 @@ def test_pymilvus_entry_points_m1_unsupported(env):
         (lambda: client.search("q", [[1, 0]], filter="id > 1"), f"filter expressions: {feature}"),
         (lambda: client.search("q", [[1, 0]], ranker=decay), f"rerank and function chains: {feature}"),
         (lambda: client.query_iterator("q", batch_size=2).next(), f"query iterators: {feature}"),
-        (lambda: client.flush("q"), f"Flush: {rpc}"),
         (lambda: client.compact("q"), f"ManualCompaction: {rpc}"),
         (lambda: client.drop_index("q", "vector"), f"DropIndex: {rpc}"),
     ]

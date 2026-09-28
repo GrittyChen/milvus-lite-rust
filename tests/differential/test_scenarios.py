@@ -47,6 +47,23 @@ def test_quick_start(diff):
     diff.step("has_after_drop", lambda c: c.has_collection("docs"))
 
 
+def test_flush_and_continue_matches_reference(diff):
+    schema = MilvusClient.create_schema(auto_id=False)
+    schema.add_field("id", DataType.INT64, is_primary=True)
+    schema.add_field("vector", DataType.FLOAT_VECTOR, dim=2)
+    diff.step("create", lambda c: c.create_collection("fl", schema=schema))
+    diff.step("insert_before_flush", lambda c: c.insert("fl", [
+        {"id": 1, "vector": [1.0, 0.0]},
+        {"id": 2, "vector": [0.0, 1.0]},
+    ]))
+    diff.step("flush", lambda c: c.flush("fl"))
+    diff.step("get_after_flush", lambda c: c.get("fl", ids=[2, 1]))
+    diff.step("insert_after_flush", lambda c: c.insert("fl", [{"id": 3, "vector": [0.5, 0.5]}]))
+    diff.step("count_after_flush", lambda c: c.query("fl", output_fields=["count(*)"]))
+    diff.step("search_after_flush", lambda c: c.search("fl", data=[[1.0, 0.0]], limit=3),
+              hits("COSINE", [[1.0, 0.0]], {1: [1.0, 0.0], 2: [0.0, 1.0], 3: [0.5, 0.5]}, k=3))
+
+
 def explicit_schema(dynamic):
     s = MilvusClient.create_schema(auto_id=False, enable_dynamic_field=dynamic)
     s.add_field("pk", DataType.INT64, is_primary=True)

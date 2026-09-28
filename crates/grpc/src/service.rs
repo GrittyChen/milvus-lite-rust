@@ -224,11 +224,13 @@ impl Service for MilvusService {
         let database = database(&request, |r| &r.db_name);
         let req = request.into_inner();
         self.run(Branch::Engine, move |db| {
-            let handle = db.collection(&database, &req.collection_name)?;
             let index_request = index::request(&req.extra_params)?;
-            handle
-                .write()
-                .create_index(&req.field_name, index_request)?;
+            db.create_index(
+                &database,
+                &req.collection_name,
+                &req.field_name,
+                index_request,
+            )?;
             Ok(success())
         })
         .await
@@ -329,29 +331,54 @@ impl Service for MilvusService {
         let database = database(&request, |r| &r.db_name);
         let req = request.into_inner();
         self.run(Branch::Engine, move |db| {
-            let handle = db.collection(&database, &req.collection_name)?;
+            let _handle = db.collection(&database, &req.collection_name)?;
             let batch = insert::decode(req.fields_data, req.num_rows)?;
             if batch.num_rows > 0 && !matches!(req.partition_name.as_str(), "" | "_default") {
                 return Err(schema::unsupported("partitions other than '_default'"));
             }
-            let mut c = handle.write();
-            let varchar = c
-                .schema()
-                .fields
-                .iter()
-                .any(|f| f.is_primary && f.data_type == milvus_lite_core::DataType::VarChar);
-            let pks = c.insert(batch)?;
-            drop(c);
+            let outcome = db.insert_with_pk_type(&database, &req.collection_name, batch)?;
+            let pks = outcome.pks;
             let n = u32::try_from(pks.len()).unwrap_or(u32::MAX);
             Ok(svc::MutationResult {
                 status: Some(success()),
-                i_ds: Some(insert::ids(&pks, varchar)),
+                i_ds: Some(insert::ids(&pks, outcome.varchar)),
                 succ_index: (0..n).collect(),
                 insert_cnt: i64::from(n),
                 ..Default::default()
             })
         })
         .await
+    }
+
+    async fn flush(
+        &self,
+        request: Request<svc::FlushRequest>,
+    ) -> Result<Response<svc::FlushResponse>, Status> {
+        let database = database(&request, |r| &r.db_name);
+        let req = request.into_inner();
+        self.run(Branch::Engine, move |db| {
+            for name in &req.collection_names {
+                match db.flush_collection(&database, name) {
+                    Err(EngineError::CollectionNotFound(_)) => continue,
+                    result => result?,
+                }
+            }
+            Ok(svc::FlushResponse {
+                status: Some(success()),
+                ..Default::default()
+            })
+        })
+        .await
+    }
+
+    async fn get_flush_state(
+        &self,
+        _request: Request<svc::GetFlushStateRequest>,
+    ) -> Result<Response<svc::GetFlushStateResponse>, Status> {
+        Ok(Response::new(svc::GetFlushStateResponse {
+            status: Some(success()),
+            flushed: true,
+        }))
     }
 
     async fn query(

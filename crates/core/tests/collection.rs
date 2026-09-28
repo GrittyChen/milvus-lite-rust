@@ -852,10 +852,10 @@ fn dynamic_floats_round_trip_exactly() {
     ));
     c.insert(b).unwrap();
     let meta = c.get(&[Pk::Int64(1)], &[]).unwrap().rows.meta.unwrap();
-    // 与 3.x 的 json.dumps(sort_keys=True) 相同：key 有序，浮点逐位保留。
+    // 与 3.x 的 json.dumps(sort_keys=True) 相同：落盘时显式排序，浮点逐位保留。
     assert_eq!(
-        serde_json::to_string(&meta[0]).unwrap(),
-        r#"{"a":493.21226683922947,"z":0.9556595384052861}"#
+        milvus_lite_core::pyjson::dumps(&serde_json::Value::Object(meta[0].clone())),
+        r#"{"a": 493.21226683922947, "z": 0.9556595384052861}"#
     );
 }
 
@@ -1097,8 +1097,8 @@ fn json_fields_accept_top_level_scalars_and_strings() {
 }
 
 #[test]
-fn wide_integers_in_dynamic_fields_are_rejected() {
-    // 0004「决策」：serde_json 会把超出 64 位的整数转成浮点数，3.x 原样保存；本实现明确报错。
+fn wide_integers_in_dynamic_fields_round_trip() {
+    // M2 使用 arbitrary_precision，与 3.x 一样保留超出 64 位的整数字面量。
     let mut c = basic(true, false);
     let meta = |text: &str| {
         batch(vec![
@@ -1113,11 +1113,13 @@ fn wide_integers_in_dynamic_fields_are_rejected() {
         r#"{"q": [1, -9223372036854775809]}"#,
         r#"{"q": {"r": 18446744073709551616}}"#,
     ] {
-        assert_eq!(
-            insert_err(&mut c, meta(text)),
-            "field '$meta' value contains an integer that does not fit in 64 bits",
-            "{text}"
-        );
+        c.insert(meta(text)).unwrap();
+        let got = c.get(&[Pk::Int64(1)], &[]).unwrap();
+        let actual = milvus_lite_core::pyjson::dumps(&serde_json::Value::Object(
+            got.rows.meta.unwrap()[0].clone(),
+        ));
+        let expected = milvus_lite_core::pyjson::dumps(&serde_json::from_str(text).unwrap());
+        assert_eq!(actual, expected, "{text}");
     }
     // 64 位以内的整数、浮点数、字符串中的长数字都照常保存。
     c.insert(meta(
@@ -1133,9 +1135,13 @@ fn wide_integers_in_dynamic_fields_are_rejected() {
             InputValues::Json(vec![b"99999999999999999999".to_vec()]),
         ),
     ]);
+    c.insert(wide).unwrap();
+    let got = c.get(&[Pk::Int64(2)], &[]).unwrap();
     assert_eq!(
-        insert_err(&mut c, wide),
-        "field 'extra' value contains an integer that does not fit in 64 bits"
+        milvus_lite_core::pyjson::dumps(&serde_json::Value::Object(
+            got.rows.meta.unwrap()[0].clone(),
+        )),
+        r#"{"extra": 99999999999999999999}"#
     );
 }
 

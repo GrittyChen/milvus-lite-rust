@@ -14,7 +14,7 @@
 
 重构基线已定：**以 3.x 为基础，不以 2.5.1（C++）为基础**。3.x 的性能损失主要来自 Python 实现，架构内只有一处需要修正的设计；2.5.1 反而有冷启动全量重放、索引不落盘等架构级瓶颈；决策、数据与由此得出的实现约束见 [0001-重构基线选择](docs/decisions/0001-refactor-baseline.md)。
 
-当前状态：仓库有 README / LICENSE（Apache-2.0）、设计决策（[docs/decisions/](docs/decisions/)）与基线基准脚本（[benchmarks/baseline/](benchmarks/baseline/)），以及 M1（[0004](docs/decisions/0004-m1-scope.md)）进行中的工程骨架：三个 crate、进程内服务的生命周期、内存引擎、gRPC 翻译与差分测试已落地，基准尚在进行。新增 module、依赖或命令时同步更新本文的[架构地图](#架构地图跨文件心智)、[技术栈](#技术栈)与[常用命令](#常用命令)；这几节中标注「待定」的内容不得当作事实引用。
+当前状态：仓库有 README / LICENSE（Apache-2.0）、设计决策（[docs/decisions/](docs/decisions/)）与基线基准脚本（[benchmarks/baseline/](benchmarks/baseline/)），以及 M1（[0004](docs/decisions/0004-m1-scope.md)）完成的工程骨架：三个 crate、进程内服务的生命周期、内存引擎、gRPC 翻译、差分测试与基准。M2（持久化、与 3.x 数据目录互通、删除与有效位图）按已确认的范围 [0006](docs/decisions/0006-m2-scope.md) 与存储设计 [0007](docs/decisions/0007-m2-storage-engine.md) 实现中。新增 module、依赖或命令时同步更新本文的[架构地图](#架构地图跨文件心智)、[技术栈](#技术栈)与[常用命令](#常用命令)；这几节中标注「待定」的内容不得当作事实引用。
 
 ## 核心业务术语
 
@@ -24,7 +24,7 @@
 | **pymilvus 接入点** | `pymilvus` 遇到以 `.db` 结尾的 URI 时，先检查父目录存在，再执行 `from milvus_lite.server_manager import server_manager_instance` 并调用 `start_and_get_uri(uri)`（3.x 的签名为 `start_and_get_uri(path, args=None)`）；返回 `None` 即报 “Open local milvus failed”，否则按返回的 `http://127.0.0.1:<port>` 走普通 Milvus gRPC（参照实现 [server_manager.py](references/milvus-lite/milvus_lite/server_manager.py)）。以上在 pymilvus 2.6.15 / 2.6.17 / 3.0.2 中逐行一致；pymilvus 升级时重新核对。**模块路径、实例名、方法签名、返回约定都是对外契约**。pymilvus 的 `milvus-lite` extra 依赖 PyPI 上的 `milvus-lite`（`>=2.4.0`，非 Windows），这个名字归官方所有，因此本项目以 `milvus-lite-rust` 发布：用户安装 `pymilvus` 与 `milvus-lite-rust`，不用 `pymilvus[milvus-lite]`。它与官方 `milvus-lite` 争用同一个 `milvus_lite` 模块与 `milvus-lite` 命令，**不得同时安装**：pip 不会阻止，后装者覆盖同名文件，卸载任一方都会弄坏另一方；pymilvus 导入失败时的提示还会把用户引向官方包。因此绑定层导入时须检测已安装的官方发行包 `milvus-lite` 并明确报错，README 的安装说明须先 `pip uninstall milvus-lite`。官方包后装覆盖本包的情形检测不到，只能靠文档说明 |
 | **CLI** | 参照实现提供 `milvus-lite server --data-dir <dir> [--host] [--port] [--max-workers]` 与 `milvus-lite dump`（[cmdline.py](references/milvus-lite/milvus_lite/cmdline.py)）。本实现先提供 `server`，参数与之一致，按对外契约对待（`--max-workers` 原本控制 grpcio 线程池，在本实现中的对应含义待定义）；`dump` 后续再做（见[技术栈](#技术栈)） |
 | **gRPC adapter** | Milvus 协议 → 引擎 API 的翻译层。**只翻译、不加能力**：引擎不支持的 RPC 返回 `UNIMPLEMENTED` + 明确信息，绝不静默成功（参照实现架构不变量 15） |
-| **`_seq`** | 操作全序号。一切覆盖 / 丢弃 / 去重判断只比较 `_seq`，不依赖调用顺序或文件物理顺序 |
+| **`_seq`** | 正常写入的操作全序号；覆盖 / 丢弃 / 去重按 `_seq` 判定。3.x 故障目录中的重复 `_seq` 属例外，按 [0007「数据结构」](docs/decisions/0007-m2-storage-engine.md#数据结构) 记录的来源与平局规则处理 |
 | **WAL / MemTable / segment / delta / manifest** | LSM 式存储：写入先落 WAL 与 MemTable，flush 生成不可变 segment，删除写 delta（tombstone），compaction 合并并回收 tombstone；manifest 是唯一真值、原子更新；`data_dir/LOCK` 保证单进程独占。机制见参照实现 [wal-design.md](references/milvus-lite/docs/wal-design.md) 与 [modules.md](references/milvus-lite/docs/modules.md) |
 | **index（向量 / 标量 / 稀疏）** | 与 segment 1:1 绑定、生命周期严格对齐、不可变；距离归一化在索引内部完成，上层看到的距离与 brute force 一致。见参照实现 [index-design.md](references/milvus-lite/docs/index-design.md) |
 | **filter 表达式** | Milvus 风格标量 / JSON / 动态字段 / 数组 / `text_match` / 几何谓词。语法与语义见参照实现 [filter-design.md](references/milvus-lite/docs/filter-design.md) |
@@ -55,6 +55,8 @@
 | 进程内服务的生命周期：同路径复用 / 进程退出时的停止与持久化 / fork 后的处理 / 与 3.x 在这些点上的差异 | [docs/decisions/0003-in-process-server-lifecycle.md](docs/decisions/0003-in-process-server-lifecycle.md) |
 | 第一个里程碑（M1）做什么、不做什么 / 阶段性对外差异 / 验收标准 | [docs/decisions/0004-m1-scope.md](docs/decisions/0004-m1-scope.md) |
 | 检索的线程模型：RPC 与计算池的分工、计算任务的约束、锁的边界、停服与 fork 下的计算池 | [docs/decisions/0005-search-thread-model.md](docs/decisions/0005-search-thread-model.md) |
+| 第二个里程碑（M2）做什么、不做什么 / 3.x 存储层的实测事实与缺陷 / 与 3.x 的差异 / 持久化保证 / 验收 | [docs/decisions/0006-m2-scope.md](docs/decisions/0006-m2-scope.md) |
+| M2 存储引擎的结构 / 取锁顺序 / 快照与有效位图 / WAL、flush、drop 与关闭的提交和失败协议 | [docs/decisions/0007-m2-storage-engine.md](docs/decisions/0007-m2-storage-engine.md) |
 | 性能基线怎么测 / 口径 / 注意事项 | [benchmarks/baseline/README.md](benchmarks/baseline/README.md) |
 | 代码审查 / 修复复审（冻结合同、完整调用链、同类全域清扫、分级与证据门槛、二三阶影响矩阵） | [code-review-rules](.agents/skills/code-review-rules/SKILL.md)（Claude Code 经 `.claude/skills` 软链读取同一份） |
 
@@ -76,7 +78,7 @@ pymilvus ──server_manager──▶ adapter/grpc ──▶ db（多 collectio
 
 | crate | 对应参照实现 | 职责 |
 | --- | --- | --- |
-| `crates/core` | [db.py](references/milvus-lite/milvus_lite/db.py) 及其下各层 | 引擎：多 collection 生命周期、LOCK、存储、检索、索引、schema。不依赖 protobuf 与 Python。module：`db`（数据库与 collection 生命周期、引擎的关闭闸门）、`collection`（内存数据、写入校验、get / count / 检索、load 状态）、`compute`（服务的计算池，rayon-core 只在这里调用）、`schema`、`data`（列式数据）、`index`（索引定义与度量）、`projection`（output_fields 展开）、`filter`（过滤表达式，M1 只识别 `<主键> in [...]`）、`flat`（暴力检索的距离）、`data_dir`（LOCK 与已有数据检查）、`error`（与 3.x 异常一一对应的错误及 Python repr 格式化）、`pyjson`（按 Python `json.dumps` 的格式输出 JSON） |
+| `crates/core` | [db.py](references/milvus-lite/milvus_lite/db.py) 及其下各层 | 引擎：多 collection 生命周期、LOCK、存储、检索、索引、schema。不依赖 protobuf 与 Python。module：`db`（数据库与 collection 生命周期、写入许可、懒打开、关闭闸门）、`collection`（列式读取视图、写入校验、get / count / 检索、load 状态）、`compute`（服务的计算池，rayon-core 只在这里调用）、`schema`、`data`（列式数据）、`index`（索引定义与度量）、`projection`（output_fields 展开）、`filter`（过滤表达式，当前只识别 `<主键> in [...]`）、`flat`（暴力检索的距离）、`data_dir`（LOCK 与数据库 staging 残留清理）、`storage::wal`（3.x Arrow IPC stream WAL 的读写与已校验前缀恢复）、`storage::manifest` / `schema_file`（3.x JSON 格式的解析与编码）、`storage::parquet_file` / `arrow_data`（3.x Parquet 与列式值的转换）、`storage::memtable` / `visibility`（M2 的位次、tombstone、跨数据源 `_seq` 判定、有效位图与读快照）、`storage::fs_commit` / `flush`（schema、manifest 与冻结代的提交和 WAL 清理）、`storage::snapshot`（读取 3.x snapshot 元数据与钉住集合）、`storage::recovery`（加载已提交 segment、delta 与 WAL 并建位图）、`storage::runtime`（WAL 代、冻结、提交、同步与故障状态）、`error`（与 3.x 异常一一对应的错误及 Python repr 格式化）、`pyjson`（按 Python `json.dumps` 的格式输出 JSON） |
 | `crates/grpc` | [adapter/grpc/](references/milvus-lite/milvus_lite/adapter/grpc/) | proto 代码生成（protox）、协议翻译与错误映射；作为服务宿主，负责服务实例（runtime、计算池、引擎、端口）的启动与停止，计算池交给引擎。module：`service`（各 RPC 的实现）、`schema` / `insert` / `search` / `query` / `index` / `output`（请求解码与响应编码）、`status`（错误映射）、`pyint`（按 Python `int()` / `float()` 解析参数）、`guard`（未实现的 RPC 与超限请求）、`server`（服务宿主）。RPC 的处理体在 tokio 的阻塞线程池中执行，检索在其中经计算池并行（[0005](docs/decisions/0005-search-thread-model.md)） |
 | `crates/py` | [server_manager.py](references/milvus-lite/milvus_lite/server_manager.py) | PyO3 扩展，加上 Python 包 `milvus_lite`：`server_manager.py` 维护路径表，导入时检测官方发行包。CLI 放在哪里待定 |
 
@@ -84,6 +86,7 @@ pymilvus ──server_manager──▶ adapter/grpc ──▶ db（多 collectio
 
 - **已实现 RPC 的唯一清单**在 [crates/grpc/build.rs](crates/grpc/build.rs) 的 `IMPLEMENTED_METHODS`：只为清单中的方法生成 trait 方法（编译器保证都有实现），其余 RPC 与其他 service 由 [guard.rs](crates/grpc/src/guard.rs) 统一返回 `UNIMPLEMENTED`。新增 RPC 只改这份清单。
 - **引擎的每次使用都经过关闭闸门**：[service.rs](crates/grpc/src/service.rs) 中每个使用引擎的 RPC 处理体先调用 `Db::enter`，[Server](crates/grpc/src/server.rs) 停止时 `Db::close` 等所有在途任务结束才释放 LOCK（0003「进程退出」）。绕过它直接使用引擎，停止时 LOCK 可能先于引擎任务释放。
+- **持久化写入只经 Db 入口**：insert、Flush、CreateIndex 与 create/drop 从 [db.rs](crates/core/src/db.rs) 取得写入许可；持久化 collection 的直接 `Collection::insert` / `create_index` 会拒绝调用。完整的锁序与尚待实现的按名字并行打开、读快照见 [0007](docs/decisions/0007-m2-storage-engine.md#取锁顺序)。
 - **检索的计算任务不拿锁、不阻塞**：[compute.rs](crates/core/src/compute.rs) 的 `Compute::for_each` 只能从计算池之外的线程（RPC 所在的阻塞线程）调用，叶子任务只写自己独占的数据；rayon-core 其余提交任务的接口由 [clippy.toml](clippy.toml) 禁止。违反时会死锁或优先级反转（[0005](docs/decisions/0005-search-thread-model.md)）。
 - **fork 安全由两层共同保证**：[server_manager.py](crates/py/python/milvus_lite/server_manager.py) 按进程号跳过继承来的服务；Rust 的 [Server](crates/grpc/src/server.rs) 在非创建者进程中拒绝 `stop`、析构时直接泄漏。
 
@@ -100,7 +103,7 @@ pymilvus ──server_manager──▶ adapter/grpc ──▶ db（多 collectio
 - **依赖边界：不引入 C++、CMake 或系统库依赖**（不绑定 FAISS 等），允许经 `cc` crate 编译、不需要额外安装任何东西的纯 C 代码，优先选纯 Rust。官方 3.x 删除了整套 C++ 构建（见 [0001](docs/decisions/0001-refactor-baseline.md)），本项目同样避免这类构建与分发负担：wheel 与 sdist 必须能在各目标平台只靠 cargo 构建。引入依赖时用 `cargo tree --workspace -e all` 核对完整依赖图（`-e build` 只列出根 crate 的直接构建依赖，看不到依赖自身的构建脚本）。
 - **gRPC / protobuf**：用 tonic + prost。prost-build 默认依赖系统 `protoc`（C++ 程序），因此改用纯 Rust 的 protox 解析 proto，再经 `compile_fds` 交给 prost / tonic 生成代码。proto 源取与 pymilvus 3.0.2 对应的 milvus-proto commit（3.0 的 `MilvusService` 是 2.6 的超集，2.6 的消息与字段在 3.0 中都保留），随仓库固定（离线构建与 sdist 都需要），引入时记录 commit 并核对其许可、注明来源；生成物不入库。参照实现运行期直接用 `pymilvus.grpc_gen`，CI 也不钉 pymilvus 版本，Rust 侧没有这条捷径。背景：3.0 在 2.6 的 117 个 RPC 之上只增不改地新增 27 个（snapshot、namespace、`AlterCollectionSchema` 等），另新增独立的 `ClientTelemetryService`（4 个 RPC）；3.0 客户端的 `add_collection_field` 会先调 `AlterCollectionSchema`，失败再回退旧 RPC。
 - **支持的 pymilvus 版本**：2.6.x 与 3.0.x 两条线都支持，兼容测试各跑一个最新版。
-- **Python 打包**：PyO3 + maturin，产出 abi3 wheel，Python 下限与 3.x 一致（`abi3-py310`）。abi3 wheel 不能在 free-threaded 版 CPython 上加载，这一点作为已知限制。服务端在 Python 进程内的后台线程上运行多线程 tokio runtime，CPU 密集的检索交给专用线程池，调用时释放 GIL，形态与 3.x 相同（进程内服务、返回 `http://127.0.0.1:<port>`）。同路径复用、atexit 时的停止顺序与持久化语义、fork 后子进程中 runtime 的处理见 [0003](docs/decisions/0003-in-process-server-lifecycle.md)；WAL 的 fsync 时机在 WAL 设计中确定。PyPI 元数据与 README 都要声明非官方、与 Milvus / Zilliz 无隶属关系。发行包名为 `milvus-lite-rust`，包内提供 `milvus_lite` 模块（见 [pymilvus 接入点](#核心业务术语)）。目标平台与 3.x 一致：Linux / macOS / Windows（3.x 的 CI 覆盖 Linux 上的 Python 3.10–3.13、macOS 上的 3.12、Windows 上的 3.10）。
+- **Python 打包**：PyO3 + maturin，产出 abi3 wheel，Python 下限与 3.x 一致（`abi3-py310`）。abi3 wheel 不能在 free-threaded 版 CPython 上加载，这一点作为已知限制。服务端在 Python 进程内的后台线程上运行多线程 tokio runtime，CPU 密集的检索交给专用线程池，调用时释放 GIL，形态与 3.x 相同（进程内服务、返回 `http://127.0.0.1:<port>`）。同路径复用、atexit 时的停止顺序与持久化语义、fork 后子进程中 runtime 的处理见 [0003](docs/decisions/0003-in-process-server-lifecycle.md)；WAL 与 flush 的 fsync 时机及持久化保证见 [0006](docs/decisions/0006-m2-scope.md) 第 19 项。PyPI 元数据与 README 都要声明非官方、与 Milvus / Zilliz 无隶属关系。发行包名为 `milvus-lite-rust`，包内提供 `milvus_lite` 模块（见 [pymilvus 接入点](#核心业务术语)）。目标平台与 3.x 一致：Linux / macOS / Windows（3.x 的 CI 覆盖 Linux 上的 Python 3.10–3.13、macOS 上的 3.12、Windows 上的 3.10）。
 - **持久化格式**：数据文件与 3.x **双向互通**，索引文件各自独立。范围、约束与验证方式见 [0002](docs/decisions/0002-data-dir-compat.md)。
 - **向量索引**：第一阶段只做 SIMD 优化的暴力检索（FLAT），同时作为召回与距离口径的正确性基准；HNSW 等 ANN 索引后期补齐，优先纯 Rust（依赖边界见上），届时再定具体方案。第一阶段对各类索引定义的处理见 [0002 «结论»](docs/decisions/0002-data-dir-compat.md#结论)。
 - **分词与 BM25**：在全文检索阶段定具体实现，但因为数据目录互通，必须与 3.x 逐位一致（范围与约束见 [0002](docs/decisions/0002-data-dir-compat.md#共享状态的语义约束) 约束 8）。
@@ -110,9 +113,10 @@ pymilvus ──server_manager──▶ adapter/grpc ──▶ db（多 collectio
   - tokio 1：tonic 的运行时，每个服务实例独占一个 runtime（[0003](docs/decisions/0003-in-process-server-lifecycle.md)）。
   - pyo3 0.29（`abi3-py310`）：Python 绑定。
   - thiserror 2：错误类型。tempfile 3：仅用于测试。
-  - serde_json 1：JSON 字段与动态字段的校验与存储，以及 gRPC 层解析 search_params、索引参数等 JSON 文本；它的 Map 按 key 排序，与 3.x 存 `$meta` 时的 `sort_keys=True` 一致。
-  - parking_lot 0.12：collection 表与每个 collection 的读写锁。它的锁没有中毒语义，不需要为 std 锁中毒另写兜底。
+  - serde_json 1：JSON 字段与动态字段的校验与存储，以及 gRPC 层解析 search_params、索引参数等 JSON 文本；开启 `float_roundtrip`、`preserve_order` 与 `arbitrary_precision`，JSON 字段保留键序与宽整数，`$meta` 由 [pyjson.rs](crates/core/src/pyjson.rs) 显式按嵌套 key 排序后输出。
+  - parking_lot 0.12：collection 表、每个 collection 的读写锁，以及 M2 已接通的数据库写入闸门、目录互斥、flush 锁与关闭等待。它的锁没有中毒语义；按名字的锁与 aliases 独立锁仍属 [0007](docs/decisions/0007-m2-storage-engine.md#取锁顺序) 的后续实现。
   - rayon-core 1.13：服务的计算池（[0005](docs/decisions/0005-search-thread-model.md)）。只用线程池部分，不引入 rayon 的并行迭代器；依赖只有 crossbeam-deque / epoch / utils，都是纯 Rust，构建脚本只做 cfg 探测（`cargo tree --workspace -e all` 核对）。可以使用的接口由 [clippy.toml](clippy.toml) 的 `disallowed-methods` 限定。
+  - arrow-array / arrow-schema / arrow-ipc 与 parquet 60.0（Parquet 只开 `arrow`、`snap`）、serde 1：M2 与 3.x 的 Arrow IPC WAL、Parquet 和 JSON 持久化格式。macOS 上经 chrono 的 `clock` feature 链接系统自带的 CoreFoundation 框架，无需额外安装。版本及依赖图评估见 [0006 第 24 项](docs/decisions/0006-m2-scope.md#五工程)；实际引入后用完整 `cargo tree --workspace -e all` 核对。
   - LOCK 用 std 的 `File::try_lock`：它在 Unix 上用 flock、在 Windows 上用覆盖第 0 字节的 LockFileEx，满足 [0002](docs/decisions/0002-data-dir-compat.md) 约束 10，因此不引入 fs2 一类依赖，`rust-version` 相应定为 1.89。
   - 构建工具 maturin 1.15，用 uv 装在开发 venv 中，不是项目依赖。
 
@@ -127,8 +131,10 @@ pymilvus ──server_manager──▶ adapter/grpc ──▶ db（多 collectio
 | 格式化 | `cargo fmt --all` |
 | lint | `cargo clippy --workspace --all-targets -- -D warnings` |
 | Rust 单测 | `cargo test --workspace` |
+| M2 持久化点故障注入单测（feature 默认关闭） | `cargo test -p milvus-lite-core --features fault-injection` |
 | 端到端测试（真实 pymilvus；含 [tests/python/adapter/](tests/python/adapter/) 中复制自参照实现的用例，逐条状态见其 INVENTORY.md） | `.venv/bin/python -m pytest tests/python` |
 | 与 3.x 的差分测试（3.x 的 venv 可用 `benchmarks/baseline/setup.sh <work_dir>` 建出的 `<work_dir>/v3`；不设环境变量时报错，不跳过；上一行的命令不包含它） | `MILVUS_LITE_3X_PYTHON=<3.x 的 venv>/bin/python .venv/bin/python -m pytest tests/differential` |
+| M2 存储文件双向互通矩阵（环境准备见 [tests/storage_interop/README.md](tests/storage_interop/README.md)） | `MILVUS_LITE_3X_PYTHON=<v3>/bin/python MILVUS_LITE_ARROW15_PYTHON=<arrow15>/bin/python MILVUS_LITE_ARROW25_PYTHON=<v3>/bin/python .venv/bin/python -m pytest tests/storage_interop` |
 | 构建 wheel / sdist | `.venv/bin/maturin build --release -m crates/py/Cargo.toml` / `.venv/bin/maturin sdist -m crates/py/Cargo.toml` |
 | 核对依赖图中没有 C++ 构建与 protoc | `cargo tree --workspace -e all` |
 
@@ -182,7 +188,7 @@ cd <work_dir> && MILVUS_LITE_3X_PYTHON=<3.x 的 venv>/bin/python v26/bin/python 
 2. **参照实现是行为真值**：对外可观察行为（RPC 语义、结果与排序、距离数值、错误码与信息、过滤语义）与参照实现不一致即为 bug，除非该差异已在本仓文档中**显式登记**（差异内容、理由、影响的用例）。不得为了“更合理”悄悄改变对外行为。
 3. **继承参照实现的架构不变量**（[modules.md «Architecture Invariants»](references/milvus-lite/docs/modules.md)），按性质分两类，另有一条由 0001 引入的 Rust 侧约束：
    - **正确性不变量，必须保持**：1–5（`_seq` 全序、MemTable 互清 seq-aware、tombstone GC 规则、文件不可变、manifest 唯一真值且原子更新）、8（单进程独占 data_dir）、9（schema 不可变）、11–15（索引与 segment 1:1 且不可变、未 load 禁止检索、距离归一化在索引内、adapter 只翻译）。持久化保证不得弱于 10（WAL 关闭前 fsync）。
-   - **Python 时代的实现选择，可重新设计**：6（同步 flush）、7（单 collection 单写者、无内部锁）是 Rust 版提升性能的主要空间，但改动前须先写设计说明（锁 / 快照边界、与正确性不变量的关系、测试矩阵）并与用户确认，不在实现里顺手突破；16（proto 生成物入库）已与参照实现代码不符，proto 方案见[技术栈](#技术栈)。
+   - **Python 时代的实现选择，可重新设计**：6（同步 flush）、7（单 collection 单写者、无内部锁；3.x 代码已有 collection 级的锁，文档滞后）是 Rust 版提升性能的主要空间，但改动前须先写设计说明（锁 / 快照边界、与正确性不变量的关系、测试矩阵）并与用户确认，不在实现里顺手突破；16（proto 生成物入库）已与参照实现代码不符，proto 方案见[技术栈](#技术栈)。
    - **Rust 侧的性能约束**：查询路径不得做 O(总行数) 的逐行有效性判定、计算保持列式、检索可并行，细节与理由见 [0001 «对 Rust 实现的约束»](docs/decisions/0001-refactor-baseline.md#对-rust-实现的约束)；涉及并发的方案仍按上一条先写设计说明。
 4. **测试是 ship 门槛**：改条件分支 / 状态流转 / 协议或持久化格式 / 修过的 bug 必须补或更新测试；提交前按“改了什么就跑什么”跑齐对应套件并全绿；不用 `#[ignore]`、skip 或放宽断言掩盖失败，也要确认套件没有因缺依赖被静默跳过。涉及对外行为的改动必须有差分测试或复用参照实现测试作证。测试不得依赖真实付费外部服务（OpenAI embedding、Cohere rerank 等）。
 5. **根源修复，禁止伪修复**：不吞错误（不 `let _ =` 丢弃 `Result`、不用 `unwrap_or_default` 兜底真实缺失）、不改宽断言迁就坏代码、不用 retry / fallback 掩盖错误原因。持久化路径尤其警惕：I/O 与校验失败必须向上传递，不得“尽力而为”地继续写。

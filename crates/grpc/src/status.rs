@@ -61,6 +61,7 @@ pub(crate) fn from_engine(
         EngineError::InvalidArgument(_)
         | EngineError::Closed
         | EngineError::DataDir(_)
+        | EngineError::Storage(_)
         | EngineError::Unsupported { .. } => (1, 0),
     };
     Ok(status(code, error_code, e.to_string()))
@@ -95,6 +96,8 @@ reply_with_status_field!(
     crate::pb::service::GetLoadingProgressResponse,
     crate::pb::service::GetLoadStateResponse,
     crate::pb::service::MutationResult,
+    crate::pb::service::FlushResponse,
+    crate::pb::service::GetFlushStateResponse,
     crate::pb::service::QueryResults,
     crate::pb::service::SearchResults,
 );
