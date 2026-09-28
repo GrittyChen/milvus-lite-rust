@@ -22,7 +22,7 @@
   - 下列分类都以**字段类型**为前提。3.x 只对标量字段校验索引类型，只放行 INVERTED（[collection.py:1463](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/milvus_lite/engine/collection.py#L1463)）；对稠密与稀疏向量字段则不校验，同一个类型名放在错误的向量字段上也会被持久化，只是 build 失败（见约束 1）。
   - **稠密向量字段上的 FLAT / BRUTE_FORCE**：原生支持。
   - **稠密向量字段上的 AUTOINDEX**：新建与存量都按 FLAT 精确执行，并登记为已知差异。AUTOINDEX 的含义本来就是「由实现选择」，pymilvus 的快速建表 `create_collection(name, dimension=...)` 固定使用它；3.x 在没有 faiss 时自己也退回暴力检索，装了 faiss 时（3.2.1 的必装依赖）建成 HNSW。
-  - **稠密向量字段上的显式 ANN 类型**（HNSW、HNSW_SQ、IVF_FLAT、IVF_SQ8）与**标量字段上的 INVERTED**：新建时明确报错。打开 3.x 写的、带这类定义的目录时，**原样保留**定义，让 3.x 回来后还能照常使用。向量检索按 FLAT 精确执行，召回只高不低，但更慢；标量过滤按扫描执行，结果相同，但更慢。
+  - **稠密向量字段上的显式 ANN 类型**（HNSW、HNSW_SQ、IVF_FLAT、IVF_SQ8）与**标量字段上的 INVERTED**：新建时明确报错。打开 3.x 写的、带这类定义的目录时，**原样保留**定义，让 3.x 回来后还能照常使用。向量检索按 FLAT 精确执行，召回只高不低，但更慢；标量过滤按扫描执行，更慢，结果也不一定相同：3.x 自身在已建索引的 segment 与 memtable 上结果就不一致，索引又是 load 之后在后台构建的，本实现按扫描求值并登记差异（[0006](0006-m2-scope.md) 第 14 项）。
   - **稀疏向量字段**：第一阶段在稀疏字段上新建任何索引都明确报错。存量的 SPARSE_INVERTED_INDEX 定义原样保留，稀疏向量检索在全文检索阶段之前明确报错。
   - 以上执行方式与 3.x 不同的地方，都登记为已知的对外差异（[AGENTS.md](../../AGENTS.md) 规则 2）。
   - **3.x 自身也无法 load 的索引定义**：包括 3.x 会原样持久化的 DISKANN、IVF_PQ，以及放错字段类型的定义，例如稀疏字段上的 AUTOINDEX / FLAT / HNSW（见约束 1）。处理与 3.x 一致：目录照常打开，只有该 collection 在 build 索引时报错，即 load 时报错；如果 collection 已处于 load 状态，`create_index` 持久化定义后会立刻 build 并报错。
@@ -35,7 +35,7 @@
 
 | 对象 | 是否互通 | 说明 |
 | --- | --- | --- |
-| 目录布局 | 是 | 数据目录根：默认数据库的 `collections/`、`aliases.json`、`database_properties.json`，以及只有一份的 `.database-staging/`（3.x 每次启动时清空）；其他数据库各自在 `databases/<db>/` 下有 `collections/`、`aliases.json`、`database_properties.json`（见 [db.py](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/milvus_lite/db.py#L7)）。collection 级：`schema.json`、`manifest.json`（首次 flush 之前可能不存在）、`manifest.json.prev`、`wal/wal_{data,delta}_NNNNNN.arrow`、`partitions/<p>/{data,delta,indexes}/`、`snapshots/metadata/<name>.json`、`snapshots/manifests/<name>/`，以及原子写入时的 `*.json.tmp` |
+| 目录布局 | 是 | 数据目录根：默认数据库的 `collections/`、`aliases.json`、`database_properties.json`，以及只有一份的 `.database-staging/`（3.x 每次打开时清空；本实现的 drop 与 create 也借它完成原子的改名，见 [0006](0006-m2-scope.md) 第 17 项）；其他数据库各自在 `databases/<db>/` 下有 `collections/`、`aliases.json`、`database_properties.json`（见 [db.py](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/milvus_lite/db.py#L7)）。collection 级：`schema.json`、`manifest.json`（首次 flush 之前可能不存在）、`manifest.json.prev`、`wal/wal_{data,delta}_NNNNNN.arrow`、`partitions/<p>/{data,delta,indexes}/`、`snapshots/metadata/<name>.json`、`snapshots/manifests/<name>/`，以及原子写入时的 `*.json.tmp` |
 | `LOCK` | 是 | 同一个文件，互斥语义一致，见约束 10 |
 | WAL | 是 | Arrow IPC stream。data 列为 `_seq`、`_partition`、用户字段、可选 `$meta`；delta 列为主键、`_seq`、`_partition`（见 [arrow_builder.py](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/milvus_lite/schema/arrow_builder.py)）。batch 语义见约束 3 |
 | Parquet data / delta | 是 | data 列为 `_seq(uint64)` + 用户字段 + 可选 `$meta(string)`；delta 列为主键 + `_seq`。文件名语义见约束 2，写入参数见约束 9 |
@@ -71,8 +71,8 @@
    - 违反以上任一条，对方重开后都会从较小的值重新分配 auto_id，重复的主键按 upsert 覆盖旧行。3.x 自己就有两处不满足逐行上界，均已实测：一是在校验之前就消耗 auto_id（[collection.py:361](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/milvus_lite/engine/collection.py#L361)），一次校验失败的 insert 之后，重开再写，原有的一行被覆盖（应为 7 行，实际 6 行）；二是 partition key 路径先按输入顺序分配 auto_id，再按桶分别分配 `_seq` 并逐桶落盘（[collection.py:421](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/milvus_lite/engine/collection.py#L421)），在两个桶之间崩溃后，重开再写会覆盖已落盘的行（应为 6 行，实际 5 行）。
 5. **索引文件与 Rust 独有文件的命名和放置。**
    - 3.x 在同名 `.idx` 存在时直接加载（[segment.py:265](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/milvus_lite/storage/segment.py#L265)）。实测：内容不合法时 load 抛异常（FLAT 为 NPY 的 `ValueError`，HNSW 为 FAISS 的 `RuntimeError`），collection 保持 released，不会回退重建，也不会删除坏文件。所以 Rust 文件不能使用 3.x 的命名。3.x 的命名为 `<data_stem>.<field>.<index_type 小写>.idx|.sidx`（[files.py:23](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/milvus_lite/index/files.py#L23)）。
-   - 3.x 会删除 `data/`、`delta/`、`.database-staging/` 下的任何陌生文件。在 `indexes/` 下，它只删除文件名能按上述格式解析的文件，并且还要满足以下之一：stem 已不在 manifest 与 snapshot 中（recovery）；stem 已不在当前 manifest 中，或 field / type 与当前索引定义不符，并且没有被 snapshot 钉住（flush，[collection.py:1985](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/milvus_lite/engine/collection.py#L1985)）；后缀与被 drop 的索引匹配（drop_index）。
-   - 为保守起见，Rust 的索引文件放在 `indexes/`，扩展名不以 `.idx` / `.sidx` 结尾。3.x 在打开、load、检索、flush、compaction、recovery、snapshot、`drop_index` 等路径下都会跳过这类文件（[collection.py:1945](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/milvus_lite/engine/collection.py#L1945)），只在 drop partition / drop collection / truncate 时随目录清理一并删除。3.x 是逐个删除未被 snapshot 钉住的文件，再删除空目录，不是整目录 rmtree；对 Rust 文件而言效果相同。
+   - 3.x 会删除 `data/`、`delta/`、`.database-staging/` 下的任何陌生文件。在 `indexes/` 下，它只删除文件名能按上述格式解析的文件，并且还要满足以下之一：stem 已不在 manifest 与 snapshot 中（recovery）；stem 已不在当前 manifest 中，或 field / type 与当前索引定义不符，并且没有被 snapshot 钉住（flush 之后，以及 collection 打开时调度的后台任务，[collection.py:1985](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/milvus_lite/engine/collection.py#L1985)）；后缀与被 drop 的索引匹配（drop_index）。
+   - 为保守起见，Rust 的索引文件放在 `indexes/`，扩展名不以 `.idx` / `.sidx` 结尾。3.x 在打开、load、检索、flush、compaction、recovery、snapshot、`drop_index` 等路径下都会跳过这类文件（[collection.py:1945](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/milvus_lite/engine/collection.py#L1945)），只在 drop partition / drop collection / truncate 时随目录清理一并删除。drop_collection 与 truncate 是整目录删除（[db.py:268](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/milvus_lite/db.py#L268)、[:519](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/milvus_lite/db.py#L519)），snapshot 随之删除；只有 drop_partition 逐个删除未被 snapshot 钉住的文件，再删除空目录。对 Rust 文件而言效果相同。
    - Rust 必须自己清理「源 segment 已不在 manifest 中」的 Rust 索引文件，包括 3.x compaction 删掉 segment 后遗留的那些。
 6. **snapshot 钉住的文件任何一方都不得删除。**
    - snapshot 元数据的 `data_files`、`delta_files`、`index_files` 都会钉住文件（[snapshots.py:117](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/milvus_lite/storage/snapshots.py#L117)）。restore 时逐个复制这些文件，缺失就直接失败。实测：删掉一个被钉住的 `.idx` 后，`restore_snapshot` 报 `FileNotFoundError`。
@@ -94,10 +94,11 @@
     - 3.x 在 Unix 上用 `fcntl.flock(LOCK_EX | LOCK_NB)`，在 Windows 上用 `msvcrt.locking(fd, LK_NBLCK, 1)`，后者是锁住第 0 字节的强制字节范围锁。
     - Rust 在 Unix 上必须用 flock，不能用 `fcntl` / `lockf` 锁：两者在 Linux 上互不感知。在 Windows 上，锁定区间必须覆盖第 0 字节。
     - 永远不删除、不重建 `LOCK` 文件，否则两个进程会锁在不同的 inode 上，互斥失效。
-    - 3.x 在加锁之前就会创建 `collections/` 与 `databases/`，即使开库失败，这两个目录也可能出现；加锁之后还会创建 `.database-staging/`，关闭时只清空、不删除（[db.py:102](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/milvus_lite/db.py#L102)），因此被 3.x 成功打开过的目录都有它。
+    - 3.x 在加锁之前就会创建 `collections/` 与 `databases/`，即使开库失败，这两个目录也可能出现；加锁之后还会创建 `.database-staging/`，并在此时清空其中的全部条目，关闭时不清空、也不删除（[db.py:102](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/milvus_lite/db.py#L102)），因此被 3.x 成功打开过的目录都有它。
 11. **版本与内容都要 fail-closed。**
     - 3.x 不校验 `manifest_format_version`、`schema_format_version`、`snapshot_format_version` 这三个版本号，重写 manifest 与 schema 时还会把版本号改回 2；snapshot 元数据只在创建时写入一次，从不重写。v3.0.0 到 v3.2.1 之间新增了 GEOMETRY、TIMESTAMPTZ、schema properties、snapshot、标量索引 `.sidx`、多数据库布局等内容，版本号却没有变。
-    - 所以 Rust 除了只接受已知的版本号，遇到未知的 dtype、function 类型、metric 也要明确报错，不能宽松读取。未知的 index_type 是例外：3.x 自己就会写出这类目录（约束 1），因此与 3.x 保持同样的粒度，目录照常打开，只在该 collection build 索引时报错。
+    - 所以 Rust 除了只接受已知的版本号，遇到未知的 dtype、function 类型、metric 也要明确报错，不能宽松读取。manifest、schema 与 snapshot 元数据中出现未知的键，同样明确报错：版本号不变，未知的键是新格式唯一的信号，而本实现重写 manifest 时会丢掉它们。
+    - 这里的 fail-closed 按 collection 生效：只有出问题的 collection 不能使用，目录中其余 collection 照常（[0006](0006-m2-scope.md) 第 14 项）。未知的 index_type 是例外：3.x 自己就会写出这类目录（约束 1），因此与 3.x 保持同样的粒度，目录照常打开，只在该 collection build 索引时报错。
     - 读取老目录时，缺失的键按 3.x 的默认值处理；3.0.x 到 3.1.0 在 Windows 上写出的 `\` 路径（manifest 与 snapshot 元数据中都可能出现；修复首见于 v3.1.1）要规范化为 `/`。
     - `aliases.json` 与 `database_properties.json` 没有版本字段。
 12. **3.x 升级格式时**，先评估新格式，再决定跟进或拒绝；跟进时按 [AGENTS.md](../../AGENTS.md) 规则 8 记录兼容性影响。对照版本升级时，同步更新本文的「对照版本」，并重跑[验证](#验证)中的全部跨实现测试。
@@ -134,7 +135,7 @@
 - **删除判定的分区语义**：tombstone 与其对应的数据行分处不同分区（包括约束 3 所述的误路由目录，以及 `_all` 删除），Rust 与 3.x 读出的结果一致（约束 13）。
 - **第一阶段的索引定义**：pymilvus 快速建表（AUTOINDEX）可用；新建 HNSW / INVERTED 以及稀疏字段上的任何索引都明确报错；打开 3.x 写的 HNSW / AUTOINDEX / INVERTED / SPARSE_INVERTED_INDEX 目录时，定义原样保留，检索与过滤结果正确（稀疏检索明确报错），3.x 再次打开时仍能使用原索引；Rust 写出的任何索引定义，3.x 都能 load。
 - **互斥**：一方持有 `LOCK` 时，另一方打开失败并明确报错。Linux（flock 与 fcntl 互不感知）与 Windows（字节范围锁）需要在对应平台上实测。
-- **fail-closed**：伪造未知的格式版本号，以及未知的 dtype、metric 时，Rust 拒绝打开，不改动任何文件；未知的 index_type 与 3.x 一致，只在该 collection build 索引时报错。
+- **fail-closed**：伪造未知的格式版本号、未知的键，以及未知的 dtype、metric 时，Rust 拒绝打开该 collection、其余 collection 照常，不改动任何文件；未知的 index_type 与 3.x 一致，只在该 collection build 索引时报错。
 - **库版本组合**：arrow-rs 写、pyarrow（3.x 支持的版本范围内）读，以及反过来，覆盖 IPC 与 Parquet；包括 TIMESTAMPTZ 时区串的写法。
 - **分词**：包含 Unicode 组合字符、全角字符、各类标点的语料，Rust 与 3.x 产出的 term ID 序列一致。
 
@@ -148,6 +149,14 @@
 - 某个 snapshot 钉住旧 `.idx` 之后，如果先 drop_index，再以同类型、不同 metric 重建，3.x 自身也会加载到陈旧索引。
 - nullable 向量用全零表示 null，与真正的零向量无法区分。
 - 校验失败的 insert 会消耗 auto_id；partition key 加 auto_id 的一次 insert 会拆成多个 batch 逐个落盘，中途崩溃也一样。两种情况下，重开后自动主键都可能重复并覆盖旧行（约束 4 的上界正是为此）。
+- 以下各条由 [0006](0006-m2-scope.md)「3.x 的缺陷」与第 8、10、12 项实测或推出：
+  - flush 提交之后、删除 WAL 之前崩溃，3.x 重开时会回放已提交的 WAL，数据重复。本实现写出的目录若在这一点中断，3.x 打开时同样会重复；本实现在提交点之后的失败一直重试不成功时，盘上留着已提交的 WAL，3.x 打开时也会重复。
+  - 本实现关闭时若仍删不掉已提交 WAL，3.x 随后打开同样可能重复计数。若同一编号的 data 已删除而只剩 delta，3.x 的 get 与部分 upsert 还可能读错；3.x 自身在两次 unlink 之间崩溃也会留下此形状（见 [0007「提交之后」](0007-m2-storage-engine.md#flush)）。
+  - 已提交的 WAL 残留时，3.x 的 compaction 与 GC 可能抹掉删除的证据，之后任一方打开，已删除的行都会复活。
+  - 3.x 并发写入同一个 collection 时，WAL 懒创建的竞态会写坏 WAL，崩溃后丢失已确认的写入。
+  - WAL 追加失败后，3.x 继续往同一个文件追加，恢复时可能把残缺的 batch 当作合法数据回放。
+  - WAL 中间损坏时，两边都取已校验的前缀，其后已确认的写入静默丢失。
+  - 异常目录中若同一主键的数据行与删除共用 `_seq`，3.x 的 [get](../../references/milvus-lite/milvus_lite/engine/collection.py) 与 [query/search 位图](../../references/milvus-lite/milvus_lite/search/bitmap.py) 可能给出不同可见性：前者会被 memtable 的本地 tombstone 直接判删，后者只在删除 `_seq` 严格大于数据行时屏蔽。本实现按 [0007「数据结构」](0007-m2-storage-engine.md#数据结构) 的同号来源与先后规则维护统一可见性，因而在这类目录上可能与 3.x 的 `get` 不同；正常唯一 `_seq` 的目录不受影响。
 
 ## 放弃的方案
 

@@ -124,7 +124,7 @@ M1 的对外行为与 3.x 有阶段性差异，本文按 [AGENTS.md](../../AGENT
    - 同一个文件里混有范围外的用例，而规则 4 不允许用 skip 占位。
    - **复用方式**：M1 把范围内的用例复制到本仓，fixture 换成本实现的起服务方式，并注明来源与 Apache-2.0 许可（[AGENTS.md](../../AGENTS.md) 规则 9）。复制出来的用例与上游脱钩，对照版本升级时要手工同步。某个文件涉及的功能全部进入范围后，改为替换 fixture、原样运行整个文件，不再复制。
    - **复用范围**：整个 [tests/adapter/](https://github.com/milvus-io/milvus-lite/tree/v3.2.1/tests/adapter)，47 个文件共 637 条用例。其中 72 条在 M1 范围内，分布在 19 个文件里；`test_milvus_lite_compat.py` 另有 4 条只用 `server_manager` 的公开接口，它是 pymilvus 接入点的契约、本仓同样提供，也复用。下面的 7 个候选文件是最初按文件名挑出的，只含 72 条中的 34 条。
-   - **改后复制**：只允许两种替换，改后的副本须先在 3.x 上通过：
+   - **改后复制**：只允许两种替换，改后的副本须先在 3.x 上通过（M2 起的扩展见 [0006](0006-m2-scope.md) 第 25 项：compatibility 也可逐条复制、重启类用例可替换起停服务的 helper、HNSW 换成 FLAT 还要求用例中不 flush 不重开）：
      - 显式的 HNSW 等 ANN 索引换成 FLAT，前提是用例写入少于 1 万行、不断言索引类型与参数。3.x 满 1 万行（`>=`，按 memtable 中的主键数加 tombstone 数计）才 flush，在此之前总在 memtable 上暴力检索，索引类型不影响结果：实测 9999 行时 FLAT、HNSW、AUTOINDEX 的主键与距离逐位相同，1 万行时才不同。
      - `<pk> == N` 换成 `<pk> in [N]`，前提是只有一个主键、没有 `offset`、字面量类型与主键相符。这三个条件下 3.x 两条路径的结果逐行相同；否则不同，例如 `offset=1` 时 `id == 3` 返回空而 `id in [3]` 返回该行，INT64 主键上 `id == '3'` 报 code 6 而 `id in ['3']` 返回空。
    - **用例清单**：[tests/python/adapter/INVENTORY.md](../../tests/python/adapter/INVENTORY.md)，随 M1 代码入库。7 个候选文件以及含范围内用例的文件逐条列出，其余文件整个记一行原因。状态为「已复制」「改后复制」「范围外」「依赖内部模块」，后两类注明原因；「依赖内部模块」要写出具体行号。
@@ -137,7 +137,7 @@ M1 的对外行为与 3.x 有阶段性差异，本文按 [AGENTS.md](../../AGENT
      - `test_grpc_error_mapping.py`：顶层导入内部模块（L14–25），`test_hybrid_search_unimplemented` 还在函数体内导入（L104），只能复制其中经 pymilvus 的用例。
    - **`tests/compatibility`**：9 个文件共约 240 条用例，以范围外的功能为主，包括过滤、分区与 partition key、多数据库、function、delete / upsert。每个文件还各自用 `start_server_in_thread` 定义起服务的 fixture。M1 不复用，理由写进用例清单；复用的时机与方式同 adapter，也就是文件涉及的功能进入范围后，替换 fixture 整文件运行。
    - **防止静默跳过**：确认 pymilvus 已安装，套件没有被 `importorskip` 整目录跳过。
-3. **生命周期**：[0003「验证」](0003-in-process-server-lifecycle.md#验证)中与持久化无关的用例全部通过，但 M1 只在本机平台上跑，Linux 与 Windows 另见「跨平台」。这收窄了 0003 的平台矩阵，要在 M2 发布前补齐。
+3. **生命周期**：[0003「验证」](0003-in-process-server-lifecycle.md#验证)中与持久化无关的用例全部通过，但 M1 只在本机平台上跑，Linux 与 Windows 另见「跨平台」。这收窄了 0003 的平台矩阵，要在首次发布前补齐（M2 不发布，见 [0006](0006-m2-scope.md) 第 4 项）。
 4. **基准**：现有的 `bench.py` 和 `concurrency.py` 包含过滤检索、delete、upsert、reopen，还要经 CLI 起服务，这些都在 M1 范围之外。因此：
    - **补 M1 口径**：给 [benchmarks/baseline/](../../benchmarks/baseline/README.md) 增加一个 M1 口径，只测写入、无过滤 FLAT 检索、空 `expr` 的 `count(*)`、按主键 `get`，以及同一进程内多线程并发检索。
    - **同口径对照**：在同一台机器上，用同一口径重跑 2.5.1、3.x 和 Rust 三组。空 `expr` 的 `count(*)` 在 3.x 中走行数快路径，与 0001 中带过滤的计数不可比。
@@ -183,16 +183,16 @@ M1 的对外行为与 3.x 有阶段性差异，本文按 [AGENTS.md](../../AGENT
   | FieldData 的 `valid_data` 含 False | 标量列与主键报 code 6；按完整长度发送的向量列忽略 valid_data；`$meta` 列丢弃该行的动态字段 | `UNIMPLEMENTED`（空值不支持） |
   | 类型为 VARCHAR 的动态列，或内容是包着 JSON 对象的字符串的 `$meta` | 解开后合并 | code 6，同上文「畸形的 JSON 与动态字段明确报错」 |
   | JSON 值是非法 UTF-8，或含 NaN、Infinity、超出 float64 的数、孤立的代理转义 | 非法 UTF-8 报 code 1；其余接受并存下 | code 6 |
-  | 动态字段中超出 64 位的整数 | 原样保存 | code 6：serde_json 会把它静默转成浮点数（pymilvus 在客户端拒绝这种值） |
+  | 动态字段中超出 64 位的整数 | 原样保存 | M1 报 code 6；M2 开启 `arbitrary_precision` 后原样保存，差异已注销（pymilvus 在客户端拒绝这种值） |
   | search_params 的 `params`、索引的 `params` / `search_params`、字段的 `analyzer_params` 是 Python 能解析而 serde_json 不能解析的对象或数组（含 NaN、Infinity 等），或以 `{`、`[` 开头但 Python 也解析不了 | 能解析时使用其内容；解析不了时当作原字符串或空对象 | `UNIMPLEMENTED`：无法得知其中是否有 range search 等参数，不能静默忽略 |
   | search_params 的其他标量参数取 NaN、Infinity 等写法 | 按 Python 的值处理 | 按原字符串处理，报错或结果可能不同 |
   | 文本查询向量是非法 UTF-8 | code 1，Python 的解码错误 | 按文本查询报 code 6 |
   | 不在 schema 中的列，类型为 ARRAY、GEOMETRY、TIMESTAMPTZ 或稀疏向量 | 解码后存入 `$meta` | `UNIMPLEMENTED` |
   | 列的槽位与目标字段类型不同：json_data 的列写入非 JSON 字段，或其他槽位的列写入 JSON 字段 | json_data 的列写入非 JSON 字段时按解码出的 Python 值校验，类型相符即成功，例如 `7` 写入 INT64、`"x"` 写入 VARCHAR、`[1.0, 0.0]` 写入向量，`null` 写入主键报 `primary key 'id' missing or None`。写入 JSON 字段时，VARCHAR 槽位的文本成功，其他槽位报 code 1（例如 `Expected bytes, got a 'int' object`） | 按槽位的值类型校验，报 code 6 的类型不符 |
-- **collection 名区分大小写。** 3.x 在 macOS 默认的文件系统上把 `Case` 与 `case` 视为同一个 collection，这是文件系统不区分大小写的副作用，Linux 上没有。M1 的数据在内存中，按原样区分大小写。M2 落盘后在 macOS 上会自然出现同样的冲突。
+- **collection 名区分大小写。** 3.x 在 macOS 默认的文件系统上把 `Case` 与 `case` 视为同一个 collection，这是文件系统不区分大小写的副作用，Linux 上没有。M1 的数据在内存中，按原样区分大小写。M2 落盘后在 macOS 上会自然出现同样的冲突，处理见 [0006](0006-m2-scope.md) 第 18 项。
 
 ## 跨平台
 
-M1 只在本机（macOS）验收。Linux 与 Windows 的 CI 与 wheel 构建单独立项，最迟在 M2 发布前完成。
+M1 只在本机（macOS）验收。Linux 与 Windows 的 CI 与 wheel 构建单独立项，最迟在首次发布前完成（M2 不发布，见 [0006](0006-m2-scope.md) 第 4 项；M2 期间在本机 Linux 容器中先跑一部分，见第 7 项）。
 
 跨平台 CI 还要验证：本实现在 x86 与 aarch64 上对同一输入算出的距离逐位相同（求和顺序只由源码决定，见 [flat.rs](../../crates/core/src/flat.rs)），与 3.x 之间仍按「决策」中的误差比较。
