@@ -717,8 +717,23 @@ def test_messages_over_256mb_are_resource_exhausted(env):
 # ── M1 范围外的功能 ──────────────────────────────────────────
 
 
-def test_pymilvus_entry_points_m1_unsupported(env):
-    """0004「不支持」的每类功能各取 pymilvus 的一个入口：pymilvus 不吞掉 UNIMPLEMENTED，用户得到明确报错。"""
+def test_upsert_field_ops_is_explicitly_unsupported(env):
+    client, _, channel = env
+    client.create_collection("q", dimension=2)
+    request = milvus_pb2.UpsertRequest(collection_name="q", num_rows=1)
+    # 2.6 的生成类没有 field_ops；按 3.0 proto 的第 11 字段拼线格式，两条客户端线均可发出。
+    op = b"\x0a\x06vector\x10\x00"
+    raw = request.SerializeToString() + bytes([0x5a, len(op)]) + op
+    call = channel.unary_unary(
+        "/milvus.proto.milvus.MilvusService/Upsert",
+        request_serializer=lambda value: value,
+        response_deserializer=milvus_pb2.MutationResult.FromString,
+    )
+    assert "field_ops" in unimplemented(call, raw)
+
+
+def test_pymilvus_entry_points_remaining_unsupported(env):
+    """当前范围外的功能各取 pymilvus 的一个入口：客户端不得吞掉 UNIMPLEMENTED。"""
     from pymilvus import AnnSearchRequest, Function, FunctionType, RRFRanker
 
     client, _, _ = env
@@ -737,8 +752,6 @@ def test_pymilvus_entry_points_m1_unsupported(env):
     decay = Function(name="r", function_type=FunctionType.RERANK, input_field_names=["id"],
                      params={"reranker": "decay", "function": "gauss", "origin": 0, "scale": 1})
     cases = [
-        (lambda: client.upsert("q", [{"id": 1, "vector": [1, 0]}]), f"Upsert: {rpc}"),
-        (lambda: client.delete("q", ids=[1]), f"Delete: {rpc}"),
         (lambda: client.create_partition("q", "p"), f"CreatePartition: {rpc}"),
         (lambda: client.list_partitions("q"), f"ShowPartitions: {rpc}"),
         (with_field("k", DataType.INT64, is_partition_key=True), f"partition key: {feature}"),

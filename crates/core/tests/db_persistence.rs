@@ -40,6 +40,175 @@ fn batch(ids: &[i64]) -> InsertBatch {
 }
 
 #[test]
+fn empty_delete_does_not_create_wal_or_consume_sequence() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("empty-delete.db");
+    let db = Db::new(DataDir::open(&path).unwrap(), compute());
+    let mut auto_schema = schema();
+    auto_schema.fields[0].auto_id = true;
+    db.create_collection("", "c", auto_schema).unwrap();
+    assert_eq!(db.delete("", "c", &[]).unwrap(), 0);
+    assert!(!path.join("collections/c/wal").exists());
+    assert!(db.delete_expr("", "c", "id in ['bad']", "").is_err());
+    assert_eq!(
+        db.insert(
+            "",
+            "c",
+            InsertBatch {
+                num_rows: 1,
+                columns: vec![(
+                    "v".to_owned(),
+                    InputValues::FloatVector {
+                        dim: 2,
+                        values: vec![1.0, 0.0],
+                    }
+                )],
+            },
+        )
+        .unwrap(),
+        [Pk::Int64(2)]
+    );
+    db.close();
+}
+
+#[test]
+fn delete_and_partial_upsert_survive_flush_and_reopen() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("mutations.db");
+    let db = Db::new(DataDir::open(&path).unwrap(), compute());
+    db.create_collection("", "c", schema()).unwrap();
+    db.insert("", "c", batch(&[1, 2])).unwrap();
+    db.flush_collection("", "c").unwrap();
+    assert_eq!(
+        db.delete("", "c", &[Pk::Int64(1), Pk::Int64(99), Pk::Int64(1)])
+            .unwrap(),
+        3
+    );
+    assert_eq!(db.collection("", "c").unwrap().read().count(), 1);
+    assert!(
+        db.upsert_with_pk_type(
+            "",
+            "c",
+            InsertBatch {
+                num_rows: 1,
+                columns: vec![("id".to_owned(), InputValues::Int(vec![1]))],
+            },
+        )
+        .is_err()
+    );
+    assert_eq!(db.collection("", "c").unwrap().read().count(), 1);
+    let partial = InsertBatch {
+        num_rows: 1,
+        columns: vec![("id".to_owned(), InputValues::Int(vec![2]))],
+    };
+    assert_eq!(
+        db.upsert_with_pk_type("", "c", partial).unwrap().pks,
+        [Pk::Int64(2)]
+    );
+    assert_eq!(db.collection("", "c").unwrap().read().count(), 1);
+    db.flush_collection("", "c").unwrap();
+    db.close();
+    drop(db);
+
+    let reopened = Db::new(DataDir::open(&path).unwrap(), compute());
+    let handle = reopened.collection("", "c").unwrap();
+    let c = handle.read();
+    assert_eq!(c.count(), 1);
+    let got = c
+        .get(&[Pk::Int64(1), Pk::Int64(2)], &["v".to_owned()])
+        .unwrap();
+    assert_eq!(got.rows.pks, [Pk::Int64(2)]);
+    assert_eq!(
+        got.rows.fields[0].1,
+        milvus_lite_core::ColumnData::FloatVector {
+            dim: 2,
+            values: vec![1.0, 0.0],
+        }
+    );
+    drop(c);
+    reopened.close();
+}
+
+#[test]
+fn upsert_repeated_pk_merges_with_earlier_row_in_same_batch() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("merge.db");
+    let db = Db::new(DataDir::open(&path).unwrap(), compute());
+    db.create_collection("", "c", schema()).unwrap();
+    let merged = InsertBatch {
+        num_rows: 2,
+        columns: vec![
+            ("id".to_owned(), InputValues::Int(vec![7, 7])),
+            (
+                "v".to_owned(),
+                InputValues::FloatVector {
+                    dim: 2,
+                    values: vec![0.0, 1.0, 1.0, 0.0],
+                },
+            ),
+        ],
+    };
+    assert_eq!(
+        db.upsert_with_pk_type("", "c", merged).unwrap().pks,
+        [Pk::Int64(7), Pk::Int64(7)]
+    );
+    assert_eq!(db.collection("", "c").unwrap().read().count(), 1);
+    db.close();
+    drop(db);
+    let reopened = Db::new(DataDir::open(&path).unwrap(), compute());
+    assert_eq!(reopened.collection("", "c").unwrap().read().count(), 1);
+    reopened.close();
+}
+
+#[test]
+fn concurrent_partial_upserts_preserve_both_fields() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("concurrent-upsert.db");
+    let db = std::sync::Arc::new(Db::new(DataDir::open(&path).unwrap(), compute()));
+    let mut dynamic_schema = schema();
+    dynamic_schema.enable_dynamic_field = true;
+    db.create_collection("", "c", dynamic_schema).unwrap();
+    db.insert("", "c", batch(&[1])).unwrap();
+    let workers: Vec<_> = ["x", "y"]
+        .into_iter()
+        .map(|name| {
+            let db = std::sync::Arc::clone(&db);
+            std::thread::spawn(move || {
+                db.upsert_with_pk_type(
+                    "",
+                    "c",
+                    InsertBatch {
+                        num_rows: 1,
+                        columns: vec![
+                            ("id".to_owned(), InputValues::Int(vec![1])),
+                            (name.to_owned(), InputValues::Int(vec![1])),
+                        ],
+                    },
+                )
+                .unwrap();
+            })
+        })
+        .collect();
+    for worker in workers {
+        worker.join().unwrap();
+    }
+    let handle = db.collection("", "c").unwrap();
+    let c = handle.read();
+    let result = c
+        .get(&[Pk::Int64(1)], &["x".to_owned(), "y".to_owned()])
+        .unwrap();
+    assert_eq!(
+        result.rows.meta.unwrap()[0],
+        serde_json::json!({"x": 1, "y": 1})
+            .as_object()
+            .unwrap()
+            .clone()
+    );
+    drop(c);
+    db.close();
+}
+
+#[test]
 fn create_insert_flush_close_and_reopen() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("demo.db");
@@ -82,6 +251,23 @@ fn close_nowait_keeps_unflushed_wal_for_recovery() {
     drop(db);
     let reopened = Db::new(DataDir::open(&path).unwrap(), compute());
     assert_eq!(reopened.collection("", "c").unwrap().read().count(), 2);
+    reopened.close();
+}
+
+#[test]
+fn close_nowait_keeps_unflushed_delta_wal_for_recovery() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("delta-wal.db");
+    let db = std::sync::Arc::new(Db::new(DataDir::open(&path).unwrap(), compute()));
+    db.create_collection("", "c", schema()).unwrap();
+    db.insert("", "c", batch(&[1, 2])).unwrap();
+    db.flush_collection("", "c").unwrap();
+    db.delete("", "c", &[Pk::Int64(1)]).unwrap();
+    db.close_nowait();
+    db.close();
+    drop(db);
+    let reopened = Db::new(DataDir::open(&path).unwrap(), compute());
+    assert_eq!(reopened.collection("", "c").unwrap().read().count(), 1);
     reopened.close();
 }
 
@@ -357,6 +543,38 @@ fn partial_wal_append_does_not_resurrect_the_failed_batch() {
 
 #[cfg(feature = "fault-injection")]
 #[test]
+fn partial_delta_wal_append_keeps_the_deleted_row_live() {
+    use milvus_lite_core::storage::wal::inject_append_failure_after_bytes;
+
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("partial-delta.db");
+    let db = Db::new(DataDir::open(&path).unwrap(), compute());
+    db.create_collection("", "c", schema()).unwrap();
+    db.insert("", "c", batch(&[1, 2])).unwrap();
+    inject_append_failure_after_bytes(20);
+    assert!(db.delete("", "c", &[Pk::Int64(1)]).is_err());
+    assert_eq!(db.collection("", "c").unwrap().read().count(), 2);
+    db.delete("", "c", &[Pk::Int64(2)]).unwrap();
+    db.close();
+    drop(db);
+    let reopened = Db::new(DataDir::open(&path).unwrap(), compute());
+    assert_eq!(reopened.collection("", "c").unwrap().read().count(), 1);
+    assert_eq!(
+        reopened
+            .collection("", "c")
+            .unwrap()
+            .read()
+            .get(&[Pk::Int64(1), Pk::Int64(2)], &[])
+            .unwrap()
+            .rows
+            .pks,
+        [Pk::Int64(1)]
+    );
+    reopened.close();
+}
+
+#[cfg(feature = "fault-injection")]
+#[test]
 fn wal_cleanup_failures_do_not_block_later_inserts() {
     use milvus_lite_core::storage::flush::inject_wal_unlink_failure_once;
 
@@ -386,11 +604,12 @@ fn close_worker_spawn_failure_still_syncs_accepted_wal() {
     let db = std::sync::Arc::new(Db::new(DataDir::open(&path).unwrap(), compute()));
     db.create_collection("", "c", schema()).unwrap();
     db.insert("", "c", batch(&[1])).unwrap();
+    db.delete("", "c", &[Pk::Int64(1)]).unwrap();
     inject_close_worker_spawn_failure_once();
     db.close_nowait();
     drop(db);
     let reopened = Db::new(DataDir::open(&path).unwrap(), compute());
-    assert_eq!(reopened.collection("", "c").unwrap().read().count(), 1);
+    assert_eq!(reopened.collection("", "c").unwrap().read().count(), 0);
     reopened.close();
 }
 

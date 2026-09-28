@@ -44,6 +44,28 @@ def test_drop_and_recreate_do_not_resurrect_old_rows(tmp_path):
     server_manager_instance.release_server(str(path))
 
 
+def test_delete_upsert_flush_and_reopen(tmp_path):
+    path = tmp_path / "mutations.db"
+    client = MilvusClient(str(path))
+    client.create_collection("c", dimension=2)
+    client.insert("c", [{"id": 1, "vector": [1.0, 0.0]}, {"id": 2, "vector": [0.0, 1.0]}])
+    client.flush("c")
+    assert client.delete("c", ids=[1, 99, 1]) == [1, 99, 1]
+    assert client.query("c", output_fields=["count(*)"]) == [{"count(*)": 1}]
+    assert client.search("c", data=[[1.0, 0.0]], limit=1)[0][0]["id"] == 2
+    assert client.upsert("c", [{"id": 2, "vector": [1.0, 1.0]}])["upsert_count"] == 1
+    client.insert("c", [{"id": 1, "vector": [2.0, 0.0]}])
+    client.close()
+    server_manager_instance.release_server(str(path))
+
+    reopened = MilvusClient(str(path))
+    assert reopened.query("c", output_fields=["count(*)"]) == [{"count(*)": 2}]
+    reopened.load_collection("c")
+    assert [row["id"] for row in reopened.get("c", ids=[1, 2])] == [1, 2]
+    reopened.close()
+    server_manager_instance.release_server(str(path))
+
+
 def test_show_collections_reports_broken_manifest_as_unavailable(tmp_path):
     path = tmp_path / "broken.db"
     client = MilvusClient(str(path))

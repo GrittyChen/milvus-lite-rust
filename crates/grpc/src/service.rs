@@ -350,6 +350,58 @@ impl Service for MilvusService {
         .await
     }
 
+    async fn delete(
+        &self,
+        request: Request<svc::DeleteRequest>,
+    ) -> Result<Response<svc::MutationResult>, Status> {
+        let database = database(&request, |r| &r.db_name);
+        let req = request.into_inner();
+        self.run(Branch::Engine, move |db| {
+            let (pks, varchar) = db.delete_expr(
+                &database,
+                &req.collection_name,
+                &req.expr,
+                &req.partition_name,
+            )?;
+            Ok(svc::MutationResult {
+                status: Some(success()),
+                i_ds: Some(insert::ids(&pks, varchar)),
+                delete_cnt: i64::try_from(pks.len()).unwrap_or(i64::MAX),
+                ..Default::default()
+            })
+        })
+        .await
+    }
+
+    async fn upsert(
+        &self,
+        request: Request<svc::UpsertRequest>,
+    ) -> Result<Response<svc::MutationResult>, Status> {
+        let database = database(&request, |r| &r.db_name);
+        let req = request.into_inner();
+        self.run(Branch::Engine, move |db| {
+            let _handle = db.collection(&database, &req.collection_name)?;
+            if !req.field_ops.is_empty() {
+                return Err(schema::unsupported("field_ops"));
+            }
+            let batch = insert::decode(req.fields_data, req.num_rows)?;
+            if batch.num_rows > 0 && !matches!(req.partition_name.as_str(), "" | "_default") {
+                return Err(schema::unsupported("partitions other than '_default'"));
+            }
+            let outcome = db.upsert_with_pk_type(&database, &req.collection_name, batch)?;
+            let pks = outcome.pks;
+            let n = u32::try_from(pks.len()).unwrap_or(u32::MAX);
+            Ok(svc::MutationResult {
+                status: Some(success()),
+                i_ds: Some(insert::ids(&pks, outcome.varchar)),
+                succ_index: (0..n).collect(),
+                upsert_cnt: i64::from(n),
+                ..Default::default()
+            })
+        })
+        .await
+    }
+
     async fn flush(
         &self,
         request: Request<svc::FlushRequest>,

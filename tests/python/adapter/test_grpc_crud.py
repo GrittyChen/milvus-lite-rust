@@ -1,6 +1,6 @@
 # 复制自 milvus-lite v3.2.1（43d1257）的 tests/adapter/test_grpc_crud.py，Apache-2.0 许可。
-# 只保留 M1 范围内的用例（逐条状态见 INVENTORY.md），并删去随之不再使用的 import、helper 与分节标题。
-# 改动：`<pk> == N` 换成 `<pk> in [N]`（M1 只识别 `<主键> in [...]`）。
+# 只保留当前范围内的用例（逐条状态见 INVENTORY.md），并删去随之不再使用的 import、helper 与分节标题。
+# 改动：`<pk> == N` 换成 `<pk> in [N]`；删除后的读回用 get 代替 S1 范围的过滤查询。
 """Phase 10.3 — pymilvus CRUD end-to-end tests.
 
 The 4 RPCs added in Phase 10.3 (Insert / Upsert / Delete / Query)
@@ -13,7 +13,7 @@ drive the following pymilvus client API surface:
     client.query(name, filter="...", output_fields=[...])
     client.get(name, ids=[...], output_fields=[...])
 
-Skipped automatically when pymilvus / grpcio is not installed.
+本仓测试环境要求 pymilvus 与 grpcio，不允许因缺依赖跳过。
 """
 
 import pytest
@@ -84,6 +84,26 @@ def test_insert_round_trip_preserves_field_values(populated_client):
     assert r["active"] is True
 
 
+def test_upsert_returns_upsert_count(milvus_client):
+    milvus_client.create_collection("demo", schema=_make_schema())
+    rows = [_row(i) for i in range(3)]
+    res = milvus_client.upsert("demo", rows)
+    assert res["upsert_count"] == 3
+
+
+def test_upsert_overwrites_existing(populated_client):
+    populated_client.upsert("demo", [{
+        "id": 1,
+        "vec": [9.0, 9.0, 9.0, 9.0],
+        "title": "OVERWRITTEN",
+        "score": 9.99,
+        "active": False,
+    }])
+    rows = populated_client.query("demo", filter="id in [1]", output_fields=["title", "score"])
+    assert rows[0]["title"] == "OVERWRITTEN"
+    assert abs(rows[0]["score"] - 9.99) < 1e-3
+
+
 # ---------------------------------------------------------------------------
 # Query — id-based path → routed to col.get
 # ---------------------------------------------------------------------------
@@ -127,3 +147,15 @@ def test_get_by_ids_with_output_fields(populated_client):
 def test_get_missing_ids_returns_empty(populated_client):
     rows = populated_client.get("demo", ids=[999])
     assert rows == []
+
+
+def test_delete_by_ids(populated_client):
+    populated_client.delete("demo", ids=[0, 2])
+    remaining = populated_client.get("demo", ids=[0, 1, 2, 3, 4])
+    assert sorted(row["id"] for row in remaining) == [1, 3, 4]
+
+
+def test_delete_idempotent(populated_client):
+    populated_client.delete("demo", ids=[999])
+    rows = populated_client.get("demo", ids=[0, 1, 2, 3, 4])
+    assert len(rows) == 5

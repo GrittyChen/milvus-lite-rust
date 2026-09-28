@@ -25,6 +25,8 @@ const IMPLEMENTED_METHODS: &[&str] = &[
     "GetLoadingProgress",
     "GetLoadState",
     "Insert",
+    "Delete",
+    "Upsert",
     "Flush",
     "GetFlushState",
     "Query",

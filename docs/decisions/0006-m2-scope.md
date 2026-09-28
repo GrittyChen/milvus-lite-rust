@@ -444,6 +444,7 @@ M1 证明了整条链路可行，但数据只在内存中，不发布（[0004](0
     - `tests/compatibility` 也允许逐条复制，现在没有任何一个文件能整文件进入范围；
     - 重启类用例允许替换起停服务的 helper，替换后须先在 3.x 上通过；
     - 「改后复制」中把 HNSW 换成 FLAT 的前提加上「用例中不 flush、不重开」：close 时会 flush，之后 3.x 会为 segment 建 HNSW。
+    - 删除用例若只断言已知的有限主键集合中哪些行仍存活，可把上游的 `<pk> >= N` 过滤读回改为 `get(ids=[...])`，但列出的 ids 必须覆盖该过滤原本可能返回的全部主键；不以过滤结果的行序、分页或过滤语义本身为断言对象。替换后须先在 3.x 上通过。此规则只适用于这种读回断言，不授权任意更换查询方式；过滤表达式仍在 S1 单独验收。
 
 26. **JSON 的落盘文本。** M1 的 JSON 字段存客户端发来的原始字节，`$meta` 经 `pyjson` 按 `json.dumps` 输出；3.x 两者都经 `json.dumps`。**建议**（负责人提出）：
     - 两者都按 3.x 的 `json.dumps` 形式写出（[0002「字段编码要点」](0002-data-dir-compat.md#字段编码要点)）：
@@ -562,6 +563,7 @@ M1 证明了整条链路可行，但数据只在内存中，不发布（[0004](0
 | INVERTED 定义的字段上的过滤 | 结果取决于数据在 segment 还是 memtable，以及后台索引是否建好 | 按扫描求值 | 3.x 自身不一致 | 3.x 写的、带 INVERTED 定义的目录 |
 | 整数列对浮点字面量、数据超出 2^53 | 已删除或已被覆盖的旧版本也会触发 code 1 | 只看存活行 | 3.x 的结果随 compaction 时机变化 | 主键或标量超出 2^53 的 collection |
 | `field_ops` 非空的 upsert | 静默按替换处理 | UNIMPLEMENTED | 不变量 15 | 使用 `field_ops` 的 upsert |
+| 同一批内重复主键的部分 upsert | 每行都与调用前的旧行合并，后一行会丢掉前一行新增但自己未提供的字段 | 每行与该主键在本批中的上一版本合并，后一行保留前一行新增的字段 | [0007「写入」](0007-m2-storage-engine.md#写入) 的批内顺序合同；避免同一次原子写入丢字段 | 同批重复主键且各行提供不同字段；`tests/differential/test_scenarios.py` 固定两边结果 |
 | 已提交删除覆盖旧行时的部分 upsert（待 Upsert 接入后验收） | 3.x 在缺陷 a 留下的重复目录上可能仍读旧行并合并字段 | 只合并仍有效的最新行，不读已提交删除覆盖的旧版本 | 缺陷 a；[0007「写入」](0007-m2-storage-engine.md#写入) | 3.x 崩溃后带重复 WAL 的目录 |
 | 检索中距离并列且落在截断位置时，取哪几行 | 由 numpy `argpartition` 决定，每个源取的个数不少于 4 时近似任意 | 取全局顺序中位置最先的 | 第 23 项；复刻要放弃流式 TopK 与并行。M1 起即如此 | 距离大量相同的检索 |
 
@@ -572,6 +574,7 @@ M1 证明了整条链路可行，但数据只在内存中，不发布（[0004](0
 | 含不支持内容的 collection | 能使用 | 列出；DescribeCollection 与 drop 照常，其余返回 UNIMPLEMENTED | 第 14 项 | 用 3.x 的其他功能写过的目录 |
 | 已有的别名与其他数据库 | 能使用 | UNIMPLEMENTED | 第 15 项 | 经别名或 `db_name` 的访问 |
 | 带 limit 的过滤结果顺序 | 后台 compaction 之后改变 | 不做 compaction，不变 | 第 3 项 | 带 limit 且文件数不少于 4 的过滤 |
+| `delete(ids=["bad"])` 对 INT64 主键生成的无引号表达式 | 解析时报 code 6，指出 `bad` 不是字面量 | 当前仅识别主键 `in` 快路径，返回 UNIMPLEMENTED；S1 过滤解析接入时对齐原文 | 第 1 项的 S1 解析尚未接入 | 非数字字符串传给 INT64 的 `delete(ids=...)` |
 | ManualCompaction 与 GetCompactionState | 返回成功，恒为 Completed | UNIMPLEMENTED | 第 3 项，不变量 15 | `client.compact()`、`optimize()` |
 | 被覆盖的旧版本与已删除的行 | compaction 回收 | 不回收 | 第 3 项 | 长期运行的写入 |
 

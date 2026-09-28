@@ -20,4 +20,4 @@ MILVUS_LITE_ARROW25_PYTHON=<work_dir>/v3/bin/python \
 .venv/bin/python -m pytest tests/storage_interop
 ```
 
-缺少环境变量或解释器版本不符时套件直接失败，不跳过。覆盖：3.x 已 flush 目录与未提交 WAL → Rust；Rust 已 flush 目录与 WAL → 3.x；3.x 读取后继续写入 → Rust；pyarrow 15 与 25 各自读取 Rust 文件、重写同格式文件后由 Rust 读取。真实数据库路径还覆盖 3.x→Rust→3.x 交替写入、3.x 崩溃 WAL 的恢复、Rust 索引定义由 3.x 重开、同号 data/delta 的应用顺序、截断 WAL 的告警，以及 JSON／`$meta` 浮点平局值在 Parquet 中的逐字节一致性。文件矩阵与真实路径只覆盖当前切片，不能证明删除、upsert、过滤或 Linux／Windows 的持久化语义。
+缺少环境变量或解释器版本不符时套件直接失败，不跳过。覆盖：3.x 已 flush 目录与未提交 WAL → Rust；Rust 已 flush 目录与 WAL → 3.x；3.x 读取后继续写入 → Rust；pyarrow 15 与 25 各自读取 Rust 文件、重写同格式文件后由 Rust 读取。真实数据库路径还覆盖 3.x→Rust→3.x 交替写入、Rust 删除与部分 upsert 后由 3.x 重开、3.x 崩溃 WAL 的恢复、Rust 索引定义由 3.x 重开、同号 data/delta 的应用顺序、截断 WAL 的告警，以及 JSON／`$meta` 浮点平局值在 Parquet 中的逐字节一致性。文件矩阵与真实路径只覆盖当前切片，不能证明完整崩溃矩阵、过滤或 Linux／Windows 的持久化语义。

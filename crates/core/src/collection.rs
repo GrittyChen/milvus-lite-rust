@@ -381,6 +381,191 @@ impl Collection {
         self.insert_inner(batch)
     }
 
+    pub(crate) fn upsert_from_db(&mut self, batch: InsertBatch) -> Result<Vec<Pk>> {
+        if self.deleted {
+            return Err(EngineError::CollectionNotFound(self.name.clone()));
+        }
+        let n = batch.num_rows;
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+        for (name, values) in &batch.columns {
+            check_column_len(name, values, n)?;
+        }
+        let dynamic = self.decode_dynamic(&batch);
+        let mut supplied: HashMap<&str, &InputValues> = HashMap::new();
+        for (name, values) in &batch.columns {
+            if name != META_FIELD && self.schema.field(name).is_some() {
+                supplied.insert(name, values);
+            }
+        }
+        let pk_field = &self.schema.fields[self.pk_pos];
+        let mut pending: HashMap<Pk, (Vec<InputValues>, Map<String, Value>)> = HashMap::new();
+        let mut fields: Vec<ColumnData> =
+            self.schema.fields.iter().map(ColumnData::empty).collect();
+        let mut metas = Vec::with_capacity(n);
+        for row in 0..n {
+            let candidate = supplied
+                .get(pk_field.name.as_str())
+                .and_then(|values| input_pk(values, row));
+            let previous = candidate.as_ref().and_then(|pk| pending.get(pk));
+            let current = candidate.as_ref().and_then(|pk| self.pk_index.get(pk));
+            let mut values = if let Some((old, _)) = previous {
+                old.clone()
+            } else if let Some(old) = current {
+                self.chunks[old.chunk]
+                    .columns
+                    .iter()
+                    .map(|column| input_from_column(column, old.row))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            if values.is_empty() {
+                values = self
+                    .schema
+                    .fields
+                    .iter()
+                    .map(|_| InputValues::Int(Vec::new()))
+                    .collect();
+            }
+            let mut present = vec![previous.is_some() || current.is_some(); values.len()];
+            for (i, field) in self.schema.fields.iter().enumerate() {
+                if let Some(input) = supplied.get(field.name.as_str()) {
+                    values[i] = input_row(input, row);
+                    present[i] = true;
+                }
+            }
+            if !present[self.pk_pos] && pk_field.auto_id {
+                let seq = self
+                    .next_seq
+                    .checked_add(row as u64)
+                    .ok_or_else(|| EngineError::invalid("auto_id space exhausted"))?;
+                values[self.pk_pos] = InputValues::Int(vec![
+                    i64::try_from(seq)
+                        .map_err(|_| EngineError::invalid("auto_id space exhausted"))?,
+                ]);
+                present[self.pk_pos] = true;
+            }
+            let mut meta = if let Some((_, old)) = previous {
+                old.clone()
+            } else if let Some(old) = current {
+                self.chunks[old.chunk]
+                    .meta
+                    .as_ref()
+                    .map_or_else(Map::new, |m| m[old.row].clone())
+            } else {
+                Map::new()
+            };
+            meta.extend(dynamic.maps[row].clone());
+            let row_fields: HashMap<&str, &InputValues> = self
+                .schema
+                .fields
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| present[*i])
+                .map(|(i, field)| (field.name.as_str(), &values[i]))
+                .collect();
+            let row_dynamic = Dynamic {
+                maps: vec![meta.clone()],
+                errors: vec![dynamic.errors[row].clone()],
+            };
+            self.validate_row(&row_fields, &row_dynamic, 0)?;
+            for (i, field) in self.schema.fields.iter().enumerate() {
+                let converted = convert(field, &values[i])?;
+                fields[i].push_row(&converted, 0);
+                values[i] = input_from_column(&converted, 0);
+            }
+            let pk = pk_at(&fields[self.pk_pos], row);
+            pending.insert(pk, (values, meta.clone()));
+            metas.push(meta);
+        }
+        let mut columns: Vec<(String, InputValues)> = self
+            .schema
+            .fields
+            .iter()
+            .zip(fields.iter())
+            .map(|(field, column)| (field.name.clone(), input_from_column_all(column)))
+            .collect();
+        if self.schema.enable_dynamic_field {
+            columns.push((
+                META_FIELD.to_owned(),
+                InputValues::Json(
+                    metas
+                        .iter()
+                        .map(serde_json::to_vec)
+                        .collect::<std::result::Result<_, _>>()
+                        .map_err(|error| EngineError::schema(error.to_string()))?,
+                ),
+            ));
+        }
+        self.insert_inner(InsertBatch {
+            num_rows: n,
+            columns,
+        })
+    }
+
+    pub(crate) fn delete_from_db(&mut self, pks: &[Pk]) -> Result<usize> {
+        if self.deleted {
+            return Err(EngineError::CollectionNotFound(self.name.clone()));
+        }
+        if pks.is_empty() {
+            return Ok(0);
+        }
+        let seq = self.next_seq;
+        self.next_seq = seq
+            .checked_add(1)
+            .ok_or_else(|| EngineError::invalid("_seq space exhausted"))?;
+        self.delete_at_seq(pks, seq)
+    }
+
+    pub(crate) fn delete_literals_from_db(&mut self, literals: &[PkLiteral]) -> Result<Vec<Pk>> {
+        if self.deleted {
+            return Err(EngineError::CollectionNotFound(self.name.clone()));
+        }
+        if literals.is_empty() {
+            return Ok(Vec::new());
+        }
+        let seq = self.next_seq;
+        self.next_seq = seq
+            .checked_add(1)
+            .ok_or_else(|| EngineError::invalid("_seq space exhausted"))?;
+        let varchar = self.schema.fields[self.pk_pos].data_type == DataType::VarChar;
+        let pks = literals
+            .iter()
+            .map(|literal| match (varchar, literal) {
+                (false, PkLiteral::Int(value)) => Ok(Pk::Int64(*value)),
+                (true, PkLiteral::Str(value)) => Ok(Pk::VarChar(value.clone())),
+                (_, PkLiteral::IntOutOfRange) => Err(EngineError::invalid(
+                    "Python int too large to convert to C long",
+                )),
+                (false, PkLiteral::Str(value)) => Err(EngineError::invalid(format!(
+                    "Could not convert {} with type str: tried to convert to int64",
+                    py_repr(value)
+                ))),
+                (true, PkLiteral::Int(_)) => {
+                    Err(EngineError::invalid("Expected bytes, got a 'int' object"))
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.delete_at_seq(&pks, seq)?;
+        Ok(pks)
+    }
+
+    fn delete_at_seq(&mut self, pks: &[Pk], seq: u64) -> Result<usize> {
+        if let Some(persistent) = self.persistent.as_mut() {
+            persistent
+                .append_delete(&self.schema, pks, seq)
+                .map_err(EngineError::Storage)?;
+        }
+        for pk in pks {
+            if let Some(old) = self.pk_index.remove(pk) {
+                self.chunks[old.chunk].live[old.row] = false;
+            }
+        }
+        Ok(pks.len())
+    }
+
     fn insert_inner(&mut self, batch: InsertBatch) -> Result<Vec<Pk>> {
         if self.deleted {
             return Err(EngineError::CollectionNotFound(self.name.clone()));
@@ -1023,6 +1208,64 @@ fn vector_values(column: &ColumnData) -> (usize, &[f32]) {
         ColumnData::FloatVector { dim, values } => (*dim, values),
         // resolve_anns_field 只返回 FLOAT_VECTOR 字段的下标。
         _ => unreachable!("anns field column must be FLOAT_VECTOR"),
+    }
+}
+
+fn input_pk(values: &InputValues, row: usize) -> Option<Pk> {
+    match values {
+        InputValues::Int(v) => Some(Pk::Int64(v[row])),
+        InputValues::Str(v) => Some(Pk::VarChar(v[row].clone())),
+        _ => None,
+    }
+}
+
+fn input_row(values: &InputValues, row: usize) -> InputValues {
+    match values {
+        InputValues::Bool(v) => InputValues::Bool(vec![v[row]]),
+        InputValues::Int(v) => InputValues::Int(vec![v[row]]),
+        InputValues::Float(v) => InputValues::Float(vec![v[row]]),
+        InputValues::Str(v) => InputValues::Str(vec![v[row].clone()]),
+        InputValues::Json(v) => InputValues::Json(vec![v[row].clone()]),
+        InputValues::FloatVector { dim, values } => InputValues::FloatVector {
+            dim: *dim,
+            values: values[row * dim..(row + 1) * dim].to_vec(),
+        },
+    }
+}
+
+fn input_from_column(column: &ColumnData, row: usize) -> InputValues {
+    match column {
+        ColumnData::Bool(v) => InputValues::Bool(vec![v[row]]),
+        ColumnData::Int8(v) => InputValues::Int(vec![i64::from(v[row])]),
+        ColumnData::Int16(v) => InputValues::Int(vec![i64::from(v[row])]),
+        ColumnData::Int32(v) => InputValues::Int(vec![i64::from(v[row])]),
+        ColumnData::Int64(v) => InputValues::Int(vec![v[row]]),
+        ColumnData::Float(v) => InputValues::Float(vec![f64::from(v[row])]),
+        ColumnData::Double(v) => InputValues::Float(vec![v[row]]),
+        ColumnData::VarChar(v) => InputValues::Str(vec![v[row].clone()]),
+        ColumnData::Json(v) => InputValues::Json(vec![v[row].clone()]),
+        ColumnData::FloatVector { dim, values } => InputValues::FloatVector {
+            dim: *dim,
+            values: values[row * dim..(row + 1) * dim].to_vec(),
+        },
+    }
+}
+
+fn input_from_column_all(column: &ColumnData) -> InputValues {
+    match column {
+        ColumnData::Bool(v) => InputValues::Bool(v.clone()),
+        ColumnData::Int8(v) => InputValues::Int(v.iter().map(|x| i64::from(*x)).collect()),
+        ColumnData::Int16(v) => InputValues::Int(v.iter().map(|x| i64::from(*x)).collect()),
+        ColumnData::Int32(v) => InputValues::Int(v.iter().map(|x| i64::from(*x)).collect()),
+        ColumnData::Int64(v) => InputValues::Int(v.clone()),
+        ColumnData::Float(v) => InputValues::Float(v.iter().map(|x| f64::from(*x)).collect()),
+        ColumnData::Double(v) => InputValues::Float(v.clone()),
+        ColumnData::VarChar(v) => InputValues::Str(v.clone()),
+        ColumnData::Json(v) => InputValues::Json(v.clone()),
+        ColumnData::FloatVector { dim, values } => InputValues::FloatVector {
+            dim: *dim,
+            values: values.clone(),
+        },
     }
 }
 

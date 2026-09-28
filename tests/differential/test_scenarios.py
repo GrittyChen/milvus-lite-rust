@@ -12,7 +12,7 @@ import numpy as np
 import pytest
 from pymilvus import DataType, MilvusClient
 
-from compare import hits
+from compare import hits, run
 
 
 def index(metric, index_type="FLAT", field="vector"):
@@ -62,6 +62,57 @@ def test_flush_and_continue_matches_reference(diff):
     diff.step("count_after_flush", lambda c: c.query("fl", output_fields=["count(*)"]))
     diff.step("search_after_flush", lambda c: c.search("fl", data=[[1.0, 0.0]], limit=3),
               hits("COSINE", [[1.0, 0.0]], {1: [1.0, 0.0], 2: [0.0, 1.0], 3: [0.5, 0.5]}, k=3))
+
+
+def test_delete_and_upsert_primary_key_path(diff):
+    schema = MilvusClient.create_schema(auto_id=False, enable_dynamic_field=True)
+    schema.add_field("id", DataType.INT64, is_primary=True)
+    schema.add_field("vector", DataType.FLOAT_VECTOR, dim=2)
+    diff.step("create_mutations", lambda c: c.create_collection("mut", schema=schema))
+    diff.step("insert_mutations", lambda c: c.insert("mut", [
+        {"id": 1, "vector": [1.0, 0.0], "tag": "old"},
+        {"id": 2, "vector": [0.0, 1.0], "tag": "old2"},
+    ]))
+    diff.step("flush_mutations", lambda c: c.flush("mut"))
+    diff.step("delete_duplicate_and_absent", lambda c: c.delete("mut", ids=[1, 99, 1]))
+    diff.step("count_after_delete", lambda c: c.query("mut", output_fields=["count(*)"]))
+    diff.step("upsert_deleted", lambda c: c.upsert("mut", [{"id": 1, "vector": [0.5, 0.5]}]))
+    diff.step("upsert_existing", lambda c: c.upsert("mut", [{"id": 2, "vector": [0.0, 2.0]}]))
+    diff.step("get_full_upsert_kept_dynamic", lambda c: c.get("mut", ids=[2], output_fields=["tag"]))
+    diff.step("partial_upsert", lambda c: c.upsert("mut", [{"id": 2, "tag": "partial"}], partial_update=True))
+    diff.step("get_after_upsert", lambda c: c.get("mut", ids=[1, 2], output_fields=["vector", "tag"]))
+    diff.step("flush_after_mutations", lambda c: c.flush("mut"))
+    diff.step("count_after_mutations", lambda c: c.query("mut", output_fields=["count(*)"]))
+
+
+def test_duplicate_upsert_merges_each_row_against_prior_batch_state(diff):
+    schema = MilvusClient.create_schema(auto_id=False, enable_dynamic_field=True)
+    schema.add_field("id", DataType.INT64, is_primary=True)
+    schema.add_field("vector", DataType.FLOAT_VECTOR, dim=2)
+    diff.step("create_duplicate", lambda c: c.create_collection("dup", schema=schema))
+    diff.step("insert_duplicate_base", lambda c: c.insert("dup", [{"id": 1, "vector": [1.0, 0.0], "base": 1}]))
+    diff.step("upsert_duplicate", lambda c: c.upsert("dup", [
+        {"id": 1, "vector": [1.0, 0.0], "first": 2},
+        {"id": 1, "vector": [0.0, 1.0], "last": 3},
+    ]))
+    read = lambda c: c.get("dup", ids=[1], output_fields=["base", "first", "last"])
+    assert run(read, diff.rust) == ("ok", [{"id": 1, "base": 1, "first": 2, "last": 3}])
+    assert run(read, diff.ref) == ("ok", [{"id": 1, "base": 1, "last": 3}])
+
+
+def test_delete_invalid_primary_keys_match_reference(diff):
+    schema = MilvusClient.create_schema(auto_id=False)
+    schema.add_field("id", DataType.INT64, is_primary=True)
+    schema.add_field("vector", DataType.FLOAT_VECTOR, dim=2)
+    diff.step("create_invalid_delete", lambda c: c.create_collection("bad_del", schema=schema))
+    diff.step("delete_string_int_pk", lambda c: c.delete("bad_del", filter="id in ['bad']"), error=True)
+    diff.step("delete_overflow_int_pk", lambda c: c.delete("bad_del", ids=[2**63]), error=True)
+    varchar = MilvusClient.create_schema(auto_id=False)
+    varchar.add_field("id", DataType.VARCHAR, is_primary=True, max_length=32)
+    varchar.add_field("vector", DataType.FLOAT_VECTOR, dim=2)
+    diff.step("create_bad_varchar_delete", lambda c: c.create_collection("bad_varchar_del", schema=varchar))
+    diff.step("delete_integer_id_coerced_to_varchar", lambda c: c.delete("bad_varchar_del", ids=[7]))
+    diff.step("delete_integer_literal_varchar_pk", lambda c: c.delete("bad_varchar_del", filter="id in [7]"), error=True)
 
 
 def explicit_schema(dynamic):

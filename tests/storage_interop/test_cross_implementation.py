@@ -103,6 +103,54 @@ db.close()
     return json.loads(run([python, "-c", code, str(root)], cwd=root.parent))
 
 
+def test_rust_delete_and_upsert_files_open_in_reference(tmp_path, interpreters):
+    root = tmp_path / "mutations.db"
+    rust_code = """
+import sys
+from pymilvus import DataType, MilvusClient
+from milvus_lite.server_manager import server_manager_instance
+path = sys.argv[1]
+schema = MilvusClient.create_schema(auto_id=False)
+schema.add_field('id', DataType.INT64, is_primary=True)
+schema.add_field('vector', DataType.FLOAT_VECTOR, dim=2)
+client = MilvusClient(path)
+client.create_collection('c', schema=schema)
+client.insert('c', [{'id': 1, 'vector': [1.0, 0.0]}, {'id': 2, 'vector': [0.0, 1.0]}])
+client.flush('c')
+client.delete('c', ids=[1])
+client.upsert('c', [{'id': 2}], partial_update=True)
+client.flush('c')
+client.close()
+server_manager_instance.release_server(path)
+"""
+    reference_code = """
+import sys
+from milvus_lite.db import MilvusLite
+db = MilvusLite(sys.argv[1])
+collection = db.get_collection('c')
+assert collection.num_entities == 1
+assert collection.get([1]) == []
+row = collection.get([2])[0]
+assert row['id'] == 2 and row['vector'] == [0.0, 1.0]
+db.close()
+"""
+    run([sys.executable, "-c", rust_code, str(root)], cwd=tmp_path)
+    arrow_code = """
+import sys
+from pathlib import Path
+import pyarrow.parquet as pq
+part = Path(sys.argv[1]) / 'collections' / 'c' / 'partitions' / '_default'
+data = sorted(part.joinpath('data').glob('*.parquet'))
+delta = sorted(part.joinpath('delta').glob('*.parquet'))
+assert len(data) == 2 and len(delta) == 1
+assert sorted(pk for path in data for pk in pq.read_table(path).column('id').to_pylist()) == [1, 2, 2]
+assert pq.read_table(delta[0]).column('id').to_pylist() == [1]
+"""
+    for name in (PYTHONS[1], PYTHONS[2]):
+        run([interpreters[name], "-c", arrow_code, str(root)], cwd=tmp_path)
+    run([interpreters[PYTHONS[0]], "-c", reference_code, str(root)], cwd=tmp_path)
+
+
 def test_real_database_path_alternates_reference_and_rust(tmp_path, interpreters):
     root = tmp_path / "alternating.db"
     reference_create(interpreters[PYTHONS[0]], root, flush=True)

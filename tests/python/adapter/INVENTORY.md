@@ -1,22 +1,22 @@
 # 参照实现 tests/adapter 用例清单
 
-对照版本：milvus-lite v3.2.1（`43d1257`）的 [tests/adapter/](https://github.com/milvus-io/milvus-lite/tree/v3.2.1/tests/adapter)，47 个文件共 637 条用例。复用规则见 [0004「验收」第 2 项](../../../docs/decisions/0004-m1-scope.md#验收)。本目录的用例复制自上游，Apache-2.0 许可；各文件保留上游的用例本体，文件头的注释写明改动。
+对照版本：milvus-lite v3.2.1（`43d1257`）的 [tests/adapter/](https://github.com/milvus-io/milvus-lite/tree/v3.2.1/tests/adapter)，47 个文件共 637 条用例。复用规则见 [0004「验收」第 2 项](../../../docs/decisions/0004-m1-scope.md#验收)及 [0006 第 25 项](../../../docs/decisions/0006-m2-scope.md#决策项)。本目录的用例复制自上游，Apache-2.0 许可；各文件保留上游的用例本体，文件头的注释写明改动。
 
 ## 状态
 
 | 状态 | 含义 | 条数 |
 | --- | --- | --- |
-| 已复制 | 原样复制到本目录 | 76 |
-| 改后复制 | 只做 0004 允许的两种替换后复制，改后的副本已在 3.x 上通过 | 38 |
-| 范围外 | 用到 M1 不支持的功能，不复制；这类功能另有用例断言返回 `UNIMPLEMENTED`，见「范围外功能的 `UNIMPLEMENTED` 断言」 | 179 |
+| 已复制 | 原样复制到本目录 | 77 |
+| 改后复制 | 仅按 0004「验收」第 2 项与 0006 第 25 项授权的条件替换，逐条说明改动 | 41 |
+| 范围外 | 用到当前切片不支持的功能，不复制；未实现能力的代表性入口见「范围外功能的 `UNIMPLEMENTED` 断言」 | 175 |
 | 依赖内部模块 | 导入或使用 3.x 的内部模块、内部对象，换成本实现后无法运行 | 33 |
 | 不运行 | 上游被同名定义覆盖，上游自己也不运行 | 1 |
 
 以上是逐条列出的 22 个文件中的 327 条；其余 25 个文件的 310 条整个文件记一行原因，见「整个文件不复用的文件」。
 
-「已复制」与「改后复制」共 114 个用例函数，参数化展开后 128 条；它们在本实现上通过，换回上游 conftest 后在 3.x 上也通过（pymilvus 3.0.2 与 2.6.17 两条线）。
+「已复制」与「改后复制」共 118 个用例函数，参数化展开后 132 条；它们在本实现上通过（pymilvus 3.0.2 与 2.6.17 两条线）。其中本切片修改的 [test_grpc_crud.py](test_grpc_crud.py) 副本已在参照实现 3.x + pymilvus 3.0.2 上整文件通过（12 条）；新增 Delete / Upsert 路径另由 [差分测试](../../differential/test_scenarios.py) 在两条客户端线上对照。新增 4 条尚未用 pymilvus 2.6.17 对参照实现整文件复跑。
 
-两种替换（HNSW 换成 FLAT、`== N` 换成 `in [N]`）的适用条件与依据见 0004「验收」第 2 项的「改后复制」。除此之外，复制时只删去随范围外用例一起不再使用的 import、helper 与空的分节标题；上游用于跳过的 `importorskip` 改为直接导入（本仓不允许因缺依赖静默跳过），上游因 HNSW 需要 faiss 而加的 `skipif` 随 HNSW 一起去掉。起服务的 fixture 与清理见 [conftest.py](conftest.py)。
+HNSW 换成 FLAT、`== N` 换成 `in [N]` 的条件见 0004「验收」第 2 项及 0006 第 25 项；本切片两条 Delete 用例依 0006 第 25 项，用 get 对已知的 0–4 主键读回，只核对存活主键集合，过滤表达式本身留给 S1 验收。除此之外，复制时只删去随范围外用例一起不再使用的 import、helper 与空的分节标题；上游用于跳过的 `importorskip` 改为直接导入（本仓不允许因缺依赖静默跳过），上游因 HNSW 需要 faiss 而加的 `skipif` 随 HNSW 一起去掉。起服务的 fixture 与清理见 [conftest.py](conftest.py)。
 
 ## 逐条列出的文件
 
@@ -49,7 +49,7 @@
 
 ### [test_grpc_crud.py](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_crud.py)（0004 候选文件）
 
-20 条：已复制 7，改后复制 1，范围外 12。
+20 条：已复制 8，改后复制 4，范围外 8。
 
 | 用例 | 状态 | 说明 |
 | --- | --- | --- |
@@ -57,8 +57,8 @@
 | [`test_insert_multiple_batches_accumulates`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_crud.py#L67) | 范围外 | 过滤表达式（`id >= 0`） |
 | [`test_insert_into_unknown_collection_raises`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_crud.py#L75) | 已复制 |  |
 | [`test_insert_round_trip_preserves_field_values`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_crud.py#L80) | 改后复制 | `== N` 换成 `in [N]` |
-| [`test_upsert_returns_upsert_count`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_crud.py#L95) | 范围外 | upsert |
-| [`test_upsert_overwrites_existing`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_crud.py#L102) | 范围外 | 过滤表达式（`id == 1`）、upsert |
+| [`test_upsert_returns_upsert_count`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_crud.py#L95) | 已复制 |  |
+| [`test_upsert_overwrites_existing`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_crud.py#L102) | 改后复制 | `== N` 换成 `in [N]` |
 | [`test_query_by_id_in_list`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_crud.py#L120) | 已复制 |  |
 | [`test_query_by_id_with_output_fields`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_crud.py#L128) | 已复制 |  |
 | [`test_query_by_filter_expression`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_crud.py#L143) | 范围外 | 过滤表达式（`active == true`） |
@@ -69,8 +69,8 @@
 | [`test_get_by_ids`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_crud.py#L185) | 已复制 |  |
 | [`test_get_by_ids_with_output_fields`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_crud.py#L191) | 已复制 |  |
 | [`test_get_missing_ids_returns_empty`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_crud.py#L198) | 已复制 |  |
-| [`test_delete_by_ids`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_crud.py#L207) | 范围外 | 过滤表达式（`id >= 0`）、delete |
-| [`test_delete_idempotent`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_crud.py#L214) | 范围外 | 过滤表达式（`id >= 0`）、delete |
+| [`test_delete_by_ids`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_crud.py#L207) | 改后复制 | 用 get 读回，S1 的 `id >= 0` 留待过滤切片 |
+| [`test_delete_idempotent`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_crud.py#L214) | 改后复制 | 用 get 读回，S1 的 `id >= 0` 留待过滤切片 |
 | [`test_delete_by_filter_active_true`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_crud.py#L226) | 范围外 | 过滤表达式（`active == true`）、delete |
 | [`test_delete_by_filter_no_match`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_crud.py#L235) | 范围外 | 过滤表达式（`id > 1000`）、delete |
 
@@ -504,21 +504,20 @@
 | [`test_statistics_missing_resources_raise`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_p0_features.py#L273) | 范围外 | 分区 |
 ## 范围外功能的 `UNIMPLEMENTED` 断言
 
-范围外的用例不复制，也不用 skip 占位；0004「不支持」中的每类功能另有用例断言返回 `UNIMPLEMENTED` 且原因正确：
+范围外的用例不复制，也不用 skip 占位；当前尚未实现的代表性功能另有用例断言返回 `UNIMPLEMENTED` 且原因正确：
 
 | 功能 | 用例 |
 | --- | --- |
-| 过滤表达式（检索的 `filter`、`<主键> in [...]` 以外的 `expr`、带 `expr` 的 `count(*)`、空 `expr` 且不含 `count(*)`） | [test_grpc_translation.py](../test_grpc_translation.py) 的 `test_search_m1_unsupported`、`test_query_m1_unsupported`、`test_pymilvus_entry_points_m1_unsupported` |
-| query iterator；search iterator 的第二批起 | `test_query_m1_unsupported`、`test_pymilvus_entry_points_m1_unsupported` |
-| Delete、Upsert | `test_pymilvus_entry_points_m1_unsupported`；[test_server_manager.py](../test_server_manager.py) 的 `test_unimplemented_rpc_reason` |
-| 分区 RPC；写入、检索、查询指定 `_default` 以外的分区；partition key | `test_insert_m1_unsupported`、`test_search_m1_unsupported`、`test_query_m1_unsupported`、`test_pymilvus_entry_points_m1_unsupported` |
-| 数据库 RPC、alias | `test_pymilvus_entry_points_m1_unsupported` |
-| schema：ARRAY、GEOMETRY、TIMESTAMPTZ、稀疏向量、nullable、default value、function、多向量字段、analyzer，properties 中的 `timezone` | `test_create_collection_m1_unsupported`、`test_pymilvus_entry_points_m1_unsupported` |
+| 过滤表达式（检索的 `filter`、`<主键> in [...]` 以外的 `expr`、带 `expr` 的 `count(*)`、空 `expr` 且不含 `count(*)`） | [test_grpc_translation.py](../test_grpc_translation.py) 的 `test_search_m1_unsupported`、`test_query_m1_unsupported`、`test_pymilvus_entry_points_remaining_unsupported` |
+| query iterator；search iterator 的第二批起 | `test_query_m1_unsupported`、`test_pymilvus_entry_points_remaining_unsupported` |
+| 分区 RPC；写入、检索、查询指定 `_default` 以外的分区；partition key | `test_insert_m1_unsupported`、`test_search_m1_unsupported`、`test_query_m1_unsupported`、`test_pymilvus_entry_points_remaining_unsupported` |
+| 数据库 RPC、alias | `test_pymilvus_entry_points_remaining_unsupported` |
+| schema：ARRAY、GEOMETRY、TIMESTAMPTZ、稀疏向量、nullable、default value、function、多向量字段、analyzer，properties 中的 `timezone` | `test_create_collection_m1_unsupported`、`test_pymilvus_entry_points_remaining_unsupported` |
 | 写入 null 值 | `test_insert_m1_unsupported` |
-| 修改 schema 与 collection properties、rename | `test_pymilvus_entry_points_m1_unsupported` |
-| HybridSearch、range search、group_by、rerank、请求中的 `timezone` | `test_search_m1_unsupported`、`test_pymilvus_entry_points_m1_unsupported` |
+| 修改 schema 与 collection properties、rename | `test_pymilvus_entry_points_remaining_unsupported` |
+| HybridSearch、range search、group_by、rerank、请求中的 `timezone` | `test_search_m1_unsupported`、`test_pymilvus_entry_points_remaining_unsupported` |
 | FLAT、BRUTE_FORCE、AUTOINDEX 以外的索引类型 | `test_create_index_m1_unsupported` |
-| DropIndex、Flush、compaction | `test_pymilvus_entry_points_m1_unsupported` |
+| DropIndex、compaction | `test_pymilvus_entry_points_remaining_unsupported` |
 | snapshot 等其余未列出的 RPC 与 service | `test_unimplemented_rpc_reason`（未实现的 RPC 统一由 [guard.rs](../../../crates/grpc/src/guard.rs) 处理） |
 
 ## 整个文件不复用的文件

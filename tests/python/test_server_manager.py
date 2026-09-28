@@ -339,8 +339,8 @@ def test_unimplemented_rpc_reason(manager, tmp_path):
     stage = "not implemented in this build of milvus-lite-rust yet"
     for path, details in [
         (
-            "/milvus.proto.milvus.MilvusService/Delete",
-            f"MilvusLite does not support Delete: {stage}",
+            "/milvus.proto.milvus.MilvusService/ManualCompaction",
+            f"MilvusLite does not support ManualCompaction: {stage}",
         ),
         # 3.x 自身也拒绝的 RPC，说明文字与 3.x 一致。
         (

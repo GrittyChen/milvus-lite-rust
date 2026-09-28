@@ -15,6 +15,7 @@ use crate::compute::Compute;
 use crate::data::{InsertBatch, Pk};
 use crate::data_dir::DataDir;
 use crate::error::{EngineError, Result, py_repr};
+use crate::filter::parse_pk_in;
 use crate::index::IndexRequest;
 use crate::schema::CollectionSchema;
 use crate::storage::{fs_commit, recovery, runtime, schema_file::SchemaFile};
@@ -534,6 +535,74 @@ impl Db {
         name: &str,
         batch: InsertBatch,
     ) -> Result<InsertOutcome> {
+        self.mutate(database, name, |collection| {
+            let varchar = collection.schema().fields.iter().any(|field| {
+                field.is_primary && field.data_type == crate::schema::DataType::VarChar
+            });
+            let pks = collection.insert_from_db(batch)?;
+            Ok(InsertOutcome { pks, varchar })
+        })
+    }
+
+    pub fn delete(&self, database: &str, name: &str, pks: &[Pk]) -> Result<usize> {
+        self.mutate(database, name, |collection| collection.delete_from_db(pks))
+    }
+
+    pub fn upsert_with_pk_type(
+        &self,
+        database: &str,
+        name: &str,
+        batch: InsertBatch,
+    ) -> Result<InsertOutcome> {
+        self.mutate(database, name, |collection| {
+            let varchar = collection.schema().fields.iter().any(|field| {
+                field.is_primary && field.data_type == crate::schema::DataType::VarChar
+            });
+            let pks = collection.upsert_from_db(batch)?;
+            Ok(InsertOutcome { pks, varchar })
+        })
+    }
+
+    pub fn delete_expr(
+        &self,
+        database: &str,
+        name: &str,
+        expr: &str,
+        partition: &str,
+    ) -> Result<(Vec<Pk>, bool)> {
+        self.mutate(database, name, |collection| {
+            let varchar = collection.schema().fields.iter().any(|field| {
+                field.is_primary && field.data_type == crate::schema::DataType::VarChar
+            });
+            let pk = collection
+                .schema()
+                .fields
+                .iter()
+                .find(|field| field.is_primary)
+                .ok_or_else(|| EngineError::schema("schema has no primary key field"))?;
+            let literals = parse_pk_in(expr, &pk.name).ok_or_else(|| {
+                EngineError::unsupported(
+                    "filter expressions other than '<primary key> in [...]'",
+                    "",
+                )
+            })?;
+            if !literals.is_empty() && !matches!(partition, "" | "_default") {
+                return Err(EngineError::unsupported(
+                    "partitions other than '_default'",
+                    "",
+                ));
+            }
+            let pks = collection.delete_literals_from_db(&literals)?;
+            Ok((pks, varchar))
+        })
+    }
+
+    fn mutate<T>(
+        &self,
+        database: &str,
+        name: &str,
+        apply: impl FnOnce(&mut Collection) -> Result<T>,
+    ) -> Result<T> {
         require_database(database)?;
         let blocked = self.write_gate.read();
         if *blocked {
@@ -551,12 +620,8 @@ impl Db {
             }
             break collection;
         };
-        let varchar =
-            collection.schema().fields.iter().any(|field| {
-                field.is_primary && field.data_type == crate::schema::DataType::VarChar
-            });
-        let ids = match collection.insert_from_db(batch) {
-            Ok(ids) => ids,
+        let outcome = match apply(&mut collection) {
+            Ok(outcome) => outcome,
             Err(error) => {
                 let pending = collection
                     .persistent()
@@ -582,10 +647,10 @@ impl Db {
         if auto_flush {
             // 写入已经落 WAL 并在内存中可见；之后的提交故障由下一次写入先重试。
             if let Err(error) = Self::flush_handle(&handle, false) {
-                eprintln!("automatic flush of {name:?} failed after accepted insert: {error}");
+                eprintln!("automatic flush of {name:?} failed after accepted mutation: {error}");
             }
         }
-        Ok(InsertOutcome { pks: ids, varchar })
+        Ok(outcome)
     }
 
     pub fn flush_collection(&self, database: &str, name: &str) -> Result<()> {

@@ -10,6 +10,7 @@ use parking_lot::Mutex;
 use serde_json::{Map, Value};
 
 use crate::data::ColumnData;
+use crate::data::Pk;
 use crate::schema::CollectionSchema;
 use crate::storage::arrow_data::{self, DecodedData};
 use crate::storage::flush::{self, FlushError};
@@ -46,6 +47,7 @@ pub struct PersistentCollection {
     pub generation: u64,
     next_source: u64,
     data_wal: Option<WalWriter>,
+    delta_wal: Option<WalWriter>,
     pending: VecDeque<Arc<FrozenGeneration>>,
     retry_manifest: bool,
     failed_flush: bool,
@@ -81,6 +83,7 @@ impl PersistentCollection {
             generation: 1,
             next_source: 2,
             data_wal: None,
+            delta_wal: None,
             pending: VecDeque::new(),
             retry_manifest: false,
             failed_flush: false,
@@ -102,6 +105,7 @@ impl PersistentCollection {
             generation: recovered.next_wal_number,
             next_source,
             data_wal: None,
+            delta_wal: None,
             pending: VecDeque::new(),
             retry_manifest: false,
             failed_flush: false,
@@ -194,6 +198,52 @@ impl PersistentCollection {
         Ok(())
     }
 
+    pub fn append_delete(
+        &mut self,
+        schema: &CollectionSchema,
+        pks: &[Pk],
+        seq: u64,
+    ) -> Result<(), String> {
+        if pks.is_empty() {
+            return Ok(());
+        }
+        if self.poisoned {
+            return Err("collection state is unusable after a storage failure".to_owned());
+        }
+        if self.needs_retry() {
+            return Err("a failed flush must complete before another write".to_owned());
+        }
+        let seqs = vec![seq; pks.len()];
+        let batch = arrow_data::wal_delta_batch(schema, pks, &seqs, "_all").map_err(err)?;
+        if self.delta_wal.is_none() {
+            let wal_dir = self.dir.join("wal");
+            fs_commit::create_dir_synced(&wal_dir).map_err(err)?;
+            let wal_schema = arrow_data::wal_delta_schema(schema).map_err(err)?;
+            match WalWriter::create(&wal_dir, WalKind::Delta, self.generation, &wal_schema) {
+                Ok(writer) => self.delta_wal = Some(writer),
+                Err(error) => {
+                    self.freeze_active(true)?;
+                    self.failed_flush = true;
+                    return Err(error.to_string());
+                }
+            }
+        }
+        let writer = self
+            .delta_wal
+            .as_mut()
+            .ok_or("delta WAL writer is missing")?;
+        if let Err(error) = writer.append(&batch) {
+            self.freeze_active(true)?;
+            self.failed_flush = true;
+            return Err(error.to_string());
+        }
+        if let Err(error) = self.active.apply_delete(pks, seq, &mut self.visibility) {
+            self.poisoned = true;
+            return Err(error.to_string());
+        }
+        Ok(())
+    }
+
     pub fn should_auto_flush(&self) -> bool {
         self.active.size() >= 10_000
     }
@@ -219,6 +269,7 @@ impl PersistentCollection {
         }));
         self.generation = next_generation;
         self.data_wal = None;
+        self.delta_wal = None;
         Ok(())
     }
 
@@ -352,6 +403,7 @@ impl PersistentCollection {
     pub fn sync_retained_wal(&mut self) -> Result<(), String> {
         // 活跃 writer 先交出 File，再按路径同步所有留下的编号和目录。
         self.data_wal = None;
+        self.delta_wal = None;
         let dir = self.dir.join("wal");
         if !dir.exists() {
             return Ok(());

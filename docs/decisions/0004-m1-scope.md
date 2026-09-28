@@ -82,9 +82,7 @@ M1 的对外行为与 3.x 有阶段性差异，本文按 [AGENTS.md](../../AGENT
 
 下列功能都返回明确错误，绝不静默成功（不变量 15）。这些功能 3.x 都支持，M1 如果忽略相应参数，就会在不自知的情况下返回与 3.x 不同的结果，所以同样报错。错误形式与 3.x 的 `_unimplemented`（[servicer.py:1563](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/milvus_lite/adapter/grpc/servicer.py#L1563)）相同：gRPC 状态码 `UNIMPLEMENTED`，details 写成 `MilvusLite does not support <功能>: <说明>`，说明中注明当前阶段尚未实现。gRPC 状态非 OK 时响应体会被丢弃，3.x 在响应体里另放的 `Status` 客户端看不到（实测 pymilvus 只得到状态码与 details），因此不必复现。pymilvus 收到 `UNIMPLEMENTED` 时不重试。
 
-- **持久化**：见下文「阶段性差异」。
 - **过滤**：除上面两种 `Query` 形式外，不支持任何 `filter` / `expr`，包括 `text_match`、JSON 路径与几何谓词；`expr` 为空且不含 `count(*)` 的 `Query`、`count(*)` 带非空 `expr`、以及 query iterator 也不支持。
-- **写入**：`Delete`、`Upsert`。
 - **分区**：partition 相关 RPC；在检索、查询与写入中指定 `_default` 以外的分区；partition key。
 - **多数据库与别名**：`CreateDatabase` 等数据库 RPC，以及 alias。
 - **schema**：
@@ -94,20 +92,17 @@ M1 的对外行为与 3.x 有阶段性差异，本文按 [AGENTS.md](../../AGENT
   - properties 中的 `timezone`，以及 Search 与 Query 请求中非空的 `timezone`：它们只作用于 TIMESTAMPTZ 字段。
 - **检索**：`HybridSearch`、range search（`params` 中的 `radius` / `range_filter`）、`group_by`、rerank。
   - search iterator 没有专门的请求：pymilvus 先按 v2 探测，服务端不支持时退回 v1，而 v1 的第一批是普通检索，之后各批才带 range search 与过滤表达式。3.x 的 Search 同样忽略 `iterator` 等参数，所以只需要第一批时（`limit` 不超过 `batch_size`）结果与 3.x 相同，需要后续批次时返回 `UNIMPLEMENTED`。
-- **其他**：snapshot、compaction 与 flush 相关 RPC；CLI 与 `milvus-lite dump`。其余未列出的 RPC 一律返回 `UNIMPLEMENTED`。
+- **其他**：snapshot、compaction 相关 RPC；CLI 与 `milvus-lite dump`。其余未列出的 RPC 一律返回 `UNIMPLEMENTED`。
 
 ## 阶段性差异（登记）
 
 | 差异 | 3.x | M1 | 理由 | 影响的用例 |
 | --- | --- | --- | --- | --- |
-| 数据只在内存中 | 数据持久化，进程重启后仍在 | 进程退出后数据消失 | 持久化连同 WAL、恢复与崩溃测试在 M2 一起做 | 所有重开数据目录的用例，例如 [test_server_restart.py](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_server_restart.py) |
-| 打开已有数据的目录 | 能打开 | `start_and_get_uri` 返回 `None`，日志写明原因，判定规则见 [0003「同路径复用」](0003-in-process-server-lifecycle.md#同路径复用) | 不能把已有数据显示为空库 | 用 3.x 写入过数据的目录启动 |
-| 写入磁盘的内容 | 完整的数据目录 | 只创建目录与 `LOCK`，不写其他文件 | 保证 M1 用过的目录 3.x 仍能打开 | 无 |
 | 索引类型 | 支持 HNSW 等 ANN 索引，AUTOINDEX 在 flush 后建成 HNSW | 按 [0002](0002-data-dir-compat.md#结论) 的 FLAT 阶段规则执行 | 0002 已登记 | 显式创建 ANN 索引的用例 |
 | 检索、查询或写入时指定 `_default` 以外的分区 | 支持；分区不存在时检索与查询返回空结果，写入报 code 200 | 返回 `UNIMPLEMENTED` | 分区不在 M1 范围内 | 带 `partition_names` 的用例 |
 | 上面「不支持」中的其余功能 | 支持 | 返回 `UNIMPLEMENTED` | 不在 M1 范围内 | 用例清单中标为「范围外」的用例 |
 
-由于数据在进程退出后消失，**M1 不发布到 PyPI**，只作为开发与测试用的构建。
+**M1 不发布到 PyPI**，只作为开发与测试用的构建；M2 期间的发布条件见 [0006 第 4 项](0006-m2-scope.md#决策项)。
 
 ## 验收
 
@@ -124,7 +119,7 @@ M1 的对外行为与 3.x 有阶段性差异，本文按 [AGENTS.md](../../AGENT
    - 同一个文件里混有范围外的用例，而规则 4 不允许用 skip 占位。
    - **复用方式**：M1 把范围内的用例复制到本仓，fixture 换成本实现的起服务方式，并注明来源与 Apache-2.0 许可（[AGENTS.md](../../AGENTS.md) 规则 9）。复制出来的用例与上游脱钩，对照版本升级时要手工同步。某个文件涉及的功能全部进入范围后，改为替换 fixture、原样运行整个文件，不再复制。
    - **复用范围**：整个 [tests/adapter/](https://github.com/milvus-io/milvus-lite/tree/v3.2.1/tests/adapter)，47 个文件共 637 条用例。其中 72 条在 M1 范围内，分布在 19 个文件里；`test_milvus_lite_compat.py` 另有 4 条只用 `server_manager` 的公开接口，它是 pymilvus 接入点的契约、本仓同样提供，也复用。下面的 7 个候选文件是最初按文件名挑出的，只含 72 条中的 34 条。
-   - **改后复制**：只允许两种替换，改后的副本须先在 3.x 上通过（M2 起的扩展见 [0006](0006-m2-scope.md) 第 25 项：compatibility 也可逐条复制、重启类用例可替换起停服务的 helper、HNSW 换成 FLAT 还要求用例中不 flush 不重开）：
+   - **改后复制**：M1 只允许两种替换，改后的副本须先在 3.x 上通过；M2 起的扩展统一见 [0006 第 25 项](0006-m2-scope.md#决策项)：
      - 显式的 HNSW 等 ANN 索引换成 FLAT，前提是用例写入少于 1 万行、不断言索引类型与参数。3.x 满 1 万行（`>=`，按 memtable 中的主键数加 tombstone 数计）才 flush，在此之前总在 memtable 上暴力检索，索引类型不影响结果：实测 9999 行时 FLAT、HNSW、AUTOINDEX 的主键与距离逐位相同，1 万行时才不同。
      - `<pk> == N` 换成 `<pk> in [N]`，前提是只有一个主键、没有 `offset`、字面量类型与主键相符。这三个条件下 3.x 两条路径的结果逐行相同；否则不同，例如 `offset=1` 时 `id == 3` 返回空而 `id in [3]` 返回该行，INT64 主键上 `id == '3'` 报 code 6 而 `id in ['3']` 返回空。
    - **用例清单**：[tests/python/adapter/INVENTORY.md](../../tests/python/adapter/INVENTORY.md)，随 M1 代码入库。7 个候选文件以及含范围内用例的文件逐条列出，其余文件整个记一行原因。状态为「已复制」「改后复制」「范围外」「依赖内部模块」，后两类注明原因；「依赖内部模块」要写出具体行号。
