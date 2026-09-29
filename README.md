@@ -2,7 +2,7 @@
 
 The unofficial milvus-lite developed with Rust.
 
-以官方 [milvus-lite](https://github.com/milvus-io/milvus-lite) 为行为规范，用 Rust 重写一个更高效的 milvus-lite：`pymilvus` 用户的代码无需修改，官方 3.x 的数据目录也能直接打开。本项目非官方，与 Milvus / Zilliz 无隶属关系。M1 工程骨架已完成；M2 已接通建表、insert、主键 Delete、Upsert、Flush、关闭、重开与基础读取，完整 M2 验收仍在进行。目前尚不可用于生产，也未发布到 PyPI。
+以官方 [milvus-lite](https://github.com/milvus-io/milvus-lite) 为行为规范，用 Rust 重写一个更高效的 milvus-lite：`pymilvus` 用户的代码无需修改，官方 3.x 的数据目录也能直接打开。本项目非官方，与 Milvus / Zilliz 无隶属关系。M1 工程骨架已完成；M2 已接通建表、insert、主键 Delete、Upsert、Flush、关闭、重开与基础读取，并已加入与 3.x 的关闭重开差分用例；完整 M2 验收仍在进行。目前尚不可用于生产，也未发布到 PyPI。
 
 ## 文档
 

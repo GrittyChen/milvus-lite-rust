@@ -1,0 +1,234 @@
+"""独立服务的重开差分：每次关闭两个引擎，再从原数据目录启动。"""
+
+import io
+import os
+import subprocess
+
+import grpc
+import pytest
+from pymilvus import DataType, MilvusClient
+from pymilvus.grpc_gen import milvus_pb2, milvus_pb2_grpc, schema_pb2
+
+from compare import Diff, run
+from conftest import ENV, REF_VERSION
+from milvus_lite.server_manager import ServerManager
+from test_scenarios import index
+
+
+class ReopenPair:
+    def __init__(self, root):
+        self.root = root
+        self.manager = ServerManager()
+        self.rust_path = str(root / "rust.db")
+        self.ref_path = str(root / "3x")
+        self.ref_log = root / "server3x.log"
+        self.proc = None
+        self.clients = None
+        self.uris = None
+
+    def open(self):
+        assert self.clients is None
+        log = open(self.ref_log, "ab")
+        try:
+            self.proc = subprocess.Popen(
+                [os.environ[ENV], os.path.join(os.path.dirname(__file__), "server3x.py"), self.ref_path],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log,
+            )
+            line = self.proc.stdout.readline().decode().split()
+            self.proc.stdout.close()
+            assert len(line) == 2, f"3.x startup failed: {self.ref_log.read_text(errors='replace')}"
+            port, version = line
+            assert version == REF_VERSION, f"3.x version {version}, expected {REF_VERSION}"
+            rust_uri = self.manager.start_and_get_uri(self.rust_path)
+            assert rust_uri is not None
+            self.uris = (rust_uri, f"http://127.0.0.1:{port}")
+            self.clients = tuple(MilvusClient(uri=uri) for uri in self.uris)
+            return Diff(*self.clients)
+        except BaseException:
+            # 启动失败的退出码属于原始错误；清理时不再用它覆盖诊断。
+            self.close(check_exit=False)
+            raise
+        finally:
+            log.close()
+
+    def close(self, *, check_exit=True):
+        if self.clients is not None:
+            for client in self.clients:
+                client.close()
+            self.clients = None
+        self.uris = None
+        self.manager.release_server(self.rust_path)
+        if self.proc is not None:
+            self.proc.stdin.close()
+            try:
+                code = self.proc.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+                code = self.proc.wait()
+            self.proc = None
+            if check_exit:
+                assert code == 0, f"3.x exit {code}: {self.ref_log.read_text(errors='replace')}"
+
+
+@pytest.fixture
+def pair(tmp_path):
+    pair = ReopenPair(tmp_path)
+    yield pair
+    pair.close()
+
+
+def schema(auto_id=False):
+    s = MilvusClient.create_schema(auto_id=auto_id, enable_dynamic_field=True)
+    s.add_field("id", DataType.INT64, is_primary=True, auto_id=auto_id)
+    s.add_field("vector", DataType.FLOAT_VECTOR, dim=2)
+    return s
+
+
+def raw_upsert(uri, pk=None):
+    """绕过 pymilvus 的 auto_id 主键检查，验证服务端 Upsert。"""
+    request = milvus_pb2.UpsertRequest(collection_name="a", num_rows=1)
+    if pk is not None:
+        primary = schema_pb2.FieldData(type=DataType.INT64, field_name="id")
+        primary.scalars.long_data.data.append(pk)
+        request.fields_data.append(primary)
+    vector = schema_pb2.FieldData(type=DataType.FLOAT_VECTOR, field_name="vector")
+    vector.vectors.dim = 2
+    vector.vectors.float_vector.data.extend([7.0, 0.0])
+    request.fields_data.append(vector)
+    channel = grpc.insecure_channel(uri.removeprefix("http://"))
+    try:
+        response = milvus_pb2_grpc.MilvusServiceStub(channel).Upsert(request)
+        return response.status.code, response.upsert_cnt, list(response.IDs.int_id.data)
+    finally:
+        channel.close()
+
+
+def test_delete_upsert_and_load_state_after_reopen(pair):
+    diff = pair.open()
+    diff.step("create", lambda c: c.create_collection("c", schema=schema(), index_params=index("L2")))
+    diff.step("insert", lambda c: c.insert("c", [
+        {"id": 1, "vector": [1.0, 0.0], "tag": "old"},
+        {"id": 2, "vector": [0.0, 1.0], "tag": "keep"},
+        {"id": 3, "vector": [2.0, 0.0]},
+    ]))
+    diff.step("flush", lambda c: c.flush("c"))
+    diff.step("delete", lambda c: c.delete("c", ids=[1]))
+    diff.step("partial_upsert", lambda c: c.upsert("c", [{"id": 2, "tag": "new"}], partial_update=True))
+    diff.step("reinsert", lambda c: c.insert("c", [{"id": 1, "vector": [3.0, 0.0], "tag": "back"}]))
+    pair.close()
+
+    diff = pair.open()
+    assert str(diff.step("load_state", lambda c: c.get_load_state("c"))[1]["state"]) == "NotLoad"
+    diff.step("get_unloaded", lambda c: c.get("c", ids=[1]), error=True)
+    diff.step("load", lambda c: c.load_collection("c"))
+    diff.step("get", lambda c: c.get("c", ids=[1, 2, 3], output_fields=["vector", "tag"]))
+    assert diff.step("count", lambda c: c.query("c", output_fields=["count(*)"]))[1] == [{"count(*)": 3}]
+    # 主键 in 快路径在 3.x 中忽略 limit；只对照重开后的主键读回结果。
+    rows = diff.step("query_pk_order", lambda c: c.query("c", filter="id in [1, 2, 3]"))[1]
+    assert [row["id"] for row in rows] == [1, 2, 3]
+    search = diff.step("search", lambda c: c.search("c", data=[[3.0, 0.0]], limit=3,
+                                                  search_params={"metric_type": "L2"}))
+    assert len(search[1][0]) == 3
+
+
+def test_auto_id_continues_after_delete_and_reopen(pair):
+    diff = pair.open()
+    diff.step("create", lambda c: c.create_collection("a", schema=schema(True), index_params=index("L2")))
+    rows = [{"vector": [float(i), 0.0], "tag": str(i)} for i in range(3)]
+    rust_ids = run(lambda c: c.insert("a", rows), diff.rust)[1]["ids"]
+    ref_ids = run(lambda c: c.insert("a", rows), diff.ref)[1]["ids"]
+    assert rust_ids == ref_ids == [1, 2, 3]
+    for client, ids in ((diff.rust, rust_ids), (diff.ref, ref_ids)):
+        assert run(lambda c: c.delete("a", ids=[ids[1]]), client)[0] == "ok"
+    extra = [{"vector": [4.0, 0.0], "tag": "four"}]
+    rust_next = run(lambda c: c.insert("a", extra), diff.rust)[1]["ids"]
+    ref_next = run(lambda c: c.insert("a", extra), diff.ref)[1]["ids"]
+    assert rust_next == [5] and ref_next == [4]  # 0004 已登记：delete 只在本实现消耗 auto_id。
+    for uri, ids in zip(pair.uris, (rust_next, ref_next)):
+        assert raw_upsert(uri, ids[0]) == (0, 1, ids)
+    pair.close()
+
+    diff = pair.open()
+    assert str(diff.step("load_state", lambda c: c.get_load_state("a"))[1]["state"]) == "NotLoad"
+    diff.step("load", lambda c: c.load_collection("a"))
+    for client, ids in ((diff.rust, rust_ids + rust_next), (diff.ref, ref_ids + ref_next)):
+        rows = run(lambda c: c.get("a", ids=ids, output_fields=["tag", "vector"]), client)
+        assert rows == ("ok", [{"id": ids[0], "tag": "0", "vector": [0.0, 0.0]},
+                               {"id": ids[2], "tag": "2", "vector": [2.0, 0.0]},
+                               {"id": ids[3], "tag": "four", "vector": [7.0, 0.0]}])
+    resumed = diff.step("insert_after_reopen", lambda c: c.insert("a", [{"vector": [8.0, 0.0]}]))
+    assert resumed[1]["ids"] == [7]
+
+
+def test_raw_grpc_upsert_generates_auto_id(pair):
+    diff = pair.open()
+    diff.step("create", lambda c: c.create_collection("a", schema=schema(True), index_params=index("L2")))
+    results = [raw_upsert(uri) for uri in pair.uris]
+    assert results == [(0, 1, [1]), (0, 1, [1])]
+    pair.close()
+    diff = pair.open()
+    assert str(diff.step("load_state", lambda c: c.get_load_state("a"))[1]["state"]) == "NotLoad"
+    diff.step("load", lambda c: c.load_collection("a"))
+    assert diff.step("get_generated", lambda c: c.get("a", ids=[1], output_fields=["vector"]))[1] == [
+        {"id": 1, "vector": [7.0, 0.0]},
+    ]
+
+
+def test_quick_create_reopens_unloaded(pair):
+    diff = pair.open()
+    # 快速建表会创建 AUTOINDEX；只核对重开状态，不做索引检索。
+    diff.step("quick_create", lambda c: c.create_collection("quick", dimension=2))
+    diff.step("insert", lambda c: c.insert("quick", [{"id": 1, "vector": [1.0, 0.0]}]))
+    pair.close()
+
+    diff = pair.open()
+    assert str(diff.step("load_state", lambda c: c.get_load_state("quick"))[1]["state"]) == "NotLoad"
+    diff.step("get_unloaded", lambda c: c.get("quick", ids=[1]), error=True)
+    diff.step("load", lambda c: c.load_collection("quick"))
+    assert diff.step("get", lambda c: c.get("quick", ids=[1]))[1][0]["id"] == 1
+
+
+@pytest.mark.parametrize("index_metric,request_metric,rows,rust_expected,ref_expected", [
+    ("IP", "L2", [[1.0, 0.0], [3.0, 0.0], [0.0, 1.0]],
+     [(1, 0.0), (3, 2.0), (2, 4.0)], [(2, 9.0), (1, 1.0), (3, 0.0)]),
+    ("L2", "IP", [[1.0, 0.0], [3.0, 0.0], [0.0, 0.0]],
+     [(2, 3.0), (1, 1.0), (3, 0.0)], [(1, -0.0), (3, -1.0), (2, -2.0)]),
+    ("IP", "COSINE", [[1.0, 0.0], [0.0, 2.0], [-2.0, 0.0]],
+     [(1, 1.0), (2, 0.0), (3, -1.0)], [(1, 2.0), (2, 1.0), (3, -1.0)]),
+])
+def test_request_metric_overrides_flushed_index_metric(pair, index_metric, request_metric, rows,
+                                                       rust_expected, ref_expected):
+    diff = pair.open()
+    diff.step("create", lambda c: c.create_collection("c", schema=schema(), index_params=index(index_metric)))
+    diff.step("insert", lambda c: c.insert("c", [
+        {"id": pk, "vector": vector} for pk, vector in enumerate(rows, start=1)
+    ]))
+    diff.step("flush", lambda c: c.flush("c"))
+    pair.close()
+
+    diff = pair.open()
+    assert str(diff.step("load_state", lambda c: c.get_load_state("c"))[1]["state"]) == "NotLoad"
+    diff.step("load", lambda c: c.load_collection("c"))
+    search = lambda c: c.search("c", data=[[1.0, 0.0]], limit=3,
+                                search_params={"metric_type": request_metric})
+    rust, ref = run(search, diff.rust), run(search, diff.ref)
+    assert rust[0] == ref[0] == "ok"
+    rust_hits = [(hit["id"], hit["distance"]) for hit in rust[1][0]]
+    ref_hits = [(hit["id"], hit["distance"]) for hit in ref[1][0]]
+    assert repr(rust_hits) == repr(rust_expected)
+    # 3.x 的已知缺陷：segment 用索引度量计算内部距离并排序，再按请求度量换算对外分数。
+    assert repr(ref_hits) == repr(ref_expected)
+
+
+def test_failed_reference_startup_preserves_error(pair, monkeypatch):
+    class FailedProcess:
+        stdout = io.BytesIO(b"")
+        stdin = io.BytesIO()
+
+        def wait(self, timeout=None):
+            return 7
+
+    monkeypatch.setattr(subprocess, "Popen", lambda *args, **kwargs: FailedProcess())
+    with pytest.raises(AssertionError, match="3.x startup failed"):
+        pair.open()
+    assert pair.proc is None
