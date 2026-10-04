@@ -9,12 +9,34 @@ use crate::storage::manifest::Manifest;
 #[cfg(feature = "fault-injection")]
 thread_local! {
     static FAIL_NEXT_MANIFEST_DIR_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static EXIT_AT_MANIFEST_REPLACE: std::cell::Cell<Option<CommitPhase>> = const { std::cell::Cell::new(None) };
 }
 
 /// 仅测试构建可用；发布 wheel 默认不含故障注入点。
 #[cfg(feature = "fault-injection")]
 pub fn inject_manifest_dir_sync_failure_once() {
     FAIL_NEXT_MANIFEST_DIR_SYNC.with(|flag| flag.set(true));
+}
+
+/// 仅测试子进程使用：模拟进程在 manifest 的逻辑提交点两侧立即消失。
+#[cfg(feature = "fault-injection")]
+pub fn inject_manifest_process_exit_once(phase: CommitPhase) {
+    EXIT_AT_MANIFEST_REPLACE.with(|slot| slot.set(Some(phase)));
+}
+
+#[cfg(feature = "fault-injection")]
+fn exit_at_manifest_replace(phase: CommitPhase) {
+    let injected = EXIT_AT_MANIFEST_REPLACE.with(|slot| {
+        if slot.get() == Some(phase) {
+            slot.set(None);
+            true
+        } else {
+            false
+        }
+    });
+    if injected {
+        std::process::exit(86);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -176,7 +198,11 @@ pub fn commit_manifest(dir: &Path, manifest: &Manifest) -> Result<ManifestCommit
         Err(error) if error.kind() == io::ErrorKind::NotFound => None,
         Err(error) => return Err(CommitError::before(&target, error)),
     };
+    #[cfg(feature = "fault-injection")]
+    exit_at_manifest_replace(CommitPhase::BeforeReplace);
     fs::rename(&tmp, &target).map_err(|source| CommitError::before(&target, source))?;
+    #[cfg(feature = "fault-injection")]
+    exit_at_manifest_replace(CommitPhase::AfterReplace);
     #[cfg(feature = "fault-injection")]
     if FAIL_NEXT_MANIFEST_DIR_SYNC.with(|flag| flag.replace(false)) {
         return Err(CommitError::after(

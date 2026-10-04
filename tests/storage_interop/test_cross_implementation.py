@@ -151,6 +151,54 @@ assert pq.read_table(delta[0]).column('id').to_pylist() == [1]
     run([interpreters[PYTHONS[0]], "-c", reference_code, str(root)], cwd=tmp_path)
 
 
+@pytest.mark.parametrize("reader", ["rust", "reference"])
+def test_confirmed_mixed_wal_survives_rust_process_crash(tmp_path, interpreters, reader):
+    root = tmp_path / "mixed-wal.db"
+    writer = """
+import os, sys
+from pymilvus import DataType, MilvusClient
+path = sys.argv[1]
+schema = MilvusClient.create_schema(auto_id=False)
+schema.add_field('id', DataType.INT64, is_primary=True)
+schema.add_field('vector', DataType.FLOAT_VECTOR, dim=2)
+client = MilvusClient(path)
+client.create_collection('c', schema=schema)
+client.insert('c', [{'id': 1, 'vector': [1.0, 0.0]}, {'id': 2, 'vector': [0.0, 1.0]}])
+client.flush('c')
+assert client.delete('c', ids=[1]) == [1]
+assert client.upsert('c', [{'id': 2, 'vector': [2.0, 0.0]}])['upsert_count'] == 1
+assert client.insert('c', [{'id': 3, 'vector': [0.0, 2.0]}])['insert_count'] == 1
+os._exit(0)
+"""
+    run([sys.executable, "-c", writer, str(root)], cwd=tmp_path)
+    collection = root / "collections" / "c"
+    wal = collection / "wal"
+    assert sorted(path.name for path in wal.glob("*.arrow")) == [
+        "wal_data_000002.arrow", "wal_delta_000002.arrow",
+    ]
+    manifest = json.loads((collection / "manifest.json").read_text())
+    assert manifest["current_seq"] == 2
+    assert manifest["active_wal_number"] == 2
+
+    verify = """
+import sys
+from pymilvus import MilvusClient
+client = MilvusClient(sys.argv[1])
+assert client.query('c', output_fields=['count(*)']) == [{'count(*)': 2}]
+assert client.get('c', ids=[1]) == []
+rows = client.get('c', ids=[2, 3], output_fields=['vector'])
+assert list(rows) == [
+    {'id': 2, 'vector': [2.0, 0.0]},
+    {'id': 3, 'vector': [0.0, 2.0]},
+], rows
+assert [row['id'] for row in client.query('c', filter='id in [1, 2, 3]')] == [2, 3]
+assert [hit['id'] for hit in client.search('c', data=[[2.0, 0.0]], limit=2)[0]] == [2, 3]
+client.close()
+"""
+    python = sys.executable if reader == "rust" else interpreters[PYTHONS[0]]
+    run([python, "-c", verify, str(root)], cwd=tmp_path)
+
+
 def test_real_database_path_alternates_reference_and_rust(tmp_path, interpreters):
     root = tmp_path / "alternating.db"
     reference_create(interpreters[PYTHONS[0]], root, flush=True)

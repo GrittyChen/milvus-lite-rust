@@ -15,11 +15,18 @@ use crate::storage::snapshot;
 thread_local! {
     static FAIL_NEXT_WAL_UNLINK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static INHERITED_SYNC_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static EXIT_AFTER_NEXT_WAL_UNLINK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 #[cfg(feature = "fault-injection")]
 pub fn inject_wal_unlink_failure_once() {
     FAIL_NEXT_WAL_UNLINK.with(|flag| flag.set(true));
+}
+
+/// 仅测试子进程使用：首个 unlink 已同步后立即退出，留下同编号的另一类 WAL。
+#[cfg(feature = "fault-injection")]
+pub fn inject_wal_process_exit_after_unlink_once() {
+    EXIT_AFTER_NEXT_WAL_UNLINK.with(|flag| flag.set(true));
 }
 
 #[cfg(feature = "fault-injection")]
@@ -372,6 +379,10 @@ pub fn cleanup_wal(wal_dir: &Path, up_to: u64) -> io::Result<()> {
         }
         fs::remove_file(&path)?;
         fs_commit::sync_dir(wal_dir)?;
+        #[cfg(feature = "fault-injection")]
+        if EXIT_AFTER_NEXT_WAL_UNLINK.with(|flag| flag.replace(false)) {
+            std::process::exit(87);
+        }
     }
     Ok(())
 }
