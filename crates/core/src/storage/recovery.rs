@@ -1,12 +1,13 @@
 //! collection 的只读恢复阶段：先验证全部引用文件，再把行与 tombstone 纳入有效位图。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::data::{ColumnData, Pk};
 use crate::schema::CollectionSchema;
 use crate::storage::arrow_data::{self, DecodedData, DecodedDelta};
+use crate::storage::fs_commit;
 use crate::storage::manifest::Manifest;
 use crate::storage::memtable::{MemTable, MemTableError};
 use crate::storage::parquet_file;
@@ -14,6 +15,38 @@ use crate::storage::schema_file::SchemaFile;
 use crate::storage::snapshot::{self, PinnedFiles};
 use crate::storage::visibility::{SourceId, Visibility};
 use crate::storage::wal;
+
+#[cfg(feature = "fault-injection")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum OrphanCleanupFault {
+    Remove,
+    Sync,
+}
+
+#[cfg(feature = "fault-injection")]
+thread_local! {
+    static ORPHAN_CLEANUP_FAULT: std::cell::Cell<Option<OrphanCleanupFault>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(feature = "fault-injection")]
+pub fn inject_orphan_cleanup_failure_once(fault: OrphanCleanupFault) {
+    ORPHAN_CLEANUP_FAULT.with(|slot| slot.set(Some(fault)));
+}
+
+#[cfg(feature = "fault-injection")]
+fn orphan_cleanup_fault(fault: OrphanCleanupFault) -> std::io::Result<()> {
+    if ORPHAN_CLEANUP_FAULT.with(|slot| {
+        if slot.get() == Some(fault) {
+            slot.set(None);
+            true
+        } else {
+            false
+        }
+    }) {
+        return Err(std::io::Error::other("injected orphan cleanup failure"));
+    }
+    Ok(())
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum RecoveryError {
@@ -43,6 +76,12 @@ pub enum RecoveryError {
     Unsupported(String),
     #[error("manifest references empty {kind} Parquet file {path:?}")]
     EmptyReferencedFile { path: PathBuf, kind: &'static str },
+    #[error("orphan cleanup failed at {path:?}: {source}")]
+    Cleanup {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 #[derive(Debug)]
@@ -64,6 +103,166 @@ pub struct RecoveredCollection {
     pub next_seq: u64,
     pub next_wal_number: u64,
     pub wal_warnings: Vec<String>,
+}
+
+/// 只在全部引用文件、WAL 与 schema 均验证成功后调用；snapshot 钉住的文件不可删除。
+pub(crate) fn cleanup_unreferenced(
+    collection_dir: &Path,
+    manifest: &Manifest,
+    pinned: &PinnedFiles,
+) -> Result<Vec<String>, RecoveryError> {
+    let partition = collection_dir.join("partitions/_default");
+    // 最终子目录即使是真目录，其父级也可能是指向库外的符号链接。
+    for dir in [collection_dir.join("partitions"), partition.clone()] {
+        match fs::symlink_metadata(&dir) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(source) => return Err(RecoveryError::Cleanup { path: dir, source }),
+            Ok(meta) if !meta.file_type().is_dir() => {
+                return Err(RecoveryError::Unsupported(format!(
+                    "orphan scan path {dir:?} is not a directory"
+                )));
+            }
+            Ok(_) => {}
+        }
+    }
+    let files = &manifest.partitions["_default"];
+    let data_refs: HashSet<PathBuf> = files
+        .data_files
+        .iter()
+        .chain(
+            pinned
+                .data
+                .iter()
+                .filter(|(p, _)| p == "_default")
+                .map(|(_, f)| f),
+        )
+        .map(PathBuf::from)
+        .collect();
+    let delta_refs: HashSet<PathBuf> = files
+        .delta_files
+        .iter()
+        .chain(
+            pinned
+                .delta
+                .iter()
+                .filter(|(p, _)| p == "_default")
+                .map(|(_, f)| f),
+        )
+        .map(PathBuf::from)
+        .collect();
+    let index_refs: HashSet<PathBuf> = pinned
+        .index
+        .iter()
+        .filter(|(p, _)| p == "_default")
+        .map(|(_, f)| PathBuf::from(f))
+        .collect();
+    let valid_stems: HashSet<&str> = data_refs
+        .iter()
+        .filter_map(|path| path.file_stem().and_then(|stem| stem.to_str()))
+        .collect();
+    let mut remove = Vec::new();
+    for (kind, refs) in [("data", &data_refs), ("delta", &delta_refs)] {
+        for entry in entries(&partition.join(kind))? {
+            let relative = PathBuf::from(kind).join(entry.file_name());
+            if !refs.contains(&relative)
+                && !entry
+                    .file_type()
+                    .map_err(|source| RecoveryError::Cleanup {
+                        path: entry.path(),
+                        source,
+                    })?
+                    .is_dir()
+            {
+                remove.push(entry.path());
+            }
+        }
+    }
+    for entry in entries(&partition.join("indexes"))? {
+        let name = entry.file_name();
+        let Some(source_stem) = name.to_str().and_then(sidecar_source_stem) else {
+            continue;
+        };
+        let relative = PathBuf::from("indexes").join(&name);
+        if !valid_stems.contains(source_stem)
+            && !index_refs.contains(&relative)
+            && !entry
+                .file_type()
+                .map_err(|source| RecoveryError::Cleanup {
+                    path: entry.path(),
+                    source,
+                })?
+                .is_dir()
+        {
+            remove.push(entry.path());
+        }
+    }
+    remove.sort();
+    let mut changed_dirs = BTreeSet::new();
+    let mut warnings = Vec::new();
+    for path in remove {
+        #[cfg(feature = "fault-injection")]
+        let removed =
+            orphan_cleanup_fault(OrphanCleanupFault::Remove).and_then(|()| fs::remove_file(&path));
+        #[cfg(not(feature = "fault-injection"))]
+        let removed = fs::remove_file(&path);
+        if let Err(error) = removed {
+            warnings.push(format!("cannot remove orphan {path:?}: {error}"));
+            continue;
+        }
+        changed_dirs.insert(path.parent().unwrap_or(&partition).to_path_buf());
+    }
+    for dir in changed_dirs {
+        #[cfg(feature = "fault-injection")]
+        let synced =
+            orphan_cleanup_fault(OrphanCleanupFault::Sync).and_then(|()| fs_commit::sync_dir(&dir));
+        #[cfg(not(feature = "fault-injection"))]
+        let synced = fs_commit::sync_dir(&dir);
+        if let Err(error) = synced {
+            warnings.push(format!(
+                "cannot sync orphan cleanup directory {dir:?}: {error}"
+            ));
+        }
+    }
+    Ok(warnings)
+}
+
+fn entries(dir: &Path) -> Result<Vec<fs::DirEntry>, RecoveryError> {
+    match fs::symlink_metadata(dir) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(source) => {
+            return Err(RecoveryError::Cleanup {
+                path: dir.to_path_buf(),
+                source,
+            });
+        }
+        Ok(meta) if !meta.file_type().is_dir() => {
+            return Err(RecoveryError::Unsupported(format!(
+                "orphan scan path {dir:?} is not a directory"
+            )));
+        }
+        Ok(_) => {}
+    }
+    fs::read_dir(dir)
+        .map_err(|source| RecoveryError::Cleanup {
+            path: dir.to_path_buf(),
+            source,
+        })?
+        .map(|item| {
+            item.map_err(|source| RecoveryError::Cleanup {
+                path: dir.to_path_buf(),
+                source,
+            })
+        })
+        .collect()
+}
+
+fn sidecar_source_stem(name: &str) -> Option<&str> {
+    let base = name
+        .strip_suffix(".idx")
+        .or_else(|| name.strip_suffix(".sidx"))?;
+    let (stem_field, index_type) = base.rsplit_once('.')?;
+    let (source, field) = stem_field.rsplit_once('.')?;
+    (!source.is_empty() && !field.is_empty() && !index_type.is_empty()).then_some(source)
 }
 
 enum WalOperation {
@@ -388,6 +587,238 @@ fn pk_at(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "fault-injection")]
+    #[test]
+    fn orphan_cleanup_io_failures_return_diagnostics() {
+        for fault in [OrphanCleanupFault::Remove, OrphanCleanupFault::Sync] {
+            let root = tempfile::tempdir().unwrap();
+            let dir = root.path().join("partitions/_default/data");
+            fs::create_dir_all(&dir).unwrap();
+            let orphan = dir.join("orphan.parquet");
+            fs::write(&orphan, b"unreferenced").unwrap();
+            let later_orphan = dir.join("z-orphan.parquet");
+            fs::write(&later_orphan, b"unreferenced").unwrap();
+            inject_orphan_cleanup_failure_once(fault);
+            let warnings =
+                cleanup_unreferenced(root.path(), &Manifest::default(), &PinnedFiles::default())
+                    .unwrap();
+            assert_eq!(warnings.len(), 1);
+            assert!(warnings[0].contains("injected orphan cleanup failure"));
+            assert!(
+                warnings[0].contains(if fault == OrphanCleanupFault::Remove {
+                    "orphan.parquet"
+                } else {
+                    "data"
+                })
+            );
+            assert_eq!(orphan.exists(), fault == OrphanCleanupFault::Remove);
+            assert!(!later_orphan.exists());
+        }
+    }
+
+    #[test]
+    fn orphan_cleanup_respects_manifest_snapshots_and_index_file_types() {
+        let root = tempfile::tempdir().unwrap();
+        let part = root.path().join("partitions/_default");
+        for kind in ["data", "delta", "indexes"] {
+            fs::create_dir_all(part.join(kind)).unwrap();
+        }
+        let keep_data = "data_000001_000001.parquet";
+        let pinned_data = "data_000002_000002.parquet";
+        let orphan_data = "data_000003_000003.parquet";
+        let pinned_delta = "delta_000004_000004.parquet";
+        let orphan_delta = "delta_000005_000005.parquet";
+        for (kind, name) in [
+            ("data", keep_data),
+            ("data", pinned_data),
+            ("data", orphan_data),
+            ("delta", pinned_delta),
+            ("delta", orphan_delta),
+        ] {
+            fs::write(part.join(kind).join(name), b"fixture").unwrap();
+        }
+        let keep_index = "data_000001_000001.v.flat.idx";
+        let pinned_index = "data_000003_000003.v.flat.idx";
+        let orphan_index = "data_000005_000005.v.flat.idx";
+        let rust_index = "data_000005_000005.v.rust-index";
+        for name in [keep_index, pinned_index, orphan_index, rust_index] {
+            fs::write(part.join("indexes").join(name), b"fixture").unwrap();
+        }
+        let mut manifest = Manifest::default();
+        manifest
+            .partitions
+            .get_mut("_default")
+            .unwrap()
+            .data_files
+            .push(format!("data/{keep_data}"));
+        let mut pinned = PinnedFiles::default();
+        pinned
+            .data
+            .insert(("_default".to_owned(), format!("data/{pinned_data}")));
+        pinned
+            .delta
+            .insert(("_default".to_owned(), format!("delta/{pinned_delta}")));
+        pinned
+            .index
+            .insert(("_default".to_owned(), format!("indexes/{pinned_index}")));
+
+        cleanup_unreferenced(root.path(), &manifest, &pinned).unwrap();
+        for (kind, name) in [
+            ("data", keep_data),
+            ("data", pinned_data),
+            ("delta", pinned_delta),
+            ("indexes", keep_index),
+            ("indexes", pinned_index),
+            ("indexes", rust_index),
+        ] {
+            assert!(part.join(kind).join(name).exists(), "removed {kind}/{name}");
+        }
+        for (kind, name) in [
+            ("data", orphan_data),
+            ("delta", orphan_delta),
+            ("indexes", orphan_index),
+        ] {
+            assert!(
+                !part.join(kind).join(name).exists(),
+                "retained {kind}/{name}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn orphan_cleanup_unlinks_symlink_without_touching_its_target() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let data_dir = root.path().join("partitions/_default/data");
+        fs::create_dir_all(&data_dir).unwrap();
+        let target = outside.path().join("keep.parquet");
+        fs::write(&target, b"outside").unwrap();
+        let link = data_dir.join("orphan.parquet");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        cleanup_unreferenced(root.path(), &Manifest::default(), &PinnedFiles::default()).unwrap();
+        assert!(fs::symlink_metadata(&link).is_err());
+        assert_eq!(fs::read(target).unwrap(), b"outside");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn orphan_cleanup_rejects_symlinked_partition_parent() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let external_data = outside.path().join("_default/data");
+        fs::create_dir_all(&external_data).unwrap();
+        let target = external_data.join("keep.parquet");
+        fs::write(&target, b"outside").unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.path().join("partitions")).unwrap();
+
+        assert!(
+            cleanup_unreferenced(root.path(), &Manifest::default(), &PinnedFiles::default())
+                .is_err()
+        );
+        assert_eq!(fs::read(target).unwrap(), b"outside");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn orphan_cleanup_rejects_symlinked_scan_directories_before_any_deletion() {
+        for kind in ["data", "delta", "indexes"] {
+            let root = tempfile::tempdir().unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            let part = root.path().join("partitions/_default");
+            fs::create_dir_all(&part).unwrap();
+            let victim = outside.path().join("data_000999_000999.v.flat.idx");
+            fs::write(&victim, b"outside").unwrap();
+            std::os::unix::fs::symlink(outside.path(), part.join(kind)).unwrap();
+
+            let result =
+                cleanup_unreferenced(root.path(), &Manifest::default(), &PinnedFiles::default());
+            assert!(
+                matches!(result, Err(RecoveryError::Unsupported(_))),
+                "accepted {kind} symlink: {result:?}"
+            );
+            assert_eq!(fs::read(&victim).unwrap(), b"outside");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn orphan_cleanup_propagates_unreadable_data_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("partitions/_default/data");
+        fs::create_dir_all(&dir).unwrap();
+        let orphan = dir.join("orphan.parquet");
+        fs::write(&orphan, b"preserve").unwrap();
+        let original = fs::metadata(&dir).unwrap().permissions();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o000)).unwrap();
+        let result =
+            cleanup_unreferenced(root.path(), &Manifest::default(), &PinnedFiles::default());
+        fs::set_permissions(&dir, original).unwrap();
+
+        assert!(
+            matches!(result, Err(RecoveryError::Cleanup { source, .. }) if source.kind() == std::io::ErrorKind::PermissionDenied)
+        );
+        assert_eq!(fs::read(&orphan).unwrap(), b"preserve");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn orphan_cleanup_finishes_all_scans_before_deleting_candidates() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let part = root.path().join("partitions/_default");
+        for kind in ["data", "delta", "indexes"] {
+            fs::create_dir_all(part.join(kind)).unwrap();
+        }
+        let data = part.join("data/orphan.parquet");
+        let delta = part.join("delta/orphan.parquet");
+        fs::write(&data, b"data").unwrap();
+        fs::write(&delta, b"delta").unwrap();
+        let indexes = part.join("indexes");
+        let original = fs::metadata(&indexes).unwrap().permissions();
+        fs::set_permissions(&indexes, fs::Permissions::from_mode(0o000)).unwrap();
+        let result =
+            cleanup_unreferenced(root.path(), &Manifest::default(), &PinnedFiles::default());
+        fs::set_permissions(&indexes, original).unwrap();
+
+        assert!(
+            matches!(result, Err(RecoveryError::Cleanup { source, .. }) if source.kind() == std::io::ErrorKind::PermissionDenied)
+        );
+        assert_eq!(fs::read(&data).unwrap(), b"data");
+        assert_eq!(fs::read(&delta).unwrap(), b"delta");
+    }
+
+    #[test]
+    fn orphan_cleanup_excludes_directory_candidates_without_warnings() {
+        let root = tempfile::tempdir().unwrap();
+        let part = root.path().join("partitions/_default");
+        for (kind, name) in [
+            ("data", "orphan.parquet"),
+            ("delta", "orphan.parquet"),
+            ("indexes", "data_000999_000999.v.flat.idx"),
+        ] {
+            fs::create_dir_all(part.join(kind).join(name)).unwrap();
+        }
+        let warnings =
+            cleanup_unreferenced(root.path(), &Manifest::default(), &PinnedFiles::default())
+                .unwrap();
+        assert!(
+            warnings.is_empty(),
+            "directories were treated as unlink candidates: {warnings:?}"
+        );
+        for (kind, name) in [
+            ("data", "orphan.parquet"),
+            ("delta", "orphan.parquet"),
+            ("indexes", "data_000999_000999.v.flat.idx"),
+        ] {
+            assert!(part.join(kind).join(name).is_dir());
+        }
+    }
 
     fn wal_collection(root: &Path) -> (PathBuf, CollectionSchema) {
         let collection = root.join("c");

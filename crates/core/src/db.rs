@@ -831,7 +831,14 @@ impl Db {
         for warning in &recovered.wal_warnings {
             eprintln!("collection {name:?} recovered only a validated WAL prefix: {warning}");
         }
-        let collection = Collection::from_recovered(name, recovered, path)?;
+        let manifest = recovered.manifest.clone();
+        let pinned_files = recovered.pinned_files.clone();
+        let collection = Collection::from_recovered(name, recovered, path.clone())?;
+        for warning in recovery::cleanup_unreferenced(&path, &manifest, &pinned_files)
+            .map_err(recovery_error)?
+        {
+            eprintln!("collection {name:?} orphan cleanup deferred: {warning}");
+        }
         let handle = Arc::new(RwLock::new(collection));
         self.collections
             .write()

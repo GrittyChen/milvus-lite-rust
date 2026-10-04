@@ -552,6 +552,7 @@ M1 证明了整条链路可行，但数据只在内存中，不发布（[0004](0
 | 读取含重复 (pk, `_seq`) 或重复路径的目录 | 计两次 | 计一次 | 缺陷 a 留下的数据 | 3.x 在缺陷 a 的崩溃点中断过的目录 |
 | manifest 解析失败、`manifest.json` 缺失而 `.prev` 存在、引用的文件缺失、Parquet 损坏、snapshot 元数据无法解析 | 回退 `.prev` 并删文件；读 `.prev`；静默少数据；每个 RPC 报 code 1；静默跳过这个 snapshot | 该 collection fail-closed，不删文件；DescribeCollection 与 drop 照常 | 规则 5，第 11 项 | 损坏的目录 |
 | WAL 读取遇到真实 I/O 错误 | 忽略，保留前缀 | 该 collection 打开失败，下次访问重试 | 规则 5 | I/O 故障 |
+| 孤儿清理路径的目录形态异常 | `os.path.isdir` 跳过非目录的 data/delta/indexes 路径，跟随目录符号链接；清理可能删除链接目标中的库外文件 | `partitions/`、`partitions/_default/` 与 data/delta/indexes 必须是真目录；符号链接或其他非目录形态使该 collection fail-closed，删除前即拒绝打开 | 防止孤儿清理穿透托管目录；这会使本仓加入清理前可读取的软链目录不再可用，[0007「打开」](0007-m2-storage-engine.md#打开) | 存量目录将分区目录或扫描目录软链到别处，或扫描路径被普通文件占据；相关目录形态反证测试固定拒绝行为 |
 | 损坏的 WAL 在哪里判定出错 | 按 pyarrow 的校验 | 按 arrow-rs 的校验，可能不同；本实现从较短的前缀续号时，3.x 之后可能看到两条操作共用一个 `_seq` | 两边的校验项不同 | 损坏的目录 |
 | manifest、schema 或 snapshot 元数据中有未知的键 | 能打开，重写时丢掉这些键 | 该 collection fail-closed，返回 UNIMPLEMENTED。`schema.json` 中有未知的键时，DescribeCollection 也报错，`has_collection` 抛异常；只有 manifest 或 snapshot 元数据中有时，DescribeCollection 照常 | 第 14 项 | 3.x 新版本写出的目录 |
 | `ShowCollections` 时有 collection 打不开 | 整个调用失败 | 其余照常列出 | 第 16 项 | 含损坏或不支持内容的目录 |
@@ -577,6 +578,7 @@ M1 证明了整条链路可行，但数据只在内存中，不发布（[0004](0
 | `delete(ids=["bad"])` 对 INT64 主键生成的无引号表达式 | 解析时报 code 6，指出 `bad` 不是字面量 | 当前仅识别主键 `in` 快路径，返回 UNIMPLEMENTED；S1 过滤解析接入时对齐原文 | 第 1 项的 S1 解析尚未接入 | 非数字字符串传给 INT64 的 `delete(ids=...)` |
 | ManualCompaction 与 GetCompactionState | 返回成功，恒为 Completed | UNIMPLEMENTED | 第 3 项，不变量 15 | `client.compact()`、`optimize()` |
 | 被覆盖的旧版本与已删除的行 | compaction 回收 | 不回收 | 第 3 项 | 长期运行的写入 |
+| 启动时 staging 残留清理失败 | 忽略残留删除错误，数据库仍可打开 | 当前 DataDir::open 向上传递清理错误，整个数据库打开失败；留待后续故障切片对齐 | 启动期清理尚未采用提交后清理的非阻断语义；[0007](0007-m2-storage-engine.md#dropcreate-与关闭) 的 drop 提交后 staging 删除失败仍只记日志 | `.database-staging/` 有不可删除的残留或目录同步失败；不包括 staging 路径类型错误 |
 
 ## 验收
 

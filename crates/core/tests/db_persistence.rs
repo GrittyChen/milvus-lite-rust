@@ -300,6 +300,8 @@ fn one_corrupt_collection_fails_closed_without_hiding_others() {
     }
     db.close();
     let manifest = path.join("collections/broken/manifest.json");
+    let orphan = path.join("collections/broken/partitions/_default/data/unreferenced.parquet");
+    std::fs::write(&orphan, b"preserve on failed open").unwrap();
     std::fs::write(&manifest, b"{").unwrap();
     let files_before = std::fs::read_dir(path.join("collections/broken/partitions/_default/data"))
         .unwrap()
@@ -328,6 +330,31 @@ fn one_corrupt_collection_fails_closed_without_hiding_others() {
         files_before
     );
     assert_eq!(std::fs::read(&manifest).unwrap(), b"{");
+    assert_eq!(std::fs::read(&orphan).unwrap(), b"preserve on failed open");
+    reopened.close();
+}
+
+#[test]
+fn invalid_snapshot_metadata_preserves_unreferenced_files() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("snapshot-error.db");
+    let db = Db::new(DataDir::open(&path).unwrap(), compute());
+    db.create_collection("", "c", schema()).unwrap();
+    db.insert("", "c", batch(&[1])).unwrap();
+    db.close();
+    let collection = path.join("collections/c");
+    let orphan = collection.join("partitions/_default/data/unreferenced.parquet");
+    std::fs::write(&orphan, b"keep").unwrap();
+    let metadata = collection.join("snapshots/metadata");
+    std::fs::create_dir_all(&metadata).unwrap();
+    std::fs::write(metadata.join("broken.json"), b"{").unwrap();
+
+    let reopened = Db::new(DataDir::open(&path).unwrap(), compute());
+    assert!(matches!(
+        reopened.collection("", "c"),
+        Err(EngineError::Storage(_))
+    ));
+    assert_eq!(std::fs::read(orphan).unwrap(), b"keep");
     reopened.close();
 }
 
@@ -472,6 +499,66 @@ fn create_checks_directory_shape_before_cleaning_aliases() {
     assert!(db.create_collection("", "missing", schema()).is_err());
     assert_eq!(std::fs::read(path.join("aliases.json")).unwrap(), aliases);
     db.close();
+}
+
+#[cfg(feature = "fault-injection")]
+#[test]
+fn orphan_cleanup_io_failures_do_not_block_healthy_collection_reads() {
+    use milvus_lite_core::storage::recovery::{
+        OrphanCleanupFault, inject_orphan_cleanup_failure_once,
+    };
+
+    for (kind, name, fault) in [
+        ("data", "orphan.parquet", OrphanCleanupFault::Remove),
+        ("delta", "orphan.parquet", OrphanCleanupFault::Remove),
+        (
+            "indexes",
+            "data_000999_000999.v.flat.idx",
+            OrphanCleanupFault::Remove,
+        ),
+        ("data", "orphan.parquet", OrphanCleanupFault::Sync),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("cleanup-error.db");
+        let db = Db::new(DataDir::open(&path).unwrap(), compute());
+        db.create_collection("", "c", schema()).unwrap();
+        db.insert("", "c", batch(&[1, 2])).unwrap();
+        db.close();
+        drop(db);
+        let dir = path.join("collections/c/partitions/_default").join(kind);
+        std::fs::create_dir_all(&dir).unwrap();
+        let orphan = dir.join(name);
+        std::fs::write(&orphan, b"unreferenced").unwrap();
+
+        let reopened = Db::new(DataDir::open(&path).unwrap(), compute());
+        inject_orphan_cleanup_failure_once(fault);
+        let handle = reopened.collection("", "c").unwrap();
+        assert_eq!(handle.read().count(), 2);
+        assert_eq!(handle.read().schema().fields[0].name, "id");
+        assert_eq!(
+            handle
+                .read()
+                .get(&[Pk::Int64(1), Pk::Int64(2)], &[])
+                .unwrap()
+                .rows
+                .pks,
+            [Pk::Int64(1), Pk::Int64(2)]
+        );
+        assert_eq!(orphan.exists(), fault == OrphanCleanupFault::Remove);
+        assert_eq!(
+            reopened.list_collections("").unwrap(),
+            [("c".to_owned(), LoadState::Loaded)]
+        );
+        reopened.insert("", "c", batch(&[3])).unwrap();
+        assert_eq!(handle.read().count(), 3);
+        drop(handle);
+        reopened.close();
+        drop(reopened);
+        let final_open = Db::new(DataDir::open(&path).unwrap(), compute());
+        assert_eq!(final_open.collection("", "c").unwrap().read().count(), 3);
+        assert!(!orphan.exists());
+        final_open.close();
+    }
 }
 
 #[cfg(feature = "fault-injection")]
