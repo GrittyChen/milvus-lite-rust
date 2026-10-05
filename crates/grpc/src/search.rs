@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 
 use milvus_lite_core::error::py_json_repr;
-use milvus_lite_core::{Collection, Compute, EngineError, Metric, QueryVectors, SearchRequest};
+use milvus_lite_core::{Compute, EngineError, Metric, QueryVectors, ReadSnapshot, SearchRequest};
 use prost::Message;
 use serde_json::Value;
 
@@ -34,7 +34,7 @@ pub(crate) struct Parsed {
 
 /// `parsed` 由 [`parse`] 在取 collection 读锁之前得到。
 pub(crate) fn search(
-    c: &Collection,
+    c: &ReadSnapshot,
     compute: &Compute,
     parsed: Parsed,
     output_fields: Vec<String>,

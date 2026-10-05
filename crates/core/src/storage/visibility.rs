@@ -16,24 +16,32 @@ pub struct RowLocation {
 }
 
 #[derive(Debug, Clone)]
-struct SourceBits {
-    len: usize,
+pub(crate) struct SourceBits {
+    pub(crate) len: usize,
     bits: Arc<Vec<u64>>,
 }
 
 impl SourceBits {
-    fn new(len: usize) -> Self {
+    pub(crate) fn new(len: usize) -> Self {
         Self {
             len,
             bits: Arc::new(vec![0; len.div_ceil(64)]),
         }
     }
 
-    fn get(&self, row: usize) -> bool {
+    pub(crate) fn from_live(live: &[bool]) -> Self {
+        let mut bits = Self::new(live.len());
+        for (row, &value) in live.iter().enumerate() {
+            bits.set(row, value);
+        }
+        bits
+    }
+
+    pub(crate) fn get(&self, row: usize) -> bool {
         self.bits[row / 64] & (1_u64 << (row % 64)) != 0
     }
 
-    fn set(&mut self, row: usize, live: bool) {
+    pub(crate) fn set(&mut self, row: usize, live: bool) {
         let word = &mut Arc::make_mut(&mut self.bits)[row / 64];
         let mask = 1_u64 << (row % 64);
         if live {
@@ -295,6 +303,31 @@ impl Visibility {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn packed_read_bits_cover_word_boundaries_and_copy_once_per_owner() {
+        for len in [0_usize, 1, 63, 64, 65, 129] {
+            let live: Vec<_> = (0..len).map(|row| row % 3 == 0).collect();
+            let mut bits = SourceBits::from_live(&live);
+            let snapshot = bits.clone();
+            assert_eq!(bits.bits.len(), len.div_ceil(64));
+            assert!(Arc::ptr_eq(&bits.bits, &snapshot.bits));
+            for (row, expected) in live.iter().enumerate() {
+                assert_eq!(bits.get(row), *expected);
+            }
+            if len > 0 {
+                bits.set(0, false);
+                assert!(!Arc::ptr_eq(&bits.bits, &snapshot.bits));
+                let copied = Arc::as_ptr(&bits.bits);
+                for (row, expected) in live.iter().enumerate() {
+                    bits.set(row, !expected);
+                    assert_eq!(Arc::as_ptr(&bits.bits), copied);
+                    assert_eq!(snapshot.get(row), *expected);
+                    assert_eq!(bits.get(row), !expected);
+                }
+            }
+        }
+    }
 
     fn pk(id: i64) -> Pk {
         Pk::Int64(id)

@@ -230,7 +230,8 @@ fn close_nowait_syncs_in_the_background_before_releasing_the_lock() {
     assert!(lock_is_free(root.path()));
 }
 
-/// 0005「验证」：检索持有读锁并行计算时，排队的写入与其后的检索都能完成，不死锁。
+/// 0005「验证」的显式持锁场景：生产路径已在取得快照后放锁，
+/// 本用例保留锁内计算时排队的写入与后到读者都能完成的不死锁证明。
 /// 计算任务不拿锁，所以即使写入排在读锁之后、又挡住后到的读者，持锁的检索也能算完并放锁。
 #[test]
 fn search_with_a_queued_writer_does_not_deadlock() {

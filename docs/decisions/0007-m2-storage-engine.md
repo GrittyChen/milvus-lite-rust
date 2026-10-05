@@ -386,7 +386,7 @@ WAL 追加（每次写入调用一个 batch，dim 128）：
 
 ## 采纳后的配套修改
 
-本节是完整 M2 设计的配套清单，不等同于已实现功能清单。Delete / Upsert 已接入主键路径；查询快照、逐名字锁、完整 fail-closed 缓存、分区与过滤等项目仍是目标合同，不能据此宣称对应代码已落地。
+本节是完整 M2 设计的配套清单，不等同于已实现功能清单。Delete / Upsert 与查询快照已接入当前支持的主键与检索路径；逐名字锁、完整 fail-closed 缓存、分区与过滤等项目仍是目标合同，不能据此宣称对应代码已落地。
 
 - [0005](0005-search-thread-model.md)：
   - 「锁的边界与排队」中「检索在整个计算期间持有 collection 的读锁」改为链接本文「读」一节；
@@ -437,3 +437,13 @@ WAL 追加（每次写入调用一个 batch，dim 128）：
 - [runtime.rs](../../crates/core/src/storage/runtime.rs)：冻结代保留原 WAL File；文件与目录同步任一点失败均不关闭其中任何句柄，全成功后才关闭；Unix 上删除 wal/ 后仍持有活跃或冻结句柄时同步报错，确实没有句柄时允许目录不存在。
 - [crash_recovery.rs](../../crates/core/tests/crash_recovery.rs) 与 [互通用例](../../tests/storage_interop/test_cross_implementation.py)：ENOSPC 报错后停止或继续写入，再由独立进程立即退出；Rust 恢复结果与成功操作一致。3.x 与 Rust 的真实客户端分别读取两类目录：追加失败后恢复 flush 已完成、失败 WAL 已清理；以及注入恢复 flush 的 WAL 预同步失败，令半截 WAL 保留在盘上再退出。用例先断言实际 WAL 文件集合，再核对 count、get、主键 query、search 与向量；参考实现及 pyarrow 15/25 逐字节读取 Rust WAL，与 Rust 的完整批前缀及值一致。
 - 边界：ENOSPC 是 File 层错误注入，并未填满宿主磁盘；本节不代表完成并发写入后崩溃、Parquet 读取 panic、全部 fs 操作顺序或跨平台验证。仍有效的载荷位翻转不由格式校验检出，继承风险见 [0002](0002-data-dir-compat.md#继承的-3x-已知风险)。
+
+### 读快照的当前实现与验收范围
+
+[collection.rs](../../crates/core/src/collection.rs) 的 `ReadSnapshot` 共享不可变的列式块（含范数、动态字段与位次）及按位压缩的有效位图；写入仅对触及的有效位图写时复制。取得检索快照不复制列数据或全量主键表。`GetSnapshot` 在状态读锁内按请求顺序定位主键，只钉住命中的块；投影结果的复制在放锁后完成。空 expr 的 `count(*)` 仍在短读锁内取计数。Search 的度量定义、load/deleted 状态和主键 Query 的校验均来自同一次状态视图，后续 release、覆盖或 drop 不改变已取得的视图。
+
+- [read_snapshot.rs](../../crates/core/tests/read_snapshot.rs) 用通道暂停取得视图后的读者，在恢复计算之前要求覆盖、删除、Upsert、重新插入、flush 发布、release、drop 与同名重建全部完成。活跃代及已提交数据各自覆盖；旧视图的主键、列、JSON、动态字段、距离与并列顺序保持不变；提交点前后失败的待提交代快照也在重试发布与后续覆盖删除之后保持原结果。
+- collection 单测核对共享数据块与只钉住 Get 命中块；VARCHAR 主键用例另核对跨块重映射、重复与缺失主键，以及覆盖、删除、flush 与 drop 后旧投影不变。[service.rs](../../crates/grpc/src/service.rs) 与 [query.rs](../../crates/grpc/src/query.rs) 的测试分别暂停真实 Search RPC 与主键 Query 的锁外阶段，要求 drop 或删除与 flush 先完成，再核对旧响应。
+- [test_read_snapshot.py](../../tests/differential/test_read_snapshot.py) 以真实 3.x 核对覆盖、删除后重插、flush 与部分 Upsert 前后的主键读取、投影、计数和非截断的并列检索顺序。
+
+本切片保持既有列式读取视图与持久化运行时的对应方式，不改变落盘格式与发布协议；块的合并、完整的数据源映射、S1 过滤查询与按名字并行打开仍待后续切片。未以本切片测试替代完整的并发崩溃矩阵或性能基准，不能据此声明吞吐或延迟提升。

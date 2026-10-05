@@ -1,10 +1,10 @@
-//! 服务的计算池（[0005](../../../docs/decisions/0005-search-thread-model.md)）：检索在持有读锁期间
+//! 服务的计算池（[0005](../../../docs/decisions/0005-search-thread-model.md)）：检索在不可变读快照上
 //! 把计算拆成叶子任务，在这里并行执行。依赖的是 rayon-core（rayon 的线程池部分，不含并行迭代器）；
 //! 它的调用只出现在本 module，其余提交任务的接口由 clippy 禁止。
 //!
 //! 叶子任务不拿锁、不阻塞，只写自己独占的数据；[`Compute::for_each`] 只能从计算池之外的线程调用
 //! （RPC 所在的 tokio 阻塞线程）。这样调用线程在 `in_place_scope` 中只等待、不偷其他请求的任务，
-//! 也不会在持有 collection 读锁时接走一个要取写锁的任务。
+//! 也不会接走一个需要锁或阻塞的业务任务。
 
 use std::num::NonZeroUsize;
 

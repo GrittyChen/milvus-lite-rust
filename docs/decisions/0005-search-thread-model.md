@@ -11,7 +11,7 @@ M1 的暴力检索是计算密集型的。距离改为 16 路累加、top-k 改�
 
 本文定下线程池怎样与现有的 RPC 执行方式、collection 的读写锁、停服与 fork 配合。按 [AGENTS.md](../../AGENTS.md) 规则 3，这是并发方面的改动，先写设计说明，经负责人确认后再实现。
 
-M1 现状：每个 RPC 的处理体在 tokio 的阻塞线程池（`spawn_blocking`）中执行，先经 `Db::enter` 通过关闭闸门；检索在持有 collection 读锁（parking_lot `RwLock`）期间完成全部计算。M2 改为取快照后放锁，具体锁边界与数据源全序见 [0007「读」](0007-m2-storage-engine.md#读) 和 [0007「数据结构」](0007-m2-storage-engine.md#数据结构)；以下未特别注明的锁描述记录的是 M1 的实现。
+M1 的实现：每个 RPC 的处理体在 tokio 的阻塞线程池（`spawn_blocking`）中执行，先经 `Db::enter` 通过关闭闸门；检索在持有 collection 读锁（parking_lot `RwLock`）期间完成全部计算。M2 已接通取快照后放锁计算，具体锁边界与数据源全序见 [0007「读」](0007-m2-storage-engine.md#读) 和 [0007「数据结构」](0007-m2-storage-engine.md#数据结构)；以下未特别注明的锁描述记录的是 M1 的实现。
 
 文中的耗时都是初步测量：本机 Apple silicon（10 核）、计算池 10 个线程、128 维，行数随文注明，原型脚本不入库，重跑时量级一致而具体数值波动较大。正式数字以 M1 基准写入 [0001「M1 部分验证」](0001-refactor-baseline.md) 的为准。
 

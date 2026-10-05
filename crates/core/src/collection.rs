@@ -2,6 +2,7 @@
 //! 语义以 3.x 的 memtable 路径为准；与 3.x 不同之处见 0004「决策」与「阶段性差异」。
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use serde_json::{Map, Value};
 
@@ -18,6 +19,7 @@ use crate::schema::{CollectionSchema, DataType, FieldSchema};
 use crate::storage::arrow_data::DecodedData;
 use crate::storage::recovery::RecoveredCollection;
 use crate::storage::runtime::PersistentCollection;
+use crate::storage::visibility::SourceBits;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoadState {
@@ -68,19 +70,261 @@ pub struct QueryResult {
     pub rows: Rows,
 }
 
-/// 一次 insert 追加的列式数据块。
+/// 锁内取得的不可变读取视图，不包含全量主键索引或可变持久化状态。
 #[derive(Debug)]
+pub struct ReadSnapshot {
+    name: String,
+    schema: CollectionSchema,
+    pk_pos: usize,
+    vector_pos: usize,
+    chunks: Vec<Chunk>,
+    indexes: Vec<IndexSpec>,
+    load_state: LoadState,
+    deleted: bool,
+}
+
+/// 主键在锁内定位，投影与结果复制在放锁后完成。
+#[derive(Debug)]
+pub struct GetSnapshot {
+    // chunks 仅为命中块的子集，refs 的块下标已重映射；此私有视图不可用于全量检索。
+    snapshot: ReadSnapshot,
+    refs: Vec<RowRef>,
+    projection: Projection,
+}
+
+impl GetSnapshot {
+    pub fn name(&self) -> &str {
+        self.snapshot.name()
+    }
+    pub fn schema(&self) -> &CollectionSchema {
+        self.snapshot.schema()
+    }
+    pub fn read(&self) -> QueryResult {
+        QueryResult {
+            projection: self.projection.clone(),
+            rows: self.snapshot.gather(&self.refs, &self.projection),
+        }
+    }
+}
+
+impl ReadSnapshot {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+    pub fn schema(&self) -> &CollectionSchema {
+        &self.schema
+    }
+    /// 在 `compute` 上并行计算（[0005](../../../docs/decisions/0005-search-thread-model.md)），
+    /// 结果与串行计算逐位相同。
+    pub fn search(&self, req: SearchRequest, compute: &Compute) -> Result<SearchResult> {
+        let rows_per_block = (BLOCK_ELEMS / field_dim(&self.schema.fields[self.vector_pos])).max(1);
+        self.search_in_blocks(req, compute, rows_per_block)
+    }
+
+    fn search_in_blocks(
+        &self,
+        req: SearchRequest,
+        compute: &Compute,
+        rows_per_block: usize,
+    ) -> Result<SearchResult> {
+        let projection = Projection::new(&self.schema, &req.output_fields, ApiKind::Search);
+        // 3.x：没有查询向量时在一切检查之前返回空结果。
+        if matches!(&req.vectors, QueryVectors::Dense(v) if v.is_empty()) {
+            return Ok(SearchResult {
+                projection,
+                metric: None,
+                hits: Vec::new(),
+            });
+        }
+        self.require_loaded()?;
+        let field_pos = self.resolve_anns_field(req.anns_field.as_deref())?;
+        let field = &self.schema.fields[field_pos];
+        let vectors = match &req.vectors {
+            QueryVectors::Dense(v) => v,
+            // 3.x `_maybe_embed_queries`：字段上没有 TEXT_EMBEDDING function（M1 不支持 function）。
+            QueryVectors::Text => {
+                return Err(EngineError::schema(format!(
+                    "Text query on field {} requires a TEXT_EMBEDDING function targeting that field",
+                    py_repr(&field.name)
+                )));
+            }
+            // 3.x 把稀疏向量（dict）交给 numpy 转成稠密数组时的 TypeError。
+            QueryVectors::Sparse => {
+                return Err(EngineError::invalid(
+                    "float() argument must be a string or a real number, not 'dict'",
+                ));
+            }
+        };
+        let metric = match &req.metric_type {
+            Some(m) => Metric::parse(m)?,
+            None => self.default_metric(&field.name)?,
+        };
+        let dim = field_dim(field);
+        // 3.x 不校验，维度不符时报 numpy 的原始错误，空 collection 上反而成功（0004「决策」）。
+        for v in vectors {
+            if v.len() != dim {
+                return Err(EngineError::invalid(format!(
+                    "query vector has dim {}, but field {} expects dim {dim}",
+                    v.len(),
+                    py_repr(&field.name)
+                )));
+            }
+        }
+        // M1 只允许一个 FLOAT_VECTOR 字段，范数只为它计算。
+        debug_assert_eq!(field_pos, self.vector_pos);
+        let take = req.limit.saturating_add(req.offset);
+        let queries: Vec<flat::Query> = vectors
+            .iter()
+            .map(|v| flat::Query::new(metric, v))
+            .collect();
+        let mut tops: Vec<TopK> = queries.iter().map(|_| TopK::new(metric, take)).collect();
+        let blocks = row_blocks(&self.chunks, rows_per_block);
+        if take > 0 && !blocks.is_empty() {
+            let groups: Vec<&[flat::Query]> = queries.chunks(flat::BATCH).collect();
+            let per_wave = groups_per_wave(compute.threads(), blocks.len());
+            for wave in (0..groups.len()).step_by(per_wave) {
+                let mut leaves: Vec<Leaf> = (wave..groups.len().min(wave + per_wave))
+                    .flat_map(|group| {
+                        blocks.iter().map(move |block| Leaf {
+                            group,
+                            block,
+                            tops: Vec::new(),
+                        })
+                    })
+                    .collect();
+                compute.for_each(&mut leaves, |leaf| {
+                    let queries = groups[leaf.group];
+                    leaf.tops = queries.iter().map(|_| TopK::new(metric, take)).collect();
+                    scan(&self.chunks, leaf.block, field_pos, queries, &mut leaf.tops);
+                    leaf.tops.iter_mut().for_each(TopK::shrink);
+                });
+                for leaf in leaves {
+                    for (i, top) in leaf.tops.into_iter().enumerate() {
+                        tops[leaf.group * flat::BATCH + i].absorb(top);
+                    }
+                }
+            }
+        }
+        let hits = tops
+            .into_iter()
+            .map(|top| {
+                let ranked = top.finish();
+                let kept = ranked.get(req.offset..).unwrap_or(&[]);
+                let refs: Vec<RowRef> = kept.iter().map(|(_, r)| *r).collect();
+                Hits {
+                    scores: kept.iter().map(|(s, _)| *s).collect(),
+                    rows: self.gather(&refs, &projection),
+                }
+            })
+            .collect();
+        Ok(SearchResult {
+            projection,
+            metric: Some(metric),
+            hits,
+        })
+    }
+
+    /// 3.x `_require_loaded`：检索与按主键读取之前的 load 状态检查。
+    pub fn require_loaded(&self) -> Result<()> {
+        check_loaded(&self.name, self.load_state, self.deleted)
+    }
+
+    fn resolve_anns_field(&self, anns_field: Option<&str>) -> Result<usize> {
+        let Some(name) = anns_field else {
+            return Ok(self.vector_pos);
+        };
+        let pos = self
+            .schema
+            .fields
+            .iter()
+            .position(|f| f.name == name)
+            .ok_or_else(|| {
+                EngineError::schema(format!("anns_field {} not found in schema", py_repr(name)))
+            })?;
+        let field = &self.schema.fields[pos];
+        if !field.data_type.is_vector() {
+            return Err(EngineError::schema(format!(
+                "anns_field {} is not a vector field (dtype={})",
+                py_repr(name),
+                field.data_type.name()
+            )));
+        }
+        Ok(pos)
+    }
+
+    /// 3.x：向量字段有索引且度量不是 NONE 时用索引的度量，否则 COSINE。
+    fn default_metric(&self, field_name: &str) -> Result<Metric> {
+        match self
+            .indexes
+            .iter()
+            .find(|spec| spec.field_name == field_name)
+        {
+            Some(spec) if spec.metric_type != "NONE" => Metric::parse(&spec.metric_type),
+            _ => Ok(Metric::Cosine),
+        }
+    }
+
+    fn gather(&self, refs: &[RowRef], projection: &Projection) -> Rows {
+        let pks = refs
+            .iter()
+            .map(|r| pk_at(&self.chunks[r.chunk].columns[self.pk_pos], r.row))
+            .collect();
+        let fields = projection
+            .schema_fields
+            .iter()
+            .map(|&i| {
+                let field = &self.schema.fields[i];
+                let mut column = ColumnData::empty(field);
+                for r in refs {
+                    column.push_row(&self.chunks[r.chunk].columns[i], r.row);
+                }
+                (field.name.clone(), column)
+            })
+            .collect();
+        let meta = self.schema.enable_dynamic_field.then(|| {
+            refs.iter()
+                .map(|r| {
+                    let full = self.chunks[r.chunk]
+                        .meta
+                        .as_ref()
+                        .and_then(|m| m.get(r.row));
+                    match full {
+                        Some(full) if projection.all_dynamic => full.clone(),
+                        Some(full) => projection
+                            .dynamic_keys
+                            .iter()
+                            .filter_map(|k| full.get(k).map(|v| (k.clone(), v.clone())))
+                            .collect(),
+                        None => Map::new(),
+                    }
+                })
+                .collect()
+        });
+        Rows { pks, fields, meta }
+    }
+}
+
+/// 数据与有效位分离，使覆盖和删除无需复制向量、JSON 与动态字段。
+#[derive(Debug, Clone)]
 struct Chunk {
-    /// 按 schema 字段顺序。
-    columns: Vec<ColumnData>,
-    /// 开启动态字段时每行的动态字段。
-    meta: Option<Vec<Map<String, Value>>>,
-    /// 该行是否仍是其主键的最新版本。被覆盖时增量清除，查询时无需逐行去重（0001 约束）。
-    live: Vec<bool>,
-    /// 向量字段每行的范数，写入时算好供 COSINE 使用（与检索时现算逐位相同），不落盘。
-    norms: Vec<f32>,
+    data: Arc<ChunkData>,
+    live: SourceBits,
     generation: u64,
+}
+
+#[derive(Debug, Clone)]
+struct ChunkData {
+    columns: Vec<ColumnData>,
+    meta: Option<Vec<Map<String, Value>>>,
+    norms: Vec<f32>,
     orders: Vec<u64>,
+}
+
+impl std::ops::Deref for Chunk {
+    type Target = ChunkData;
+    fn deref(&self) -> &ChunkData {
+        &self.data
+    }
 }
 
 /// 行的位置。派生的全序即扫描顺序：先按 chunk、再按行。
@@ -231,12 +475,14 @@ impl Collection {
         let (dim, vectors) = vector_values(&decoded.columns[self.vector_pos]);
         let chunk_index = self.chunks.len();
         let mut chunk = Chunk {
-            columns: decoded.columns.clone(),
-            meta: decoded.meta.clone(),
-            live,
-            norms: vectors.chunks_exact(dim).map(flat::norm).collect(),
+            data: Arc::new(ChunkData {
+                columns: decoded.columns.clone(),
+                meta: decoded.meta.clone(),
+                norms: vectors.chunks_exact(dim).map(flat::norm).collect(),
+                orders: Vec::with_capacity(n),
+            }),
+            live: SourceBits::from_live(&live),
             generation,
-            orders: Vec::with_capacity(n),
         };
         for row in 0..n {
             let order = self.next_order;
@@ -244,8 +490,9 @@ impl Collection {
                 .next_order
                 .checked_add(1)
                 .ok_or_else(|| EngineError::Storage("row order space exhausted".to_owned()))?;
-            chunk.orders.push(order);
-            if chunk.live[row] {
+            // 尚未发布的局部块独占此 Arc，不会复制列数据；发布后不得补写位次。
+            Arc::make_mut(&mut chunk.data).orders.push(order);
+            if chunk.live.get(row) {
                 let pk = pk_at(&chunk.columns[self.pk_pos], row);
                 self.pk_index.insert(
                     pk,
@@ -560,7 +807,7 @@ impl Collection {
         }
         for pk in pks {
             if let Some(old) = self.pk_index.remove(pk) {
-                self.chunks[old.chunk].live[old.row] = false;
+                self.chunks[old.chunk].live.set(old.row, false);
             }
         }
         Ok(pks.len())
@@ -650,12 +897,14 @@ impl Collection {
         let chunk_idx = self.chunks.len();
         let generation = self.persistent.as_ref().map_or(1, |p| p.generation);
         let mut chunk = Chunk {
-            columns,
-            meta,
-            live: vec![true; n],
-            norms,
+            data: Arc::new(ChunkData {
+                columns,
+                meta,
+                norms,
+                orders: Vec::with_capacity(n),
+            }),
+            live: SourceBits::from_live(&vec![true; n]),
             generation,
-            orders: Vec::with_capacity(n),
         };
         let mut ids = Vec::with_capacity(n);
         for row in 0..n {
@@ -670,7 +919,8 @@ impl Collection {
                     order
                 }
             };
-            chunk.orders.push(order);
+            // 尚未发布的局部块独占此 Arc，不会复制列数据；发布后不得补写位次。
+            Arc::make_mut(&mut chunk.data).orders.push(order);
             let new_ref = RowRef {
                 order,
                 chunk: chunk_idx,
@@ -679,9 +929,9 @@ impl Collection {
             // _seq 严格递增，因此新行总是该主键的最新版本（不变量 1–2）。
             if let Some(old) = self.pk_index.insert(pk.clone(), new_ref) {
                 if old.chunk == chunk_idx {
-                    chunk.live[old.row] = false;
+                    chunk.live.set(old.row, false);
                 } else {
-                    self.chunks[old.chunk].live[old.row] = false;
+                    self.chunks[old.chunk].live.set(old.row, false);
                 }
             }
             ids.push(pk);
@@ -690,24 +940,41 @@ impl Collection {
         Ok(ids)
     }
 
-    /// 按主键读取。结果按输入顺序，重复的主键重复输出，不存在的跳过。
-    pub fn get(&self, pks: &[Pk], output_fields: &[String]) -> Result<QueryResult> {
+    /// 只钉住命中的数据块，主键索引留在状态锁内，避免按总行数复制索引。
+    pub fn prepare_get(&self, pks: &[Pk], output_fields: &[String]) -> Result<GetSnapshot> {
         self.require_loaded()?;
-        let projection = Projection::new(&self.schema, output_fields, ApiKind::Query);
-        let refs: Vec<RowRef> = pks
+        let mut snapshot = self.read_metadata();
+        let mut mapping = HashMap::new();
+        let refs = pks
             .iter()
-            .filter_map(|pk| self.pk_index.get(pk).copied())
+            .filter_map(|pk| {
+                let mut at = *self.pk_index.get(pk)?;
+                at.chunk = *mapping.entry(at.chunk).or_insert_with(|| {
+                    let index = snapshot.chunks.len();
+                    snapshot.chunks.push(self.chunks[at.chunk].clone());
+                    index
+                });
+                Some(at)
+            })
             .collect();
-        let rows = self.gather(&refs, &projection);
-        Ok(QueryResult { projection, rows })
+        let projection = Projection::new(&self.schema, output_fields, ApiKind::Query);
+        Ok(GetSnapshot {
+            snapshot,
+            refs,
+            projection,
+        })
     }
 
-    /// 按 `<主键> in [...]` 中的字面量读取。与主键类型不符或超出 int64 的字面量查不到，不报错（3.x 相同）。
-    pub fn get_literals(
+    pub fn get(&self, pks: &[Pk], output_fields: &[String]) -> Result<QueryResult> {
+        Ok(self.prepare_get(pks, output_fields)?.read())
+    }
+
+    /// 类型不符的字面量查不到，与 3.x 的主键快路径相同。
+    pub fn prepare_get_literals(
         &self,
         literals: &[PkLiteral],
         output_fields: &[String],
-    ) -> Result<QueryResult> {
+    ) -> Result<GetSnapshot> {
         let int_pk = self.schema.fields[self.pk_pos].data_type == DataType::Int64;
         let pks: Vec<Pk> = literals
             .iter()
@@ -717,198 +984,54 @@ impl Collection {
                 _ => None,
             })
             .collect();
-        self.get(&pks, output_fields)
+        self.prepare_get(&pks, output_fields)
     }
 
-    /// 在 `compute` 上并行计算（[0005](../../../docs/decisions/0005-search-thread-model.md)），
-    /// 结果与串行计算逐位相同。
+    pub fn get_literals(
+        &self,
+        literals: &[PkLiteral],
+        output_fields: &[String],
+    ) -> Result<QueryResult> {
+        Ok(self.prepare_get_literals(literals, output_fields)?.read())
+    }
+
+    /// 数据与位图分别共享，后续覆盖只复制位图，不复制向量或动态字段。
+    fn read_metadata(&self) -> ReadSnapshot {
+        ReadSnapshot {
+            name: self.name.clone(),
+            schema: self.schema.clone(),
+            pk_pos: self.pk_pos,
+            vector_pos: self.vector_pos,
+            chunks: Vec::new(),
+            indexes: self.indexes.clone(),
+            load_state: self.load_state,
+            deleted: self.deleted,
+        }
+    }
+
+    pub fn read_snapshot(&self) -> ReadSnapshot {
+        let mut snapshot = self.read_metadata();
+        snapshot.chunks = self.chunks.clone();
+        snapshot
+    }
+
     pub fn search(&self, req: SearchRequest, compute: &Compute) -> Result<SearchResult> {
-        let rows_per_block = (BLOCK_ELEMS / field_dim(&self.schema.fields[self.vector_pos])).max(1);
-        self.search_in_blocks(req, compute, rows_per_block)
+        self.read_snapshot().search(req, compute)
     }
 
+    #[cfg(test)]
     fn search_in_blocks(
         &self,
         req: SearchRequest,
         compute: &Compute,
         rows_per_block: usize,
     ) -> Result<SearchResult> {
-        let projection = Projection::new(&self.schema, &req.output_fields, ApiKind::Search);
-        // 3.x：没有查询向量时在一切检查之前返回空结果。
-        if matches!(&req.vectors, QueryVectors::Dense(v) if v.is_empty()) {
-            return Ok(SearchResult {
-                projection,
-                metric: None,
-                hits: Vec::new(),
-            });
-        }
-        self.require_loaded()?;
-        let field_pos = self.resolve_anns_field(req.anns_field.as_deref())?;
-        let field = &self.schema.fields[field_pos];
-        let vectors = match &req.vectors {
-            QueryVectors::Dense(v) => v,
-            // 3.x `_maybe_embed_queries`：字段上没有 TEXT_EMBEDDING function（M1 不支持 function）。
-            QueryVectors::Text => {
-                return Err(EngineError::schema(format!(
-                    "Text query on field {} requires a TEXT_EMBEDDING function targeting that field",
-                    py_repr(&field.name)
-                )));
-            }
-            // 3.x 把稀疏向量（dict）交给 numpy 转成稠密数组时的 TypeError。
-            QueryVectors::Sparse => {
-                return Err(EngineError::invalid(
-                    "float() argument must be a string or a real number, not 'dict'",
-                ));
-            }
-        };
-        let metric = match &req.metric_type {
-            Some(m) => Metric::parse(m)?,
-            None => self.default_metric(&field.name)?,
-        };
-        let dim = field_dim(field);
-        // 3.x 不校验，维度不符时报 numpy 的原始错误，空 collection 上反而成功（0004「决策」）。
-        for v in vectors {
-            if v.len() != dim {
-                return Err(EngineError::invalid(format!(
-                    "query vector has dim {}, but field {} expects dim {dim}",
-                    v.len(),
-                    py_repr(&field.name)
-                )));
-            }
-        }
-        // M1 只允许一个 FLOAT_VECTOR 字段，范数只为它计算。
-        debug_assert_eq!(field_pos, self.vector_pos);
-        let take = req.limit.saturating_add(req.offset);
-        let queries: Vec<flat::Query> = vectors
-            .iter()
-            .map(|v| flat::Query::new(metric, v))
-            .collect();
-        let mut tops: Vec<TopK> = queries.iter().map(|_| TopK::new(metric, take)).collect();
-        let blocks = row_blocks(&self.chunks, rows_per_block);
-        if take > 0 && !blocks.is_empty() {
-            let groups: Vec<&[flat::Query]> = queries.chunks(flat::BATCH).collect();
-            let per_wave = groups_per_wave(compute.threads(), blocks.len());
-            for wave in (0..groups.len()).step_by(per_wave) {
-                let mut leaves: Vec<Leaf> = (wave..groups.len().min(wave + per_wave))
-                    .flat_map(|group| {
-                        blocks.iter().map(move |block| Leaf {
-                            group,
-                            block,
-                            tops: Vec::new(),
-                        })
-                    })
-                    .collect();
-                compute.for_each(&mut leaves, |leaf| {
-                    let queries = groups[leaf.group];
-                    leaf.tops = queries.iter().map(|_| TopK::new(metric, take)).collect();
-                    scan(&self.chunks, leaf.block, field_pos, queries, &mut leaf.tops);
-                    leaf.tops.iter_mut().for_each(TopK::shrink);
-                });
-                for leaf in leaves {
-                    for (i, top) in leaf.tops.into_iter().enumerate() {
-                        tops[leaf.group * flat::BATCH + i].absorb(top);
-                    }
-                }
-            }
-        }
-        let hits = tops
-            .into_iter()
-            .map(|top| {
-                let ranked = top.finish();
-                let kept = ranked.get(req.offset..).unwrap_or(&[]);
-                let refs: Vec<RowRef> = kept.iter().map(|(_, r)| *r).collect();
-                Hits {
-                    scores: kept.iter().map(|(s, _)| *s).collect(),
-                    rows: self.gather(&refs, &projection),
-                }
-            })
-            .collect();
-        Ok(SearchResult {
-            projection,
-            metric: Some(metric),
-            hits,
-        })
+        self.read_snapshot()
+            .search_in_blocks(req, compute, rows_per_block)
     }
 
-    /// 3.x `_require_loaded`：检索与按主键读取之前的 load 状态检查。
     pub fn require_loaded(&self) -> Result<()> {
-        if self.deleted {
-            return Err(EngineError::CollectionNotFound(self.name.clone()));
-        }
-        match self.load_state {
-            LoadState::Loaded => Ok(()),
-            LoadState::Released => Err(EngineError::CollectionNotLoaded(self.name.clone())),
-        }
-    }
-
-    fn resolve_anns_field(&self, anns_field: Option<&str>) -> Result<usize> {
-        let Some(name) = anns_field else {
-            return Ok(self.vector_pos);
-        };
-        let pos = self
-            .schema
-            .fields
-            .iter()
-            .position(|f| f.name == name)
-            .ok_or_else(|| {
-                EngineError::schema(format!("anns_field {} not found in schema", py_repr(name)))
-            })?;
-        let field = &self.schema.fields[pos];
-        if !field.data_type.is_vector() {
-            return Err(EngineError::schema(format!(
-                "anns_field {} is not a vector field (dtype={})",
-                py_repr(name),
-                field.data_type.name()
-            )));
-        }
-        Ok(pos)
-    }
-
-    /// 3.x：向量字段有索引且度量不是 NONE 时用索引的度量，否则 COSINE。
-    fn default_metric(&self, field_name: &str) -> Result<Metric> {
-        match self.index(field_name) {
-            Some(spec) if spec.metric_type != "NONE" => Metric::parse(&spec.metric_type),
-            _ => Ok(Metric::Cosine),
-        }
-    }
-
-    fn gather(&self, refs: &[RowRef], projection: &Projection) -> Rows {
-        let pks = refs
-            .iter()
-            .map(|r| pk_at(&self.chunks[r.chunk].columns[self.pk_pos], r.row))
-            .collect();
-        let fields = projection
-            .schema_fields
-            .iter()
-            .map(|&i| {
-                let field = &self.schema.fields[i];
-                let mut column = ColumnData::empty(field);
-                for r in refs {
-                    column.push_row(&self.chunks[r.chunk].columns[i], r.row);
-                }
-                (field.name.clone(), column)
-            })
-            .collect();
-        let meta = self.schema.enable_dynamic_field.then(|| {
-            refs.iter()
-                .map(|r| {
-                    let full = self.chunks[r.chunk]
-                        .meta
-                        .as_ref()
-                        .and_then(|m| m.get(r.row));
-                    match full {
-                        Some(full) if projection.all_dynamic => full.clone(),
-                        Some(full) => projection
-                            .dynamic_keys
-                            .iter()
-                            .filter_map(|k| full.get(k).map(|v| (k.clone(), v.clone())))
-                            .collect(),
-                        None => Map::new(),
-                    }
-                })
-                .collect()
-        });
-        Rows { pks, fields, meta }
+        check_loaded(&self.name, self.load_state, self.deleted)
     }
 
     /// 解出每行的动态字段：`$meta` 列（JSON 对象）与不在 schema 中的列，按列顺序合并。
@@ -1059,8 +1182,8 @@ fn row_blocks(chunks: &[Chunk], rows_per_block: usize) -> Vec<Vec<Segment>> {
     let mut filled = 0;
     for (chunk, c) in chunks.iter().enumerate() {
         let mut start = 0;
-        while start < c.live.len() {
-            let end = c.live.len().min(start + rows_per_block - filled);
+        while start < c.live.len {
+            let end = c.live.len.min(start + rows_per_block - filled);
             current.push(Segment {
                 chunk,
                 rows: start..end,
@@ -1106,7 +1229,7 @@ fn scan(
         let live_rows = || {
             seg.rows
                 .clone()
-                .filter(|row| chunk.live[*row])
+                .filter(|row| chunk.live.get(*row))
                 .map(|row| (row, &values[row * dim..(row + 1) * dim], chunk.norms[row]))
         };
         let at = |row| RowRef {
@@ -1466,9 +1589,55 @@ fn py_value_repr(values: &InputValues, row: usize) -> String {
     }
 }
 
+fn check_loaded(name: &str, state: LoadState, deleted: bool) -> Result<()> {
+    if deleted {
+        return Err(EngineError::CollectionNotFound(name.to_owned()));
+    }
+    match state {
+        LoadState::Loaded => Ok(()),
+        LoadState::Released => Err(EngineError::CollectionNotLoaded(name.to_owned())),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshots_share_columns_and_only_pin_get_matches() {
+        let mut rng = Rng(7);
+        let mut c = collection(&mut rng, 2);
+        let snapshot = c.read_snapshot();
+        assert_eq!(snapshot.chunks.len(), c.chunks.len());
+        for (old, current) in snapshot.chunks.iter().zip(&c.chunks) {
+            assert!(Arc::ptr_eq(&old.data, &current.data));
+        }
+        let at = c.pk_index[&Pk::Int64(1)];
+        let get = c
+            .prepare_get(&[Pk::Int64(1), Pk::Int64(1), Pk::Int64(-1)], &[])
+            .unwrap();
+        assert_eq!(get.snapshot.chunks.len(), 1);
+        assert_eq!(get.refs.len(), 2);
+        assert!(Arc::ptr_eq(
+            &get.snapshot.chunks[0].data,
+            &c.chunks[at.chunk].data
+        ));
+        c.delete_at_seq(&[Pk::Int64(1)], c.next_seq).unwrap();
+        assert!(!c.chunks[at.chunk].live.get(at.row));
+        assert!(snapshot.chunks[at.chunk].live.get(at.row));
+        assert!(Arc::ptr_eq(
+            &snapshot.chunks[at.chunk].data,
+            &c.chunks[at.chunk].data
+        ));
+        assert_eq!(get.read().rows.pks, [Pk::Int64(1), Pk::Int64(1)]);
+        assert!(
+            c.prepare_get(&[Pk::Int64(-1)], &[])
+                .unwrap()
+                .snapshot
+                .chunks
+                .is_empty()
+        );
+    }
 
     use std::num::NonZeroUsize;
 
@@ -1548,8 +1717,8 @@ mod tests {
                 let mut scored = Vec::new();
                 for chunk in &c.chunks {
                     let (dim, values) = vector_values(&chunk.columns[c.vector_pos]);
-                    for row in 0..chunk.live.len() {
-                        if chunk.live[row] {
+                    for row in 0..chunk.live.len {
+                        if chunk.live.get(row) {
                             let cand = &values[row * dim..(row + 1) * dim];
                             let pk = pk_at(&chunk.columns[c.pk_pos], row);
                             scored.push((q.score(cand, flat::norm(cand)), chunk.orders[row], pk));

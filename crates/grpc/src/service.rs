@@ -14,11 +14,18 @@ use crate::{MAX_MESSAGE_SIZE, index, insert, query, schema, search};
 pub(crate) struct MilvusService {
     version: String,
     db: Arc<Db>,
+    #[cfg(test)]
+    after_search_snapshot: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl MilvusService {
     pub(crate) fn new(version: String, db: Arc<Db>) -> Self {
-        Self { version, db }
+        Self {
+            version,
+            db,
+            #[cfg(test)]
+            after_search_snapshot: None,
+        }
     }
 
     /// 在阻塞线程池中执行一个 RPC 的处理体（解码、引擎调用、编码都是 CPU 密集或可能等锁），
@@ -441,8 +448,7 @@ impl Service for MilvusService {
         let req = request.into_inner();
         self.run(Branch::Engine, move |db| {
             let handle = db.collection(&database, &req.collection_name)?;
-            let c = handle.read();
-            query::query(&c, req)
+            query::query(&handle, req)
         })
         .await
     }
@@ -453,13 +459,22 @@ impl Service for MilvusService {
     ) -> Result<Response<svc::SearchResults>, Status> {
         let database = database(&request, |r| &r.db_name);
         let req = request.into_inner();
+        #[cfg(test)]
+        let after_snapshot = self.after_search_snapshot.clone();
         self.run(Branch::Engine, move |db| {
             let handle = db.collection(&database, &req.collection_name)?;
             // 解析（包括解码查询向量）不需要 collection 的状态，放在取读锁之前以缩短持锁时间；
             // collection 不存在的错误仍然最先报出（3.x 相同）。
             let parsed = search::parse(&req)?;
-            let c = handle.read();
-            search::search(&c, db.compute(), parsed, req.output_fields)
+            let snapshot = {
+                let guard = handle.read();
+                guard.read_snapshot()
+            };
+            #[cfg(test)]
+            if let Some(pause) = after_snapshot {
+                pause();
+            }
+            search::search(&snapshot, db.compute(), parsed, req.output_fields)
         })
         .await
     }
@@ -470,6 +485,116 @@ mod tests {
     use milvus_lite_core::{Compute, DataDir};
 
     use super::*;
+
+    #[test]
+    fn search_rpc_releases_state_lock_before_computing_and_encoding() {
+        use milvus_lite_core::{CollectionSchema, DataType, FieldSchema, InputValues, InsertBatch};
+        use prost::Message;
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let root = tempfile::tempdir().unwrap();
+        let db = Arc::new(Db::new(
+            DataDir::open(root.path()).unwrap(),
+            Compute::for_host().unwrap(),
+        ));
+        let mut id = FieldSchema::new("id", DataType::Int64);
+        id.is_primary = true;
+        let mut v = FieldSchema::new("v", DataType::FloatVector);
+        v.dim = Some(2);
+        db.create_collection(
+            "",
+            "c",
+            CollectionSchema {
+                fields: vec![id, v],
+                enable_dynamic_field: false,
+                properties: vec![],
+            },
+        )
+        .unwrap();
+        db.insert(
+            "",
+            "c",
+            InsertBatch {
+                num_rows: 2,
+                columns: vec![
+                    ("id".into(), InputValues::Int(vec![1, 2])),
+                    (
+                        "v".into(),
+                        InputValues::FloatVector {
+                            dim: 2,
+                            values: vec![1.0, 0.0, 0.0, 1.0],
+                        },
+                    ),
+                ],
+            },
+        )
+        .unwrap();
+        let mut service = MilvusService::new("test".into(), Arc::clone(&db));
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let resume_rx = std::sync::Mutex::new(resume_rx);
+        service.after_search_snapshot = Some(Arc::new(move || {
+            ready_tx.send(()).unwrap();
+            resume_rx
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap();
+        }));
+        let reader = std::thread::spawn(move || {
+            let req = svc::SearchRequest {
+                collection_name: "c".into(),
+                search_input: Some(svc::search_request::SearchInput::PlaceholderGroup(
+                    common::PlaceholderGroup {
+                        placeholders: vec![common::PlaceholderValue {
+                            tag: "$0".into(),
+                            r#type: 101,
+                            element_level: false,
+                            values: vec![
+                                [1.0_f32, 0.0]
+                                    .into_iter()
+                                    .flat_map(f32::to_le_bytes)
+                                    .collect(),
+                            ],
+                        }],
+                    }
+                    .encode_to_vec(),
+                )),
+                search_params: vec![common::KeyValuePair {
+                    key: "topk".into(),
+                    value: "2".into(),
+                }],
+                ..Default::default()
+            };
+            let reply = tokio::runtime::Runtime::new()
+                .unwrap()
+                .block_on(service.search(Request::new(req)))
+                .unwrap()
+                .into_inner();
+            assert_eq!(reply.status.unwrap().code, 0);
+            let result = reply.results.unwrap();
+            assert_eq!(result.scores, [1.0, 0.0]);
+            assert_eq!(
+                result.ids.unwrap().id_field,
+                Some(crate::pb::schema::i_ds::IdField::IntId(
+                    crate::pb::schema::LongArray { data: vec![1, 2] }
+                ))
+            );
+        });
+        ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let writer_db = Arc::clone(&db);
+        let (done_tx, done_rx) = mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            writer_db.drop_collection("", "c").unwrap();
+            done_tx.send(()).unwrap();
+        });
+        let completed = done_rx.recv_timeout(Duration::from_secs(10));
+        resume_tx.send(()).unwrap();
+        reader.join().unwrap();
+        writer.join().unwrap();
+        completed.unwrap();
+        db.close();
+    }
 
     /// 0005「验证」叶子任务 panic 的后半段：处理体中的 panic（包括计算池从叶子任务传回的 panic，
     /// 见 core 的 compute 用例）映射成 code 1、error_code 0，之后服务照常可用。
