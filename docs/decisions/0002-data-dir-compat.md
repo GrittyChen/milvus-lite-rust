@@ -156,7 +156,8 @@
   - 已提交的 WAL 残留时，3.x 的 compaction 与 GC 可能抹掉删除的证据，之后任一方打开，已删除的行都会复活。
   - 3.x 并发写入同一个 collection 时，WAL 懒创建的竞态会写坏 WAL，崩溃后丢失已确认的写入。
   - WAL 追加失败后，3.x 继续往同一个文件追加，恢复时可能把残缺的 batch 当作合法数据回放。
-  - WAL 中间损坏时，两边都取已校验的前缀，其后已确认的写入静默丢失。
+  - WAL 被读取器识别为格式或批校验失败，且参考端捕获该异常时，两边都只取各自已校验的前缀，其后已确认的写入可能丢失。IPC 流中间的零长度消息按 EOS 停止读取，不再寻找之后的批。3.x 在抛出已捕获的错误后不重新扫描后续批；但向半截批继续拼接字节，可能使本应失败的批通过其校验，不能将这种故障目录等同于普通截断目录。
+  - WAL 没有校验和，Arrow 完整校验只证明数组结构有效；例如翻转向量的符号位仍会被双方接受，不能承诺检出任意载荷变化，也不能推断任意损坏都被当作前缀终止。3.x 的 `_read_wal_file` 只捕获 `ArrowInvalid` 与 `OSError`/`IOError`；未被捕获的 `ArrowNotImplementedError` 或 `ArrowMemoryError` 会使 collection 访问失败，数据库构造本身仍是懒打开。例如单字节翻转 schema 的整数宽度 64→96，会让真实 3.x collection 访问抛 `ArrowNotImplementedError`；本实现对同一目录按 arrow-rs 解码错误取该 data WAL 的空前缀、继续打开并输出 WAL 告警，本用例的 `count(*)` 为 0，访问不报错。这是读取器判定差异的具体形态，不能将两侧都失败或恢复同一行集视为保证。共享格式保持不变，逐字节截断、载荷变异及 schema 损坏用例分别固定这些边界。
   - 异常目录中若同一主键的数据行与删除共用 `_seq`，3.x 的 [get](../../references/milvus-lite/milvus_lite/engine/collection.py) 与 [query/search 位图](../../references/milvus-lite/milvus_lite/search/bitmap.py) 可能给出不同可见性：前者会被 memtable 的本地 tombstone 直接判删，后者只在删除 `_seq` 严格大于数据行时屏蔽。本实现按 [0007「数据结构」](0007-m2-storage-engine.md#数据结构) 的同号来源与先后规则维护统一可见性，因而在这类目录上可能与 3.x 的 `get` 不同；正常唯一 `_seq` 的目录不受影响。
 
 ## 放弃的方案

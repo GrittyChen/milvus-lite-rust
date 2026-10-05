@@ -51,9 +51,56 @@ fn retained_wal_sync_fault(point: RetainedWalSyncFault) -> Result<(), String> {
     }
 }
 
+#[cfg(feature = "fault-injection")]
+thread_local! { static HOLD_RETRY_WINDOW: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+
+/// 避免故障窗口断言依赖机器速度；只冻结测试线程的窗口，不改变生产的一秒节流。
+#[cfg(feature = "fault-injection")]
+#[must_use]
+pub struct FlushRetryWindowGuard {
+    previous: bool,
+    _not_send: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+#[cfg(feature = "fault-injection")]
+pub fn hold_flush_retry_window() -> FlushRetryWindowGuard {
+    FlushRetryWindowGuard {
+        previous: HOLD_RETRY_WINDOW.with(|cell| cell.replace(true)),
+        _not_send: std::marker::PhantomData,
+    }
+}
+#[cfg(feature = "fault-injection")]
+impl Drop for FlushRetryWindowGuard {
+    fn drop(&mut self) {
+        HOLD_RETRY_WINDOW.with(|cell| cell.set(self.previous));
+    }
+}
+
 pub struct FrozenGeneration {
     pub number: u64,
     pub table: FrozenMemTable,
+    wal_files: Mutex<Vec<(WalKind, File)>>,
+}
+
+impl FrozenGeneration {
+    fn sync_and_close_wal(&self, dir: &Path) -> Result<(), String> {
+        let mut files = self.wal_files.lock();
+        if files.is_empty() {
+            return Ok(());
+        }
+        for (_kind, file) in files.iter() {
+            #[cfg(feature = "fault-injection")]
+            retained_wal_sync_fault(match _kind {
+                WalKind::Data => RetainedWalSyncFault::Data,
+                WalKind::Delta => RetainedWalSyncFault::Delta,
+            })?;
+            file.sync_all().map_err(err)?;
+        }
+        #[cfg(feature = "fault-injection")]
+        retained_wal_sync_fault(RetainedWalSyncFault::Directory)?;
+        fs_commit::sync_dir(&dir.join("wal")).map_err(err)?;
+        files.clear();
+        Ok(())
+    }
 }
 
 pub struct FlushOutcome {
@@ -157,7 +204,13 @@ impl PersistentCollection {
     pub fn throttled_failure(&self) -> Option<&str> {
         self.last_failure
             .as_ref()
-            .filter(|(at, _)| at.elapsed() < Duration::from_secs(1))
+            .filter(|(at, _)| {
+                #[cfg(feature = "fault-injection")]
+                if HOLD_RETRY_WINDOW.with(|cell| cell.get()) {
+                    return true;
+                }
+                at.elapsed() < Duration::from_secs(1)
+            })
             .map(|(_, reason)| reason.as_str())
     }
 
@@ -292,13 +345,19 @@ impl PersistentCollection {
             .ok_or("source ID space exhausted")?;
         self.visibility.add_source(new_source, 0).map_err(err)?;
         let old = std::mem::replace(&mut self.active, MemTable::new(new_source));
+        let mut wal_files = Vec::new();
+        if let Some(writer) = self.data_wal.take() {
+            wal_files.push((WalKind::Data, writer.into_file()));
+        }
+        if let Some(writer) = self.delta_wal.take() {
+            wal_files.push((WalKind::Delta, writer.into_file()));
+        }
         self.pending.push_back(Arc::new(FrozenGeneration {
             number: self.generation,
             table: old.freeze(&self.visibility),
+            wal_files: Mutex::new(wal_files),
         }));
         self.generation = next_generation;
-        self.data_wal = None;
-        self.delta_wal = None;
         Ok(())
     }
 
@@ -432,8 +491,20 @@ impl PersistentCollection {
     pub fn sync_retained_wal(&mut self) -> Result<(), String> {
         // 全部同步成功之前保留 writer；drop 同步失败后仍须允许原 collection 写入。
         let dir = self.dir.join("wal");
-        if !dir.exists() {
-            return Ok(());
+        match fs::metadata(&dir) {
+            Ok(_) => {}
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound
+                    && self.data_wal.is_none()
+                    && self.delta_wal.is_none()
+                    && self
+                        .pending
+                        .iter()
+                        .all(|generation| generation.wal_files.lock().is_empty()) =>
+            {
+                return Ok(());
+            }
+            Err(error) => return Err(err(error)),
         }
         for entry in fs::read_dir(&dir).map_err(err)? {
             let entry = entry.map_err(err)?;
@@ -459,6 +530,9 @@ impl PersistentCollection {
         fs_commit::sync_dir(&dir).map_err(err)?;
         self.data_wal = None;
         self.delta_wal = None;
+        for generation in &self.pending {
+            generation.wal_files.lock().clear();
+        }
         Ok(())
     }
 
@@ -493,6 +567,15 @@ pub fn flush_one(
         .data
         .as_ref()
         .map_or(0, |batch| batch.num_rows());
+    generation
+        .sync_and_close_wal(dir)
+        .map_err(|reason| FlushError {
+            path: dir.join("wal"),
+            phase: CommitPhase::BeforeReplace,
+            reason,
+            committed_manifest: None,
+            cleanup_failed: false,
+        })?;
     match flush::flush_generation_with_inherited_sync(
         dir,
         manifest,
@@ -587,5 +670,125 @@ mod retained_wal_tests {
             assert!(persistent.data_wal.is_none());
             assert!(persistent.delta_wal.is_none());
         }
+    }
+    #[test]
+    fn frozen_generation_keeps_original_files_until_all_syncs_succeed() {
+        use crate::{CollectionSchema, DataType, FieldSchema};
+        let root = tempfile::tempdir().unwrap();
+        let mut pk = FieldSchema::new("id", DataType::Int64);
+        pk.is_primary = true;
+        let schema = CollectionSchema {
+            fields: vec![pk],
+            enable_dynamic_field: false,
+            properties: Vec::new(),
+        };
+        for fault in [
+            RetainedWalSyncFault::Data,
+            RetainedWalSyncFault::Delta,
+            RetainedWalSyncFault::Directory,
+        ] {
+            for close_all in [false, true] {
+                let dir = root.path().join(format!("{fault:?}-{close_all}"));
+                std::fs::create_dir_all(dir.join("wal")).unwrap();
+                let mut persistent = PersistentCollection::new(dir.clone()).unwrap();
+                persistent.data_wal = Some(
+                    WalWriter::create(
+                        &dir.join("wal"),
+                        WalKind::Data,
+                        1,
+                        &arrow_data::wal_data_schema(&schema).unwrap(),
+                    )
+                    .unwrap(),
+                );
+                persistent.delta_wal = Some(
+                    WalWriter::create(
+                        &dir.join("wal"),
+                        WalKind::Delta,
+                        1,
+                        &arrow_data::wal_delta_schema(&schema).unwrap(),
+                    )
+                    .unwrap(),
+                );
+                persistent.freeze_active(true).unwrap();
+                let frozen = persistent.front().unwrap();
+                assert!(persistent.data_wal.is_none() && persistent.delta_wal.is_none());
+                assert_eq!(frozen.wal_files.lock().len(), 2);
+                inject_retained_wal_sync_failure_once(fault);
+                let result = if close_all {
+                    persistent.sync_retained_wal()
+                } else {
+                    frozen.sync_and_close_wal(&dir)
+                };
+                assert!(result.is_err());
+                assert_eq!(frozen.wal_files.lock().len(), 2);
+                if close_all {
+                    persistent.sync_retained_wal().unwrap();
+                } else {
+                    frozen.sync_and_close_wal(&dir).unwrap();
+                }
+                assert!(frozen.wal_files.lock().is_empty());
+            }
+        }
+    }
+    #[cfg(unix)]
+    #[test]
+    fn missing_wal_directory_only_succeeds_when_no_owned_handles_remain() {
+        use crate::{CollectionSchema, ColumnData, DataType, FieldSchema};
+        let root = tempfile::tempdir().unwrap();
+        let mut pk = FieldSchema::new("id", DataType::Int64);
+        pk.is_primary = true;
+        let schema = CollectionSchema {
+            fields: vec![pk],
+            enable_dynamic_field: false,
+            properties: Vec::new(),
+        };
+        for frozen in [false, true] {
+            let dir = root.path().join(format!("{frozen}"));
+            std::fs::create_dir(&dir).unwrap();
+            let mut persistent = PersistentCollection::new(dir.clone()).unwrap();
+            assert!(persistent.sync_retained_wal().is_ok());
+            persistent
+                .append(&schema, &[1], &[ColumnData::Int64(vec![1])], None)
+                .unwrap();
+            persistent
+                .append_delete(&schema, &[Pk::Int64(1)], 2)
+                .unwrap();
+            if frozen {
+                persistent.freeze_active(true).unwrap();
+            }
+            std::fs::remove_dir_all(dir.join("wal")).unwrap();
+            assert!(persistent.sync_retained_wal().is_err());
+            if frozen {
+                assert_eq!(persistent.front().unwrap().wal_files.lock().len(), 2);
+            } else {
+                assert!(persistent.data_wal.is_some() && persistent.delta_wal.is_some());
+            }
+        }
+        let mut empty = PersistentCollection::new(root.path().join("empty")).unwrap();
+        empty.freeze_active(true).unwrap();
+        assert!(empty.sync_retained_wal().is_ok());
+    }
+
+    #[test]
+    fn retry_window_guard_restores_thread_state_and_does_not_create_a_failure() {
+        let root = tempfile::tempdir().unwrap();
+        let mut persistent = PersistentCollection::new(root.path().to_path_buf()).unwrap();
+        assert!(!HOLD_RETRY_WINDOW.with(|cell| cell.get()));
+        {
+            let _guard = hold_flush_retry_window();
+            assert!(persistent.throttled_failure().is_none());
+            persistent.last_failure = Some((
+                Instant::now() - Duration::from_secs(2),
+                "known failure".into(),
+            ));
+            assert_eq!(persistent.throttled_failure(), Some("known failure"));
+            {
+                let _inner = hold_flush_retry_window();
+                assert!(HOLD_RETRY_WINDOW.with(|cell| cell.get()));
+            }
+            assert!(HOLD_RETRY_WINDOW.with(|cell| cell.get()));
+        }
+        assert!(!HOLD_RETRY_WINDOW.with(|cell| cell.get()));
+        assert!(persistent.throttled_failure().is_none());
     }
 }

@@ -139,6 +139,8 @@ WAL 追加（每次写入调用一个 batch，dim 128）：
   - 这一代若非空，立即冻结，按 flush 处理；若为空，只换一个新的编号。
   - 非空的一代中另一个文件创建失败（例如 data 文件已有数据，delta 文件创建失败），同样按追加失败处理，冻结这一代，不把它的写入分到两个编号里。
 - **冻结时**：丢弃内存中的 stream writer，保留 File 用于之后的 fsync；不写 EOS。3.x 运行中的 WAL 也不带 EOS。
+  - 原 File 由冻结代持有。flush 的锁外阶段先同步该代全部原 File 与 `wal/` 目录，全部成功后才关闭；若失败，句柄全部保留，错误仍按提交点之前处理。关闭或 drop 的全局 WAL 同步也只有在全部文件及目录同步成功后才关闭活跃与冻结代的句柄。该步骤补齐关闭前同步合同；现有删除前的同步仍保留，其性能由最终基准核对。
+
 
 ### flush
 
@@ -353,7 +355,7 @@ WAL 追加（每次写入调用一个 batch，dim 128）：
 | 首次读触发懒打开 | 尚未打开的健康 collection 有孤儿 data/delta 文件；另一 collection 的 create/drop 在目录 fsync 失败后封锁数据库，再对前者发 Query/Search/Get：不得删除孤儿文件，首次打开返回封锁错误；已打开 collection 的纯读仍可继续。另以钩子暂停首次打开的清理，create/drop 的独占许可须等清理结束，不能反向持名字锁等写入闸门 |
 | 空 delete | 过滤删除零命中、主键快路径的空列表都返回 0，且不创建 WAL、不消耗 `_seq`；随后重开并插入 auto_id，主键与 3.x 相同。非空但全为不存在主键的列表仍消耗一个 `_seq` |
 | 有待提交状态 | 注入提交点前后的失败：触发 flush 的写入成功；1 秒内的写入被拒绝且不生效；多个写者并发时不死锁；恢复之后的写入先完成重新提交；显式 Flush 返回错误；之后正常关闭，3.x 打开时行数不变 |
-| WAL 追加失败 | 在 File 这一层注入部分写入加报错，包括 batch 小于写缓冲大小的情形；之后空间恢复，文件长度不再增长；经冻结、fsync、关闭与崩溃，重开时失败的写入不存在；进程内不再分配用过的 `_seq`，重开之后的下一个 `_seq` 与 3.x 从同一目录推出的值相同（失败的写入回放不出来，复用是安全的） |
+| WAL 追加失败 | 在 File 这一层注入部分写入加报错，包括 batch 小于写缓冲大小的情形；之后空间恢复，文件长度不再增长；经冻结、fsync、关闭与崩溃，重开时失败的写入不存在；进程内不再分配用过的 `_seq`，重开之后按本实现已校验的前缀继续分配 `_seq`；与 3.x 的同号断言限于失败恢复 flush 与 WAL 清理已经完成，或双方确实恢复出同一前缀的目录（失败的写入在该前缀中不存在，复用是安全的；保留半截批并继续拼接字节的故障目录不承诺同号，见 0002 的继承风险） |
 | 空的一代与 `current_seq` | 关闭时的空提交，以及追加失败时这一代为空、只换编号之后，`current_seq` 不下降；3.x 打开后能继续写入并 flush；打开时全部跳过、只读后关闭，3.x 打开时行数不变 |
 | 打开后第一次提交前的 fsync | 文件系统操作顺序的断言中，第一次 replace 之前，非本进程写出的被引用文件与各级目录都已 sync；在这一步注入失败，manifest 仍为旧版且 WAL 未删；第一次删除打开时就存在的 WAL 只能发生在首个活跃代发布之后。3.x 打开只剩 delta WAL 的目录时，本实现读出的结果正确 |
 | 乱序回放 | WAL 编号的先后与 `_seq` 的先后不一致（3.x 缺陷 e 写出的目录）时，回放结果与按 `_seq` 判定的参考结果相同；回放出的一代与已被引用的文件同名时，向外放宽 seq_max 后提交成功 |
@@ -427,3 +429,11 @@ WAL 追加（每次写入调用一个 batch，dim 128）：
 - [crash_recovery.rs](../../crates/core/tests/crash_recovery.rs)：目录生命周期的验证父进程单独运行，避免 Unix 上并行测试启动的兄弟子进程在 exec 前短暂继承父进程的 LOCK；各崩溃子进程在 create/drop 改名之前与之后退出，重开按实际目录状态判断，staging 残留清理且同名重建不接回旧别名。进程退出证明恢复路径，不能替代断电时目录改名回退的验证。
 - [存储互通用例](../../tests/storage_interop/test_cross_implementation.py)：3.x 读取上述 Rust 进程在目录改名两侧留下的目录；staging 删除失败、条目类型判定与根目录符号链接的两侧行为，由互通用例与上述 Rust 回归测试分别验证；未提交混合 WAL 的互通用例仍只证明两类 WAL 都存在的形态。
 - 尚待验证：真实断电下的改名回退、所有 aliases 维护入口、平台目录同步与完整文件操作顺序；本节不代表整个 M2 崩溃矩阵完成。
+
+### WAL 故障恢复的当前验收证据
+
+- [wal_recovery.rs](../../crates/core/tests/wal_recovery.rs)：data/delta、多批 WAL 的每个字节截断位置与中间消息损坏/零填充；首次与后续批的每个部分写入位置注入 ENOSPC，断言原 writer 作废、关闭不补写、只恢复完整批前缀；schema/批解码 panic 保留格式错误诊断，真实 I/O 错误向上传递。
+- [db_persistence.rs](../../crates/core/tests/db_persistence.rs)：insert/upsert/delete 的首次与已有 writer、零字节/头部/批末 ENOSPC，失败后内存不变，停止或继续写入后正常关闭重开；auto_id 在进程内不复用失败序号，重开仅从可恢复序号继续；读取 I/O 失败保留文件且懒打开可重试；flush 预同步分别在 data/delta/目录处失败时保持 BeforeReplace、manifest 与行集不变，同步失败的 collection 在重试窗口内拒绝写入，无关 collection 不受影响，显式 Flush 可立即完成重试并恢复写入。窗口断言使用仅测试构建可用的线程局部护栏，不依赖机器执行速度。
+- [runtime.rs](../../crates/core/src/storage/runtime.rs)：冻结代保留原 WAL File；文件与目录同步任一点失败均不关闭其中任何句柄，全成功后才关闭；Unix 上删除 wal/ 后仍持有活跃或冻结句柄时同步报错，确实没有句柄时允许目录不存在。
+- [crash_recovery.rs](../../crates/core/tests/crash_recovery.rs) 与 [互通用例](../../tests/storage_interop/test_cross_implementation.py)：ENOSPC 报错后停止或继续写入，再由独立进程立即退出；Rust 恢复结果与成功操作一致。3.x 与 Rust 的真实客户端分别读取两类目录：追加失败后恢复 flush 已完成、失败 WAL 已清理；以及注入恢复 flush 的 WAL 预同步失败，令半截 WAL 保留在盘上再退出。用例先断言实际 WAL 文件集合，再核对 count、get、主键 query、search 与向量；参考实现及 pyarrow 15/25 逐字节读取 Rust WAL，与 Rust 的完整批前缀及值一致。
+- 边界：ENOSPC 是 File 层错误注入，并未填满宿主磁盘；本节不代表完成并发写入后崩溃、Parquet 读取 panic、全部 fs 操作顺序或跨平台验证。仍有效的载荷位翻转不由格式校验检出，继承风险见 [0002](0002-data-dir-compat.md#继承的-3x-已知风险)。

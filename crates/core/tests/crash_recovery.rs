@@ -415,3 +415,121 @@ fn collection_directory_rename_crashes_preserve_commit_boundary() {
         reopened.close();
     }
 }
+
+#[test]
+fn failed_wal_append_then_process_exit_never_applies_failed_insert_upsert_or_delete() {
+    use milvus_lite_core::storage::wal::inject_storage_full_after_bytes;
+    if let Ok(case) = std::env::var("MILVUS_LITE_FAILED_WAL_CASE") {
+        let path = std::env::var("MILVUS_LITE_CRASH_DIR").unwrap();
+        let parts: Vec<_> = case.split('-').collect();
+        let operation = parts[0];
+        let existing = parts[1] == "existing";
+        let cut = if parts[2] == "tail" { usize::MAX } else { 20 };
+        let continued = parts[3] == "continue";
+        let retained = parts[3] == "retained";
+        let db = Db::new(
+            DataDir::open(std::path::Path::new(&path)).unwrap(),
+            compute(),
+        );
+        db.create_collection("", "c", schema()).unwrap();
+        db.insert("", "c", batch(&[(1, [1.0, 0.0]), (2, [1.0, 0.0])]))
+            .unwrap();
+        db.flush_collection("", "c").unwrap();
+        if existing {
+            if operation == "delete" {
+                db.delete("", "c", &[Pk::Int64(2)]).unwrap();
+            } else {
+                db.insert("", "c", batch(&[(3, [1.0, 0.0])])).unwrap();
+            }
+        }
+        let before = db.collection("", "c").unwrap().read().count();
+        if retained {
+            use milvus_lite_core::storage::runtime::{
+                RetainedWalSyncFault, inject_retained_wal_sync_failure_once,
+            };
+            inject_retained_wal_sync_failure_once(if operation == "delete" {
+                RetainedWalSyncFault::Delta
+            } else {
+                RetainedWalSyncFault::Data
+            });
+        }
+        inject_storage_full_after_bytes(cut);
+        let result = match operation {
+            "insert" => db
+                .insert("", "c", batch(&[(4, [9.0, 0.0]), (5, [9.0, 0.0])]))
+                .map(|_| ()),
+            "upsert" => db
+                .upsert_with_pk_type("", "c", batch(&[(1, [9.0, 0.0]), (4, [9.0, 0.0])]))
+                .map(|_| ()),
+            "delete" => db
+                .delete("", "c", &[Pk::Int64(1), Pk::Int64(99)])
+                .map(|_| ()),
+            _ => panic!("unknown operation"),
+        };
+        assert!(result.is_err());
+        assert_eq!(db.collection("", "c").unwrap().read().count(), before);
+        if continued {
+            db.insert("", "c", batch(&[(6, [1.0, 0.0])])).unwrap();
+        }
+        let wal_files = std::fs::read_dir(std::path::Path::new(&path).join("collections/c/wal"))
+            .unwrap()
+            .count();
+        assert_eq!(wal_files > 0, retained || continued);
+        std::process::exit(89);
+    }
+    if std::env::var_os("MILVUS_LITE_FAILED_WAL_PARENT").is_none() {
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "failed_wal_append_then_process_exit_never_applies_failed_insert_upsert_or_delete",
+                "--nocapture",
+            ])
+            .env("MILVUS_LITE_FAILED_WAL_PARENT", "1")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        return;
+    }
+    for operation in ["insert", "upsert", "delete"] {
+        for writer in ["first", "existing"] {
+            for cut in ["header", "tail"] {
+                for next in ["stop", "continue", "retained"] {
+                    let root = tempfile::tempdir().unwrap();
+                    let path = root.path().join("failed-wal.db");
+                    let case = format!("{operation}-{writer}-{cut}-{next}");
+                    let status = Command::new(std::env::current_exe().unwrap()).args(["--exact", "failed_wal_append_then_process_exit_never_applies_failed_insert_upsert_or_delete", "--nocapture"])
+                        .env("MILVUS_LITE_FAILED_WAL_CASE", &case).env("MILVUS_LITE_CRASH_DIR", &path).status().unwrap();
+                    assert_eq!(status.code(), Some(89), "{case}");
+                    let db = Db::new(DataDir::open(&path).unwrap(), compute());
+                    let handle = db.collection("", "c").unwrap();
+                    let mut expected = vec![Pk::Int64(1)];
+                    if operation != "delete" || writer == "first" {
+                        expected.push(Pk::Int64(2));
+                    }
+                    if operation != "delete" && writer == "existing" {
+                        expected.push(Pk::Int64(3));
+                    }
+                    if next == "continue" {
+                        expected.push(Pk::Int64(6));
+                    }
+                    assert_eq!(handle.read().count(), expected.len(), "{case}");
+                    let actual = handle
+                        .read()
+                        .get(&[1, 2, 3, 4, 5, 6].map(Pk::Int64), &["v".into()])
+                        .unwrap()
+                        .rows;
+                    assert_eq!(actual.pks, expected, "{case}");
+                    assert_eq!(
+                        actual.fields[0].1,
+                        milvus_lite_core::ColumnData::FloatVector {
+                            dim: 2,
+                            values: [1.0, 0.0].repeat(expected.len())
+                        },
+                        "{case}"
+                    );
+                    db.close();
+                }
+            }
+        }
+    }
+}

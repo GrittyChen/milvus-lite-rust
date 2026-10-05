@@ -13,13 +13,33 @@ use arrow_schema::{ArrowError, Schema, SchemaRef};
 
 #[cfg(feature = "fault-injection")]
 thread_local! {
-    static FAIL_NEXT_APPEND_AFTER_BYTES: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    static FAIL_NEXT_APPEND_AFTER_BYTES: std::cell::Cell<Option<(usize, bool)>> = const { std::cell::Cell::new(None) };
 }
 
 /// 仅测试构建可用；模拟 File 写出一部分 batch 后报错。
 #[cfg(feature = "fault-injection")]
 pub fn inject_append_failure_after_bytes(bytes: usize) {
-    FAIL_NEXT_APPEND_AFTER_BYTES.with(|cell| cell.set(Some(bytes)));
+    FAIL_NEXT_APPEND_AFTER_BYTES.with(|cell| cell.set(Some((bytes, false))));
+}
+
+/// 在 File 边界注入部分写入后 ENOSPC；不要求测试填满宿主磁盘。
+#[cfg(feature = "fault-injection")]
+pub fn inject_storage_full_after_bytes(bytes: usize) {
+    FAIL_NEXT_APPEND_AFTER_BYTES.with(|cell| cell.set(Some((bytes, true))));
+}
+
+#[cfg(feature = "fault-injection")]
+#[derive(Clone, Copy, Debug)]
+pub enum WalReadFault {
+    Io,
+    SchemaPanic,
+    BatchPanicAfter(usize),
+}
+#[cfg(feature = "fault-injection")]
+thread_local! { static READ_FAULT: std::cell::Cell<Option<WalReadFault>> = const { std::cell::Cell::new(None) }; }
+#[cfg(feature = "fault-injection")]
+pub fn inject_read_fault_once(fault: WalReadFault) {
+    READ_FAULT.with(|cell| cell.set(Some(fault)));
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -116,8 +136,9 @@ impl WalWriter {
         // 会拼接多个 stream，3.x 的 open_stream 在第二个 schema 处报错。
         let encoded = std::mem::take(self.stream.get_mut());
         #[cfg(feature = "fault-injection")]
-        if let Some(bytes) = FAIL_NEXT_APPEND_AFTER_BYTES.with(|cell| cell.take()) {
-            let prefix = bytes.min(encoded.len());
+        if let Some((bytes, storage_full)) = FAIL_NEXT_APPEND_AFTER_BYTES.with(|cell| cell.take()) {
+            // 真实 write_all 失败只发生在写入尚未完成时，不能伪造「全批写完后仍失败」。
+            let prefix = bytes.min(encoded.len().saturating_sub(1));
             if let Err(source) = self.file.write_all(&encoded[..prefix]) {
                 self.poisoned = true;
                 return Err(WalError::Io {
@@ -128,7 +149,22 @@ impl WalWriter {
             self.poisoned = true;
             return Err(WalError::Io {
                 path: self.path.clone(),
-                source: io::Error::other("injected partial WAL append failure"),
+                source: if storage_full {
+                    #[cfg(unix)]
+                    {
+                        io::Error::from_raw_os_error(28)
+                    }
+                    #[cfg(windows)]
+                    {
+                        io::Error::from_raw_os_error(112)
+                    }
+                    #[cfg(not(any(unix, windows)))]
+                    {
+                        io::Error::from(io::ErrorKind::StorageFull)
+                    }
+                } else {
+                    io::Error::other("injected partial WAL append failure")
+                },
             });
         }
         if let Err(source) = self.file.write_all(&encoded) {
@@ -158,11 +194,24 @@ pub struct RecoveredWal {
 
 pub fn read_prefix(path: &Path) -> Result<RecoveredWal, WalError> {
     // 文件先完整读进内存，之后解码产生的 UnexpectedEof 才能确定为格式/截断错误。
+    #[cfg(feature = "fault-injection")]
+    let mut read_fault = READ_FAULT.with(|cell| cell.take());
+    #[cfg(feature = "fault-injection")]
+    if matches!(read_fault, Some(WalReadFault::Io)) {
+        return Err(WalError::Io {
+            path: path.to_path_buf(),
+            source: io::Error::other("injected WAL read I/O failure"),
+        });
+    }
     let bytes = fs::read(path).map_err(|source| WalError::Io {
         path: path.to_path_buf(),
         source,
     })?;
     let reader = catch_unwind(AssertUnwindSafe(|| {
+        #[cfg(feature = "fault-injection")]
+        if matches!(read_fault, Some(WalReadFault::SchemaPanic)) {
+            panic!("injected WAL schema decode panic");
+        }
         StreamReader::try_new(Cursor::new(bytes), None)
     }));
     let mut reader = match reader {
@@ -186,6 +235,13 @@ pub fn read_prefix(path: &Path) -> Result<RecoveredWal, WalError> {
     let mut batches = Vec::new();
     loop {
         let next = catch_unwind(AssertUnwindSafe(|| {
+            #[cfg(feature = "fault-injection")]
+            if let Some(WalReadFault::BatchPanicAfter(left)) = &mut read_fault {
+                if *left == 0 {
+                    panic!("injected WAL batch decode panic");
+                }
+                *left -= 1;
+            }
             reader.next().map(|r| {
                 r.and_then(|batch| {
                     for column in batch.columns() {

@@ -110,6 +110,99 @@ fn inspect(root: &Path) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+fn write_wal_matrix(root: &Path) -> Result<(), Box<dyn Error>> {
+    fs_commit::create_dir_synced(root)?;
+    let schema = schema();
+    let mut ends = serde_json::Map::new();
+    for kind in [WalKind::Data, WalKind::Delta] {
+        let mut writer = None;
+        let mut boundaries = Vec::new();
+        for n in 0..3u64 {
+            let batch = match kind {
+                WalKind::Data => arrow_data::wal_data_batch(
+                    &schema,
+                    &[2 * n + 1, 2 * n + 2],
+                    "_default",
+                    &[
+                        ColumnData::Int64(vec![(2 * n + 1) as i64, (2 * n + 2) as i64]),
+                        ColumnData::FloatVector {
+                            dim: 2,
+                            values: vec![1.0, 2.0, 3.0, 4.0],
+                        },
+                    ],
+                    None,
+                )?,
+                WalKind::Delta => arrow_data::wal_delta_batch(
+                    &schema,
+                    &[Pk::Int64((2 * n + 1) as i64), Pk::Int64((2 * n + 2) as i64)],
+                    &[n + 1; 2],
+                    "_all",
+                )?,
+            };
+            if writer.is_none() {
+                writer = Some(WalWriter::create(root, kind, 1, &batch.schema())?);
+            }
+            let current = writer
+                .as_mut()
+                .ok_or_else(|| io::Error::other("writer missing"))?;
+            current.append(&batch)?;
+            boundaries.push(std::fs::metadata(current.path())?.len());
+        }
+        ends.insert(
+            if kind == WalKind::Data {
+                "data"
+            } else {
+                "delta"
+            }
+            .into(),
+            serde_json::json!(boundaries),
+        );
+    }
+    std::fs::write(root.join("ends.json"), serde_json::to_vec(&ends)?)?;
+    Ok(())
+}
+
+fn read_wal_matrix(root: &Path) -> Result<(), Box<dyn Error>> {
+    let cases: Vec<(String, String)> =
+        serde_json::from_slice(&std::fs::read(root.join("cases.json"))?)?;
+    let mut result = Vec::new();
+    let schema = schema();
+    for (file, kind) in cases {
+        let recovered = milvus_lite_core::storage::wal::read_prefix(&root.join(file))?;
+        let mut batches = Vec::new();
+        for batch in recovered.batches {
+            let summary = match kind.as_str() {
+                "data" => {
+                    let data = arrow_data::decode_wal_data_batch(&schema, &batch)?;
+                    let (ColumnData::Int64(ids), ColumnData::FloatVector { values, .. }) =
+                        (&data.columns[0], &data.columns[1])
+                    else {
+                        return Err(io::Error::other("unexpected data columns").into());
+                    };
+                    serde_json::json!({ "seq": data.seqs, "ids": ids, "vectors": values })
+                }
+                "delta" => {
+                    let delta = arrow_data::decode_wal_delta_batch(&schema, &batch)?;
+                    let ids: Vec<_> = delta
+                        .pks
+                        .iter()
+                        .map(|pk| match pk {
+                            Pk::Int64(id) => Ok(*id),
+                            _ => Err(io::Error::other("unexpected primary key type")),
+                        })
+                        .collect::<Result<_, _>>()?;
+                    serde_json::json!({ "seq": delta.seqs, "ids": ids })
+                }
+                _ => return Err(io::Error::other("unknown WAL kind").into()),
+            };
+            batches.push(summary);
+        }
+        result.push(batches);
+    }
+    println!("{}", serde_json::to_string(&result)?);
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     let mut args = std::env::args().skip(1);
     let operation = args
@@ -126,6 +219,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         "write-wal" => write(root, false),
         "write-flushed" => write(root, true),
         "inspect" => inspect(root),
+        "write-wal-matrix" => write_wal_matrix(root),
+        "read-wal-matrix" => read_wal_matrix(root),
         _ => Err(io::Error::new(io::ErrorKind::InvalidInput, "unknown operation").into()),
     }
 }

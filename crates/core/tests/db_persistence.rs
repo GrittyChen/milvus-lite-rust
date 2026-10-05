@@ -1248,3 +1248,239 @@ fn staging_entry_type_failure_rejects_open_without_deleting_any_residue() {
     assert!(std::fs::read_dir(staging).unwrap().next().is_none());
     db.close();
 }
+
+#[cfg(feature = "fault-injection")]
+#[test]
+fn enospc_insert_upsert_delete_preserve_memory_and_recover_after_close() {
+    use milvus_lite_core::storage::wal::inject_storage_full_after_bytes;
+    for operation in ["insert", "upsert", "delete"] {
+        for existing_writer in [false, true] {
+            for cut in [0, 20, usize::MAX] {
+                for continue_writing in [false, true] {
+                    let root = tempfile::tempdir().unwrap();
+                    let db = Db::new(DataDir::open(root.path()).unwrap(), compute());
+                    db.create_collection("", "c", schema()).unwrap();
+                    db.insert("", "c", batch(&[1, 2])).unwrap();
+                    db.flush_collection("", "c").unwrap();
+                    if existing_writer {
+                        if operation == "delete" {
+                            db.delete("", "c", &[Pk::Int64(2)]).unwrap();
+                        } else {
+                            db.insert("", "c", batch(&[3])).unwrap();
+                        }
+                    }
+                    let handle = db.collection("", "c").unwrap();
+                    let ids = [1, 2, 3, 4, 5, 6].map(Pk::Int64);
+                    let before = handle.read().get(&ids, &["v".into()]).unwrap().rows;
+                    inject_storage_full_after_bytes(cut);
+                    let result = match operation {
+                        "insert" => db.insert("", "c", batch(&[4, 5])).map(|_| ()),
+                        "upsert" => {
+                            let mut input = batch(&[1, 4]);
+                            input.columns[1].1 = InputValues::FloatVector {
+                                dim: 2,
+                                values: vec![9.0, 0.0, 9.0, 0.0],
+                            };
+                            db.upsert_with_pk_type("", "c", input).map(|_| ())
+                        }
+                        _ => db
+                            .delete("", "c", &[Pk::Int64(1), Pk::Int64(99)])
+                            .map(|_| ()),
+                    };
+                    assert!(
+                        matches!(result, Err(EngineError::Storage(_))),
+                        "{operation}, existing={existing_writer}, cut={cut}"
+                    );
+                    let after = handle.read().get(&ids, &["v".into()]).unwrap().rows;
+                    assert_eq!(after.pks, before.pks);
+                    assert_eq!(after.fields, before.fields);
+                    if continue_writing {
+                        db.insert("", "c", batch(&[6])).unwrap();
+                    }
+                    let expected = handle.read().get(&ids, &["v".into()]).unwrap().rows;
+                    db.close();
+                    let reopened = Db::new(DataDir::open(root.path()).unwrap(), compute());
+                    let recovered = reopened.collection("", "c").unwrap();
+                    assert_eq!(recovered.read().count(), expected.pks.len());
+                    let actual = recovered.read().get(&ids, &["v".into()]).unwrap().rows;
+                    assert_eq!(actual.pks, expected.pks);
+                    assert_eq!(actual.fields, expected.fields);
+                    assert!(!actual.pks.contains(&Pk::Int64(4)));
+                    assert!(!actual.pks.contains(&Pk::Int64(5)));
+                    reopened.close();
+                }
+            }
+        }
+    }
+}
+
+#[cfg(feature = "fault-injection")]
+#[test]
+fn wal_read_io_failure_preserves_files_and_lazy_open_can_retry() {
+    use milvus_lite_core::storage::{
+        arrow_data,
+        wal::{WalKind, WalReadFault, WalWriter, inject_read_fault_once},
+    };
+    let root = tempfile::tempdir().unwrap();
+    let db = Db::new(DataDir::open(root.path()).unwrap(), compute());
+    db.create_collection("", "c", schema()).unwrap();
+    db.insert("", "c", batch(&[1, 2])).unwrap();
+    db.close();
+    let dir = root.path().join("collections/c");
+    let wal_dir = dir.join("wal");
+    std::fs::create_dir_all(&wal_dir).unwrap();
+    let input = arrow_data::wal_data_batch(
+        &schema(),
+        &[3],
+        "_default",
+        &[
+            milvus_lite_core::ColumnData::Int64(vec![3]),
+            milvus_lite_core::ColumnData::FloatVector {
+                dim: 2,
+                values: vec![1.0, 0.0],
+            },
+        ],
+        None,
+    )
+    .unwrap();
+    let mut writer = WalWriter::create(&wal_dir, WalKind::Data, 100, &input.schema()).unwrap();
+    writer.append(&input).unwrap();
+    let path = writer.path().to_path_buf();
+    writer.into_file().sync_all().unwrap();
+    let before = std::fs::read(&path).unwrap();
+    let orphan = dir.join("partitions/_default/data/orphan");
+    std::fs::write(&orphan, b"orphan").unwrap();
+    let db = Db::new(DataDir::open(root.path()).unwrap(), compute());
+    inject_read_fault_once(WalReadFault::Io);
+    assert!(
+        db.collection("", "c")
+            .unwrap_err()
+            .to_string()
+            .contains("injected WAL read I/O failure")
+    );
+    assert!(orphan.exists());
+    assert_eq!(std::fs::read(path).unwrap(), before);
+    assert_eq!(db.collection("", "c").unwrap().read().count(), 3);
+    assert!(!orphan.exists());
+    db.close();
+}
+
+#[cfg(feature = "fault-injection")]
+#[test]
+fn failed_wal_append_consumes_auto_ids_in_process_but_reopen_uses_recoverable_sequence() {
+    use milvus_lite_core::storage::wal::inject_storage_full_after_bytes;
+    for continued in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let db = Db::new(DataDir::open(root.path()).unwrap(), compute());
+        let mut auto_schema = schema();
+        auto_schema.fields[0].auto_id = true;
+        db.create_collection("", "c", auto_schema).unwrap();
+        let input = |rows| InsertBatch {
+            num_rows: rows,
+            columns: vec![(
+                "v".into(),
+                InputValues::FloatVector {
+                    dim: 2,
+                    values: [1.0, 0.0].repeat(rows),
+                },
+            )],
+        };
+        assert_eq!(
+            db.insert("", "c", input(2)).unwrap(),
+            [Pk::Int64(1), Pk::Int64(2)]
+        );
+        inject_storage_full_after_bytes(usize::MAX);
+        assert!(db.insert("", "c", input(2)).is_err());
+        if continued {
+            assert_eq!(db.insert("", "c", input(1)).unwrap(), [Pk::Int64(5)]);
+        }
+        db.close();
+        let reopened = Db::new(DataDir::open(root.path()).unwrap(), compute());
+        assert_eq!(
+            reopened.insert("", "c", input(1)).unwrap(),
+            [Pk::Int64(if continued { 6 } else { 3 })]
+        );
+        reopened.close();
+    }
+}
+
+#[cfg(feature = "fault-injection")]
+#[test]
+fn frozen_wal_pre_sync_failure_stays_before_replace_and_explicit_flush_recovers() {
+    use milvus_lite_core::storage::runtime::{
+        RetainedWalSyncFault, hold_flush_retry_window, inject_retained_wal_sync_failure_once,
+    };
+    for fault in [
+        RetainedWalSyncFault::Data,
+        RetainedWalSyncFault::Delta,
+        RetainedWalSyncFault::Directory,
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let db = Db::new(DataDir::open(root.path()).unwrap(), compute());
+        db.create_collection("", "c", schema()).unwrap();
+        db.create_collection("", "other", schema()).unwrap();
+        db.insert("", "c", batch(&[1, 2, 3])).unwrap();
+        db.flush_collection("", "c").unwrap();
+        db.insert("", "c", batch(&[4])).unwrap();
+        db.delete("", "c", &[Pk::Int64(2)]).unwrap();
+        let dir = root.path().join("collections/c");
+        let manifest = std::fs::read(dir.join("manifest.json")).unwrap();
+        let wal: Vec<_> = std::fs::read_dir(dir.join("wal"))
+            .unwrap()
+            .map(|entry| {
+                let path = entry.unwrap().path();
+                let bytes = std::fs::read(&path).unwrap();
+                (path, bytes)
+            })
+            .collect();
+        assert_eq!(wal.len(), 2);
+        let _window = hold_flush_retry_window();
+        inject_retained_wal_sync_failure_once(fault);
+        let error = db.flush_collection("", "c").unwrap_err();
+        assert!(matches!(error, EngineError::Storage(_)));
+        assert!(error.to_string().contains("BeforeReplace"));
+        assert!(
+            error
+                .to_string()
+                .contains("injected retained WAL sync failure")
+        );
+        assert_eq!(std::fs::read(dir.join("manifest.json")).unwrap(), manifest);
+        for (path, bytes) in &wal {
+            assert_eq!(std::fs::read(path).unwrap(), *bytes);
+        }
+        let expected = [Pk::Int64(1), Pk::Int64(3), Pk::Int64(4)];
+        assert_eq!(
+            db.collection("", "c")
+                .unwrap()
+                .read()
+                .get(&[1, 2, 3, 4, 99].map(Pk::Int64), &[])
+                .unwrap()
+                .rows
+                .pks,
+            expected
+        );
+        assert!(
+            db.insert("", "c", batch(&[99]))
+                .unwrap_err()
+                .to_string()
+                .contains("throttled")
+        );
+        db.insert("", "other", batch(&[99])).unwrap();
+        db.flush_collection("", "c").unwrap();
+        db.insert("", "c", batch(&[5])).unwrap();
+        db.close();
+        let reopened = Db::new(DataDir::open(root.path()).unwrap(), compute());
+        let rows = reopened
+            .collection("", "c")
+            .unwrap()
+            .read()
+            .get(&[1, 2, 3, 4, 5, 99].map(Pk::Int64), &[])
+            .unwrap()
+            .rows;
+        assert_eq!(
+            rows.pks,
+            [Pk::Int64(1), Pk::Int64(3), Pk::Int64(4), Pk::Int64(5)]
+        );
+        reopened.close();
+    }
+}

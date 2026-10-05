@@ -673,3 +673,201 @@ db.close()
 """
     run([interpreters[PYTHONS[0]], "-c", reference_code, str(root)], cwd=tmp_path)
     assert not victim.exists()
+
+
+@pytest.mark.parametrize("reader", PYTHONS)
+def test_every_wal_byte_cut_and_middle_corruption_matches_reader(
+    tmp_path, interpreters, rust_binary, reader,
+):
+    import struct
+
+    root = tmp_path / "wal-matrix"
+    rust(rust_binary, "write-wal-matrix", root)
+    ends = json.loads((root / "ends.json").read_text())
+    cases, expected_counts = [], []
+    originals = {}
+    for kind in ("data", "delta"):
+        original = (root / f"wal_{kind}_000001.arrow").read_bytes()
+        originals[kind] = original
+        for length in range(len(original) + 1):
+            name = f"{kind}-cut-{length}.arrow"
+            (root / name).write_bytes(original[:length])
+            cases.append((name, kind))
+            expected_counts.append(sum(end <= length for end in ends[kind]))
+        for mode in ("bad-length", "zero-middle"):
+            content = bytearray(original)
+            first, second, _ = ends[kind]
+            if mode == "bad-length":
+                content[first + 4:first + 8] = b"\xff" * 4
+            else:
+                content[first:second] = b"\x00" * (second - first)
+            name = f"{kind}-{mode}.arrow"
+            (root / name).write_bytes(content)
+            cases.append((name, kind))
+            expected_counts.append(1)
+    # 没有校验和，结构仍有效的向量载荷变化会被双方接受；不能误称能检出任意损坏。
+    payload = bytearray(originals["data"])
+    vector_at = payload.find(struct.pack("<4f", 1.0, 2.0, 3.0, 4.0))
+    assert vector_at >= 0
+    payload[vector_at + 3] ^= 0x80
+    (root / "payload-flip.arrow").write_bytes(payload)
+    cases.append(("payload-flip.arrow", "data"))
+    expected_counts.append(3)
+    (root / "cases.json").write_text(json.dumps(cases))
+    actual = json.loads(run([str(rust_binary), "read-wal-matrix", str(root)]))
+    assert [len(batches) for batches in actual] == expected_counts
+    assert actual[-1][0]["vectors"][0] == -1.0
+    code = """
+import json, logging, struct, sys
+from pathlib import Path
+import pyarrow as pa
+logging.disable(logging.CRITICAL)
+root, mode = Path(sys.argv[1]), sys.argv[2]
+if mode == 'reference':
+    from milvus_lite.storage.wal import _read_wal_file
+result = []
+for name, kind in json.loads((root / 'cases.json').read_text()):
+    path = root / name
+    if mode == 'reference':
+        batches = _read_wal_file(str(path))
+    else:
+        batches = []
+        try:
+            with pa.OSFile(str(path), 'rb') as source:
+                for batch in pa.ipc.open_stream(source):
+                    batch.validate(full=True)
+                    batches.append(batch)
+        except (pa.ArrowInvalid, OSError):
+            pass
+    summaries = []
+    for batch in batches:
+        summary = {'seq': batch.column('_seq').to_pylist(), 'ids': batch.column('id').to_pylist()}
+        if kind == 'data':
+            summary['vectors'] = [number for value in batch.column('vector').to_pylist() for number in value]
+        summaries.append(summary)
+    result.append(summaries)
+print(json.dumps(result))
+"""
+    expected = json.loads(run([
+        interpreters[reader], "-c", code, str(root),
+        "reference" if reader == PYTHONS[0] else "pyarrow",
+    ], cwd=tmp_path))
+    assert actual == expected
+    for kind, original in originals.items():
+        assert (root / f"wal_{kind}_000001.arrow").read_bytes() == original
+
+
+@pytest.mark.parametrize("operation", ["insert", "upsert", "delete"])
+@pytest.mark.parametrize("existing", [False, True])
+@pytest.mark.parametrize("reader", ["rust", "reference"])
+@pytest.mark.parametrize("retained", [False, True])
+def test_failed_enospc_batch_is_absent_after_rust_crash(
+    tmp_path, interpreters, directory_crash_binary, operation, existing, reader, retained,
+):
+    root = tmp_path / "failed-wal.db"
+    case = f"{operation}-{'existing' if existing else 'first'}-tail-{'retained' if retained else 'stop'}"
+    env = dict(os.environ, MILVUS_LITE_FAILED_WAL_CASE=case, MILVUS_LITE_CRASH_DIR=str(root))
+    result = subprocess.run([
+        directory_crash_binary, "--exact",
+        "failed_wal_append_then_process_exit_never_applies_failed_insert_upsert_or_delete", "--nocapture",
+    ], cwd=tmp_path, env=env, text=True, capture_output=True, check=False)
+    assert result.returncode == 89, result.stdout + result.stderr
+    wal_files = list((root / "collections/c/wal").glob("wal_*.arrow"))
+    assert bool(wal_files) == retained
+    if retained:
+        kind = "delta" if operation == "delete" else "data"
+        assert any(path.name.startswith(f"wal_{kind}_") for path in wal_files)
+        assert "WAL failure recovery flush" in result.stderr
+        assert "BeforeReplace" in result.stderr
+    expected = [1]
+    if operation != "delete" or not existing:
+        expected.append(2)
+    if operation != "delete" and existing:
+        expected.append(3)
+    code = """
+import json, sys
+from pymilvus import MilvusClient
+from milvus_lite.server_manager import server_manager_instance
+path, encoded = sys.argv[1:]
+expected = json.loads(encoded)
+client = MilvusClient(path)
+assert client.query('c', output_fields=['count(*)']) == [{'count(*)': len(expected)}]
+rows = client.get('c', ids=[1,2,3,4,5,6], output_fields=['id','v'])
+assert [row['id'] for row in rows] == expected
+assert all(row['v'] == [1.0, 0.0] for row in rows)
+assert list(client.query('c', filter='id in [1,2,3,4,5,6]', output_fields=['id','v'])) == list(rows)
+hits = client.search('c', data=[[1.0, 0.0]], anns_field='v', limit=6, search_params={'metric_type': 'L2'}, output_fields=['v'])[0]
+assert sorted(hit['id'] for hit in hits) == expected
+assert all(hit['distance'] == 0.0 and hit['entity']['v'] == [1.0, 0.0] for hit in hits)
+client.close()
+server_manager_instance.release_server(path)
+"""
+    python = sys.executable if reader == "rust" else interpreters[PYTHONS[0]]
+    run([python, "-c", code, str(root), json.dumps(expected)], cwd=tmp_path)
+
+
+def test_reference_uncaught_wal_schema_error_fails_collection_access(tmp_path, interpreters):
+    import struct
+
+    root = tmp_path / "unsupported-wal.db"
+    reference_create(interpreters[PYTHONS[0]], root, flush=False)
+    path = root / "collections/c/wal/wal_data_000001.arrow"
+    data = bytearray(path.read_bytes())
+
+    # 定位 schema 首个 Int 字段的宽度，而不把当前编码器的某个绝对字节位置当成合同。
+    def slot(table, field):
+        vtable = table - struct.unpack_from("<i", data, table)[0]
+        offset = struct.unpack_from("<H", data, vtable + 4 + field * 2)[0]
+        assert offset != 0
+        return table + offset
+
+    def indirect(offset):
+        return offset + struct.unpack_from("<I", data, offset)[0]
+
+    message = 8 + struct.unpack_from("<I", data, 8)[0]
+    schema = indirect(slot(message, 2))
+    fields = indirect(slot(schema, 1))
+    field = indirect(fields + 4)
+    integer = indirect(slot(field, 3))
+    width = slot(integer, 0)
+    assert struct.unpack_from("<i", data, width)[0] == 64
+    data[width] ^= 0x20
+    assert struct.unpack_from("<i", data, width)[0] == 96
+    path.write_bytes(data)
+    code = """
+import sys
+import pyarrow as pa
+from milvus_lite.db import MilvusLite
+from milvus_lite.storage.wal import _read_wal_file
+root = sys.argv[1]
+db = MilvusLite(root)
+for operation in (lambda: _read_wal_file(root + '/collections/c/wal/wal_data_000001.arrow'), lambda: db.get_collection('c')):
+    try:
+        operation()
+    except pa.ArrowNotImplementedError as error:
+        assert 'Integers with more than 64 bits not implemented' in str(error)
+    else:
+        raise AssertionError('schema corruption did not raise the uncaught exception')
+db.close()
+"""
+    run([interpreters[PYTHONS[0]], "-c", code, str(root)], cwd=tmp_path)
+    assert path.read_bytes() == data
+    rust_code = """
+import sys
+from pymilvus import MilvusClient
+from milvus_lite.server_manager import server_manager_instance
+path = sys.argv[1]
+client = MilvusClient(path)
+assert client.query('c', output_fields=['count(*)']) == [{'count(*)': 0}]
+assert list(client.get('c', ids=[1,2])) == []
+client.close()
+server_manager_instance.release_server(path)
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", rust_code, str(root)], cwd=tmp_path,
+        text=True, capture_output=True, check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "recovered only a validated WAL prefix" in result.stderr
+    assert "Int type with bit width of 96" in result.stderr
+    assert "not supported" in result.stderr
