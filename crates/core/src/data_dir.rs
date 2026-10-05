@@ -6,6 +6,20 @@ use std::path::{Path, PathBuf};
 
 pub const LOCK_FILENAME: &str = "LOCK";
 
+#[cfg(feature = "fault-injection")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StagingFault {
+    EntryTypeAfter(usize),
+    Remove,
+    Sync,
+}
+#[cfg(feature = "fault-injection")]
+thread_local! { static STAGING_FAULT: std::cell::Cell<Option<StagingFault>> = const { std::cell::Cell::new(None) }; }
+#[cfg(feature = "fault-injection")]
+pub fn inject_staging_failure_once(fault: StagingFault) {
+    STAGING_FAULT.with(|slot| slot.set(Some(fault)));
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum DataDirError {
     #[error("failed to open data directory {path:?}: {source}")]
@@ -77,15 +91,68 @@ fn cleanup_staging(data_dir: &Path) -> io::Result<()> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error),
     }
-    for entry in fs::read_dir(&staging)? {
-        let entry = entry?;
-        if entry.file_type()?.is_dir() {
-            fs::remove_dir_all(entry.path())?;
+    // 先完整判定；只有已确认残留的删除与后续同步属于非阻断清理。
+    let entries = fs::read_dir(&staging)?
+        .map(|entry| {
+            let entry = entry?;
+            #[cfg(feature = "fault-injection")]
+            if STAGING_FAULT.with(|slot| match slot.get() {
+                Some(StagingFault::EntryTypeAfter(0)) => {
+                    slot.set(None);
+                    true
+                }
+                Some(StagingFault::EntryTypeAfter(left)) => {
+                    slot.set(Some(StagingFault::EntryTypeAfter(left - 1)));
+                    false
+                }
+                _ => false,
+            }) {
+                return Err(io::Error::other("injected staging entry type failure"));
+            }
+            Ok((entry.path(), entry.file_type()?.is_dir()))
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    for (path, directory) in entries {
+        #[cfg(feature = "fault-injection")]
+        let injected = STAGING_FAULT.with(|slot| {
+            if slot.get() == Some(StagingFault::Remove) {
+                slot.set(None);
+                true
+            } else {
+                false
+            }
+        });
+        #[cfg(not(feature = "fault-injection"))]
+        let injected = false;
+        let result = if injected {
+            Err(io::Error::other("injected staging removal failure"))
+        } else if directory {
+            fs::remove_dir_all(&path)
         } else {
-            fs::remove_file(entry.path())?;
+            fs::remove_file(&path)
+        };
+        if let Err(error) = result {
+            eprintln!("database staging cleanup deferred for {path:?}: {error}");
         }
     }
-    crate::storage::fs_commit::sync_dir(&staging)
+    let sync = || {
+        #[cfg(feature = "fault-injection")]
+        if STAGING_FAULT.with(|slot| {
+            if slot.get() == Some(StagingFault::Sync) {
+                slot.set(None);
+                true
+            } else {
+                false
+            }
+        }) {
+            return Err(io::Error::other("injected staging sync failure"));
+        }
+        crate::storage::fs_commit::sync_dir(&staging)
+    };
+    if let Err(error) = sync() {
+        eprintln!("cannot sync database staging cleanup {staging:?}: {error}");
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -204,5 +271,32 @@ mod tests {
         File::create(&file).unwrap();
         let err = DataDir::open(&file).unwrap_err();
         assert!(matches!(err, DataDirError::Io { .. }), "{err}");
+    }
+    #[cfg(unix)]
+    #[test]
+    fn staging_root_symlink_is_rejected_without_deleting_external_residue() {
+        let root = tmp();
+        let outside = tmp();
+        let sentinel = outside.path().join("keep");
+        fs::write(&sentinel, b"keep").unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.path().join(".database-staging")).unwrap();
+        assert!(DataDir::open(root.path()).is_err());
+        assert_eq!(fs::read(sentinel).unwrap(), b"keep");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_staging_scan_fails_before_deleting_residue() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tmp();
+        let staging = root.path().join(".database-staging");
+        fs::create_dir(&staging).unwrap();
+        let sentinel = staging.join("keep");
+        fs::write(&sentinel, b"keep").unwrap();
+        fs::set_permissions(&staging, fs::Permissions::from_mode(0o000)).unwrap();
+        let result = DataDir::open(root.path());
+        fs::set_permissions(&staging, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(result.is_err());
+        assert_eq!(fs::read(sentinel).unwrap(), b"keep");
     }
 }

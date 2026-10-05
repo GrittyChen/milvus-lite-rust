@@ -272,8 +272,8 @@ WAL 追加（每次写入调用一个 batch，dim 128）：
   - 改名之前任一 WAL fsync 若失败，不关闭任何 WAL 句柄；健康句柄撤销「已删除」标记、继续持有全部写者，损坏句柄保持损坏。drop 报错且不改名，不把一次同步错误变成半完成的 drop。
   - **提交点是改名成功**：
     - 成功：仍持目录变更锁与名字锁，先从 collection 表移除旧句柄、清除 fail-closed 缓存，再放开状态写锁；这些内存收尾发生在任何后续 fsync 之前，不能被其错误或 panic 跳过。之后依次 fsync `collections/` 与 staging。两处都成功，才持 aliases 锁维护 `aliases.json`，最后删除 staging 中的目录。fsync 处的 panic 由局部 `catch_unwind` 转成错误，按同步失败处理；不能用一次包住整段、捕获后直接返回的写法。
-    - 改名之后的目录 fsync 若失败，drop 报错，写明「目录已移走，但断电持久化未确认」；保留 aliases 与 staging 不动，在释放数据库写入闸门的独占许可前进入本服务实例的**写入封锁状态**。否则若别名已持久删除而目录改名在断电后回退，会出现旧 collection 存在、别名却永久丢失。封锁后所有写入、显式 Flush、CreateIndex、create 与 drop 都拒绝，不再尝试对同一脏目录原样 fsync：一次 fsync 错误可能只上报一次，之后的成功不证明原改名落盘（0006 第 8 项）。正常关闭不 flush，只同步并保留全部 WAL，写日志并释放 LOCK；重开后按实际目录状态判断：原名仍在时保留别名，原名不在时清理悬空别名与 staging。删除 staging 中目录的失败属于第 17 项已采纳的提交后清理例外，只写日志，下次打开时再尝试清理。启动期清理失败的当前阶段性差异见 [0006](0006-m2-scope.md)。
-    - 写 `aliases.json` 失败则向上传递错误，文案说明 collection 已移走、别名尚待清理；3.x 也在删除目录之后写别名，写别名失败会报错（[db.py:251](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/milvus_lite/db.py#L251)）。同名的 drop 重试即使已找不到 collection，也要先清理指向这个已不存在目标的别名；下一次写 `aliases.json`、重新打开数据库或同名 create 也会清理。这样 I/O 错误不被吞掉，重试也能完成未做完的工作。由于目录改名已经生效，这类报错是「操作已生效、后续元数据维护失败」，在 0006 的故障模型中单列，不能套用写入 RPC「报错即未生效」的断言。
+    - 改名之后的目录 fsync 若失败，drop 报错，写明「目录已移走，但断电持久化未确认」；保留 aliases 与 staging 不动，在释放数据库写入闸门的独占许可前进入本服务实例的**写入封锁状态**。否则若别名已持久删除而目录改名在断电后回退，会出现旧 collection 存在、别名却永久丢失。封锁后所有写入、显式 Flush、CreateIndex、create 与 drop 都拒绝，不再尝试对同一脏目录原样 fsync：一次 fsync 错误可能只上报一次，之后的成功不证明原改名落盘（0006 第 8 项）。正常关闭不 flush，只同步并保留全部 WAL，写日志并释放 LOCK；重开后按实际目录状态判断：原名仍在时保留别名，原名不在时清理 staging；悬空别名由同名 drop 重试、同名 create，或之后触发的 `aliases.json` 写入清理。删除 staging 中目录的失败属于第 17 项已采纳的提交后清理例外，只写日志，下次打开时再尝试清理。启动期 staging 同样先完整扫描与判定，已确认残留的删除或目录同步失败只记警告并保留重试机会；路径类型与扫描错误仍拒绝打开。单条目类型判定错误的严格处理与 3.x 的差异见 [0006「与 3.x 的差异」](0006-m2-scope.md#与-3x-的差异)。
+    - 写 `aliases.json` 失败则向上传递错误，文案说明 collection 已移走、别名尚待清理；3.x 也在删除目录之后写别名，写别名失败会报错（[db.py:251](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/milvus_lite/db.py#L251)）。同名的 drop 重试即使已找不到 collection，也要先清理指向这个已不存在目标的别名；下一次写 `aliases.json` 或同名 create 也会清理；仅重新打开数据库不写别名文件。这样 I/O 错误不被吞掉，重试也能完成未做完的工作。由于目录改名已经生效，这类报错是「操作已生效、后续元数据维护失败」，在 0006 的故障模型中单列，不能套用写入 RPC「报错即未生效」的断言。
       - 判断别名是否悬空，按目标路径是否存在，与 3.x 解析别名的方式相同，不按精确的目录列表：3.x 在不区分大小写的文件系统上允许别名指向只差大小写的名字，照常使用（3.2.1 实测），按精确列表判断会误删它们。
     - 失败：按提交点之前的失败处理，与 CreateIndex 相同：
       - 改名期间一直持状态写锁；失败时撤销「已删除」标记，内存状态不变，collection 照常可用，drop 返回错误；
@@ -345,7 +345,7 @@ WAL 追加（每次写入调用一个 batch，dim 128）：
 | 快照 | 检索进行中有写入、flush 发布与 drop，检索的结果等于开始时的快照；写时复制之后旧快照不受影响 |
 | 按代的顺序提交 | 两代同时等待提交，后冻结的写者先拿到 flush 锁；manifest 中文件的先后与 `active_wal_number` 的推进仍按代的顺序 |
 | drop 与在途操作 | drop 发生在 flush 的锁外阶段、有写者排在 flush 锁上、有 collection 正在懒打开时：drop 等待或让对方放弃；之后不会在已删除的位置或同名的新 collection 中写入任何文件；drop 之后同名的 create 拿到的是新句柄 |
-| drop 与 create 失败 | 注入 drop 改名失败：报错且 collection 照常可用，之后再次 drop 可成功。分别在 drop/create 改名之后的目录 fsync 注入错误与 panic：RPC 报「目录已变更、持久化未确认」，表项和失败缓存已清理；drop 保留别名与 staging，该服务实例内的后续写入、Flush、CreateIndex、create/drop 均被拒绝。让无关 collection 的写者在 create/drop 之前进入闸门并暂停，create/drop 必须等它完成；再令 fsync 报错，后到的无关写者也被拒绝。再让同一目录的 fsync 返回成功，也不得解除封锁或删除 WAL；正常关闭只同步 WAL。模拟断电使未确认的改名回退或生效，前者保留旧 collection 与别名，后者清理悬空别名与 staging。注入写 `aliases.json` 失败：drop 报错且明确目录已移走，同名 drop 重试、下一次写 `aliases.json`、重开数据库或同名 create 都能清理悬空别名；立即同名 create 后别名不指向新 collection。不得出现半个 collection 目录 |
+| drop 与 create 失败 | 注入 drop 改名失败：报错且 collection 照常可用，之后再次 drop 可成功。分别在 drop/create 改名之后的目录 fsync 注入错误与 panic：RPC 报「目录已变更、持久化未确认」，表项和失败缓存已清理；drop 保留别名与 staging，该服务实例内的后续写入、Flush、CreateIndex、create/drop 均被拒绝。让无关 collection 的写者在 create/drop 之前进入闸门并暂停，create/drop 必须等它完成；再令 fsync 报错，后到的无关写者也被拒绝。再让同一目录的 fsync 返回成功，也不得解除封锁或删除 WAL；正常关闭只同步 WAL。模拟断电使未确认的改名回退或生效，前者保留旧 collection 与别名，后者重开时清理 staging，并在后续同名 drop 重试、同名 create 或 `aliases.json` 写入时清理悬空别名。注入写 `aliases.json` 失败：drop 报错且明确目录已移走，同名 drop 重试、下一次写 `aliases.json` 或同名 create 都能清理悬空别名；仅重开不清理；立即同名 create 后别名不指向新 collection。不得出现半个 collection 目录 |
 | fail-closed 后 drop | 从未打开过、schema 不支持、manifest 有未知键、被引用 Parquet 损坏或缺失时直接 drop；无 collection 句柄也能改名并清理别名，之后同名 create 成功，不读取或删除原目录内的单个数据文件 |
 | 损坏句柄的 drop | 锁内 panic 标记损坏时，旧 flush 正在锁外写盘；drop 等待 flush 锁、同步并关闭 WAL 后才改名，旧 flush 不会在删除位置或同名新 collection 中继续写文件；WAL 同步失败则不改名 |
 | drop 前 WAL 同步失败 | 活跃代同时有 data 与 delta WAL，对 data 的 fsync 成功、delta 的 fsync 失败：两个 writer 都不关闭，drop 不改名；解除故障后同一 collection 的 insert 与 delete 仍能写 WAL，重开与 3.x 读取都不丢行 |
@@ -419,3 +419,11 @@ WAL 追加（每次写入调用一个 batch，dim 128）：
   - 「架构地图」中 core 的 module 随实现补充；
   - 「跨文件的隐含约定」加入本文的取锁顺序、叶子锁，以及「写 manifest 必须持 flush 锁」；
   - 「技术栈」中 parking_lot 一条：锁不再只有 collection 表与每个 collection 的读写锁，还有数据库写入闸门、目录变更锁、名字锁、flush 锁与 aliases 锁。
+
+### 目录生命周期的当前验收证据
+
+- [db_persistence.rs](../../crates/core/tests/db_persistence.rs)：create/drop 改名失败后的重试；两处改名后目录 fsync 的 I/O 错误与 panic、整库写入封锁、已打开纯读与首次懒打开、封锁关闭时不提交 manifest；别名维护失败后的同名 drop 重试、create 与下一次无关 drop 的别名写入；staging 删除/同步失败不阻断读库、下次服务重建重试；暂停首次懒打开清理时 create/drop 等待；人工构造未确认改名回退或生效的目录形态，重开核对可见行与别名保留。
+- [runtime.rs](../../crates/core/src/storage/runtime.rs) 的单测与上述集成用例：data WAL、delta WAL 与 WAL 目录同步分别失败时，两个活跃 writer 均保留，drop 不生效，后续写入与重开正确。
+- [crash_recovery.rs](../../crates/core/tests/crash_recovery.rs)：目录生命周期的验证父进程单独运行，避免 Unix 上并行测试启动的兄弟子进程在 exec 前短暂继承父进程的 LOCK；各崩溃子进程在 create/drop 改名之前与之后退出，重开按实际目录状态判断，staging 残留清理且同名重建不接回旧别名。进程退出证明恢复路径，不能替代断电时目录改名回退的验证。
+- [存储互通用例](../../tests/storage_interop/test_cross_implementation.py)：3.x 读取上述 Rust 进程在目录改名两侧留下的目录；staging 删除失败、条目类型判定与根目录符号链接的两侧行为，由互通用例与上述 Rust 回归测试分别验证；未提交混合 WAL 的互通用例仍只证明两类 WAL 都存在的形态。
+- 尚待验证：真实断电下的改名回退、所有 aliases 维护入口、平台目录同步与完整文件操作顺序；本节不代表整个 M2 崩溃矩阵完成。

@@ -559,7 +559,10 @@ M1 证明了整条链路可行，但数据只在内存中，不发布（[0004](0
 | drop 时 flush 失败 | drop 报错 | drop 不 flush，照常完成 | 第 17 项 | 磁盘写满时的 drop |
 | drop 与 create 中途崩溃 | drop 留下半个目录，collection 可能仍可见但数据不全；create 留下没有 schema 的目录，这个名字永久不能再用 | 两者都是原子的 | 第 17 项 | drop、create 时崩溃 |
 | create/drop 改名后目录 fsync 失败 | 3.x 不执行这两处目录 fsync | 返回「目录已变更、持久化未确认」；本服务实例停止所有 collection 的写入、Flush、CreateIndex、create/drop 与可能清理孤儿文件的首次打开，直到重开；已打开 collection 的纯读可继续 | 未确认的目录改名不能靠原样重试 fsync 证明持久化，[0007](0007-m2-storage-engine.md) | 该故障后的无关 collection 写入及首次 Query/Search/Get |
-| drop 目录已移走而 `aliases.json` 写入失败 | 报错，旧别名可能悬空 | 报错并说明目录已移走；同名 drop 重试或下次打开会清理悬空别名 | 规则 5、[0007](0007-m2-storage-engine.md) | drop 后立即重试或同名 create |
+| create 遇到指向不存在目标的旧别名 | 保留旧别名；目标同名重建后旧别名重新指向新 collection | create 改名前删除悬空别名，后续别名写入也过滤悬空目标 | 避免旧别名静默接到新 collection，见 [0007](0007-m2-storage-engine.md#dropcreate-与关闭) | 3.x 写出 `aliases.json` 后目标消失，再同名建表并由 3.x 读取别名；Rust 别名 RPC 仍不支持 |
+| staging 根路径是目录符号链接 | 跟随链接并清理目标中的残留，可能删除库外文件 | 拒绝打开数据库，不删除链接目标中的文件 | 防止启动期清理穿透托管目录；普通文件占据根路径时两边均拒绝打开 | `.database-staging/` 被软链到库外；互通用例固定两边的打开与删除行为 |
+| staging 单条目的类型读取失败 | `isdir/islink` 把 stat 错误转换为否；后续单条目删除错误被忽略，不阻断打开 | 完整判定期间 `DirEntry::file_type` 报错则拒绝打开，尚未删除任何残留 | 类型不明时保留全部残留，维持先判定后删除；整目录扫描失败两边均向上传递 | 文件系统返回条目类型读取错误；不将外程删除条目必然视为这种错误 |
+| drop 目录已移走而 `aliases.json` 写入失败 | 报错，旧别名可能悬空 | 报错并说明目录已移走；同名 drop 重试、同名 create 或后续写 `aliases.json` 时清理悬空别名；仅重开不清理 | 规则 5、[0007](0007-m2-storage-engine.md) | drop 后立即重试或同名 create |
 | 只差大小写或 Unicode 规范化不同的 collection 名 | 另开一个实例指向同一目录；drop 会删掉真实的 collection；HFS+ 上非 ASCII 的名字按路径能找到 | 访问与 drop 都按「collection 不存在」处理，新建时报「已存在」 | 第 18 项 | 不区分大小写或做规范化的文件系统 |
 | INVERTED 定义的字段上的过滤 | 结果取决于数据在 segment 还是 memtable，以及后台索引是否建好 | 按扫描求值 | 3.x 自身不一致 | 3.x 写的、带 INVERTED 定义的目录 |
 | 整数列对浮点字面量、数据超出 2^53 | 已删除或已被覆盖的旧版本也会触发 code 1 | 只看存活行 | 3.x 的结果随 compaction 时机变化 | 主键或标量超出 2^53 的 collection |
@@ -578,7 +581,6 @@ M1 证明了整条链路可行，但数据只在内存中，不发布（[0004](0
 | `delete(ids=["bad"])` 对 INT64 主键生成的无引号表达式 | 解析时报 code 6，指出 `bad` 不是字面量 | 当前仅识别主键 `in` 快路径，返回 UNIMPLEMENTED；S1 过滤解析接入时对齐原文 | 第 1 项的 S1 解析尚未接入 | 非数字字符串传给 INT64 的 `delete(ids=...)` |
 | ManualCompaction 与 GetCompactionState | 返回成功，恒为 Completed | UNIMPLEMENTED | 第 3 项，不变量 15 | `client.compact()`、`optimize()` |
 | 被覆盖的旧版本与已删除的行 | compaction 回收 | 不回收 | 第 3 项 | 长期运行的写入 |
-| 启动时 staging 残留清理失败 | 忽略残留删除错误，数据库仍可打开 | 当前 DataDir::open 向上传递清理错误，整个数据库打开失败；留待后续故障切片对齐 | 启动期清理尚未采用提交后清理的非阻断语义；[0007](0007-m2-storage-engine.md#dropcreate-与关闭) 的 drop 提交后 staging 删除失败仍只记日志 | `.database-staging/` 有不可删除的残留或目录同步失败；不包括 staging 路径类型错误 |
 
 ## 验收
 

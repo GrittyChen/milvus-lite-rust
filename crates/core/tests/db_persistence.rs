@@ -780,3 +780,471 @@ fn normalized_create_name_rolls_back_before_exposing_collection() {
     assert_eq!(db.list_collections("").unwrap().len(), 1);
     db.close();
 }
+
+#[cfg(feature = "fault-injection")]
+#[test]
+fn directory_sync_failure_and_panic_seal_all_mutations_but_preserve_open_reads() {
+    use milvus_lite_core::db::{
+        DirectoryFault, DirectoryOperation, DirectoryPoint, inject_directory_fault_once,
+    };
+    for op in [DirectoryOperation::Create, DirectoryOperation::Drop] {
+        for point in [DirectoryPoint::CollectionsSync, DirectoryPoint::StagingSync] {
+            for fault in [DirectoryFault::Error, DirectoryFault::Panic] {
+                let root = tempfile::tempdir().unwrap();
+                let path = root.path().join("sealed.db");
+                let db = Db::new(DataDir::open(&path).unwrap(), compute());
+                for name in ["existing", "lazy", "victim"] {
+                    db.create_collection("", name, schema()).unwrap();
+                    db.insert("", name, batch(&[1])).unwrap();
+                }
+                db.close();
+                let db = Db::new(DataDir::open(&path).unwrap(), compute());
+                let existing = db.collection("", "existing").unwrap();
+                let victim = db.collection("", "victim").unwrap();
+                let orphan = path.join("collections/lazy/partitions/_default/data/orphan");
+                std::fs::write(&orphan, b"orphan").unwrap();
+                db.insert("", "existing", batch(&[2])).unwrap();
+                std::fs::write(path.join("aliases.json"), br#"{"old":"victim"}"#).unwrap();
+                inject_directory_fault_once(op, point, fault);
+                let result = if op == DirectoryOperation::Create {
+                    db.create_collection("", "new", schema())
+                } else {
+                    db.drop_collection("", "victim")
+                };
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("durability is unconfirmed")
+                );
+                assert_eq!(
+                    path.join("collections/victim").exists(),
+                    op == DirectoryOperation::Create
+                );
+                assert_eq!(
+                    path.join("collections/new").exists(),
+                    op == DirectoryOperation::Create
+                );
+                assert_eq!(
+                    std::fs::read(path.join("aliases.json")).unwrap(),
+                    br#"{"old":"victim"}"#
+                );
+                assert_eq!(existing.read().count(), 2);
+                assert_eq!(
+                    victim.read().get(&[Pk::Int64(1)], &[]).is_err(),
+                    op == DirectoryOperation::Drop
+                );
+                assert!(
+                    db.collection("", "lazy")
+                        .unwrap_err()
+                        .to_string()
+                        .contains("blocked")
+                );
+                for result in [
+                    db.insert("", "existing", batch(&[3])).map(|_| ()),
+                    db.upsert_with_pk_type("", "existing", batch(&[3]))
+                        .map(|_| ()),
+                    db.delete("", "existing", &[Pk::Int64(1)]).map(|_| ()),
+                    db.flush_collection("", "existing"),
+                    db.create_index(
+                        "",
+                        "existing",
+                        "v",
+                        IndexRequest {
+                            index_type: "FLAT".into(),
+                            metric_type: Some("L2".into()),
+                            ..Default::default()
+                        },
+                    ),
+                    db.create_collection("", "later", schema()),
+                    db.drop_collection("", "existing"),
+                ] {
+                    assert!(result.unwrap_err().to_string().contains("blocked"));
+                }
+                assert!(orphan.exists());
+                // 注入已消耗，真实 fsync 成功也不应被拿来解除封锁。
+                std::fs::File::open(path.join("collections"))
+                    .unwrap()
+                    .sync_all()
+                    .unwrap();
+                assert!(db.flush_collection("", "existing").is_err());
+                let manifest = path.join("collections/existing/manifest.json");
+                let before = std::fs::read(&manifest).unwrap();
+                let wal = path.join("collections/existing/wal");
+                let retained: Vec<_> = std::fs::read_dir(&wal)
+                    .unwrap()
+                    .map(|entry| {
+                        let path = entry.unwrap().path();
+                        let bytes = std::fs::read(&path).unwrap();
+                        (path, bytes)
+                    })
+                    .collect();
+                assert!(!retained.is_empty());
+                db.close();
+                assert_eq!(std::fs::read(&manifest).unwrap(), before);
+                for (path, bytes) in retained {
+                    assert_eq!(std::fs::read(path).unwrap(), bytes);
+                }
+                let reopened = Db::new(DataDir::open(&path).unwrap(), compute());
+                assert_eq!(
+                    reopened.collection("", "existing").unwrap().read().count(),
+                    2
+                );
+                assert!(reopened.collection("", "lazy").is_ok());
+                assert!(!orphan.exists());
+                reopened.insert("", "existing", batch(&[3])).unwrap();
+                reopened.close();
+            }
+        }
+    }
+}
+
+#[cfg(feature = "fault-injection")]
+#[test]
+fn rename_failure_keeps_collection_usable_and_retryable() {
+    use milvus_lite_core::db::{
+        DirectoryFault, DirectoryOperation, DirectoryPoint, inject_directory_fault_once,
+    };
+    let root = tempfile::tempdir().unwrap();
+    let db = Db::new(DataDir::open(root.path()).unwrap(), compute());
+    inject_directory_fault_once(
+        DirectoryOperation::Create,
+        DirectoryPoint::BeforeRename,
+        DirectoryFault::Error,
+    );
+    assert!(db.create_collection("", "c", schema()).is_err());
+    assert!(!root.path().join("collections/c").exists());
+    db.create_collection("", "c", schema()).unwrap();
+    db.insert("", "c", batch(&[1])).unwrap();
+    inject_directory_fault_once(
+        DirectoryOperation::Drop,
+        DirectoryPoint::BeforeRename,
+        DirectoryFault::Error,
+    );
+    assert!(db.drop_collection("", "c").is_err());
+    db.insert("", "c", batch(&[2])).unwrap();
+    assert_eq!(db.collection("", "c").unwrap().read().count(), 2);
+    db.drop_collection("", "c").unwrap();
+    assert!(!root.path().join("collections/c").exists());
+    db.close();
+}
+
+#[cfg(feature = "fault-injection")]
+#[test]
+fn committed_drop_alias_error_is_explicit_and_retry_does_not_rebind_old_alias() {
+    use milvus_lite_core::db::{
+        DirectoryFault, DirectoryOperation, DirectoryPoint, inject_directory_fault_once,
+    };
+    for retry in ["same-drop", "recreate", "other-drop"] {
+        let root = tempfile::tempdir().unwrap();
+        let db = Db::new(DataDir::open(root.path()).unwrap(), compute());
+        db.create_collection("", "c", schema()).unwrap();
+        db.create_collection("", "other", schema()).unwrap();
+        std::fs::write(
+            root.path().join("aliases.json"),
+            br#"{"old":"c","keep":"other"}"#,
+        )
+        .unwrap();
+        inject_directory_fault_once(
+            DirectoryOperation::Drop,
+            DirectoryPoint::Aliases,
+            DirectoryFault::Error,
+        );
+        let error = db.drop_collection("", "c").unwrap_err().to_string();
+        assert!(error.contains("collection was removed, but aliases cleanup is pending"));
+        assert!(!root.path().join("collections/c").exists());
+        assert!(db.collection("", "c").is_err());
+        assert!(
+            std::fs::read_to_string(root.path().join("aliases.json"))
+                .unwrap()
+                .contains("old")
+        );
+        match retry {
+            "recreate" => db.create_collection("", "c", schema()).unwrap(),
+            "other-drop" => db.drop_collection("", "other").unwrap(),
+            _ => db.drop_collection("", "c").unwrap(),
+        }
+        let aliases: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.path().join("aliases.json")).unwrap())
+                .unwrap();
+        assert!(aliases.get("old").is_none());
+        if retry == "other-drop" {
+            assert!(aliases.get("keep").is_none());
+        } else {
+            assert_eq!(aliases["keep"], "other");
+        }
+        db.close();
+    }
+}
+
+#[cfg(feature = "fault-injection")]
+#[test]
+fn startup_staging_cleanup_failures_allow_healthy_collection_reads_and_retry() {
+    use milvus_lite_core::data_dir::{StagingFault, inject_staging_failure_once};
+    for fault in [StagingFault::Remove, StagingFault::Sync] {
+        let root = tempfile::tempdir().unwrap();
+        let db = Db::new(DataDir::open(root.path()).unwrap(), compute());
+        db.create_collection("", "c", schema()).unwrap();
+        db.insert("", "c", batch(&[1])).unwrap();
+        db.close();
+        let residue = root.path().join(".database-staging/residue");
+        std::fs::create_dir_all(&residue).unwrap();
+        std::fs::write(residue.join("keep"), b"residue").unwrap();
+        inject_staging_failure_once(fault);
+        let db = Db::new(DataDir::open(root.path()).unwrap(), compute());
+        assert_eq!(db.collection("", "c").unwrap().read().count(), 1);
+        assert_eq!(residue.exists(), fault == StagingFault::Remove);
+        db.close();
+        let db = Db::new(DataDir::open(root.path()).unwrap(), compute());
+        assert!(!residue.exists());
+        assert_eq!(db.collection("", "c").unwrap().read().count(), 1);
+        db.close();
+    }
+}
+
+#[cfg(feature = "fault-injection")]
+#[test]
+fn create_and_drop_wait_for_first_lazy_open_cleanup() {
+    use milvus_lite_core::db::pause_open_cleanup_once;
+    use std::sync::{Arc, mpsc};
+    use std::time::Duration;
+    for creating in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let db = Db::new(DataDir::open(root.path()).unwrap(), compute());
+        for name in ["lazy", "victim"] {
+            db.create_collection("", name, schema()).unwrap();
+        }
+        db.insert("", "lazy", batch(&[1])).unwrap();
+        db.close();
+        let orphan = root
+            .path()
+            .join("collections/lazy/partitions/_default/data/orphan");
+        std::fs::write(&orphan, b"orphan").unwrap();
+        let db = Arc::new(Db::new(DataDir::open(root.path()).unwrap(), compute()));
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let opener = Arc::clone(&db);
+        let opening = std::thread::spawn(move || {
+            pause_open_cleanup_once(entered_tx, resume_rx);
+            assert_eq!(opener.collection("", "lazy").unwrap().read().count(), 1);
+        });
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(orphan.exists());
+        let (starting_tx, starting_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let changer = Arc::clone(&db);
+        let changing = std::thread::spawn(move || {
+            starting_tx.send(()).unwrap();
+            if creating {
+                changer.create_collection("", "new", schema()).unwrap();
+            } else {
+                changer.drop_collection("", "victim").unwrap();
+            }
+            finished_tx.send(()).unwrap();
+        });
+        starting_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(matches!(
+            finished_rx.recv_timeout(Duration::from_millis(100)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        assert!(!root.path().join("collections/new").exists());
+        assert!(root.path().join("collections/victim").exists());
+        resume_tx.send(()).unwrap();
+        finished_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        opening.join().unwrap();
+        changing.join().unwrap();
+        assert!(!orphan.exists());
+        assert_eq!(root.path().join("collections/new").exists(), creating);
+        assert_eq!(root.path().join("collections/victim").exists(), creating);
+        db.close();
+    }
+}
+
+#[cfg(feature = "fault-injection")]
+#[test]
+fn drop_wal_sync_failure_preserves_data_and_delta_and_accepts_later_writes() {
+    use milvus_lite_core::storage::runtime::{
+        RetainedWalSyncFault, inject_retained_wal_sync_failure_once,
+    };
+    for fault in [
+        RetainedWalSyncFault::Data,
+        RetainedWalSyncFault::Delta,
+        RetainedWalSyncFault::Directory,
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let db = Db::new(DataDir::open(root.path()).unwrap(), compute());
+        db.create_collection("", "c", schema()).unwrap();
+        db.insert("", "c", batch(&[1, 2])).unwrap();
+        db.delete("", "c", &[Pk::Int64(1)]).unwrap();
+        inject_retained_wal_sync_failure_once(fault);
+        assert!(db.drop_collection("", "c").is_err());
+        assert!(root.path().join("collections/c").exists());
+        db.insert("", "c", batch(&[3])).unwrap();
+        db.delete("", "c", &[Pk::Int64(2)]).unwrap();
+        assert_eq!(
+            db.collection("", "c")
+                .unwrap()
+                .read()
+                .get(&[Pk::Int64(1), Pk::Int64(2), Pk::Int64(3)], &[])
+                .unwrap()
+                .rows
+                .pks,
+            [Pk::Int64(3)]
+        );
+        db.close();
+        let reopened = Db::new(DataDir::open(root.path()).unwrap(), compute());
+        assert_eq!(
+            reopened
+                .collection("", "c")
+                .unwrap()
+                .read()
+                .get(&[Pk::Int64(1), Pk::Int64(2), Pk::Int64(3)], &[])
+                .unwrap()
+                .rows
+                .pks,
+            [Pk::Int64(3)]
+        );
+        reopened.drop_collection("", "c").unwrap();
+        reopened.close();
+    }
+}
+
+#[cfg(feature = "fault-injection")]
+#[test]
+fn reopen_uses_actual_directory_state_after_unconfirmed_rename() {
+    use milvus_lite_core::db::{
+        DirectoryFault, DirectoryOperation, DirectoryPoint, inject_directory_fault_once,
+    };
+    for op in [DirectoryOperation::Create, DirectoryOperation::Drop] {
+        for rolled_back in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let db = Db::new(DataDir::open(root.path()).unwrap(), compute());
+            if op == DirectoryOperation::Drop {
+                db.create_collection("", "c", schema()).unwrap();
+                db.insert("", "c", batch(&[1, 2])).unwrap();
+                db.delete("", "c", &[Pk::Int64(1)]).unwrap();
+                std::fs::write(root.path().join("aliases.json"), br#"{"old":"c"}"#).unwrap();
+            }
+            inject_directory_fault_once(op, DirectoryPoint::CollectionsSync, DirectoryFault::Error);
+            let result = if op == DirectoryOperation::Create {
+                db.create_collection("", "c", schema())
+            } else {
+                db.drop_collection("", "c")
+            };
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("durability is unconfirmed")
+            );
+            db.close();
+            // 人工构造断电后改名回退的实际目录形态，不将进程退出等同于断电。
+            if rolled_back {
+                let staging = root.path().join(".database-staging");
+                if op == DirectoryOperation::Create {
+                    std::fs::rename(
+                        root.path().join("collections/c"),
+                        staging.join("rolled-back-create"),
+                    )
+                    .unwrap();
+                } else {
+                    let residue = std::fs::read_dir(staging)
+                        .unwrap()
+                        .next()
+                        .unwrap()
+                        .unwrap()
+                        .path();
+                    std::fs::rename(residue, root.path().join("collections/c")).unwrap();
+                }
+            }
+            let reopened = Db::new(DataDir::open(root.path()).unwrap(), compute());
+            let exists = (op == DirectoryOperation::Create) != rolled_back;
+            assert_eq!(reopened.collection("", "c").is_ok(), exists);
+            if exists {
+                let handle = reopened.collection("", "c").unwrap();
+                assert_eq!(
+                    handle.read().count(),
+                    usize::from(op == DirectoryOperation::Drop)
+                );
+                if op == DirectoryOperation::Drop {
+                    assert_eq!(
+                        handle
+                            .read()
+                            .get(&[Pk::Int64(1), Pk::Int64(2)], &[])
+                            .unwrap()
+                            .rows
+                            .pks,
+                        [Pk::Int64(2)]
+                    );
+                    assert_eq!(
+                        std::fs::read(root.path().join("aliases.json")).unwrap(),
+                        br#"{"old":"c"}"#
+                    );
+                }
+            }
+            assert!(
+                std::fs::read_dir(root.path().join(".database-staging"))
+                    .unwrap()
+                    .next()
+                    .is_none()
+            );
+            reopened.close();
+        }
+    }
+}
+
+#[cfg(feature = "fault-injection")]
+#[test]
+fn create_alias_cleanup_fault_fires_before_directory_commit_and_can_retry() {
+    use milvus_lite_core::db::{
+        DirectoryFault, DirectoryOperation, DirectoryPoint, inject_directory_fault_once,
+    };
+    let root = tempfile::tempdir().unwrap();
+    let db = Db::new(DataDir::open(root.path()).unwrap(), compute());
+    db.create_collection("", "existing", schema()).unwrap();
+    let aliases_path = root.path().join("aliases.json");
+    let aliases = br#"{"old":"gone","live":"existing"}"#;
+    std::fs::write(&aliases_path, aliases).unwrap();
+    inject_directory_fault_once(
+        DirectoryOperation::Create,
+        DirectoryPoint::Aliases,
+        DirectoryFault::Error,
+    );
+    let error = db
+        .create_collection("", "gone", schema())
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("injected directory lifecycle failure"));
+    assert!(!root.path().join("collections/gone").exists());
+    assert_eq!(std::fs::read(&aliases_path).unwrap(), aliases);
+    db.create_collection("", "gone", schema()).unwrap();
+    let aliases: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(aliases_path).unwrap()).unwrap();
+    assert_eq!(aliases, serde_json::json!({"live": "existing"}));
+    db.close();
+}
+
+#[cfg(feature = "fault-injection")]
+#[test]
+fn staging_entry_type_failure_rejects_open_without_deleting_any_residue() {
+    use milvus_lite_core::data_dir::{StagingFault, inject_staging_failure_once};
+    let root = tempfile::tempdir().unwrap();
+    let staging = root.path().join(".database-staging");
+    std::fs::create_dir(&staging).unwrap();
+    for name in ["first", "second"] {
+        std::fs::write(staging.join(name), name.as_bytes()).unwrap();
+    }
+    inject_staging_failure_once(StagingFault::EntryTypeAfter(1));
+    assert!(
+        DataDir::open(root.path())
+            .unwrap_err()
+            .to_string()
+            .contains("injected staging entry type failure")
+    );
+    for name in ["first", "second"] {
+        assert_eq!(std::fs::read(staging.join(name)).unwrap(), name.as_bytes());
+    }
+    let db = Db::new(DataDir::open(root.path()).unwrap(), compute());
+    assert!(std::fs::read_dir(staging).unwrap().next().is_none());
+    db.close();
+}

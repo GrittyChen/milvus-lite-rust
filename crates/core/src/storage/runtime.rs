@@ -22,6 +22,35 @@ use crate::storage::recovery::RecoveredCollection;
 use crate::storage::visibility::{SourceId, Visibility};
 use crate::storage::wal::{WalKind, WalWriter};
 
+#[cfg(feature = "fault-injection")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RetainedWalSyncFault {
+    Data,
+    Delta,
+    Directory,
+}
+#[cfg(feature = "fault-injection")]
+thread_local! { static RETAINED_WAL_SYNC_FAULT: std::cell::Cell<Option<RetainedWalSyncFault>> = const { std::cell::Cell::new(None) }; }
+#[cfg(feature = "fault-injection")]
+pub fn inject_retained_wal_sync_failure_once(fault: RetainedWalSyncFault) {
+    RETAINED_WAL_SYNC_FAULT.with(|slot| slot.set(Some(fault)));
+}
+#[cfg(feature = "fault-injection")]
+fn retained_wal_sync_fault(point: RetainedWalSyncFault) -> Result<(), String> {
+    if RETAINED_WAL_SYNC_FAULT.with(|slot| {
+        if slot.get() == Some(point) {
+            slot.set(None);
+            true
+        } else {
+            false
+        }
+    }) {
+        Err("injected retained WAL sync failure".into())
+    } else {
+        Ok(())
+    }
+}
+
 pub struct FrozenGeneration {
     pub number: u64,
     pub table: FrozenMemTable,
@@ -401,9 +430,7 @@ impl PersistentCollection {
     }
 
     pub fn sync_retained_wal(&mut self) -> Result<(), String> {
-        // 活跃 writer 先交出 File，再按路径同步所有留下的编号和目录。
-        self.data_wal = None;
-        self.delta_wal = None;
+        // 全部同步成功之前保留 writer；drop 同步失败后仍须允许原 collection 写入。
         let dir = self.dir.join("wal");
         if !dir.exists() {
             return Ok(());
@@ -411,12 +438,28 @@ impl PersistentCollection {
         for entry in fs::read_dir(&dir).map_err(err)? {
             let entry = entry.map_err(err)?;
             if entry.file_type().map_err(err)?.is_file() {
+                #[cfg(feature = "fault-injection")]
+                {
+                    let name = entry.file_name();
+                    let name = name.to_string_lossy();
+                    if name.starts_with("wal_data_") {
+                        retained_wal_sync_fault(RetainedWalSyncFault::Data)?;
+                    }
+                    if name.starts_with("wal_delta_") {
+                        retained_wal_sync_fault(RetainedWalSyncFault::Delta)?;
+                    }
+                }
                 File::open(entry.path())
                     .and_then(|file| file.sync_all())
                     .map_err(err)?;
             }
         }
-        fs_commit::sync_dir(&dir).map_err(err)
+        #[cfg(feature = "fault-injection")]
+        retained_wal_sync_fault(RetainedWalSyncFault::Directory)?;
+        fs_commit::sync_dir(&dir).map_err(err)?;
+        self.data_wal = None;
+        self.delta_wal = None;
+        Ok(())
     }
 
     pub fn has_wal(&self) -> Result<bool, String> {
@@ -493,4 +536,56 @@ pub fn flush_one(
 
 fn err(error: impl std::fmt::Display) -> String {
     error.to_string()
+}
+
+#[cfg(all(test, feature = "fault-injection"))]
+mod retained_wal_tests {
+    use super::*;
+    #[test]
+    fn failed_sync_keeps_both_active_writers() {
+        use crate::{CollectionSchema, DataType, FieldSchema};
+        let root = tempfile::tempdir().unwrap();
+        let mut pk = FieldSchema::new("id", DataType::Int64);
+        pk.is_primary = true;
+        let schema = CollectionSchema {
+            fields: vec![pk],
+            enable_dynamic_field: false,
+            properties: Vec::new(),
+        };
+        for fault in [
+            RetainedWalSyncFault::Data,
+            RetainedWalSyncFault::Delta,
+            RetainedWalSyncFault::Directory,
+        ] {
+            let dir = root.path().join(format!("{fault:?}"));
+            std::fs::create_dir(&dir).unwrap();
+            let mut persistent = PersistentCollection::new(dir.clone()).unwrap();
+            std::fs::create_dir(dir.join("wal")).unwrap();
+            persistent.data_wal = Some(
+                WalWriter::create(
+                    &dir.join("wal"),
+                    WalKind::Data,
+                    1,
+                    &arrow_data::wal_data_schema(&schema).unwrap(),
+                )
+                .unwrap(),
+            );
+            persistent.delta_wal = Some(
+                WalWriter::create(
+                    &dir.join("wal"),
+                    WalKind::Delta,
+                    1,
+                    &arrow_data::wal_delta_schema(&schema).unwrap(),
+                )
+                .unwrap(),
+            );
+            inject_retained_wal_sync_failure_once(fault);
+            assert!(persistent.sync_retained_wal().is_err());
+            assert!(persistent.data_wal.is_some());
+            assert!(persistent.delta_wal.is_some());
+            persistent.sync_retained_wal().unwrap();
+            assert!(persistent.data_wal.is_none());
+            assert!(persistent.delta_wal.is_none());
+        }
+    }
 }

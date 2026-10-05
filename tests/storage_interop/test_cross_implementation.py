@@ -528,3 +528,148 @@ def test_pyarrow_written_wal_and_parquet_open_in_rust(
     assert parquet_result["live_count"] == 1
     assert parquet_result["ids"] == [2]
     assert parquet_result["next_seq"] == 4
+
+
+@pytest.fixture(scope="session")
+def directory_crash_binary():
+    output = run([
+        "cargo", "test", "-p", "milvus-lite-core", "--features", "fault-injection",
+        "--test", "crash_recovery", "--no-run", "--message-format=json",
+    ])
+    artifacts = [json.loads(line) for line in output.splitlines()]
+    executables = [
+        item["executable"] for item in artifacts
+        if item.get("reason") == "compiler-artifact"
+        and item.get("target", {}).get("name") == "crash_recovery"
+        and item.get("executable")
+    ]
+    assert len(executables) == 1
+    return executables[0]
+
+
+@pytest.mark.parametrize("stage", ["create-before", "create-after", "drop-before", "drop-after"])
+def test_reference_reads_rust_directory_rename_crash_boundary(
+    tmp_path, interpreters, directory_crash_binary, stage,
+):
+    root = tmp_path / "directory-crash.db"
+    environment = dict(os.environ, MILVUS_LITE_DIRECTORY_CRASH=stage, MILVUS_LITE_CRASH_DIR=str(root))
+    result = subprocess.run(
+        [directory_crash_binary, "--exact", "collection_directory_rename_crashes_preserve_commit_boundary", "--nocapture"],
+        cwd=tmp_path, env=environment, text=True, capture_output=True, check=False,
+    )
+    assert result.returncode == 88, result.stdout + result.stderr
+    assert (root / "collections/c/schema.json").exists() == (stage in ("create-after", "drop-before"))
+    code = """
+import json, sys
+from milvus_lite.db import MilvusLite
+path, stage = sys.argv[1:]
+db = MilvusLite(path)
+expected = stage in ('create-after', 'drop-before')
+assert db.has_collection('c') == expected
+if expected:
+    col = db.get_collection('c')
+    assert col.num_entities == (1 if stage == 'drop-before' else 0)
+    if stage == 'drop-before':
+        assert col.get([1])[0]['v'] == [1.0, 0.0]
+        assert db.describe_alias('old')['collection'] == 'c'
+db.close()
+print(json.dumps({'exists': expected}))
+"""
+    actual = json.loads(run([interpreters[PYTHONS[0]], "-c", code, str(root), stage], cwd=tmp_path))
+    assert actual["exists"] == (stage in ("create-after", "drop-before"))
+    assert not any((root / ".database-staging").iterdir())
+
+
+@pytest.mark.parametrize("reader", ["rust", "reference"])
+def test_staging_unlink_failure_does_not_block_healthy_reads_and_retries(
+    tmp_path, interpreters, reader,
+):
+    root = tmp_path / "staging.db"
+    reference_create(interpreters[PYTHONS[0]], root, flush=True)
+    staging = root / ".database-staging"
+    staging.mkdir(exist_ok=True)
+    residue = staging / "orphan.tmp"
+    residue.write_bytes(b"residue")
+    python = sys.executable if reader == "rust" else interpreters[PYTHONS[0]]
+    code = """
+import sys
+from pymilvus import MilvusClient
+from milvus_lite.server_manager import server_manager_instance
+path = sys.argv[1]
+client = MilvusClient(path)
+assert client.query('c', output_fields=['count(*)']) == [{'count(*)': 1}]
+assert client.has_collection('c')
+assert client.describe_collection('c')['collection_name'] == 'c'
+assert client.get('c', ids=[2])[0]['id'] == 2
+client.close()
+server_manager_instance.release_server(path)
+"""
+    # 若以 root 运行而不能制造删除失败，显式失败，不能静默失去故障覆盖。
+    staging.chmod(0o555)
+    try:
+        result = subprocess.run([python, "-c", code, str(root)], cwd=tmp_path, text=True, capture_output=True, check=False)
+        assert result.returncode == 0, result.stderr
+        assert residue.read_bytes() == b"residue"
+        if reader == "rust":
+            assert "database staging cleanup deferred" in result.stderr
+    finally:
+        staging.chmod(0o755)
+    run([python, "-c", code, str(root)], cwd=tmp_path)
+    assert not residue.exists()
+
+
+def test_reference_staging_entry_stat_failure_does_not_block_open(tmp_path, interpreters):
+    root = tmp_path / "staging-stat.db"
+    reference_create(interpreters[PYTHONS[0]], root, flush=True)
+    code = """
+import errno, os, sys
+from pathlib import Path
+from unittest.mock import patch
+from milvus_lite.db import MilvusLite
+root = Path(sys.argv[1])
+entry = root / '.database-staging' / 'unknown-type'
+entry.write_bytes(b'residue')
+original_stat = os.stat
+observed = []
+def fail_entry_stat(path, *args, **kwargs):
+    if os.fspath(path) == str(entry):
+        observed.append(path)
+        raise OSError(errno.EIO, 'injected staging entry stat error')
+    return original_stat(path, *args, **kwargs)
+with patch('os.stat', side_effect=fail_entry_stat):
+    db = MilvusLite(str(root))
+    assert db.get_collection('c').num_entities == 1
+    db.close()
+assert observed, 'entry stat injection did not fire'
+# isdir 将错误转换为 False 后，参照实现继续走 remove；Rust 的对应类型判定错误会拒绝打开并保留残留。
+assert not entry.exists()
+"""
+    run([interpreters[PYTHONS[0]], "-c", code, str(root)], cwd=tmp_path)
+
+
+def test_staging_root_symlink_is_rejected_without_deleting_external_files(tmp_path, interpreters):
+    root = tmp_path / "staging-link.db"
+    reference_create(interpreters[PYTHONS[0]], root, flush=True)
+    staging = root / ".database-staging"
+    staging.rmdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    victim = outside / "victim"
+    victim.write_bytes(b"keep")
+    staging.symlink_to(outside, target_is_directory=True)
+    rust_code = """
+import sys
+from milvus_lite.server_manager import server_manager_instance
+assert server_manager_instance.start_and_get_uri(sys.argv[1]) is None
+"""
+    run([sys.executable, "-c", rust_code, str(root)], cwd=tmp_path)
+    assert victim.read_bytes() == b"keep"
+    reference_code = """
+import sys
+from milvus_lite.db import MilvusLite
+db = MilvusLite(sys.argv[1])
+assert db.get_collection('c').num_entities == 1
+db.close()
+"""
+    run([interpreters[PYTHONS[0]], "-c", reference_code, str(root)], cwd=tmp_path)
+    assert not victim.exists()

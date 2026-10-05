@@ -47,6 +47,105 @@ pub fn inject_create_name_verification_failure_once() {
     FAIL_NEXT_CREATE_NAME_VERIFICATION.with(|flag| flag.set(true));
 }
 
+#[cfg(feature = "fault-injection")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DirectoryOperation {
+    Create,
+    Drop,
+}
+#[cfg(feature = "fault-injection")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DirectoryPoint {
+    BeforeRename,
+    AfterRename,
+    CollectionsSync,
+    StagingSync,
+    Aliases,
+}
+#[cfg(feature = "fault-injection")]
+#[derive(Clone, Copy, Debug)]
+pub enum DirectoryFault {
+    Error,
+    Panic,
+    Exit,
+}
+
+#[cfg(feature = "fault-injection")]
+thread_local! {
+    static DIRECTORY_FAULT: std::cell::Cell<Option<(DirectoryOperation, DirectoryPoint, DirectoryFault)>> = const { std::cell::Cell::new(None) };
+    static OPEN_CLEANUP_PAUSE: std::cell::RefCell<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(feature = "fault-injection")]
+pub fn inject_directory_fault_once(
+    op: DirectoryOperation,
+    point: DirectoryPoint,
+    fault: DirectoryFault,
+) {
+    DIRECTORY_FAULT.with(|slot| slot.set(Some((op, point, fault))));
+}
+
+#[cfg(feature = "fault-injection")]
+pub fn pause_open_cleanup_once(
+    entered: std::sync::mpsc::Sender<()>,
+    resume: std::sync::mpsc::Receiver<()>,
+) {
+    OPEN_CLEANUP_PAUSE.with(|slot| *slot.borrow_mut() = Some((entered, resume)));
+}
+
+#[cfg(feature = "fault-injection")]
+fn directory_fault(op: DirectoryOperation, point: DirectoryPoint) -> std::io::Result<()> {
+    let fault = DIRECTORY_FAULT.with(|slot| match slot.get() {
+        Some((wanted_op, wanted_point, fault)) if op == wanted_op && point == wanted_point => {
+            slot.set(None);
+            Some(fault)
+        }
+        _ => None,
+    });
+    match fault {
+        Some(DirectoryFault::Error) => Err(std::io::Error::other(
+            "injected directory lifecycle failure",
+        )),
+        Some(DirectoryFault::Panic) => panic!("injected directory lifecycle panic"),
+        Some(DirectoryFault::Exit) => std::process::exit(88),
+        None => Ok(()),
+    }
+}
+
+// 改名后的同步 panic 与 I/O 错误必须走同一封锁协议，不能越过内存收尾。
+fn sync_directory_change(
+    root: &std::path::Path,
+    staging: &std::path::Path,
+    creating: bool,
+) -> std::io::Result<()> {
+    std::panic::catch_unwind(|| {
+        #[cfg(feature = "fault-injection")]
+        {
+            let op = if creating {
+                DirectoryOperation::Create
+            } else {
+                DirectoryOperation::Drop
+            };
+            directory_fault(op, DirectoryPoint::AfterRename)?;
+            directory_fault(op, DirectoryPoint::CollectionsSync)?;
+        }
+        #[cfg(not(feature = "fault-injection"))]
+        let _creating = creating;
+        fs_commit::sync_dir(root)?;
+        #[cfg(feature = "fault-injection")]
+        directory_fault(
+            if creating {
+                DirectoryOperation::Create
+            } else {
+                DirectoryOperation::Drop
+            },
+            DirectoryPoint::StagingSync,
+        )?;
+        fs_commit::sync_dir(staging)
+    })
+    .unwrap_or_else(|_| Err(std::io::Error::other("directory sync panicked")))
+}
+
 #[derive(Debug)]
 pub struct Db {
     /// 按名字排序，list 的顺序与 3.x 的 `sorted(names)`（码点序）一致。
@@ -269,7 +368,7 @@ impl Db {
                 && self.collection_path(target_name).exists()
         });
         if aliases.len() != old_alias_count {
-            self.save_aliases(&aliases)?;
+            self.save_aliases(&aliases, true)?;
         }
         if aliases.contains_key(name) {
             return Err(EngineError::CollectionAlreadyExists(name.to_owned()));
@@ -290,6 +389,13 @@ impl Db {
             return Err(storage(error));
         }
         if let Err(error) = fs_commit::write_new_schema(&staging.join("schema.json"), &bytes) {
+            cleanup_failed_staging(&staging);
+            return Err(storage(error));
+        }
+        #[cfg(feature = "fault-injection")]
+        if let Err(error) =
+            directory_fault(DirectoryOperation::Create, DirectoryPoint::BeforeRename)
+        {
             cleanup_failed_staging(&staging);
             return Err(storage(error));
         }
@@ -330,20 +436,19 @@ impl Db {
                 return Err(storage(reason));
             }
         }
+        *blocked = true;
         collection.attach_persistence(
             runtime::PersistentCollection::new(target.clone()).map_err(EngineError::Storage)?,
         );
         self.collections
             .write()
             .insert(name.to_owned(), Arc::new(RwLock::new(collection)));
-        if let Err(error) =
-            fs_commit::sync_dir(&root).and_then(|()| fs_commit::sync_dir(&staging_root))
-        {
-            *blocked = true;
+        if let Err(error) = sync_directory_change(&root, &staging_root, true) {
             return Err(EngineError::Storage(format!(
                 "collection was created, but directory durability is unconfirmed: {error}"
             )));
         }
+        *blocked = false;
         Ok(())
     }
 
@@ -386,9 +491,7 @@ impl Db {
             if let Some(persistent) = collection.persistent_mut()
                 && let Err(error) = persistent.sync_retained_wal()
             {
-                let rotate = persistent.freeze_active(true);
                 collection.mark_deleted(false);
-                rotate.map_err(storage)?;
                 return Err(storage(error));
             }
         }
@@ -397,7 +500,12 @@ impl Db {
             std::process::id(),
             STAGING_NUMBER.fetch_add(1, Ordering::Relaxed)
         ));
-        if let Err(error) = fs::rename(&target, &staging) {
+        let rename = || {
+            #[cfg(feature = "fault-injection")]
+            directory_fault(DirectoryOperation::Drop, DirectoryPoint::BeforeRename)?;
+            fs::rename(&target, &staging)
+        };
+        if let Err(error) = rename() {
             if let Some(handle) = &handle {
                 let mut collection = handle.write();
                 collection.mark_deleted(false);
@@ -408,15 +516,18 @@ impl Db {
             return Err(storage(error));
         }
         self.collections.write().remove(name);
-        if let Err(error) =
-            fs_commit::sync_dir(&root).and_then(|()| fs_commit::sync_dir(&staging_root))
-        {
-            *blocked = true;
+        *blocked = true;
+        if let Err(error) = sync_directory_change(&root, &staging_root, false) {
             return Err(storage(format!(
                 "collection was removed, but directory durability is unconfirmed: {error}"
             )));
         }
-        self.remove_aliases_for(name, aliases)?;
+        *blocked = false;
+        self.remove_aliases_for(name, aliases).map_err(|error| {
+            storage(format!(
+                "collection was removed, but aliases cleanup is pending: {error}"
+            ))
+        })?;
         if let Err(error) =
             fs::remove_dir_all(&staging).and_then(|()| fs_commit::sync_dir(&staging_root))
         {
@@ -473,17 +584,43 @@ impl Db {
         if aliases.len() == len {
             return Ok(());
         }
-        self.save_aliases(&aliases)
+        self.save_aliases(&aliases, false)
     }
 
-    fn save_aliases(&self, aliases: &BTreeMap<String, String>) -> Result<()> {
+    fn save_aliases(&self, aliases: &BTreeMap<String, String>, creating: bool) -> Result<()> {
+        #[cfg(feature = "fault-injection")]
+        directory_fault(
+            if creating {
+                DirectoryOperation::Create
+            } else {
+                DirectoryOperation::Drop
+            },
+            DirectoryPoint::Aliases,
+        )
+        .map_err(storage)?;
+        #[cfg(not(feature = "fault-injection"))]
+        let _creating = creating;
         let path = self.path.join("aliases.json");
         let tmp = self.path.join(format!(
             "aliases.json.tmp.{}.{}",
             std::process::id(),
             STAGING_NUMBER.fetch_add(1, Ordering::Relaxed)
         ));
-        let bytes = serde_json::to_vec_pretty(&aliases).map_err(storage)?;
+        // 上一次 drop 可能已经改名成功却未能写别名；任意后续别名提交都须清掉悬空目标。
+        let mut live_aliases = BTreeMap::new();
+        for (alias, target) in aliases {
+            if validate_filesystem_name(target, "collection").is_err() {
+                continue;
+            }
+            match fs::metadata(self.collection_path(target)) {
+                Ok(_) => {
+                    live_aliases.insert(alias, target);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(storage(error)),
+            }
+        }
+        let bytes = serde_json::to_vec_pretty(&live_aliases).map_err(storage)?;
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -834,6 +971,14 @@ impl Db {
         let manifest = recovered.manifest.clone();
         let pinned_files = recovered.pinned_files.clone();
         let collection = Collection::from_recovered(name, recovered, path.clone())?;
+        #[cfg(feature = "fault-injection")]
+        OPEN_CLEANUP_PAUSE.with(|slot| -> Result<()> {
+            if let Some((entered, resume)) = slot.borrow_mut().take() {
+                entered.send(()).map_err(storage)?;
+                resume.recv().map_err(storage)?;
+            }
+            Ok(())
+        })?;
         for warning in recovery::cleanup_unreferenced(&path, &manifest, &pinned_files)
             .map_err(recovery_error)?
         {
@@ -1075,5 +1220,123 @@ mod tests {
         ));
         assert!(!path.join("collections/c").exists());
         db.close();
+    }
+    #[cfg(feature = "fault-injection")]
+    #[test]
+    fn lazy_cleanup_holds_shared_write_permission_before_namespace_lock() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let root = tempfile::tempdir().unwrap();
+        let db = Db::new(
+            DataDir::open(root.path()).unwrap(),
+            Compute::new(std::num::NonZeroUsize::MIN).unwrap(),
+        );
+        db.create_collection("", "c", basic_schema()).unwrap();
+        db.close();
+        let db = Arc::new(Db::new(
+            DataDir::open(root.path()).unwrap(),
+            Compute::new(std::num::NonZeroUsize::MIN).unwrap(),
+        ));
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let opener = Arc::clone(&db);
+        let opening = std::thread::spawn(move || {
+            pause_open_cleanup_once(entered_tx, resume_rx);
+            opener.collection("", "c").unwrap();
+        });
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(db.write_gate.try_write().is_none());
+        assert!(db.namespace.try_lock().is_none());
+        resume_tx.send(()).unwrap();
+        opening.join().unwrap();
+        db.close();
+    }
+    #[cfg(feature = "fault-injection")]
+    #[test]
+    fn directory_changes_wait_for_an_unrelated_writer_before_taking_namespace() {
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+        for creating in [true, false] {
+            let root = tempfile::tempdir().unwrap();
+            let db = Arc::new(Db::new(
+                DataDir::open(root.path()).unwrap(),
+                Compute::new(std::num::NonZeroUsize::MIN).unwrap(),
+            ));
+            db.create_collection("", "writer", basic_schema()).unwrap();
+            db.create_collection("", "victim", basic_schema()).unwrap();
+            let handle = db.collection("", "writer").unwrap();
+            let state = handle.write();
+            let writer = Arc::clone(&db);
+            let writing = std::thread::spawn(move || {
+                writer.insert(
+                    "",
+                    "writer",
+                    InsertBatch {
+                        num_rows: 1,
+                        columns: vec![
+                            ("id".into(), InputValues::Int(vec![1])),
+                            (
+                                "v".into(),
+                                InputValues::FloatVector {
+                                    dim: 2,
+                                    values: vec![1.0, 0.0],
+                                },
+                            ),
+                        ],
+                    },
+                )
+            });
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while db.write_gate.try_write().is_some() {
+                assert!(Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let changer = Arc::clone(&db);
+            let (started_tx, started_rx) = mpsc::channel();
+            let (done_tx, done_rx) = mpsc::channel();
+            let changing = std::thread::spawn(move || {
+                inject_directory_fault_once(
+                    if creating {
+                        DirectoryOperation::Create
+                    } else {
+                        DirectoryOperation::Drop
+                    },
+                    DirectoryPoint::CollectionsSync,
+                    DirectoryFault::Error,
+                );
+                started_tx.send(()).unwrap();
+                let result = if creating {
+                    changer.create_collection("", "new", basic_schema())
+                } else {
+                    changer.drop_collection("", "victim")
+                };
+                done_tx.send(result).unwrap();
+            });
+            started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert!(matches!(
+                done_rx.recv_timeout(Duration::from_millis(100)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ));
+            assert!(db.namespace.try_lock().is_some());
+            drop(state);
+            writing.join().unwrap().unwrap();
+            assert!(
+                done_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("durability is unconfirmed")
+            );
+            changing.join().unwrap();
+            assert_eq!(handle.read().count(), 1);
+            assert!(
+                db.flush_collection("", "writer")
+                    .unwrap_err()
+                    .to_string()
+                    .contains("blocked")
+            );
+            db.close();
+        }
     }
 }

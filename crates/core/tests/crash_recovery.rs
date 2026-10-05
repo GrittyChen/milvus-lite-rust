@@ -297,3 +297,121 @@ fn data_wal_unlinked_before_delta_wal_crash_does_not_resurrect_rows() {
     db.close();
     assert!(!wal.join("wal_delta_000002.arrow").exists());
 }
+
+#[test]
+fn collection_directory_rename_crashes_preserve_commit_boundary() {
+    use milvus_lite_core::db::{
+        DirectoryFault, DirectoryOperation, DirectoryPoint, inject_directory_fault_once,
+    };
+    if let Ok(stage) = std::env::var("MILVUS_LITE_DIRECTORY_CRASH") {
+        let path = std::env::var("MILVUS_LITE_CRASH_DIR").unwrap();
+        let db = Db::new(
+            DataDir::open(std::path::Path::new(&path)).unwrap(),
+            compute(),
+        );
+        let creating = stage.starts_with("create");
+        if !creating {
+            db.create_collection("", "c", schema()).unwrap();
+            db.insert("", "c", batch(&[(1, [1.0, 0.0])])).unwrap();
+            std::fs::write(
+                std::path::Path::new(&path).join("aliases.json"),
+                br#"{"old":"c"}"#,
+            )
+            .unwrap();
+        }
+        inject_directory_fault_once(
+            if creating {
+                DirectoryOperation::Create
+            } else {
+                DirectoryOperation::Drop
+            },
+            if stage.ends_with("before") {
+                DirectoryPoint::BeforeRename
+            } else {
+                DirectoryPoint::AfterRename
+            },
+            DirectoryFault::Exit,
+        );
+        if creating {
+            db.create_collection("", "c", schema()).unwrap();
+        } else {
+            db.drop_collection("", "c").unwrap();
+        }
+        panic!("directory crash injection did not fire");
+    }
+    // Unix 上 CLOEXEC 只在 exec 时关闭 fd；并行测试的兄弟子进程在此之前可能短暂继承父进程的 LOCK。
+    // 让验证过程拥有独立父进程，避免其他用例启动子进程时暂时钉住刚关闭的数据目录。
+    if std::env::var_os("MILVUS_LITE_DIRECTORY_PARENT").is_none() {
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "collection_directory_rename_crashes_preserve_commit_boundary",
+                "--nocapture",
+            ])
+            .env("MILVUS_LITE_DIRECTORY_PARENT", "1")
+            .status()
+            .unwrap();
+        assert!(
+            status.success(),
+            "isolated directory recovery parent failed: {status:?}"
+        );
+        return;
+    }
+    for stage in ["create-before", "create-after", "drop-before", "drop-after"] {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("directory-crash.db");
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "collection_directory_rename_crashes_preserve_commit_boundary",
+                "--nocapture",
+            ])
+            .env("MILVUS_LITE_DIRECTORY_CRASH", stage)
+            .env("MILVUS_LITE_CRASH_DIR", &path)
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(88));
+        let exists = stage == "create-after" || stage == "drop-before";
+        assert_eq!(path.join("collections/c/schema.json").exists(), exists);
+        let db = Db::new(DataDir::open(&path).unwrap(), compute());
+        assert!(
+            std::fs::read_dir(path.join(".database-staging"))
+                .unwrap()
+                .next()
+                .is_none()
+        );
+        if exists {
+            let handle = db.collection("", "c").unwrap();
+            assert_eq!(
+                handle.read().count(),
+                usize::from(stage.starts_with("drop"))
+            );
+            if stage == "drop-before" {
+                assert_eq!(
+                    handle.read().get(&[Pk::Int64(1)], &[]).unwrap().rows.pks,
+                    [Pk::Int64(1)]
+                );
+                assert_eq!(
+                    std::fs::read(path.join("aliases.json")).unwrap(),
+                    br#"{"old":"c"}"#
+                );
+            }
+        } else {
+            assert!(db.collection("", "c").is_err());
+        }
+        // 同名重建必须先清悬空别名，不能将旧别名接到新表。
+        if stage == "drop-after" {
+            db.create_collection("", "c", schema()).unwrap();
+            let aliases: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(path.join("aliases.json")).unwrap()).unwrap();
+            assert!(aliases.get("old").is_none());
+        }
+        db.close();
+        let reopened = Db::new(DataDir::open(&path).unwrap(), compute());
+        assert_eq!(
+            reopened.collection("", "c").is_ok(),
+            exists || stage == "drop-after"
+        );
+        reopened.close();
+    }
+}
