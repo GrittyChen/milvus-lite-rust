@@ -1,8 +1,10 @@
 """独立服务的重开差分：每次关闭两个引擎，再从原数据目录启动。"""
 
 import io
+import json
 import os
 import subprocess
+from pathlib import Path
 
 import grpc
 import pytest
@@ -101,6 +103,111 @@ def raw_upsert(uri, pk=None):
         return response.status.code, response.upsert_cnt, list(response.IDs.int_id.data)
     finally:
         channel.close()
+
+
+def raw_json_insert(uri, collection, pk, text):
+    primary = schema_pb2.FieldData(type=DataType.INT64, field_name="id")
+    primary.scalars.long_data.data.append(pk)
+    vector = schema_pb2.FieldData(type=DataType.FLOAT_VECTOR, field_name="vector")
+    vector.vectors.dim = 2
+    vector.vectors.float_vector.data.extend([1.0, 0.0])
+    value = schema_pb2.FieldData(type=DataType.JSON, field_name="json")
+    value.scalars.json_data.data.append(text.encode())
+    with grpc.insecure_channel(uri.removeprefix("http://"), options=[("grpc.enable_http_proxy", 0)]) as channel:
+        return milvus_pb2_grpc.MilvusServiceStub(channel).Insert(milvus_pb2.InsertRequest(
+            collection_name=collection, num_rows=1, fields_data=[primary, vector, value],
+        ))
+
+
+def raw_json_query(uri, collection, pk):
+    with grpc.insecure_channel(uri.removeprefix("http://"), options=[("grpc.enable_http_proxy", 0)]) as channel:
+        return milvus_pb2_grpc.MilvusServiceStub(channel).Query(milvus_pb2.QueryRequest(
+            collection_name=collection, expr=f"id in [{pk}]", output_fields=["json"],
+        ))
+
+
+def test_reopen_preserves_manifest_ties_and_finite_json_bytes(pair):
+    diff = pair.open()
+    s = schema()
+    s.add_field("json", DataType.JSON)
+    diff.step("create", lambda c: c.create_collection("c", schema=s, index_params=index("L2")))
+    raw = '{"a":1e5,"wide":9223372036854775808,"中文":"三"}'
+    expected_json = json.dumps(json.loads(raw), ensure_ascii=False).encode()
+    for pk in [5, 3, 1, 2]:
+        for uri in pair.uris:
+            assert raw_json_insert(uri, "c", pk, raw).status.code == 0
+    diff.step("first_flush", lambda c: c.flush("c"))
+    diff.step("delete", lambda c: c.delete("c", ids=[5, 1]))
+    for pk in [6, 4, 6]:
+        for uri in pair.uris:
+            assert raw_json_insert(uri, "c", pk, raw).status.code == 0
+    diff.step("second_flush", lambda c: c.flush("c"))
+    for pk in [7, 8, 8]:
+        for uri in pair.uris:
+            assert raw_json_insert(uri, "c", pk, raw).status.code == 0
+
+    def check(label):
+        result = diff.step(label + "_ties", lambda c: c.search("c", data=[[1.0, 0.0]], limit=6,
+                          search_params={"metric_type": "L2"}, output_fields=["*"]))[1][0]
+        # 返回全部存活行且距离精确为零，有意固定两侧非截断的并列顺序。
+        assert [r["id"] for r in result] == [3, 2, 6, 4, 7, 8]
+        assert [r["distance"] for r in result] == [0.0] * 6
+        for pk in [3, 2, 6, 4, 7, 8]:
+            for uri in pair.uris:
+                response = raw_json_query(uri, "c", pk)
+                assert response.status.code == 0
+                field = next(f for f in response.fields_data if f.field_name == "json")
+                assert list(field.scalars.json_data.data) == [expected_json]
+
+    check("before_close")
+    pair.close()
+    # close 会提交最后的活跃代，总计三个 data 文件，未达到 3.x compaction 阈值。
+    manifest = json.loads((Path(pair.ref_path) / "collections/c/manifest.json").read_text())
+    assert len(manifest["partitions"]["_default"]["data_files"]) == 3
+    diff = pair.open()
+    assert str(diff.step("unloaded", lambda c: c.get_load_state("c"))[1]["state"]) == "NotLoad"
+    diff.step("load", lambda c: c.load_collection("c"))
+    check("after_reopen")
+
+
+def test_raw_json_float_overflow_rejects_before_wal_and_finite_input_can_retry(pair):
+    diff = pair.open()
+    s = schema()
+    s.add_field("json", DataType.JSON)
+    diff.step("create", lambda c: c.create_collection("c", schema=s, index_params=index("L2")))
+    for text in ['{"a":1e999}', '{"a":-1e999}', '[{"a":1e999}]']:
+        reply = raw_json_insert(pair.uris[0], "c", 99, text)
+        assert reply.status.code == 1
+        assert 'JSON number outside the finite float64 range' in reply.status.reason
+        assert not reply.status.reason.startswith('storage error:')
+        assert not (Path(pair.rust_path) / "collections/c/wal").exists()
+    assert diff.rust.query("c", output_fields=["count(*)"]) == [{"count(*)": 0}]
+    # 0006 登记的有意差异：3.x 接受写入，但 raw Query 返回非标准 JSON 常量。
+    diff.ref.create_collection("overflow_reference", schema=s, index_params=index("L2"))
+    assert raw_json_insert(pair.uris[1], "overflow_reference", 99, '{"a":1e999}').status.code == 0
+    reference_reply = raw_json_query(pair.uris[1], "overflow_reference", 99)
+    assert reference_reply.status.code == 0
+    reference_field = next(f for f in reference_reply.fields_data if f.field_name == "json")
+    assert list(reference_field.scalars.json_data.data) == [b'{"a": Infinity}']
+    valid = '{"a":1e5,"wide":9223372036854775808,"中文":"三"}'
+    expected = json.dumps(json.loads(valid), ensure_ascii=False).encode()
+    for uri in pair.uris:
+        reply = raw_json_insert(uri, "c", 1, valid)
+        assert reply.status.code == 0
+    for stage in range(3):
+        for uri in pair.uris:
+            reply = raw_json_query(uri, "c", 1)
+            assert reply.status.code == 0
+            field = next(f for f in reply.fields_data if f.field_name == "json")
+            assert list(field.scalars.json_data.data) == [expected]
+        if stage == 0:
+            diff.step("flush", lambda c: c.flush("c"))
+            manifest = json.loads((Path(pair.rust_path) / "collections/c/manifest.json").read_text())
+            assert manifest["current_seq"] == 1
+        elif stage == 1:
+            pair.close()
+            diff = pair.open()
+            diff.step("load", lambda c: c.load_collection("c"))
 
 
 def test_delete_upsert_and_load_state_after_reopen(pair):

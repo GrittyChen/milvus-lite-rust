@@ -119,11 +119,18 @@ fn wal_memtable_flush_bitmap_and_reopen_keep_dict_order() {
     )
     .unwrap();
     visibility
-        .replace_source(
+        .replace_source_known_rows(
             SourceId(1),
             SourceId(2),
             data.num_rows(),
             &materialized.mapping,
+            &[
+                (Pk::Int64(1), 0),
+                (Pk::Int64(2), 1),
+                (Pk::Int64(3), 2),
+                (Pk::Int64(1), 3),
+                (Pk::Int64(2), 4),
+            ],
         )
         .unwrap();
     assert_eq!(visibility.live_count(), 3);
@@ -239,11 +246,12 @@ fn frozen_generation_survives_later_unflushed_change(delete: bool) {
     assert_eq!(manifest.current_seq, 1);
     assert!(new_wal_path.exists());
     visibility
-        .replace_source(
+        .replace_source_known_rows(
             SourceId(1),
             SourceId(3),
             old_data.num_rows(),
             &materialized.mapping,
+            &[(Pk::Int64(1), 0)],
         )
         .unwrap();
     assert_eq!(visibility.is_live(SourceId(3), 0), Some(false));

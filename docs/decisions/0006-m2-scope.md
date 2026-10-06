@@ -567,6 +567,7 @@ M1 证明了整条链路可行，但数据只在内存中，不发布（[0004](0
 | INVERTED 定义的字段上的过滤 | 结果取决于数据在 segment 还是 memtable，以及后台索引是否建好 | 按扫描求值 | 3.x 自身不一致 | 3.x 写的、带 INVERTED 定义的目录 |
 | 整数列对浮点字面量、数据超出 2^53 | 已删除或已被覆盖的旧版本也会触发 code 1 | 只看存活行 | 3.x 的结果随 compaction 时机变化 | 主键或标量超出 2^53 的 collection |
 | `field_ops` 非空的 upsert | 静默按替换处理 | UNIMPLEMENTED | 不变量 15 | 使用 `field_ops` 的 upsert |
+| JSON 字段的浮点形式数字超出有限 float64 范围（raw gRPC，如 `{"a":1e999}`） | 接受写入；raw Query 可返回 code 0 和含 `Infinity` 的非标准 JSON，pymilvus 解码失败 | 在 JSON 归一化时返回 code 1、明确的有限 float64 范围错误，不推进序号或追加 WAL | 不复制参照实现接受写入但无法由客户端读回的行为；宽整数和字符串不受此限制，`pyjson` 的兼容输出规则不改 | [test_reopen.py](../../tests/differential/test_reopen.py) 的 raw 插入拒绝、两侧响应与有限输入重试用例；正常值在写前、发布后、重开后的字节一致 |
 | 同一批内重复主键的部分 upsert | 每行都与调用前的旧行合并，后一行会丢掉前一行新增但自己未提供的字段 | 每行与该主键在本批中的上一版本合并，后一行保留前一行新增的字段 | [0007「写入」](0007-m2-storage-engine.md#写入) 的批内顺序合同；避免同一次原子写入丢字段 | 同批重复主键且各行提供不同字段；`tests/differential/test_scenarios.py` 固定两边结果 |
 | 已提交删除覆盖旧行时的部分 upsert（待 Upsert 接入后验收） | 3.x 在缺陷 a 留下的重复目录上可能仍读旧行并合并字段 | 只合并仍有效的最新行，不读已提交删除覆盖的旧版本 | 缺陷 a；[0007「写入」](0007-m2-storage-engine.md#写入) | 3.x 崩溃后带重复 WAL 的目录 |
 | 检索中距离并列且落在截断位置时，取哪几行 | 由 numpy `argpartition` 决定，每个源取的个数不少于 4 时近似任意 | 取全局顺序中位置最先的 | 第 23 项；复刻要放弃流式 TopK 与并行。M1 起即如此 | 距离大量相同的检索 |

@@ -154,13 +154,15 @@ impl Visibility {
         self.live_count
     }
 
-    /// 冻结 memtable 变成已提交 segment 时，在状态写锁内一次性换源；旧快照继续持旧位图。
-    pub fn replace_source(
+    /// 发布调用方提供冻结源的物理主键，不扫描无关数据源的全量主键表。
+    /// 已知行集合须涵盖该源实际写入的物理行；当前主键引用所在行不可省略。
+    pub fn replace_source_known_rows(
         &mut self,
         old: SourceId,
         new: SourceId,
         new_rows: usize,
         mapping: &[Option<usize>],
+        rows: &[(Pk, usize)],
     ) -> Result<(), VisibilityError> {
         if self.sources.contains_key(&new) {
             return Err(VisibilityError::DuplicateSource(new));
@@ -172,6 +174,15 @@ impl Visibility {
                 actual: mapping.len(),
                 expected: old_bits.len,
             });
+        }
+        // 已知行集合也是调用方的输入；边界校验必须在换源之前完成。
+        for (_, row) in rows {
+            if mapping.get(*row).is_none() {
+                return Err(VisibilityError::RowOutOfRange {
+                    source_id: old,
+                    row: *row,
+                });
+            }
         }
         let mut used = HashSet::new();
         let mut new_bits = SourceBits::new(new_rows);
@@ -204,18 +215,19 @@ impl Visibility {
         self.sources.remove(&old);
         self.sources.insert(new, new_bits);
         self.source_order[rank] = new;
-        self.latest_data.retain(|_, location| {
-            if location.source != old {
-                return true;
+        for (pk, row) in rows {
+            if let Some(location) = self.latest_data.get_mut(pk)
+                && location.source == old
+                && location.row == *row
+            {
+                if let Some(target) = mapping.get(*row).copied().flatten() {
+                    location.source = new;
+                    location.row = target;
+                } else {
+                    self.latest_data.remove(pk);
+                }
             }
-            if let Some(target) = mapping[location.row] {
-                location.source = new;
-                location.row = target;
-                true
-            } else {
-                false
-            }
-        });
+        }
         Ok(())
     }
 
@@ -303,6 +315,32 @@ impl Visibility {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invalid_known_row_rejects_before_changing_visibility_or_primary_locations() {
+        let mut vis = Visibility::default();
+        vis.add_source(SourceId(1), 1).unwrap();
+        vis.apply_row(Pk::Int64(7), 1, SourceId(1), 0).unwrap();
+        let old = vis.snapshot();
+        let at = vis.latest_data(&Pk::Int64(7));
+        assert!(matches!(
+            vis.replace_source_known_rows(
+                SourceId(1),
+                SourceId(2),
+                1,
+                &[Some(0)],
+                &[(Pk::Int64(7), 99)]
+            ),
+            Err(VisibilityError::RowOutOfRange {
+                source_id: SourceId(1),
+                row: 99
+            })
+        ));
+        assert_eq!(vis.snapshot().source_order, old.source_order);
+        assert_eq!(vis.latest_data(&Pk::Int64(7)), at);
+        assert_eq!(vis.is_live(SourceId(1), 0), Some(true));
+        assert_eq!(vis.is_live(SourceId(2), 0), None);
+    }
 
     #[test]
     fn packed_read_bits_cover_word_boundaries_and_copy_once_per_owner() {
@@ -409,8 +447,14 @@ mod tests {
         let frozen_snapshot = vis.snapshot();
         vis.add_source(SourceId(2), 1).unwrap();
         vis.apply_row(pk(1), 3, SourceId(2), 0).unwrap();
-        vis.replace_source(SourceId(1), SourceId(3), 2, &[Some(0), Some(1), None])
-            .unwrap();
+        vis.replace_source_known_rows(
+            SourceId(1),
+            SourceId(3),
+            2,
+            &[Some(0), Some(1), None],
+            &[(pk(1), 0), (pk(2), 1)],
+        )
+        .unwrap();
         assert_eq!(frozen_snapshot.is_live(SourceId(1), 0), Some(true));
         assert_eq!(vis.is_live(SourceId(3), 0), Some(false));
         assert_eq!(vis.is_live(SourceId(3), 1), Some(true));

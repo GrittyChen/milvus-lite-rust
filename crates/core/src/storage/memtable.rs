@@ -107,6 +107,21 @@ impl MemTable {
         self.physical_rows
     }
 
+    pub(crate) fn read_batches(&self) -> &[Arc<DecodedData>] {
+        &self.batches
+    }
+
+    pub(crate) fn position(&self, pk: &Pk, global_row: usize) -> Option<u64> {
+        self.active
+            .get(pk)
+            .filter(|entry| entry.global_row == global_row)
+            .map(|entry| entry.position)
+    }
+
+    pub(crate) fn next_position(&self) -> u64 {
+        self.next_position
+    }
+
     pub fn max_seq(&self) -> u64 {
         self.max_seq
     }
@@ -116,15 +131,6 @@ impl MemTable {
             memtable: self,
             live_at_freeze: visibility.snapshot(),
         }
-    }
-
-    /// 打开时只为构建查询视图借用活跃代；写入状态仍留在 memtable 中。
-    pub fn materialize(
-        &self,
-        schema: &CollectionSchema,
-        visibility: &Visibility,
-    ) -> Result<Materialized, MemTableError> {
-        self.materialize_with(schema, &visibility.snapshot())
     }
 
     /// 调用方先追加 WAL；这里之后只更新内存。重复或旧 seq 的物理行不进入主键表。
@@ -190,6 +196,49 @@ impl MemTable {
         }
         self.physical_rows = new_len;
         self.batches.push(Arc::new(decoded));
+        self.merge_tail(schema)?;
+        Ok(())
+    }
+
+    fn merge_tail(&mut self, schema: &CollectionSchema) -> Result<(), MemTableError> {
+        let dim = schema
+            .fields
+            .iter()
+            .find(|f| f.data_type == DataType::FloatVector)
+            .map_or(1, crate::data::field_dim)
+            .max(1);
+        let limit = (crate::collection::BLOCK_ELEMS / dim).max(1);
+        while self.batches.len() >= 2 {
+            let right = self.batches.len() - 1;
+            let left = right - 1;
+            let a = self.batches[left].seqs.len();
+            let b = self.batches[right].seqs.len();
+            if !mergeable(a, b, limit) {
+                break;
+            }
+            let mut merged = (*self.batches[left]).clone();
+            merged.seqs.extend_from_slice(&self.batches[right].seqs);
+            for (dst, src) in merged.columns.iter_mut().zip(&self.batches[right].columns) {
+                dst.append_column(src);
+            }
+            if let (Some(dst), Some(src)) = (&mut merged.meta, &self.batches[right].meta) {
+                dst.extend_from_slice(src);
+            }
+            // 所有可能失败的主键提取先完成，随后才修改引用，避免留下半合并状态。
+            let pks = (0..merged.seqs.len())
+                .map(|row| primary_key(schema, &merged.columns, row))
+                .collect::<Result<Vec<_>, _>>()?;
+            for pk in pks {
+                if let Some(entry) = self.active.get_mut(&pk)
+                    && entry.batch == right
+                {
+                    entry.batch = left;
+                    entry.row += a;
+                }
+            }
+            self.batches.pop();
+            self.batches[left] = Arc::new(merged);
+        }
         Ok(())
     }
 
@@ -305,6 +354,14 @@ impl MemTable {
     }
 }
 
+/// 大小相近的尾块逐级拼接，单次复制的向量不超过计算行块。
+pub(crate) fn mergeable(left: usize, right: usize, limit: usize) -> bool {
+    left > 0
+        && right > 0
+        && left.abs_diff(right) <= left.min(right)
+        && left.checked_add(right).is_some_and(|sum| sum <= limit)
+}
+
 fn primary_key(
     schema: &CollectionSchema,
     columns: &[ColumnData],
@@ -370,6 +427,49 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn failed_key_extraction_during_merge_does_not_remap_any_entry() {
+        let schema = schema();
+        let mut visibility = Visibility::default();
+        visibility.add_source(SourceId(1), 0).unwrap();
+        let mut mem = MemTable::new(SourceId(1));
+        mem.apply_data(&schema, data(&[1], &[1]), &mut visibility)
+            .unwrap();
+        // 跳过入口校验构造损坏尾块，验证后段提取错误不会留下先改过的引用。
+        let mut malformed = data(&[2], &[2, 3]);
+        malformed.columns[1] = ColumnData::FloatVector {
+            dim: 2,
+            values: vec![1.0, 0.0, 1.0, 0.0],
+        };
+        mem.batches.push(Arc::new(malformed));
+        mem.active.insert(
+            Pk::Int64(2),
+            Entry {
+                batch: 1,
+                row: 0,
+                global_row: 1,
+                seq: 2,
+                position: 1,
+            },
+        );
+        let before = mem.batches.clone();
+        assert!(matches!(
+            mem.merge_tail(&schema),
+            Err(MemTableError::PrimaryKey { row: 2 })
+        ));
+        assert_eq!(
+            (
+                mem.active[&Pk::Int64(2)].batch,
+                mem.active[&Pk::Int64(2)].row
+            ),
+            (1, 0)
+        );
+        assert_eq!(mem.batches.len(), before.len());
+        for (a, b) in mem.batches.iter().zip(before) {
+            assert!(Arc::ptr_eq(a, &b));
+        }
+    }
+
     fn schema() -> CollectionSchema {
         let mut pk = FieldSchema::new("id", DataType::Int64);
         pk.is_primary = true;
@@ -394,6 +494,44 @@ mod tests {
             ],
             meta: None,
         }
+    }
+
+    #[test]
+    fn tail_merge_keeps_physical_rows_and_remaps_entries_without_mutating_old_batches() {
+        let schema = schema();
+        let mut vis = Visibility::default();
+        vis.add_source(SourceId(1), 0).unwrap();
+        let mut mem = MemTable::new(SourceId(1));
+        mem.apply_data(&schema, data(&[1], &[1]), &mut vis).unwrap();
+        let old = mem.batches[0].clone();
+        for seq in 2..=1024 {
+            mem.apply_data(&schema, data(&[1], &[seq]), &mut vis)
+                .unwrap();
+        }
+        assert_eq!(old.seqs, [1]);
+        // 合同允许大小相近而非严格等长的拼接，不承诺最终只剩一个块。
+        assert!(mem.batches.len() <= 11);
+        assert_eq!(
+            mem.batches
+                .iter()
+                .map(|batch| batch.seqs.len())
+                .sum::<usize>(),
+            1024
+        );
+        assert_eq!(mem.physical_rows(), 1024);
+        assert_eq!(mem.active[&Pk::Int64(1)].global_row, 1023);
+        let entry = mem.active[&Pk::Int64(1)];
+        assert_eq!(mem.batches[entry.batch].seqs[entry.row], 1024);
+        let materialized = mem.freeze(&vis).materialize(&schema).unwrap();
+        assert_eq!(materialized.mapping.len(), 1024);
+        assert!(materialized.mapping[..1023].iter().all(Option::is_none));
+        assert_eq!(materialized.mapping[1023], Some(0));
+        assert_eq!(
+            arrow_data::decode_data_batch(&schema, materialized.data.as_ref().unwrap())
+                .unwrap()
+                .seqs,
+            [1024]
+        );
     }
 
     #[test]

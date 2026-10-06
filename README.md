@@ -2,7 +2,7 @@
 
 The unofficial milvus-lite developed with Rust.
 
-以官方 [milvus-lite](https://github.com/milvus-io/milvus-lite) 为行为规范，用 Rust 重写一个更高效的 milvus-lite：`pymilvus` 用户的代码无需修改，官方 3.x 的数据目录也能直接打开。本项目非官方，与 Milvus / Zilliz 无隶属关系。M1 工程骨架已完成；M2 已接通建表、insert、主键 Delete、Upsert、Flush、关闭、重开与基础读取，并已加入与 3.x 的关闭重开差分用例；Search 与主键 Query/Get 已改为短锁取得不可变视图、放锁后计算与编码；完整 M2 验收仍在进行。目前尚不可用于生产，也未发布到 PyPI。
+以官方 [milvus-lite](https://github.com/milvus-io/milvus-lite) 为行为规范，用 Rust 重写一个更高效的 milvus-lite：`pymilvus` 用户的代码无需修改，官方 3.x 的数据目录也能直接打开。本项目非官方，与 Milvus / Zilliz 无隶属关系。M1 工程骨架已完成；M2 已接通建表、insert、主键 Delete、Upsert、Flush、关闭、重开与基础读取，并已加入与 3.x 的关闭重开差分用例；Search 与主键 Query/Get 已改为短锁取得不可变视图、放锁后计算与编码；相邻小块合并与冻结代到 segment 的读取映射也已接通；完整 M2 验收仍在进行。目前尚不可用于生产，也未发布到 PyPI。
 
 M2 崩溃矩阵已覆盖混合 data/delta WAL 写入后的进程退出、flush 与 CreateIndex 的 manifest replace 前后，以及同一代两类 WAL 删除之间及 create/drop 目录改名两侧的崩溃；其他持久化点仍待验收。
 

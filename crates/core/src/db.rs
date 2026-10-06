@@ -645,19 +645,21 @@ impl Db {
 
     pub fn collection(&self, database: &str, name: &str) -> Result<CollectionHandle> {
         require_database(database)?;
-        if let Some(handle) = self.collections.read().get(name) {
-            return Ok(Arc::clone(handle));
+        let cached = self.collections.read().get(name).cloned();
+        if let Some(handle) = cached {
+            return checked_read_handle(handle);
         }
         let blocked = self.write_gate.read();
         if *blocked {
-            if let Some(handle) = self.collections.read().get(name) {
-                return Ok(Arc::clone(handle));
+            let cached = self.collections.read().get(name).cloned();
+            if let Some(handle) = cached {
+                return checked_read_handle(handle);
             }
             return Err(EngineError::Storage(
                 "database writes are blocked after an unconfirmed directory change".to_owned(),
             ));
         }
-        self.collection_inner(name)
+        checked_read_handle(self.collection_inner(name)?)
     }
 
     /// 写入从数据库入口取得许可；自动 flush 的磁盘阶段不持 collection 状态锁。
@@ -750,6 +752,11 @@ impl Db {
         let handle = self.collection_inner(name)?;
         let mut collection = loop {
             let collection = handle.write();
+            if collection.persistent().is_some_and(|p| p.poisoned()) {
+                return Err(storage(
+                    "collection state is unusable after a storage failure",
+                ));
+            }
             if collection.persistent().is_some_and(|p| p.needs_retry()) {
                 drop(collection);
                 Self::flush_handle(&handle, false)?;
@@ -896,18 +903,17 @@ impl Db {
                         Some(runtime::PostCommitError::Durability(_))
                     );
                     let mut collection = handle.write();
+                    collection.publish_generation(
+                        &work,
+                        outcome.manifest,
+                        &outcome.mapping,
+                        outcome.data,
+                        outcome.norms,
+                        retry_manifest,
+                    )?;
                     let persistent = collection
                         .persistent_mut()
                         .ok_or_else(|| storage("persistent state missing"))?;
-                    persistent
-                        .publish(
-                            &work,
-                            outcome.manifest,
-                            &outcome.mapping,
-                            outcome.data_rows,
-                            retry_manifest,
-                        )
-                        .map_err(storage)?;
                     if let Some(runtime::PostCommitError::Durability(reason)) =
                         &outcome.post_commit_error
                     {
@@ -1033,6 +1039,17 @@ impl Db {
         }
         result.sort_by(|a, b| a.0.cmp(&b.0));
         Ok(result)
+    }
+}
+
+fn checked_read_handle(handle: CollectionHandle) -> Result<CollectionHandle> {
+    let poisoned = handle.read().persistent().is_some_and(|p| p.poisoned());
+    if poisoned {
+        Err(storage(
+            "collection state is unusable after a storage failure",
+        ))
+    } else {
+        Ok(handle)
     }
 }
 

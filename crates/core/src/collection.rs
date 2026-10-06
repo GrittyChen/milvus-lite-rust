@@ -1,7 +1,7 @@
 //! 单个 collection 的内存引擎：写入、按主键读取、计数、暴力检索、索引定义与 load 状态。
 //! 语义以 3.x 的 memtable 路径为准；与 3.x 不同之处见 0004「决策」与「阶段性差异」。
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use serde_json::{Map, Value};
@@ -19,7 +19,7 @@ use crate::schema::{CollectionSchema, DataType, FieldSchema};
 use crate::storage::arrow_data::DecodedData;
 use crate::storage::recovery::RecoveredCollection;
 use crate::storage::runtime::PersistentCollection;
-use crate::storage::visibility::SourceBits;
+use crate::storage::visibility::{SourceBits, SourceId};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoadState {
@@ -81,6 +81,7 @@ pub struct ReadSnapshot {
     indexes: Vec<IndexSpec>,
     load_state: LoadState,
     deleted: bool,
+    unusable: bool,
 }
 
 /// 主键在锁内定位，投影与结果复制在放锁后完成。
@@ -210,7 +211,7 @@ impl ReadSnapshot {
             .map(|top| {
                 let ranked = top.finish();
                 let kept = ranked.get(req.offset..).unwrap_or(&[]);
-                let refs: Vec<RowRef> = kept.iter().map(|(_, r)| *r).collect();
+                let refs: Vec<RowRef> = kept.iter().map(|(_, r)| r.at).collect();
                 Hits {
                     scores: kept.iter().map(|(s, _)| *s).collect(),
                     rows: self.gather(&refs, &projection),
@@ -226,7 +227,7 @@ impl ReadSnapshot {
 
     /// 3.x `_require_loaded`：检索与按主键读取之前的 load 状态检查。
     pub fn require_loaded(&self) -> Result<()> {
-        check_loaded(&self.name, self.load_state, self.deleted)
+        check_loaded(&self.name, self.load_state, self.deleted, self.unusable)
     }
 
     fn resolve_anns_field(&self, anns_field: Option<&str>) -> Result<usize> {
@@ -310,6 +311,9 @@ struct Chunk {
     data: Arc<ChunkData>,
     live: SourceBits,
     generation: u64,
+    source: SourceId,
+    row_start: usize,
+    source_rank: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -317,6 +321,7 @@ struct ChunkData {
     columns: Vec<ColumnData>,
     meta: Option<Vec<Map<String, Value>>>,
     norms: Vec<f32>,
+    seqs: Vec<u64>,
     orders: Vec<u64>,
 }
 
@@ -327,7 +332,7 @@ impl std::ops::Deref for Chunk {
     }
 }
 
-/// 行的位置。派生的全序即扫描顺序：先按 chunk、再按行。
+/// 块 ID 不因其他块的合并或发布移动；位次保留，检索的源序另由快照派生。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct RowRef {
     order: u64,
@@ -341,7 +346,8 @@ pub struct Collection {
     schema: CollectionSchema,
     pk_pos: usize,
     vector_pos: usize,
-    chunks: Vec<Chunk>,
+    chunks: BTreeMap<usize, Chunk>,
+    next_chunk: usize,
     pk_index: HashMap<Pk, RowRef>,
     /// 下一个 `_seq`。auto_id 取所在行的 `_seq`（0004「决策」），因此 auto_id 不超过 `_seq`（0002 约束 4）。
     next_seq: u64,
@@ -373,7 +379,8 @@ impl Collection {
             schema,
             pk_pos,
             vector_pos,
-            chunks: Vec::new(),
+            chunks: BTreeMap::new(),
+            next_chunk: 0,
             pk_index: HashMap::new(),
             next_seq: 1,
             indexes: Vec::new(),
@@ -427,28 +434,53 @@ impl Collection {
                             })
                     })
                     .collect::<Result<Vec<_>>>()?;
-                collection.append_recovered(batch, 0, live)?;
+                collection.append_recovered(batch, 0, segment.source, row, live, None)?;
                 row += batch.seqs.len();
             }
         }
-        let active_source = recovered.active_memtable.source;
-        let materialized = recovered
-            .active_memtable
-            .materialize(&recovered.schema, &recovered.visibility)
-            .map_err(|error| EngineError::Storage(error.to_string()))?;
-        if let Some(batch) = materialized.data {
-            let decoded = crate::storage::arrow_data::decode_data_batch(&collection.schema, &batch)
-                .map_err(|error| EngineError::Storage(error.to_string()))?;
-            let mut live = vec![false; decoded.seqs.len()];
-            for (old, mapped) in materialized.mapping.iter().enumerate() {
-                if let Some(new_row) = mapped {
-                    live[*new_row] = snapshot.is_live(active_source, old).ok_or_else(|| {
-                        EngineError::Storage("recovered WAL visibility is incomplete".to_owned())
-                    })?;
-                }
-            }
-            collection.append_recovered(&decoded, recovered.next_wal_number, live)?;
+        let active = &recovered.active_memtable;
+        let base_order = collection.next_order;
+        let mut row_start = 0;
+        for batch in active.read_batches() {
+            let live = (0..batch.seqs.len())
+                .map(|row| {
+                    snapshot
+                        .is_live(active.source, row_start + row)
+                        .ok_or_else(|| {
+                            EngineError::Storage(
+                                "recovered WAL visibility is incomplete".to_owned(),
+                            )
+                        })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let orders = (0..batch.seqs.len())
+                .map(|row| {
+                    let pk = pk_at(&batch.columns[collection.pk_pos], row);
+                    match active.position(&pk, row_start + row) {
+                        Some(position) => base_order.checked_add(position).ok_or_else(|| {
+                            EngineError::Storage("row order space exhausted".to_owned())
+                        }),
+                        None if !live[row] => Ok(0),
+                        None => Err(EngineError::Storage(format!(
+                            "live recovered WAL row {} has no memtable position",
+                            row_start + row
+                        ))),
+                    }
+                })
+                .collect::<Result<Vec<_>>>()?;
+            collection.append_recovered(
+                batch,
+                recovered.next_wal_number,
+                active.source,
+                row_start,
+                live,
+                Some(orders),
+            )?;
+            row_start += batch.seqs.len();
         }
+        collection.next_order = base_order
+            .checked_add(active.next_position())
+            .ok_or_else(|| EngineError::Storage("row order space exhausted".to_owned()))?;
         for spec in recovered.manifest.index_specs.values() {
             collection.indexes.push(crate::index::IndexSpec {
                 field_name: spec.field_name.clone(),
@@ -469,42 +501,269 @@ impl Collection {
         &mut self,
         decoded: &DecodedData,
         generation: u64,
+        source: SourceId,
+        row_start: usize,
         live: Vec<bool>,
+        orders: Option<Vec<u64>>,
     ) -> Result<()> {
         let n = decoded.seqs.len();
         let (dim, vectors) = vector_values(&decoded.columns[self.vector_pos]);
-        let chunk_index = self.chunks.len();
-        let mut chunk = Chunk {
+        let orders = if let Some(orders) = orders {
+            orders
+        } else {
+            let start = self.next_order;
+            self.next_order = start
+                .checked_add(n as u64)
+                .ok_or_else(|| EngineError::Storage("row order space exhausted".to_owned()))?;
+            (start..self.next_order).collect()
+        };
+        let chunk_index = self.next_chunk;
+        self.next_chunk += 1;
+        let chunk = Chunk {
             data: Arc::new(ChunkData {
                 columns: decoded.columns.clone(),
                 meta: decoded.meta.clone(),
                 norms: vectors.chunks_exact(dim).map(flat::norm).collect(),
-                orders: Vec::with_capacity(n),
+                seqs: decoded.seqs.clone(),
+                orders,
             }),
             live: SourceBits::from_live(&live),
             generation,
+            source,
+            row_start,
+            source_rank: 0,
         };
         for row in 0..n {
-            let order = self.next_order;
-            self.next_order = self
-                .next_order
-                .checked_add(1)
-                .ok_or_else(|| EngineError::Storage("row order space exhausted".to_owned()))?;
-            // 尚未发布的局部块独占此 Arc，不会复制列数据；发布后不得补写位次。
-            Arc::make_mut(&mut chunk.data).orders.push(order);
             if chunk.live.get(row) {
                 let pk = pk_at(&chunk.columns[self.pk_pos], row);
                 self.pk_index.insert(
                     pk,
                     RowRef {
-                        order,
+                        order: chunk.orders[row],
                         chunk: chunk_index,
                         row,
                     },
                 );
             }
         }
-        self.chunks.push(chunk);
+        self.chunks.insert(chunk_index, chunk);
+        if generation != 0 {
+            self.merge_tail();
+        }
+        Ok(())
+    }
+
+    fn clear_live(&mut self, at: RowRef) {
+        match self.chunks.get_mut(&at.chunk) {
+            Some(chunk) => chunk.live.set(at.row, false),
+            // 主键只从仍在表中的块建立，合并与发布在同一次写锁内重映射它。
+            None => unreachable!("live primary key refers to an existing block"),
+        }
+    }
+
+    fn merge_tail(&mut self) {
+        let limit = (BLOCK_ELEMS / field_dim(&self.schema.fields[self.vector_pos])).max(1);
+        loop {
+            let mut tail = self.chunks.iter().rev();
+            let Some((&right_id, right)) = tail.next() else {
+                break;
+            };
+            let Some((&left_id, left)) = tail.next() else {
+                break;
+            };
+            let left_len = left.live.len;
+            if left.generation == 0
+                || left.source != right.source
+                || left.generation != right.generation
+                || left.row_start + left_len != right.row_start
+                || !crate::storage::memtable::mergeable(left_len, right.live.len, limit)
+            {
+                break;
+            }
+            let mut data = (*left.data).clone();
+            for (dst, src) in data.columns.iter_mut().zip(&right.columns) {
+                dst.append_column(src);
+            }
+            if let (Some(dst), Some(src)) = (&mut data.meta, &right.meta) {
+                dst.extend_from_slice(src);
+            }
+            data.norms.extend_from_slice(&right.norms);
+            data.seqs.extend_from_slice(&right.seqs);
+            data.orders.extend_from_slice(&right.orders);
+            let live: Vec<_> = (0..left_len)
+                .map(|row| left.live.get(row))
+                .chain((0..right.live.len).map(|row| right.live.get(row)))
+                .collect();
+            let merged = Chunk {
+                data: Arc::new(data),
+                live: SourceBits::from_live(&live),
+                generation: left.generation,
+                source: left.source,
+                row_start: left.row_start,
+                source_rank: 0,
+            };
+            // 稳定块 ID 不搬动后续数据源；只重映射参与拼接的主键引用。
+            for row in 0..merged.live.len {
+                let pk = pk_at(&merged.columns[self.pk_pos], row);
+                if let Some(at) = self.pk_index.get_mut(&pk)
+                    && at.chunk == right_id
+                {
+                    at.chunk = left_id;
+                    at.row += left_len;
+                }
+            }
+            self.chunks.remove(&right_id);
+            self.chunks.insert(left_id, merged);
+        }
+    }
+
+    /// 同一次状态写锁内转换读取映射与持久化位图；列与范数在锁外已构建完成。
+    pub(crate) fn publish_generation(
+        &mut self,
+        generation: &Arc<crate::storage::runtime::FrozenGeneration>,
+        manifest: crate::storage::manifest::Manifest,
+        mapping: &[Option<usize>],
+        decoded: Option<DecodedData>,
+        norms: Vec<f32>,
+        retry_manifest: bool,
+    ) -> Result<()> {
+        let old_source = generation.table.source();
+        let ids: Vec<_> = self
+            .chunks
+            .iter()
+            .filter(|(_, c)| c.source == old_source)
+            .map(|(&id, _)| id)
+            .collect();
+        let rows = decoded.as_ref().map_or(0, |data| data.seqs.len());
+        let prepared = (|| -> Result<_> {
+            if decoded.is_some() && rows == 0 {
+                return Err(EngineError::Storage("published data batch is empty".into()));
+            }
+            if norms.len() != rows {
+                return Err(EngineError::Storage(
+                    "published vector norms are incomplete".into(),
+                ));
+            }
+            let mut orders = vec![0; rows];
+            let mut live = vec![false; rows];
+            let mut seen = vec![false; rows];
+            let mut physical_rows = 0;
+            let mut refs = Vec::new();
+            let mut source_rows = Vec::with_capacity(mapping.len());
+            for &id in &ids {
+                let chunk = &self.chunks[&id];
+                if chunk.row_start != physical_rows {
+                    return Err(EngineError::Storage(
+                        "frozen read blocks are not contiguous".into(),
+                    ));
+                }
+                for row in 0..chunk.live.len {
+                    let global_row = chunk.row_start + row;
+                    source_rows.push((pk_at(&chunk.columns[self.pk_pos], row), global_row));
+                    let target = mapping.get(global_row).ok_or_else(|| {
+                        EngineError::Storage("frozen read mapping is incomplete".into())
+                    })?;
+                    if let Some(target) = *target {
+                        if target >= rows || seen[target] {
+                            return Err(EngineError::Storage(
+                                "frozen read mapping has invalid targets".into(),
+                            ));
+                        }
+                        let data = decoded.as_ref().ok_or_else(|| {
+                            EngineError::Storage("published data is missing".into())
+                        })?;
+                        let pk = pk_at(&chunk.columns[self.pk_pos], row);
+                        if chunk.seqs[row] != data.seqs[target]
+                            || pk != pk_at(&data.columns[self.pk_pos], target)
+                        {
+                            return Err(EngineError::Storage(
+                                "published data does not match frozen rows".into(),
+                            ));
+                        }
+                        seen[target] = true;
+                        orders[target] = chunk.orders[row];
+                        live[target] = chunk.live.get(row);
+                        if live[target] {
+                            let at = self.pk_index.get(&pk).ok_or_else(|| {
+                                EngineError::Storage(
+                                    "live frozen row has no primary reference".into(),
+                                )
+                            })?;
+                            if at.chunk != id || at.row != row {
+                                return Err(EngineError::Storage(
+                                    "live frozen primary reference does not match".into(),
+                                ));
+                            }
+                            refs.push((
+                                pk,
+                                RowRef {
+                                    order: orders[target],
+                                    chunk: ids[0],
+                                    row: target,
+                                },
+                            ));
+                        }
+                    } else if chunk.live.get(row) {
+                        return Err(EngineError::Storage(
+                            "published mapping omits a live frozen row".into(),
+                        ));
+                    }
+                }
+                physical_rows += chunk.live.len;
+            }
+            if mapping.len() != physical_rows || seen.iter().any(|value| !value) {
+                return Err(EngineError::Storage(
+                    "published mapping does not cover frozen physical rows".into(),
+                ));
+            }
+            Ok((orders, live, refs, source_rows))
+        })();
+        let (orders, live, refs, source_rows) = match prepared {
+            Ok(value) => value,
+            Err(error) => {
+                if let Some(persistent) = self.persistent.as_mut() {
+                    persistent.poison();
+                }
+                return Err(error);
+            }
+        };
+        let persistent = self
+            .persistent
+            .as_mut()
+            .ok_or_else(|| EngineError::Storage("persistent state missing".into()))?;
+        let source = persistent
+            .publish(
+                generation,
+                manifest,
+                mapping,
+                rows,
+                &source_rows,
+                retry_manifest,
+            )
+            .map_err(EngineError::Storage)?;
+        for &id in &ids {
+            self.chunks.remove(&id);
+        }
+        if let Some(decoded) = decoded {
+            let chunk = Chunk {
+                data: Arc::new(ChunkData {
+                    columns: decoded.columns,
+                    meta: decoded.meta,
+                    seqs: decoded.seqs,
+                    norms,
+                    orders,
+                }),
+                live: SourceBits::from_live(&live),
+                source,
+                row_start: 0,
+                source_rank: 0,
+                generation: 0,
+            };
+            self.chunks.insert(ids[0], chunk);
+            for (pk, at) in refs {
+                self.pk_index.insert(pk, at);
+            }
+        }
         Ok(())
     }
 
@@ -660,7 +919,7 @@ impl Collection {
             let mut values = if let Some((old, _)) = previous {
                 old.clone()
             } else if let Some(old) = current {
-                self.chunks[old.chunk]
+                self.chunks[&old.chunk]
                     .columns
                     .iter()
                     .map(|column| input_from_column(column, old.row))
@@ -697,7 +956,7 @@ impl Collection {
             let mut meta = if let Some((_, old)) = previous {
                 old.clone()
             } else if let Some(old) = current {
-                self.chunks[old.chunk]
+                self.chunks[&old.chunk]
                     .meta
                     .as_ref()
                     .map_or_else(Map::new, |m| m[old.row].clone())
@@ -807,7 +1066,7 @@ impl Collection {
         }
         for pk in pks {
             if let Some(old) = self.pk_index.remove(pk) {
-                self.chunks[old.chunk].live.set(old.row, false);
+                self.clear_live(old);
             }
         }
         Ok(pks.len())
@@ -883,10 +1142,31 @@ impl Collection {
             };
             columns.push(column);
         }
+        if self.persistent.is_some() {
+            crate::storage::arrow_data::normalize_data_json(&self.schema, &mut columns).map_err(
+                |error| match error {
+                    crate::storage::arrow_data::ArrowDataError::NonFiniteJsonNumber { .. } => {
+                        EngineError::InvalidArgument(error.to_string())
+                    }
+                    _ => EngineError::Storage(error.to_string()),
+                },
+            )?;
+        }
         // schema 校验保证 dim > 0。
         let (dim, values) = vector_values(&columns[self.vector_pos]);
         let norms = values.chunks_exact(dim).map(flat::norm).collect();
         let meta = self.schema.enable_dynamic_field.then_some(dynamic.maps);
+        let (source, row_start) = self.persistent.as_ref().map_or_else(
+            || {
+                (
+                    SourceId(1),
+                    self.chunks
+                        .last_key_value()
+                        .map_or(0, |(_, chunk)| chunk.row_start + chunk.live.len),
+                )
+            },
+            |p| (p.active.source, p.active.physical_rows()),
+        );
         self.next_seq = next_seq;
         if let Some(persistent) = self.persistent.as_mut() {
             persistent
@@ -894,17 +1174,22 @@ impl Collection {
                 .map_err(EngineError::Storage)?;
         }
         // WAL 已成功追加；后续内存更新必须保持不可失败。
-        let chunk_idx = self.chunks.len();
+        let chunk_idx = self.next_chunk;
+        self.next_chunk += 1;
         let generation = self.persistent.as_ref().map_or(1, |p| p.generation);
         let mut chunk = Chunk {
             data: Arc::new(ChunkData {
                 columns,
                 meta,
                 norms,
+                seqs: seqs.clone(),
                 orders: Vec::with_capacity(n),
             }),
             live: SourceBits::from_live(&vec![true; n]),
             generation,
+            source,
+            row_start,
+            source_rank: 0,
         };
         let mut ids = Vec::with_capacity(n);
         for row in 0..n {
@@ -912,7 +1197,7 @@ impl Collection {
             let previous = self.pk_index.get(&pk).copied();
             let order = match previous {
                 Some(old) if old.chunk == chunk_idx => old.order,
-                Some(old) if self.chunks[old.chunk].generation == generation => old.order,
+                Some(old) if self.chunks[&old.chunk].generation == generation => old.order,
                 _ => {
                     let order = self.next_order;
                     self.next_order += 1;
@@ -931,12 +1216,13 @@ impl Collection {
                 if old.chunk == chunk_idx {
                     chunk.live.set(old.row, false);
                 } else {
-                    self.chunks[old.chunk].live.set(old.row, false);
+                    self.clear_live(old);
                 }
             }
             ids.push(pk);
         }
-        self.chunks.push(chunk);
+        self.chunks.insert(chunk_idx, chunk);
+        self.merge_tail();
         Ok(ids)
     }
 
@@ -951,7 +1237,7 @@ impl Collection {
                 let mut at = *self.pk_index.get(pk)?;
                 at.chunk = *mapping.entry(at.chunk).or_insert_with(|| {
                     let index = snapshot.chunks.len();
-                    snapshot.chunks.push(self.chunks[at.chunk].clone());
+                    snapshot.chunks.push(self.chunks[&at.chunk].clone());
                     index
                 });
                 Some(at)
@@ -1006,12 +1292,27 @@ impl Collection {
             indexes: self.indexes.clone(),
             load_state: self.load_state,
             deleted: self.deleted,
+            unusable: self.persistent.as_ref().is_some_and(|p| p.poisoned()),
         }
     }
 
     pub fn read_snapshot(&self) -> ReadSnapshot {
         let mut snapshot = self.read_metadata();
-        snapshot.chunks = self.chunks.clone();
+        let mut previous = None;
+        let mut rank = 0;
+        snapshot.chunks = self
+            .chunks
+            .values()
+            .map(|chunk| {
+                if previous.is_some_and(|source| source != chunk.source) {
+                    rank += 1;
+                }
+                previous = Some(chunk.source);
+                let mut chunk = chunk.clone();
+                chunk.source_rank = rank;
+                chunk
+            })
+            .collect();
         snapshot
     }
 
@@ -1031,7 +1332,12 @@ impl Collection {
     }
 
     pub fn require_loaded(&self) -> Result<()> {
-        check_loaded(&self.name, self.load_state, self.deleted)
+        check_loaded(
+            &self.name,
+            self.load_state,
+            self.deleted,
+            self.persistent.as_ref().is_some_and(|p| p.poisoned()),
+        )
     }
 
     /// 解出每行的动态字段：`$meta` 列（JSON 对象）与不在 schema 中的列，按列顺序合并。
@@ -1166,7 +1472,7 @@ struct Dynamic {
 }
 
 /// 每个行块的计算量约为这么多个浮点数（0005，初值，由基准调整）。
-const BLOCK_ELEMS: usize = 1 << 20;
+pub(crate) const BLOCK_ELEMS: usize = 1 << 20;
 
 /// 扫描顺序上连续的一段行。
 struct Segment {
@@ -1232,10 +1538,17 @@ fn scan(
                 .filter(|row| chunk.live.get(*row))
                 .map(|row| (row, &values[row * dim..(row + 1) * dim], chunk.norms[row]))
         };
-        let at = |row| RowRef {
-            order: chunk.orders[row],
-            chunk: seg.chunk,
-            row,
+        let at = |row| RankedRow {
+            source_rank: chunk.source_rank,
+            at: RowRef {
+                order: if chunk.generation == 0 {
+                    (chunk.row_start + row) as u64
+                } else {
+                    chunk.orders[row]
+                },
+                chunk: seg.chunk,
+                row,
+            },
         };
         if let Ok(batch) = <&[flat::Query; flat::BATCH]>::try_from(queries) {
             for (row, candidate, norm) in live_rows() {
@@ -1254,16 +1567,24 @@ fn scan(
     }
 }
 
+/// 数据源序号只存在于本次检索候选中，不扩大存活主键索引的行引用。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct RankedRow {
+    source_rank: usize,
+    at: RowRef,
+}
+
 /// 一条查询的前 `take` 个结果，按 (分数的名次, 行的位置) 这一全序排列。
 ///
-/// 与对全部分数按名次做稳定排序的结果完全相同：扫描按位置递增进行，稳定排序在名次相同时保持扫描顺序，
-/// 即按位置排序。只保留可能进入前 `take` 个的候选，不收集全部分数。
+/// 扫描物理行时位次不一定递增：同代覆盖会复用旧位次。
+/// 所有叶子与归并都使用同一全序，因而结果与按该全序串行排序一致，且不依赖任务完成顺序。
+/// 只保留可能进入前 `take` 个的候选，不收集全部分数。
 struct TopK {
     metric: Metric,
     take: usize,
-    candidates: Vec<(f32, RowRef)>,
+    candidates: Vec<(f32, RankedRow)>,
     /// 已确定的第 `take` 名；不排在它前面的候选不可能进入结果。
-    bound: Option<(f32, RowRef)>,
+    bound: Option<(f32, RankedRow)>,
 }
 
 impl TopK {
@@ -1276,7 +1597,7 @@ impl TopK {
         }
     }
 
-    fn push(&mut self, score: f32, pos: RowRef) {
+    fn push(&mut self, score: f32, pos: RankedRow) {
         let candidate = (score, pos);
         if self.take == 0
             || self
@@ -1313,7 +1634,7 @@ impl TopK {
         }
     }
 
-    fn finish(mut self) -> Vec<(f32, RowRef)> {
+    fn finish(mut self) -> Vec<(f32, RankedRow)> {
         self.shrink();
         let metric = self.metric;
         // 位置各不相同，全序下没有相等的元素，不稳定排序即可。
@@ -1322,7 +1643,7 @@ impl TopK {
     }
 }
 
-fn order(metric: Metric, a: &(f32, RowRef), b: &(f32, RowRef)) -> std::cmp::Ordering {
+fn order(metric: Metric, a: &(f32, RankedRow), b: &(f32, RankedRow)) -> std::cmp::Ordering {
     flat::rank(metric, a.0, b.0).then(a.1.cmp(&b.1))
 }
 
@@ -1589,9 +1910,14 @@ fn py_value_repr(values: &InputValues, row: usize) -> String {
     }
 }
 
-fn check_loaded(name: &str, state: LoadState, deleted: bool) -> Result<()> {
+fn check_loaded(name: &str, state: LoadState, deleted: bool, unusable: bool) -> Result<()> {
     if deleted {
         return Err(EngineError::CollectionNotFound(name.to_owned()));
+    }
+    if unusable {
+        return Err(EngineError::Storage(
+            "collection state is unusable after a storage failure".to_owned(),
+        ));
     }
     match state {
         LoadState::Loaded => Ok(()),
@@ -1604,12 +1930,482 @@ mod tests {
     use super::*;
 
     #[test]
+    fn recovery_requires_a_position_for_live_rows_but_allows_dead_row_placeholders() {
+        use crate::storage::recovery::load_committed;
+        use crate::{DataDir, Db};
+        for force_live in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let mut rng = Rng(3);
+            let db = Db::new(
+                DataDir::open(root.path()).unwrap(),
+                Compute::for_host().unwrap(),
+            );
+            db.create_collection("", "c", collection(&mut rng, 2).schema.clone())
+                .unwrap();
+            db.close();
+            let dir = root.path().join("collections/c");
+            let mut recovered = load_committed(&dir).unwrap();
+            let source = recovered.active_memtable.source;
+            recovered.visibility.apply_delete(Pk::Int64(1), 5).unwrap();
+            recovered
+                .active_memtable
+                .apply_data(
+                    &recovered.schema,
+                    DecodedData {
+                        seqs: vec![1],
+                        columns: vec![
+                            ColumnData::Int64(vec![1]),
+                            ColumnData::FloatVector {
+                                dim: 2,
+                                values: vec![1.0, 0.0],
+                            },
+                        ],
+                        meta: None,
+                    },
+                    &mut recovered.visibility,
+                )
+                .unwrap();
+            // 构造不一致的恢复对象：位图声称有效，但 memtable 未保留这行的位次。
+            if force_live {
+                recovered
+                    .visibility
+                    .apply_row(Pk::Int64(1), 6, source, 0)
+                    .unwrap();
+            }
+            let result = Collection::from_recovered("c", recovered, dir);
+            if force_live {
+                assert!(
+                    matches!(result, Err(EngineError::Storage(message)) if message.contains("has no memtable position"))
+                );
+            } else {
+                assert_eq!(result.unwrap().count(), 0);
+            }
+        }
+    }
+
+    #[cfg(feature = "fault-injection")]
+    #[test]
+    fn publication_poison_after_committed_manifest_recovers_without_replaying_retained_wal() {
+        use crate::storage::{fs_commit, runtime};
+        use crate::{DataDir, Db};
+        let root = tempfile::tempdir().unwrap();
+        let mut rng = Rng(9);
+        let db = Db::new(
+            DataDir::open(root.path()).unwrap(),
+            Compute::for_host().unwrap(),
+        );
+        db.create_collection("", "c", collection(&mut rng, 2).schema.clone())
+            .unwrap();
+        db.insert(
+            "",
+            "c",
+            InsertBatch {
+                num_rows: 2,
+                columns: vec![
+                    ("id".into(), InputValues::Int(vec![1, 2])),
+                    (
+                        "v".into(),
+                        InputValues::FloatVector {
+                            dim: 2,
+                            values: vec![1.0, 0.0, 2.0, 0.0],
+                        },
+                    ),
+                ],
+            },
+        )
+        .unwrap();
+        let handle = db.collection("", "c").unwrap();
+        let mut c = handle.write();
+        c.persistent_mut().unwrap().freeze_active(false).unwrap();
+        let persistent = c.persistent().unwrap();
+        let work = persistent.front().unwrap();
+        let dir = persistent.dir.clone();
+        let manifest = persistent.manifest.clone();
+        let schema = c.schema().clone();
+        drop(c);
+        fs_commit::inject_manifest_dir_sync_failure_once();
+        let outcome = runtime::flush_one(&dir, &manifest, &work, &schema, true).unwrap();
+        assert!(matches!(
+            outcome.post_commit_error,
+            Some(runtime::PostCommitError::Durability(_))
+        ));
+        assert_eq!(std::fs::read_dir(dir.join("wal")).unwrap().count(), 1);
+        let mut mapping = outcome.mapping;
+        mapping[0] = None;
+        assert!(
+            handle
+                .write()
+                .publish_generation(
+                    &work,
+                    outcome.manifest,
+                    &mapping,
+                    outcome.data,
+                    outcome.norms,
+                    true
+                )
+                .is_err()
+        );
+        assert!(matches!(
+            db.collection("", "c"),
+            Err(EngineError::Storage(_))
+        ));
+        db.close();
+        let reopened = Db::new(
+            DataDir::open(root.path()).unwrap(),
+            Compute::for_host().unwrap(),
+        );
+        let recovered = reopened.collection("", "c").unwrap();
+        assert_storage_mapping(&recovered.read());
+        assert_eq!(recovered.read().count(), 2);
+        assert_eq!(
+            recovered
+                .read()
+                .get(&[Pk::Int64(1), Pk::Int64(2)], &[])
+                .unwrap()
+                .rows
+                .pks,
+            [Pk::Int64(1), Pk::Int64(2)]
+        );
+        reopened.close();
+    }
+
+    #[test]
+    fn committed_ties_use_source_rank_then_original_parquet_row() {
+        use crate::{DataDir, Db};
+        let root = tempfile::tempdir().unwrap();
+        let mut rng = Rng(6);
+        let db = Db::new(
+            DataDir::open(root.path()).unwrap(),
+            Compute::for_host().unwrap(),
+        );
+        db.create_collection("", "c", collection(&mut rng, 2).schema.clone())
+            .unwrap();
+        let rows = |ids: &[i64]| InsertBatch {
+            num_rows: ids.len(),
+            columns: vec![
+                ("id".into(), InputValues::Int(ids.to_vec())),
+                (
+                    "v".into(),
+                    InputValues::FloatVector {
+                        dim: 2,
+                        values: [1.0, 0.0].repeat(ids.len()),
+                    },
+                ),
+            ],
+        };
+        db.insert("", "c", rows(&[1, 2, 3])).unwrap();
+        db.flush_collection("", "c").unwrap();
+        db.delete("", "c", &[Pk::Int64(1), Pk::Int64(2)]).unwrap();
+        db.insert("", "c", rows(&[4, 5])).unwrap();
+        db.flush_collection("", "c").unwrap();
+        let handle = db.collection("", "c").unwrap();
+        let c = handle.read();
+        assert_storage_mapping(&c);
+        let first = c.chunks.first_key_value().unwrap().1;
+        assert_eq!(first.live.len, 3);
+        assert_eq!(
+            (first.live.get(0), first.live.get(1), first.live.get(2)),
+            (false, false, true)
+        );
+        let req = SearchRequest {
+            anns_field: None,
+            vectors: QueryVectors::Dense(vec![vec![1.0, 0.0]]),
+            metric_type: Some("L2".into()),
+            limit: 10,
+            offset: 0,
+            output_fields: vec![],
+        };
+        assert_eq!(
+            c.search(req, db.compute()).unwrap().hits[0].rows.pks,
+            [Pk::Int64(3), Pk::Int64(4), Pk::Int64(5)]
+        );
+        drop(c);
+        db.close();
+    }
+
+    fn assert_storage_mapping(c: &Collection) {
+        let persistent = c.persistent().unwrap();
+        let visibility = persistent.visibility.snapshot();
+        let mut physical_rows = HashMap::<SourceId, usize>::new();
+        let mut live_count = 0;
+        for (&id, chunk) in &c.chunks {
+            let cursor = physical_rows.entry(chunk.source).or_default();
+            assert_eq!(chunk.row_start, *cursor);
+            *cursor += chunk.live.len;
+            assert_eq!(chunk.seqs.len(), chunk.live.len);
+            assert_eq!(chunk.orders.len(), chunk.live.len);
+            for row in 0..chunk.live.len {
+                assert_eq!(
+                    visibility.is_live(chunk.source, chunk.row_start + row),
+                    Some(chunk.live.get(row))
+                );
+                if chunk.live.get(row) {
+                    live_count += 1;
+                    let pk = pk_at(&chunk.columns[c.pk_pos], row);
+                    let at = c.pk_index[&pk];
+                    assert_eq!((at.chunk, at.row), (id, row));
+                    let stored = persistent.visibility.latest_data(&pk).unwrap();
+                    assert_eq!(
+                        (stored.source, stored.row, stored.seq),
+                        (chunk.source, chunk.row_start + row, chunk.seqs[row])
+                    );
+                }
+            }
+        }
+        assert_eq!(live_count, c.count());
+        assert_eq!(live_count, visibility.live_count);
+        let committed_sources = c
+            .chunks
+            .values()
+            .filter(|c| c.generation == 0)
+            .map(|c| c.source)
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(
+            committed_sources.len(),
+            persistent.manifest.partitions["_default"].data_files.len()
+        );
+    }
+
+    #[test]
+    fn row_model_matches_blocks_primary_references_and_storage_after_each_publication() {
+        use crate::{DataDir, Db};
+        let root = tempfile::tempdir().unwrap();
+        let mut rng = Rng(19);
+        let template = collection(&mut rng, 2);
+        let db = Db::new(
+            DataDir::open(root.path()).unwrap(),
+            Compute::for_host().unwrap(),
+        );
+        db.create_collection("", "c", template.schema.clone())
+            .unwrap();
+        let handle = db.collection("", "c").unwrap();
+        let mut model = HashMap::new();
+        let mut previous_snapshots = Vec::new();
+        let req = SearchRequest {
+            anns_field: None,
+            vectors: QueryVectors::Dense(vec![vec![0.0, 0.0]]),
+            metric_type: Some("L2".into()),
+            limit: 100,
+            offset: 0,
+            output_fields: vec!["*".into()],
+        };
+        for step in 0..180 {
+            let pk = rng.below(13) as i64;
+            if step % 7 == 0 {
+                db.delete("", "c", &[Pk::Int64(pk)]).unwrap();
+                model.remove(&pk);
+            } else {
+                let value = step as f32;
+                let batch = InsertBatch {
+                    num_rows: 1,
+                    columns: vec![
+                        ("id".into(), InputValues::Int(vec![pk])),
+                        (
+                            "v".into(),
+                            InputValues::FloatVector {
+                                dim: 2,
+                                values: vec![value, 0.0],
+                            },
+                        ),
+                    ],
+                };
+                if step % 3 == 0 {
+                    db.upsert_with_pk_type("", "c", batch).unwrap();
+                } else {
+                    db.insert("", "c", batch).unwrap();
+                }
+                model.insert(pk, value);
+            }
+            if step % 11 == 0 {
+                let snapshot = handle.read().read_snapshot();
+                let expected = snapshot.search(req.clone(), db.compute()).unwrap();
+                previous_snapshots.push((snapshot, expected));
+                db.flush_collection("", "c").unwrap();
+            }
+            let c = handle.read();
+            assert_storage_mapping(&c);
+            assert_eq!(c.count(), model.len());
+            let mut ids: Vec<_> = model.keys().copied().collect();
+            ids.sort();
+            let pks: Vec<_> = ids.iter().map(|id| Pk::Int64(*id)).collect();
+            let actual = c.get(&pks, &["v".into()]).unwrap();
+            assert_eq!(actual.rows.pks, pks);
+            assert_eq!(
+                actual.rows.fields[0].1,
+                ColumnData::FloatVector {
+                    dim: 2,
+                    values: ids.iter().flat_map(|id| [model[id], 0.0]).collect(),
+                }
+            );
+            drop(c);
+            for (snapshot, expected) in &previous_snapshots {
+                assert_eq!(
+                    &snapshot.search(req.clone(), db.compute()).unwrap(),
+                    expected
+                );
+            }
+        }
+        db.close();
+        let reopened = Db::new(
+            DataDir::open(root.path()).unwrap(),
+            Compute::for_host().unwrap(),
+        );
+        assert_storage_mapping(&reopened.collection("", "c").unwrap().read());
+        reopened.close();
+    }
+
+    #[test]
+    fn bounded_tail_merges_keep_old_blocks_and_do_not_filter_dead_rows() {
+        let dim = 32768;
+        let mut rng = Rng(11);
+        let schema = collection(&mut rng, 2).schema.clone();
+        let mut schema = schema;
+        schema.fields[1].dim = Some(dim as i64);
+        let mut c = Collection::new("c", schema).unwrap();
+        let mut snapshots = Vec::new();
+        for step in 0..80 {
+            c.insert(InsertBatch {
+                num_rows: 1,
+                columns: vec![
+                    ("id".into(), InputValues::Int(vec![step % 3])),
+                    (
+                        "v".into(),
+                        InputValues::FloatVector {
+                            dim,
+                            values: vec![step as f32; dim],
+                        },
+                    ),
+                ],
+            })
+            .unwrap();
+            let snapshot = c.read_snapshot();
+            assert!(snapshot.chunks.iter().all(|chunk| chunk.live.len <= 32));
+            assert_eq!(
+                snapshot
+                    .chunks
+                    .iter()
+                    .map(|chunk| chunk.live.len)
+                    .sum::<usize>(),
+                step as usize + 1
+            );
+            assert!(snapshot.chunks.len() <= (step as usize + 1).div_ceil(32) + 5);
+            snapshots.push(snapshot);
+        }
+        for (step, snapshot) in snapshots.iter().enumerate() {
+            assert_eq!(
+                snapshot
+                    .chunks
+                    .iter()
+                    .map(|chunk| chunk.live.len)
+                    .sum::<usize>(),
+                step + 1
+            );
+            assert_eq!(
+                snapshot
+                    .chunks
+                    .iter()
+                    .map(|chunk| (0..chunk.live.len)
+                        .filter(|&row| chunk.live.get(row))
+                        .count())
+                    .sum::<usize>(),
+                (step + 1).min(3)
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_publication_mapping_rejects_cached_reads_and_writes_before_changing_sources() {
+        use crate::{DataDir, Db};
+        for mode in 0..6 {
+            let root = tempfile::tempdir().unwrap();
+            let mut rng = Rng(5);
+            let db = Db::new(
+                DataDir::open(root.path()).unwrap(),
+                Compute::for_host().unwrap(),
+            );
+            db.create_collection("", "c", collection(&mut rng, 2).schema.clone())
+                .unwrap();
+            db.insert(
+                "",
+                "c",
+                InsertBatch {
+                    num_rows: 2,
+                    columns: vec![
+                        ("id".into(), InputValues::Int(vec![1, 2])),
+                        (
+                            "v".into(),
+                            InputValues::FloatVector {
+                                dim: 2,
+                                values: vec![1.0, 0.0, 2.0, 0.0],
+                            },
+                        ),
+                    ],
+                },
+            )
+            .unwrap();
+            let handle = db.collection("", "c").unwrap();
+            let mut c = handle.write();
+            c.persistent_mut().unwrap().freeze_active(false).unwrap();
+            let work = c.persistent().unwrap().front().unwrap();
+            let materialized = work.table.materialize(c.schema()).unwrap();
+            let mut decoded = crate::storage::arrow_data::decode_data_batch(
+                c.schema(),
+                materialized.data.as_ref().unwrap(),
+            )
+            .unwrap();
+            let mut mapping = materialized.mapping;
+            let mut norms = vec![1.0, 2.0];
+            match mode {
+                0 => mapping.swap(0, 1),
+                1 => mapping[0] = Some(8),
+                2 => mapping[0] = None,
+                3 => {
+                    mapping.pop();
+                }
+                4 => norms.clear(),
+                _ => decoded.seqs[0] += 1,
+            }
+            let manifest = c.persistent().unwrap().manifest.clone();
+            let sources: Vec<_> = c.chunks.values().map(|c| c.source).collect();
+            let seq = c.next_seq;
+            assert!(
+                c.publish_generation(
+                    &work,
+                    manifest.clone(),
+                    &mapping,
+                    Some(decoded),
+                    norms,
+                    false
+                )
+                .is_err()
+            );
+            assert_eq!(c.persistent().unwrap().manifest, manifest);
+            assert_eq!(
+                c.chunks.values().map(|c| c.source).collect::<Vec<_>>(),
+                sources
+            );
+            assert!(matches!(c.require_loaded(), Err(EngineError::Storage(_))));
+            drop(c);
+            assert!(matches!(
+                db.collection("", "c"),
+                Err(EngineError::Storage(_))
+            ));
+            assert!(matches!(
+                db.delete("", "c", &[Pk::Int64(1)]),
+                Err(EngineError::Storage(_))
+            ));
+            assert_eq!(handle.read().next_seq, seq);
+            db.close();
+        }
+    }
+
+    #[test]
     fn snapshots_share_columns_and_only_pin_get_matches() {
         let mut rng = Rng(7);
         let mut c = collection(&mut rng, 2);
         let snapshot = c.read_snapshot();
         assert_eq!(snapshot.chunks.len(), c.chunks.len());
-        for (old, current) in snapshot.chunks.iter().zip(&c.chunks) {
+        for (old, current) in snapshot.chunks.iter().zip(c.chunks.values()) {
             assert!(Arc::ptr_eq(&old.data, &current.data));
         }
         let at = c.pk_index[&Pk::Int64(1)];
@@ -1620,14 +2416,14 @@ mod tests {
         assert_eq!(get.refs.len(), 2);
         assert!(Arc::ptr_eq(
             &get.snapshot.chunks[0].data,
-            &c.chunks[at.chunk].data
+            &c.chunks[&at.chunk].data
         ));
         c.delete_at_seq(&[Pk::Int64(1)], c.next_seq).unwrap();
-        assert!(!c.chunks[at.chunk].live.get(at.row));
+        assert!(!c.chunks[&at.chunk].live.get(at.row));
         assert!(snapshot.chunks[at.chunk].live.get(at.row));
         assert!(Arc::ptr_eq(
             &snapshot.chunks[at.chunk].data,
-            &c.chunks[at.chunk].data
+            &c.chunks[&at.chunk].data
         ));
         assert_eq!(get.read().rows.pks, [Pk::Int64(1), Pk::Int64(1)]);
         assert!(
@@ -1715,7 +2511,7 @@ mod tests {
             .map(|v| {
                 let q = flat::Query::new(metric, v);
                 let mut scored = Vec::new();
-                for chunk in &c.chunks {
+                for chunk in c.chunks.values() {
                     let (dim, values) = vector_values(&chunk.columns[c.vector_pos]);
                     for row in 0..chunk.live.len {
                         if chunk.live.get(row) {
@@ -1818,7 +2614,7 @@ mod tests {
         for case in 0..3000 {
             let metric = [Metric::L2, Metric::Ip, Metric::Cosine][case % 3];
             let n = (next() % 300) as usize;
-            let scored: Vec<(f32, RowRef)> = (0..n)
+            let scored: Vec<(f32, RankedRow)> = (0..n)
                 .map(|i| {
                     let r = next();
                     let score = if r % 4 == 0 {
@@ -1828,10 +2624,13 @@ mod tests {
                     };
                     (
                         score,
-                        RowRef {
-                            order: i as u64,
-                            chunk: i / 50,
-                            row: i % 50,
+                        RankedRow {
+                            source_rank: 0,
+                            at: RowRef {
+                                order: i as u64,
+                                chunk: i / 50,
+                                row: i % 50,
+                            },
                         },
                     )
                 })
@@ -1850,8 +2649,9 @@ mod tests {
                 top.push(*s, *pos);
             }
             let got = top.finish();
-            let bits =
-                |v: &[(f32, RowRef)]| v.iter().map(|(s, p)| (s.to_bits(), *p)).collect::<Vec<_>>();
+            let bits = |v: &[(f32, RankedRow)]| {
+                v.iter().map(|(s, p)| (s.to_bits(), *p)).collect::<Vec<_>>()
+            };
             assert_eq!(bits(&got), bits(&expected), "case {case}");
         }
     }

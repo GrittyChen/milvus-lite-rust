@@ -23,6 +23,19 @@ use crate::storage::visibility::{SourceId, Visibility};
 use crate::storage::wal::{WalKind, WalWriter};
 
 #[cfg(feature = "fault-injection")]
+thread_local! {
+    static BEFORE_COMMIT_PAUSE: std::cell::RefCell<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(feature = "fault-injection")]
+pub fn pause_flush_before_commit_once(
+    entered: std::sync::mpsc::Sender<()>,
+    resume: std::sync::mpsc::Receiver<()>,
+) {
+    BEFORE_COMMIT_PAUSE.with(|slot| *slot.borrow_mut() = Some((entered, resume)));
+}
+
+#[cfg(feature = "fault-injection")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RetainedWalSyncFault {
     Data,
@@ -106,7 +119,9 @@ impl FrozenGeneration {
 pub struct FlushOutcome {
     pub manifest: Manifest,
     pub mapping: Vec<Option<usize>>,
-    pub data_rows: usize,
+    /// 与实际写出 Parquet 相同的批次，锁外解码后交给读取视图。
+    pub data: Option<DecodedData>,
+    pub norms: Vec<f32>,
     pub post_commit_error: Option<PostCommitError>,
 }
 
@@ -224,6 +239,10 @@ impl PersistentCollection {
 
     pub fn inherited_synced(&self) -> bool {
         self.inherited_synced
+    }
+
+    pub(crate) fn poison(&mut self) {
+        self.poisoned = true;
     }
 
     pub fn poisoned(&self) -> bool {
@@ -440,8 +459,9 @@ impl PersistentCollection {
         manifest: Manifest,
         mapping: &[Option<usize>],
         data_rows: usize,
+        source_rows: &[(Pk, usize)],
         after_replace_error: bool,
-    ) -> Result<(), String> {
+    ) -> Result<SourceId, String> {
         if !self
             .pending
             .front()
@@ -455,11 +475,12 @@ impl PersistentCollection {
             .next_source
             .checked_add(1)
             .ok_or("source ID space exhausted")?;
-        if let Err(error) = self.visibility.replace_source(
+        if let Err(error) = self.visibility.replace_source_known_rows(
             generation.table.source(),
             segment_source,
             data_rows,
             mapping,
+            source_rows,
         ) {
             self.poisoned = true;
             return Err(error.to_string());
@@ -473,7 +494,7 @@ impl PersistentCollection {
         if !self.retry_manifest {
             self.last_failure = None;
         }
-        Ok(())
+        Ok(segment_source)
     }
 
     pub fn failed_before_replace(&mut self, reason: impl Into<String>) {
@@ -563,10 +584,54 @@ pub fn flush_one(
             committed_manifest: None,
             cleanup_failed: false,
         })?;
-    let data_rows = materialized
+    let data = materialized
         .data
         .as_ref()
-        .map_or(0, |batch| batch.num_rows());
+        .map(|batch| arrow_data::decode_data_batch(schema, batch))
+        .transpose()
+        .map_err(|error| FlushError {
+            path: dir.to_path_buf(),
+            phase: CommitPhase::BeforeReplace,
+            reason: error.to_string(),
+            committed_manifest: None,
+            cleanup_failed: false,
+        })?;
+    let norms = match &data {
+        None => Vec::new(),
+        Some(decoded) => decoded
+            .columns
+            .iter()
+            .find_map(|column| {
+                if let ColumnData::FloatVector { dim, values } = column {
+                    Some(values.chunks_exact(*dim).map(crate::flat::norm).collect())
+                } else {
+                    None
+                }
+            })
+            .ok_or_else(|| FlushError {
+                path: dir.to_path_buf(),
+                phase: CommitPhase::BeforeReplace,
+                reason: "published data has no dense vector column".to_owned(),
+                committed_manifest: None,
+                cleanup_failed: false,
+            })?,
+    };
+    // 钩子的诊断失败必须落在提交点之前，不能跳过已提交数据的锁内发布。
+    #[cfg(feature = "fault-injection")]
+    BEFORE_COMMIT_PAUSE.with(|slot| -> Result<(), FlushError> {
+        if let Some((entered, resume)) = slot.borrow_mut().take() {
+            let error = |reason: String| FlushError {
+                path: dir.to_path_buf(),
+                phase: CommitPhase::BeforeReplace,
+                reason,
+                committed_manifest: None,
+                cleanup_failed: false,
+            };
+            entered.send(()).map_err(|cause| error(cause.to_string()))?;
+            resume.recv().map_err(|cause| error(cause.to_string()))?;
+        }
+        Ok(())
+    })?;
     generation
         .sync_and_close_wal(dir)
         .map_err(|reason| FlushError {
@@ -588,7 +653,8 @@ pub fn flush_one(
         Ok(manifest) => Ok(FlushOutcome {
             manifest,
             mapping: materialized.mapping,
-            data_rows,
+            data,
+            norms,
             post_commit_error: None,
         }),
         Err(error) if error.phase == CommitPhase::AfterReplace => {
@@ -605,7 +671,8 @@ pub fn flush_one(
             Ok(FlushOutcome {
                 manifest: (**manifest).clone(),
                 mapping: materialized.mapping,
-                data_rows,
+                data,
+                norms,
                 post_commit_error: Some(if error.cleanup_failed {
                     PostCommitError::WalCleanup(error.reason)
                 } else {

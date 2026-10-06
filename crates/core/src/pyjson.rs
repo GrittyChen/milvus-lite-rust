@@ -34,25 +34,28 @@ pub fn dumps_unicode(value: &Value) -> String {
     out
 }
 
+/// 数字文本含浮点形式标记时才进入 f64；宽整数不受浮点范围限制。
+pub(crate) fn json_float_text(raw: &str) -> Option<f64> {
+    raw.contains(['.', 'e', 'E'])
+        .then(|| raw.parse::<f64>().ok())
+        .flatten()
+}
+
 fn write_value(out: &mut String, value: &Value, ensure_ascii: bool, sort_keys: bool) {
     match value {
         Value::Null => out.push_str("null"),
         Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
         Value::Number(n) => {
             let raw = n.to_string();
-            if raw.contains(['.', 'e', 'E']) {
-                if let Ok(value) = raw.parse::<f64>() {
-                    if value.is_infinite() {
-                        out.push_str(if value.is_sign_positive() {
-                            "Infinity"
-                        } else {
-                            "-Infinity"
-                        });
+            if let Some(value) = json_float_text(&raw) {
+                if value.is_infinite() {
+                    out.push_str(if value.is_sign_positive() {
+                        "Infinity"
                     } else {
-                        out.push_str(&py_float_repr(value));
-                    }
+                        "-Infinity"
+                    });
                 } else {
-                    out.push_str(&raw);
+                    out.push_str(&py_float_repr(value));
                 }
             } else if raw == "-0" {
                 out.push('0');
@@ -135,6 +138,9 @@ mod tests {
             "\"\x5cu4e2d\x5cud83d\x5cude00\x5c\"\x5c\x5c\x5cn\x5cu0007\x5cu007f\""
         );
         assert_eq!(dumps(&json!({})), "{}");
+        // arbitrary_precision 接受标准 JSON 的大指数，兼容输出分支仍然可达。
+        let overflow: Value = serde_json::from_str("[1e999,-1e999]").unwrap();
+        assert_eq!(dumps_unicode(&overflow), "[Infinity, -Infinity]");
         let (a, z) = (json!(1), json!("s"));
         assert_eq!(
             dumps_object([("z", &z), ("a", &a)]),

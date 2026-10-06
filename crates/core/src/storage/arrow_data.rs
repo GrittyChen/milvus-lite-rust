@@ -31,6 +31,8 @@ pub enum ArrowDataError {
         #[source]
         source: serde_json::Error,
     },
+    #[error("field {name:?} contains a JSON number outside the finite float64 range: {value}")]
+    NonFiniteJsonNumber { name: String, value: String },
     #[error("field {name:?} has an incompatible Arrow type or null value")]
     TypeMismatch { name: String },
     #[error("Arrow column {position} is {actual:?}, expected {expected:?}")]
@@ -56,6 +58,65 @@ pub struct DecodedData {
 pub struct DecodedDelta {
     pub pks: Vec<Pk>,
     pub seqs: Vec<u64>,
+}
+
+fn json_strings(name: &str, values: &[Vec<u8>]) -> Result<Vec<String>, ArrowDataError> {
+    values
+        .iter()
+        .map(|raw| {
+            let value = serde_json::from_slice::<Value>(raw).map_err(|source| {
+                ArrowDataError::JsonText {
+                    name: name.to_owned(),
+                    source,
+                }
+            })?;
+            check_finite_json_numbers(name, &value)?;
+            Ok(pyjson::dumps_unicode(&value))
+        })
+        .collect()
+}
+
+fn check_finite_json_numbers(name: &str, value: &Value) -> Result<(), ArrowDataError> {
+    match value {
+        Value::Number(number) => {
+            let raw = number.to_string();
+            // 与 pyjson 的浮点分支使用同一判定；整数文本不能因超出 f64 而被拒绝。
+            if pyjson::json_float_text(&raw).is_some_and(|v| v.is_infinite()) {
+                return Err(ArrowDataError::NonFiniteJsonNumber {
+                    name: name.to_owned(),
+                    value: raw,
+                });
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                check_finite_json_numbers(name, value)?;
+            }
+        }
+        Value::Object(values) => {
+            for value in values.values() {
+                check_finite_json_numbers(name, value)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// 持久化读取视图与写出的 Arrow 批采用同一 JSON 文本，发布不改变读取字节。
+pub(crate) fn normalize_data_json(
+    schema: &CollectionSchema,
+    columns: &mut [ColumnData],
+) -> Result<(), ArrowDataError> {
+    for (field, column) in schema.fields.iter().zip(columns) {
+        if let ColumnData::Json(values) = column {
+            *values = json_strings(&field.name, values)?
+                .into_iter()
+                .map(String::into_bytes)
+                .collect();
+        }
+    }
+    Ok(())
 }
 
 pub fn data_schema(schema: &CollectionSchema) -> Result<Schema, ArrowDataError> {
@@ -370,20 +431,7 @@ fn build_batch(
             ColumnData::Float(v) => Arc::new(Float32Array::from(v.clone())),
             ColumnData::Double(v) => Arc::new(Float64Array::from(v.clone())),
             ColumnData::VarChar(v) => Arc::new(StringArray::from_iter_values(v)),
-            ColumnData::Json(v) => {
-                let strings: Vec<String> = v
-                    .iter()
-                    .map(|raw| {
-                        serde_json::from_slice::<Value>(raw)
-                            .map(|value| pyjson::dumps_unicode(&value))
-                            .map_err(|source| ArrowDataError::JsonText {
-                                name: field.name.clone(),
-                                source,
-                            })
-                    })
-                    .collect::<Result<_, _>>()?;
-                Arc::new(StringArray::from(strings))
-            }
+            ColumnData::Json(v) => Arc::new(StringArray::from(json_strings(&field.name, v)?)),
             ColumnData::FloatVector { dim, values } => {
                 let dim = i32::try_from(*dim)
                     .ok()
@@ -656,6 +704,39 @@ mod tests {
     use crate::schema::FieldSchema;
 
     use super::*;
+
+    #[test]
+    fn json_overflow_rejects_nested_floats_but_keeps_wide_integers_and_literal_strings() {
+        for raw in [r#"{"a":1e999}"#, r#"[0,{"a":-1e999}]"#, "1E999"] {
+            assert!(matches!(
+                json_strings("j", &[raw.as_bytes().to_vec()]),
+                Err(ArrowDataError::NonFiniteJsonNumber { .. })
+            ));
+        }
+        let cases = [
+            (r#"{"a":1e5}"#, r#"{"a": 100000.0}"#),
+            (r#"{"a":1e-999}"#, r#"{"a": 0.0}"#),
+            (
+                r#"{"a":9223372036854775808}"#,
+                r#"{"a": 9223372036854775808}"#,
+            ),
+            (
+                r#"{"a":"Infinity","b":"三"}"#,
+                r#"{"a": "Infinity", "b": "三"}"#,
+            ),
+        ];
+        for (raw, expected) in cases {
+            assert_eq!(
+                json_strings("j", &[raw.as_bytes().to_vec()]).unwrap(),
+                [expected]
+            );
+        }
+        let huge_integer = "9".repeat(400);
+        assert_eq!(
+            json_strings("j", &[huge_integer.as_bytes().to_vec()]).unwrap(),
+            [huge_integer]
+        );
+    }
 
     #[test]
     fn m1_dense_schema_matches_3x_wal_columns() {

@@ -68,7 +68,7 @@ pub enum ColumnData {
     Float(Vec<f32>),
     Double(Vec<f64>),
     VarChar(Vec<String>),
-    /// 校验过的 JSON 文本，原样保存。
+    /// 校验过的 JSON 文本；持久化读取视图与 Arrow 批使用同一文本（0007）。
     Json(Vec<Vec<u8>>),
     FloatVector {
         dim: usize,
@@ -132,6 +132,25 @@ impl ColumnData {
             // 同一字段的存储列与输出列都由 ColumnData::empty(field) 创建，变体一致。
             _ => unreachable!("column type mismatch within one schema field"),
         }
+    }
+
+    /// 同一 schema 的相邻块只拼接，保留失效行与物理行号。
+    pub(crate) fn append_column(&mut self, src: &ColumnData) {
+        macro_rules! append {
+            ($($variant:ident),*) => {
+                match (self, src) {
+                    $((Self::$variant(dst), Self::$variant(source)) => dst.extend_from_slice(source),)*
+                    (Self::FloatVector { dim, values: dst }, Self::FloatVector { dim: other, values: source }) => {
+                        assert_eq!(dim, other, "columns of one field have the same dimension");
+                        dst.extend_from_slice(source);
+                    }
+                    _ => unreachable!("columns of one field have the same type"),
+                }
+            };
+        }
+        append!(
+            Bool, Int8, Int16, Int32, Int64, Float, Double, VarChar, Json
+        );
     }
 }
 

@@ -104,6 +104,70 @@ fn varchar_get_pins_remapped_blocks_and_keeps_duplicate_input_order() {
     }
 }
 
+#[cfg(feature = "fault-injection")]
+#[test]
+fn publication_maps_latest_visibility_after_writes_in_the_next_generation() {
+    use milvus_lite_core::storage::runtime::pause_flush_before_commit_once;
+    let root = tempfile::tempdir().unwrap();
+    let db = Arc::new(Db::new(
+        DataDir::open(root.path()).unwrap(),
+        Compute::for_host().unwrap(),
+    ));
+    db.create_collection("", "c", schema()).unwrap();
+    for id in [3, 1, 2] {
+        db.insert("", "c", batch(&[id], 1.0)).unwrap();
+    }
+    let handle = db.collection("", "c").unwrap();
+    let old = handle.read().read_snapshot();
+    let expected_old = old.search(request(), db.compute()).unwrap();
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (resume_tx, resume_rx) = mpsc::channel();
+    let flushing_db = Arc::clone(&db);
+    let flush = std::thread::spawn(move || {
+        pause_flush_before_commit_once(entered_tx, resume_rx);
+        flushing_db.flush_collection("", "c").unwrap();
+    });
+    entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    db.insert("", "c", batch(&[3], 4.0)).unwrap();
+    db.delete("", "c", &[Pk::Int64(1)]).unwrap();
+    db.upsert_with_pk_type("", "c", batch(&[2], 5.0)).unwrap();
+    db.insert("", "c", batch(&[1], 6.0)).unwrap();
+    let before_publish = handle.read().read_snapshot();
+    let expected_new = before_publish.search(request(), db.compute()).unwrap();
+    resume_tx.send(()).unwrap();
+    flush.join().unwrap();
+    assert_eq!(
+        handle.read().search(request(), db.compute()).unwrap(),
+        expected_new
+    );
+    assert_eq!(
+        before_publish.search(request(), db.compute()).unwrap(),
+        expected_new
+    );
+    assert_eq!(old.search(request(), db.compute()).unwrap(), expected_old);
+    db.flush_collection("", "c").unwrap();
+    assert_eq!(
+        handle.read().search(request(), db.compute()).unwrap(),
+        expected_new
+    );
+    assert_eq!(handle.read().count(), 3);
+    db.close();
+    let reopened = Db::new(
+        DataDir::open(root.path()).unwrap(),
+        Compute::for_host().unwrap(),
+    );
+    assert_eq!(
+        reopened
+            .collection("", "c")
+            .unwrap()
+            .read()
+            .search(request(), reopened.compute())
+            .unwrap(),
+        expected_new
+    );
+    reopened.close();
+}
+
 #[test]
 fn locked_snapshot_acquisition_then_unlocked_read_survives_mutation_publication_and_drop() {
     // 分别钉住活跃代与已提交数据；重复请求主键与缺失主键同时验收 Get。
@@ -240,5 +304,43 @@ fn pending_generation_snapshot_survives_pre_and_post_commit_failure_then_retry()
             expected
         );
         db.close();
+    }
+}
+
+#[cfg(feature = "fault-injection")]
+#[test]
+fn disconnected_flush_pause_stays_before_commit_and_can_retry() {
+    use milvus_lite_core::storage::runtime::pause_flush_before_commit_once;
+    for dropped_entered in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let db = Db::new(
+            DataDir::open(root.path()).unwrap(),
+            Compute::for_host().unwrap(),
+        );
+        db.create_collection("", "c", schema()).unwrap();
+        db.insert("", "c", batch(&[1], 1.0)).unwrap();
+        db.flush_collection("", "c").unwrap();
+        db.insert("", "c", batch(&[2], 1.0)).unwrap();
+        let manifest = root.path().join("collections/c/manifest.json");
+        let original = std::fs::read(&manifest).unwrap();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        drop(resume_tx);
+        if dropped_entered {
+            drop(entered_rx);
+        }
+        pause_flush_before_commit_once(entered_tx, resume_rx);
+        let error = db.flush_collection("", "c").unwrap_err().to_string();
+        assert!(error.contains("BeforeReplace"), "{error}");
+        assert_eq!(std::fs::read(&manifest).unwrap(), original);
+        assert_eq!(db.collection("", "c").unwrap().read().count(), 2);
+        db.flush_collection("", "c").unwrap();
+        db.close();
+        let reopened = Db::new(
+            DataDir::open(root.path()).unwrap(),
+            Compute::for_host().unwrap(),
+        );
+        assert_eq!(reopened.collection("", "c").unwrap().read().count(), 2);
+        reopened.close();
     }
 }
