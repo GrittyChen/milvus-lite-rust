@@ -3,7 +3,9 @@
 import io
 import json
 import os
+import shutil
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import grpc
@@ -84,6 +86,100 @@ def schema(auto_id=False):
     s.add_field("id", DataType.INT64, is_primary=True, auto_id=auto_id)
     s.add_field("vector", DataType.FLOAT_VECTOR, dim=2)
     return s
+
+
+def test_concurrent_lazy_opens_preserve_rows_and_same_name_recreation(pair):
+    diff = pair.open()
+    for name in ["a", "b"]:
+        diff.step(name + "_create", lambda c: c.create_collection(name, schema=schema(), index_params=index("L2")))
+        diff.step(name + "_insert", lambda c: c.insert(name, [{"id": 1, "vector": [1.0, 0.0]}]))
+    pair.close()
+    diff = pair.open()
+
+    def concurrent_counts(c):
+        names = ["a", "a", "b", "b"] * 4
+        with ThreadPoolExecutor(max_workers=8) as workers:
+            return list(workers.map(lambda name: c.query(name, filter="", output_fields=["count(*)"]), names))
+
+    # Rust 的并发首次打开由受控 core 用例证明；参照侧串行取基准，避免触发其重复实例缺陷。
+    expected = [diff.ref.query(name, filter="", output_fields=["count(*)"]) for name in ["a", "a", "b", "b"] * 4]
+    assert repr(concurrent_counts(diff.rust)) == repr(expected)
+    for name in ["a", "b"]:
+        diff.step(name + "_unloaded", lambda c: c.get_load_state(name))
+        diff.step(name + "_load", lambda c: c.load_collection(name))
+        assert diff.step(name + "_get", lambda c: c.get(name, ids=[1], output_fields=["id"])) == ("ok", [{"id": 1}])
+    diff.step("drop_a", lambda c: c.drop_collection("a"))
+    diff.step("recreate_a", lambda c: c.create_collection("a", schema=schema(), index_params=index("L2")))
+    assert diff.step("new_a_empty", lambda c: c.query("a", filter="", output_fields=["count(*)"])) == ("ok", [{"count(*)": 0}])
+    assert diff.step("b_untouched", lambda c: c.get("b", ids=[1], output_fields=["id"])) == ("ok", [{"id": 1}])
+
+
+@pytest.mark.parametrize("bad_schema", [b"{", b"[]", b"{}"], ids=["syntax", "shape", "required-field"])
+def test_cached_fail_closed_survives_external_repair_until_recreation(pair, bad_schema):
+    diff = pair.open()
+    for name in ["a", "b"]:
+        diff.step(name + "_create", lambda c: c.create_collection(name, schema=schema(), index_params=index("L2")))
+        diff.step(name + "_insert", lambda c: c.insert(name, [{"id": 1, "vector": [1.0, 0.0]}]))
+    pair.close()
+    paths = [Path(root) / "collections/a/schema.json" for root in [pair.rust_path, pair.ref_path]]
+    originals = [path.read_bytes() for path in paths]
+    for path in paths:
+        path.write_bytes(bad_schema)
+    diff = pair.open()
+    count = lambda c: c.query("a", filter="", output_fields=["count(*)"])
+    first = run(count, diff.rust)
+    # 0006「schema.json 的 JSON 语法错误」登记既有的磁盘错误与 schema 校验错误映射差异。
+    assert first[:3] == ("err", 1, 0)
+    assert run(count, diff.ref)[:3] == ("err", 6, 6)
+    assert all(path.read_bytes() == bad_schema for path in paths)
+    for path, original in zip(paths, originals):
+        path.write_bytes(original)
+    # 0006 登记的缓存差异：外部修复不使同一服务实例重新解析；3.x 再次访问即可打开。
+    assert run(count, diff.rust) == first
+    assert run(count, diff.ref) == ("ok", [{"count(*)": 1}])
+    assert diff.step("healthy_b", lambda c: c.query("b", filter="", output_fields=["count(*)"])) == ("ok", [{"count(*)": 1}])
+    diff.step("drop_cached_a", lambda c: c.drop_collection("a"))
+    diff.step("recreate_a", lambda c: c.create_collection("a", schema=schema(), index_params=index("L2")))
+    assert diff.step("fresh_a", count) == ("ok", [{"count(*)": 0}])
+
+
+@pytest.mark.parametrize("change", ["move", "delete"])
+def test_cached_failure_does_not_mask_externally_removed_directory(pair, change):
+    diff = pair.open()
+    diff.step("create", lambda c: c.create_collection("a", schema=schema(), index_params=index("L2")))
+    diff.step("insert", lambda c: c.insert("a", [{"id": 1, "vector": [1.0, 0.0]}]))
+    pair.close()
+    directories = [Path(root) / "collections/a" for root in [pair.rust_path, pair.ref_path]]
+    originals = [(directory / "schema.json").read_bytes() for directory in directories]
+    for directory in directories:
+        (directory / "schema.json").write_bytes(b"{")
+    diff = pair.open()
+    count = lambda c: c.query("a", filter="", output_fields=["count(*)"])
+    first = run(count, diff.rust)
+    assert first[:3] == ("err", 1, 0)
+    assert run(count, diff.ref)[:3] == ("err", 6, 6)
+    saved = []
+    for directory in directories:
+        target = directory.parent.parent / "saved-a"
+        if change == "move":
+            directory.rename(target)
+            saved.append(target)
+        else:
+            shutil.rmtree(directory)
+    assert diff.step("absent_has", lambda c: c.has_collection("a")) == ("ok", False)
+    assert diff.step("absent_describe", lambda c: c.describe_collection("a"), error=True) == ("err", 100, 4, "collection 'a' does not exist")
+    assert str(diff.step("absent_load_state", lambda c: c.get_load_state("a"))[1]["state"]) == "NotExist"
+    assert diff.step("absent_stats", lambda c: c.get_collection_stats("a"), error=True) == ("err", 100, 4, "collection 'a' does not exist")
+    if change == "move":
+        for target, directory, original in zip(saved, directories, originals):
+            target.rename(directory)
+            (directory / "schema.json").write_bytes(original)
+        # 0006 的缓存边界：不存在时不报旧错误，但移回修复后的路径并不清除判定。
+        assert run(count, diff.rust) == first
+        assert run(count, diff.ref) == ("ok", [{"count(*)": 1}])
+    diff.step("drop", lambda c: c.drop_collection("a"))
+    diff.step("recreate", lambda c: c.create_collection("a", schema=schema(), index_params=index("L2")))
+    assert diff.step("new_count", count) == ("ok", [{"count(*)": 0}])
 
 
 def raw_upsert(uri, pk=None):

@@ -551,7 +551,9 @@ M1 证明了整条链路可行，但数据只在内存中，不发布（[0004](0
 | 并发首次打开、并发写入 | 两个实例；WAL 损坏，崩溃后丢数据 | 互斥 | 缺陷 d、e | 多线程客户端 |
 | 读取含重复 (pk, `_seq`) 或重复路径的目录 | 计两次 | 计一次 | 缺陷 a 留下的数据 | 3.x 在缺陷 a 的崩溃点中断过的目录 |
 | manifest 解析失败、`manifest.json` 缺失而 `.prev` 存在、引用的文件缺失、Parquet 损坏、snapshot 元数据无法解析 | 回退 `.prev` 并删文件；读 `.prev`；静默少数据；每个 RPC 报 code 1；静默跳过这个 snapshot | 该 collection fail-closed，不删文件；DescribeCollection 与 drop 照常 | 规则 5，第 11 项 | 损坏的目录 |
+| `schema.json` 的 JSON 语法错误、根节点不是对象或顶层必需字段缺失（不含下述未知键/dtype 判定） | `SchemaValidationError`，引擎分支 RPC 返回 code 6 / error_code 6，并带 schema 校验诊断 | 按磁盘格式错误返回 code 1 / error_code 0，信息带 `storage error:`；该 collection fail-closed，不改文件 | 区分用户建表参数校验与已有目录损坏，保留既有恢复错误分类 | [test_reopen.py](../../tests/differential/test_reopen.py) 的损坏 schema 首次访问与缓存断言；两侧分别固定状态码 |
 | WAL 读取遇到真实 I/O 错误 | 忽略，保留前缀 | 该 collection 打开失败，下次访问重试 | 规则 5 | I/O 故障 |
+| 首次打开失败、尚未登记句柄，且确定性 fail-closed 判定已缓存之后，外部工具改变同名目录 | 修复后再次尝试打开；删除或移走目录后按 collection 不存在处理 | 先检查精确名字与目录/schema 是否仍存在，再读取缓存；删除或移走后按不存在处理，缓存保留。路径重新出现或原地修复后仍返回原错误类型与信息；重建服务实例或同名 drop/create 清除判定。真实 I/O 与清理扫描故障不缓存 | 缓存不能掩盖不存在的 collection；也不因任意外部替换就重新信任同名目录，避免每个 RPC 重复解析无法安全处理的内容，[0007「打开」](0007-m2-storage-engine.md#打开) | 修复 schema/manifest/snapshot、补回引用文件、删除或移走后再次访问；缓存、重试、移回路径及同名重建用例固定边界 |
 | 孤儿清理路径的目录形态异常 | `os.path.isdir` 跳过非目录的 data/delta/indexes 路径，跟随目录符号链接；清理可能删除链接目标中的库外文件 | `partitions/`、`partitions/_default/` 与 data/delta/indexes 必须是真目录；符号链接或其他非目录形态使该 collection fail-closed，删除前即拒绝打开 | 防止孤儿清理穿透托管目录；这会使本仓加入清理前可读取的软链目录不再可用，[0007「打开」](0007-m2-storage-engine.md#打开) | 存量目录将分区目录或扫描目录软链到别处，或扫描路径被普通文件占据；相关目录形态反证测试固定拒绝行为 |
 | 损坏的 WAL 在哪里判定出错 | 按 pyarrow 的校验 | 按 arrow-rs 的校验，可能不同；本实现从较短的前缀续号时，3.x 之后可能看到两条操作共用一个 `_seq` | 两边的校验项不同 | 损坏的目录 |
 | manifest、schema 或 snapshot 元数据中有未知的键 | 能打开，重写时丢掉这些键 | 该 collection fail-closed，返回 UNIMPLEMENTED。`schema.json` 中有未知的键时，DescribeCollection 也报错，`has_collection` 抛异常；只有 manifest 或 snapshot 元数据中有时，DescribeCollection 照常 | 第 14 项 | 3.x 新版本写出的目录 |
