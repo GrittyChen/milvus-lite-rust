@@ -1,14 +1,61 @@
 # 复制自 milvus-lite v3.2.1（43d1257）的 tests/adapter/test_issue_fixes.py，Apache-2.0 许可。
-# 只保留 M1 范围内的用例（逐条状态见 INVENTORY.md），并删去随之不再使用的 import、helper 与分节标题。
-# 改动：`<pk> == N` 换成 `<pk> in [N]`（M1 只识别 `<主键> in [...]`）。
-# 改动：上游的 importorskip 改为直接导入（本仓不允许因缺依赖静默跳过）。
+# 仅保留 INVENTORY.md 中已复用的用例；S1 表达式及断言保持上游原文。
+# 直接导入依赖；FLAT 不需要 faiss，移除上游的 faiss 跳过条件。
 """Tests for GitHub issue fixes #1-#7."""
 
 import numpy as np
 import pytest
 
-# 上游在此 importorskip pymilvus 与 grpc；本仓的规则不允许因缺依赖静默跳过，改为直接导入。
 from pymilvus import MilvusClient, DataType
+
+
+# ---------------------------------------------------------------------------
+# #1: Dynamic field values returned in query output
+# ---------------------------------------------------------------------------
+
+def test_dynamic_field_query_output(milvus_client):
+    """Issue #1: Dynamic field values must be returned in query output."""
+    schema = MilvusClient.create_schema(enable_dynamic_field=True)
+    schema.add_field("id", DataType.INT64, is_primary=True)
+    schema.add_field("vec", DataType.FLOAT_VECTOR, dim=4)
+    milvus_client.create_collection("dyn_test", schema=schema)
+    milvus_client.insert("dyn_test", [
+        {"id": 1, "vec": [1, 0, 0, 0], "category": "tech", "level": 5},
+        {"id": 2, "vec": [0, 1, 0, 0], "category": "news", "level": 3},
+    ])
+    idx = milvus_client.prepare_index_params()
+    idx.add_index(field_name="vec", index_type="FLAT",
+                  metric_type="COSINE", params={})
+    milvus_client.create_index("dyn_test", idx)
+    milvus_client.load_collection("dyn_test")
+
+    # Query with dynamic field in output_fields
+    rows = milvus_client.query("dyn_test", filter="id >= 1",
+                                output_fields=["category", "level"], limit=10)
+    assert len(rows) == 2
+    for r in rows:
+        assert "category" in r
+        assert "level" in r
+    assert rows[0]["category"] in ("tech", "news")
+
+    # Search with dynamic field in output_fields
+    results = milvus_client.search("dyn_test", data=[[1, 0, 0, 0]], limit=2,
+                                    output_fields=["category"])
+    assert "category" in results[0][0]["entity"]
+
+    milvus_client.drop_collection("dyn_test")
+
+
+# ---------------------------------------------------------------------------
+# #2: Multiple FLOAT_VECTOR fields
+# ---------------------------------------------------------------------------
+
+
+
+# ---------------------------------------------------------------------------
+# #3: IP distance sign
+# ---------------------------------------------------------------------------
+
 
 
 # ---------------------------------------------------------------------------
@@ -54,6 +101,12 @@ def test_describe_index_by_field_name(milvus_client):
     assert info is not None
 
     milvus_client.drop_collection("idx_desc")
+
+
+# ---------------------------------------------------------------------------
+# #7: AUTOINDEX uses HNSW when faiss available
+# ---------------------------------------------------------------------------
+
 
 
 # ---------------------------------------------------------------------------
@@ -151,10 +204,9 @@ def test_dynamic_wildcard_and_meta_search_output(milvus_client, suffix, fields):
     assert entity["page"] == 1
     assert entity["source"] == "test"
 
-    # 上游为 filter="id == 1"：M1 只识别 <pk> in [...]，单个主键时二者结果相同
     rows = milvus_client.query(
         name,
-        filter="id in [1]",
+        filter="id == 1",
         output_fields=fields,
         limit=1,
     )

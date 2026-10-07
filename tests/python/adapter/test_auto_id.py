@@ -1,5 +1,5 @@
 # 复制自 milvus-lite v3.2.1（43d1257）的 tests/adapter/test_auto_id.py，Apache-2.0 许可。
-# 只保留 M1 范围内的用例（逐条状态见 INVENTORY.md），并删去随之不再使用的 import、helper 与分节标题。
+# 仅保留 INVENTORY.md 中已复用的用例；S1 表达式及断言保持上游原文。
 """Phase 15 — Auto ID tests.
 
 Covers:
@@ -13,6 +13,12 @@ Covers:
 """
 
 from pymilvus import DataType, MilvusClient
+
+
+# ---------------------------------------------------------------------------
+# Engine-level tests
+# ---------------------------------------------------------------------------
+
 
 
 # ---------------------------------------------------------------------------
@@ -66,6 +72,36 @@ def test_grpc_auto_id_search(milvus_client):
     assert len(results[0]) == 3
 
     milvus_client.drop_collection("auto_search")
+
+
+def test_grpc_auto_id_query(milvus_client):
+    """Query on auto_id collection via pymilvus."""
+    schema = MilvusClient.create_schema(auto_id=False)
+    schema.add_field("id", DataType.INT64, is_primary=True, auto_id=True)
+    schema.add_field("vec", DataType.FLOAT_VECTOR, dim=4)
+    schema.add_field("tag", DataType.INT64)
+    milvus_client.create_collection("auto_query", schema=schema)
+
+    result = milvus_client.insert("auto_query", [
+        {"vec": [1, 0, 0, 0], "tag": 10},
+        {"vec": [0, 1, 0, 0], "tag": 20},
+    ])
+    auto_ids = result["ids"]
+
+    idx = milvus_client.prepare_index_params()
+    idx.add_index(field_name="vec", index_type="BRUTE_FORCE",
+                  metric_type="COSINE", params={})
+    milvus_client.create_index("auto_query", idx)
+    milvus_client.load_collection("auto_query")
+
+    # Query by filter
+    rows = milvus_client.query("auto_query", filter="tag == 10",
+                               output_fields=["tag"], limit=10)
+    assert len(rows) == 1
+    assert rows[0]["tag"] == 10
+    assert rows[0]["id"] == auto_ids[0]
+
+    milvus_client.drop_collection("auto_query")
 
 
 def test_grpc_auto_id_ids_increasing(milvus_client):

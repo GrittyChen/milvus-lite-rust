@@ -1,6 +1,5 @@
 # 复制自 milvus-lite v3.2.1（43d1257）的 tests/adapter/test_dynamic_field_coverage.py，Apache-2.0 许可。
-# 只保留 M1 范围内的用例（逐条状态见 INVENTORY.md），并删去随之不再使用的 import、helper 与分节标题。
-# 改动：`<pk> == N` 换成 `<pk> in [N]`（M1 只识别 `<主键> in [...]`）。
+# 只保留当前支持范围内的用例（逐条状态见 INVENTORY.md），并删去随之不再使用的 import、helper 与分节标题。
 """Comprehensive dynamic-field regression coverage through pymilvus."""
 
 import pytest
@@ -96,9 +95,8 @@ def test_dynamic_get_projection(milvus_client, fields, expected, absent):
 def test_dynamic_wildcard_preserves_all_json_types(milvus_client, fields):
     name = _create_dynamic_collection(milvus_client, "dynamic_wildcard_types")
 
-    # 上游为 filter="id == 1"：M1 只识别 <pk> in [...]，单个主键时二者结果相同
     row = milvus_client.query(
-        name, filter="id in [1]", output_fields=fields, limit=1
+        name, filter="id == 1", output_fields=fields, limit=1
     )[0]
 
     assert row["page"] == 1 and isinstance(row["page"], int)

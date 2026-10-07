@@ -1,6 +1,5 @@
 # 复制自 milvus-lite v3.2.1（43d1257）的 tests/adapter/test_crud_alignment.py，Apache-2.0 许可。
-# 只保留 M1 范围内的用例（逐条状态见 INVENTORY.md），并删去随之不再使用的 import、helper 与分节标题。
-# 改动：`<pk> == N` 换成 `<pk> in [N]`（M1 只识别 `<主键> in [...]`）。
+# 仅保留 INVENTORY.md 中已复用的用例；S1 表达式及断言保持上游原文。
 """CRUD alignment tests — gaps fixed between MilvusLite and pymilvus.
 
 1. delete(filter=...) without load
@@ -36,8 +35,53 @@ def _load(client, name):
 
 
 # ---------------------------------------------------------------------------
+# 1. Delete by filter without load
+# ---------------------------------------------------------------------------
+
+def test_delete_by_filter_without_load(milvus_client):
+    """delete(filter=...) should work without explicit load_collection."""
+    _setup(milvus_client, "del_nol")
+    # Do NOT call load_collection
+    milvus_client.delete("del_nol", filter="score >= 50")
+
+    # Now load and verify
+    _load(milvus_client, "del_nol")
+    rows = milvus_client.query("del_nol", filter="id >= 0",
+                               output_fields=["id"], limit=100)
+    ids = {r["id"] for r in rows}
+    # ids 5-9 had score 50-90, should be deleted
+    for i in range(5, 10):
+        assert i not in ids
+    # ids 0-4 should remain
+    for i in range(5):
+        assert i in ids
+    milvus_client.drop_collection("del_nol")
+
+
+# ---------------------------------------------------------------------------
 # 2. count(*) aggregation
 # ---------------------------------------------------------------------------
+
+def test_query_count_star(milvus_client):
+    """query(output_fields=['count(*)']) returns row count."""
+    _setup(milvus_client, "cnt1")
+    _load(milvus_client, "cnt1")
+    result = milvus_client.query("cnt1", filter="id >= 0",
+                                 output_fields=["count(*)"])
+    assert len(result) == 1
+    assert result[0]["count(*)"] == 10
+    milvus_client.drop_collection("cnt1")
+
+
+def test_query_count_star_with_filter(milvus_client):
+    """count(*) respects filter expression."""
+    _setup(milvus_client, "cnt2")
+    _load(milvus_client, "cnt2")
+    result = milvus_client.query("cnt2", filter="score >= 50",
+                                 output_fields=["count(*)"])
+    assert result[0]["count(*)"] == 5  # ids 5-9
+    milvus_client.drop_collection("cnt2")
+
 
 def test_query_count_star_no_filter(milvus_client):
     """count(*) with empty filter returns total count."""
@@ -96,8 +140,7 @@ def test_query_wildcard_output_fields(milvus_client):
     """query(output_fields=['*']) returns all schema fields."""
     _setup(milvus_client, "wc1")
     _load(milvus_client, "wc1")
-    # 上游为 filter="id == 0"：M1 只识别 <pk> in [...]，单个主键时二者结果相同
-    rows = milvus_client.query("wc1", filter="id in [0]",
+    rows = milvus_client.query("wc1", filter="id == 0",
                                output_fields=["*"])
     assert len(rows) == 1
     r = rows[0]

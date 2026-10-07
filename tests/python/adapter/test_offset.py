@@ -1,5 +1,5 @@
 # 复制自 milvus-lite v3.2.1（43d1257）的 tests/adapter/test_offset.py，Apache-2.0 许可。
-# 只保留 M1 范围内的用例（逐条状态见 INVENTORY.md），并删去随之不再使用的 import、helper 与分节标题。
+# 仅保留 INVENTORY.md 中已复用的用例；S1 表达式及断言保持上游原文。
 """Phase 17 — Search/Query offset pagination tests.
 
 Covers:
@@ -44,6 +44,17 @@ def test_grpc_search_offset(milvus_client):
     for h in off_res[0]:
         assert h["id"] not in top3_ids
     milvus_client.drop_collection("off_search")
+
+
+def test_grpc_query_offset(milvus_client):
+    _setup(milvus_client, "off_query")
+    all_rows = milvus_client.query("off_query", filter="id >= 0",
+                                   output_fields=["id"], limit=20)
+    off_rows = milvus_client.query("off_query", filter="id >= 0",
+                                   output_fields=["id"],
+                                   limit=5, offset=3)
+    assert len(off_rows) == 5
+    milvus_client.drop_collection("off_query")
 
 
 def test_grpc_search_offset_empty(milvus_client):

@@ -1,7 +1,7 @@
 # 复制自 milvus-lite v3.2.1（43d1257）的 tests/adapter/test_milvus_compat.py，Apache-2.0 许可。
-# 只保留 M1 范围内的用例（逐条状态见 INVENTORY.md），并删去随之不再使用的 import、helper 与分节标题。
-# 改动：HNSW 换成 FLAT（M1 只有 FLAT，用例少于 1 万行时 3.x 不会 flush，结果不变）。
-# 改动：删去上游因 HNSW 需要 faiss 而加的 skipif（它导入了 3.x 内部模块）。
+# 仅保留 INVENTORY.md 中已复用的用例；S1 表达式及断言保持上游原文。
+# HNSW 换成 FLAT 并去除 HNSW 参数；小数据集在 3.x 的 MemTable 上按相同度量检索。
+# 直接导入依赖；FLAT 不需要 faiss，移除上游的 faiss 跳过条件。
 """Milvus pymilvus compatibility tests — adapted from milvus-io/milvus
 python_client/milvus_client/ test suite.
 
@@ -27,6 +27,8 @@ Skipped automatically when pymilvus / faiss-cpu is not installed.
 import numpy as np
 import pytest
 from pymilvus import DataType, MilvusClient
+
+
 
 DIM = 8
 NB = 200  # small but enough to exercise filters meaningfully
@@ -71,9 +73,6 @@ def _create_loaded(client, name, rows=None, metric="COSINE", dynamic=False):
     client.create_collection(name, schema=_schema(client, dynamic=dynamic))
     client.insert(name, rows)
     idx = client.prepare_index_params()
-    # 上游为 HNSW（M=16、efConstruction=200）。M1 只有 FLAT；用例都少于 1 万行，3.x 不会
-    # flush，一直在 memtable 上暴力检索，换成 FLAT 不改变结果。上游因 HNSW 需要 faiss 而加的
-    # skipif 随之去掉。
     idx.add_index(field_name="vec", index_type="FLAT", metric_type=metric,
                   params={})
     client.create_index(name, idx)
@@ -86,6 +85,12 @@ def _create_loaded(client, name, rows=None, metric="COSINE", dynamic=False):
 # ===========================================================================
 
 class TestInsert:
+    def test_insert_and_count(self, milvus_client):
+        rows = _create_loaded(milvus_client, "ins1")
+        result = milvus_client.query("ins1", filter="id >= 0", output_fields=["id"])
+        assert len(result) == NB
+        milvus_client.drop_collection("ins1")
+
     def test_insert_string_pk(self, milvus_client):
         schema = MilvusClient.create_schema(auto_id=False)
         schema.add_field("pk", DataType.VARCHAR, is_primary=True, max_length=64)
@@ -95,6 +100,24 @@ class TestInsert:
         res = milvus_client.insert("strpk", rows)
         assert res["insert_count"] == 10
         milvus_client.drop_collection("strpk")
+
+    def test_insert_multiple_batches(self, milvus_client):
+        milvus_client.create_collection("batch", schema=_schema(milvus_client))
+        for batch in range(5):
+            rows = _gen_rows(n=20, rng=np.random.default_rng(batch))
+            # Offset ids to avoid pk collision
+            for i, r in enumerate(rows):
+                r["id"] = batch * 20 + i
+            milvus_client.insert("batch", rows)
+        idx = milvus_client.prepare_index_params()
+        idx.add_index(field_name="vec", index_type="FLAT", metric_type="L2",
+                      params={})
+        milvus_client.create_index("batch", idx)
+        milvus_client.load_collection("batch")
+        result = milvus_client.query("batch", filter="id >= 0", output_fields=["id"])
+        assert len(result) == 100
+        milvus_client.drop_collection("batch")
+
 
 # ===========================================================================
 # 2. SEARCH — basic, filters, metrics, multi-query, output_fields
@@ -125,6 +148,46 @@ class TestSearch:
         res = milvus_client.search(f"met_{metric}", data=q, limit=5)
         assert len(res[0]) == 5
         milvus_client.drop_collection(f"met_{metric}")
+
+    def test_search_with_filter_int(self, milvus_client):
+        _create_loaded(milvus_client, "filt_int")
+        q = _rng().standard_normal((1, DIM)).astype(np.float32).tolist()
+        res = milvus_client.search(
+            "filt_int", data=q, limit=50,
+            filter="id >= 100",
+            output_fields=["id"],
+        )
+        for hit in res[0]:
+            assert hit["entity"]["id"] >= 100
+        milvus_client.drop_collection("filt_int")
+
+    def test_search_with_filter_bool(self, milvus_client):
+        _create_loaded(milvus_client, "filt_bool")
+        q = _rng().standard_normal((1, DIM)).astype(np.float32).tolist()
+        res = milvus_client.search(
+            "filt_bool", data=q, limit=50,
+            filter="bool_field == true",
+            output_fields=["bool_field"],
+        )
+        for hit in res[0]:
+            assert hit["entity"]["bool_field"] is True
+        milvus_client.drop_collection("filt_bool")
+
+
+
+    def test_search_with_filter_in(self, milvus_client):
+        _create_loaded(milvus_client, "filt_in")
+        q = _rng().standard_normal((1, DIM)).astype(np.float32).tolist()
+        target_ids = [10, 20, 30, 40, 50]
+        res = milvus_client.search(
+            "filt_in", data=q, limit=50,
+            filter=f"id in {target_ids}",
+            output_fields=["id"],
+        )
+        for hit in res[0]:
+            assert hit["entity"]["id"] in target_ids
+        milvus_client.drop_collection("filt_in")
+
 
     def test_search_multi_query(self, milvus_client):
         rows = _create_loaded(milvus_client, "multi_q", metric="L2")
@@ -162,6 +225,18 @@ class TestSearch:
 # ===========================================================================
 
 class TestQuery:
+    def test_query_all(self, milvus_client):
+        _create_loaded(milvus_client, "qa")
+        rows = milvus_client.query("qa", filter="id >= 0", output_fields=["id"])
+        assert len(rows) == NB
+        milvus_client.drop_collection("qa")
+
+    def test_query_with_limit(self, milvus_client):
+        _create_loaded(milvus_client, "ql")
+        rows = milvus_client.query("ql", filter="id >= 0", limit=10, output_fields=["id"])
+        assert len(rows) == 10
+        milvus_client.drop_collection("ql")
+
     def test_query_id_in_list(self, milvus_client):
         _create_loaded(milvus_client, "qid")
         rows = milvus_client.query(
@@ -171,6 +246,30 @@ class TestQuery:
         ids = sorted(r["id"] for r in rows)
         assert ids == [5, 10, 15]
         milvus_client.drop_collection("qid")
+
+    def test_query_range_expression(self, milvus_client):
+        _create_loaded(milvus_client, "qr")
+        rows = milvus_client.query(
+            "qr", filter="float_field >= 50.0 and float_field < 60.0",
+            output_fields=["id", "float_field"],
+        )
+        for r in rows:
+            assert 50.0 <= r["float_field"] < 60.0
+        assert len(rows) == 10
+        milvus_client.drop_collection("qr")
+
+
+    def test_query_bool_filter(self, milvus_client):
+        _create_loaded(milvus_client, "qb")
+        rows = milvus_client.query(
+            "qb", filter="bool_field == false",
+            output_fields=["id", "bool_field"],
+        )
+        for r in rows:
+            assert r["bool_field"] is False
+        assert len(rows) == NB // 2
+        milvus_client.drop_collection("qb")
+
 
     def test_get_by_ids(self, milvus_client):
         _create_loaded(milvus_client, "gid")
@@ -183,6 +282,132 @@ class TestQuery:
         rows = milvus_client.get("gm", ids=[9999])
         assert rows == []
         milvus_client.drop_collection("gm")
+
+    def test_query_output_fields_subset(self, milvus_client):
+        _create_loaded(milvus_client, "qof")
+        rows = milvus_client.query(
+            "qof", filter="id < 5",
+            output_fields=["varchar"],
+        )
+        for r in rows:
+            assert "varchar" in r
+            assert "id" in r  # pk always included
+        milvus_client.drop_collection("qof")
+
+
+# ===========================================================================
+# 4. DELETE — by IDs, by filter, then verify
+# ===========================================================================
+
+class TestDelete:
+    def test_delete_by_ids(self, milvus_client):
+        _create_loaded(milvus_client, "did")
+        milvus_client.delete("did", ids=[0, 1, 2])
+        remaining = milvus_client.query("did", filter="id >= 0", output_fields=["id"])
+        ids = {r["id"] for r in remaining}
+        assert 0 not in ids and 1 not in ids and 2 not in ids
+        assert len(remaining) == NB - 3
+        milvus_client.drop_collection("did")
+
+    def test_delete_by_filter(self, milvus_client):
+        _create_loaded(milvus_client, "dfilt")
+        milvus_client.delete("dfilt", filter="id < 10")
+        remaining = milvus_client.query("dfilt", filter="id >= 0", output_fields=["id"])
+        for r in remaining:
+            assert r["id"] >= 10
+        assert len(remaining) == NB - 10
+        milvus_client.drop_collection("dfilt")
+
+
+    def test_delete_nonexistent_pk_no_error(self, milvus_client):
+        _create_loaded(milvus_client, "dne")
+        milvus_client.delete("dne", ids=[99999])
+        remaining = milvus_client.query("dne", filter="id >= 0", output_fields=["id"])
+        assert len(remaining) == NB
+        milvus_client.drop_collection("dne")
+
+
+# ===========================================================================
+# 5. UPSERT — overwrite existing, insert new
+# ===========================================================================
+
+class TestUpsert:
+    def test_upsert_existing_pk_overwrites(self, milvus_client):
+        rows = _create_loaded(milvus_client, "uex")
+        milvus_client.upsert("uex", [{
+            "id": 10,
+            "vec": [9.0] * DIM,
+            "float_field": 999.0,
+            "varchar": "OVERWRITTEN",
+            "bool_field": False,
+        }])
+        result = milvus_client.query(
+            "uex", filter="id == 10",
+            output_fields=["varchar", "float_field"],
+        )
+        assert result[0]["varchar"] == "OVERWRITTEN"
+        assert abs(result[0]["float_field"] - 999.0) < 1e-3
+        milvus_client.drop_collection("uex")
+
+    def test_upsert_new_pk_inserts(self, milvus_client):
+        _create_loaded(milvus_client, "unew")
+        milvus_client.upsert("unew", [{
+            "id": NB + 1,
+            "vec": [1.0] * DIM,
+            "float_field": 0.0,
+            "varchar": "NEW",
+            "bool_field": True,
+        }])
+        result = milvus_client.query(
+            "unew", filter=f"id == {NB + 1}",
+            output_fields=["varchar"],
+        )
+        assert len(result) == 1
+        assert result[0]["varchar"] == "NEW"
+        milvus_client.drop_collection("unew")
+
+    def test_upsert_multiple_times(self, milvus_client):
+        _create_loaded(milvus_client, "umul")
+        for val in range(5):
+            milvus_client.upsert("umul", [{
+                "id": 0,
+                "vec": [float(val)] * DIM,
+                "float_field": float(val),
+                "varchar": f"v{val}",
+                "bool_field": True,
+            }])
+        result = milvus_client.query(
+            "umul", filter="id == 0",
+            output_fields=["varchar"],
+        )
+        assert len(result) == 1
+        assert result[0]["varchar"] == "v4"  # last upsert wins
+        milvus_client.drop_collection("umul")
+
+
+# ===========================================================================
+# 6. PARTITION — create, insert, search scoped, drop
+# ===========================================================================
+
+
+
+# ===========================================================================
+# 7. INDEX LIFECYCLE — create, load, search, release, drop, re-create
+# ===========================================================================
+
+
+
+# ===========================================================================
+# 8. DYNAMIC FIELD — $meta access via filter
+# ===========================================================================
+
+
+
+# ===========================================================================
+# 9. NULLABLE FIELD — null handling in insert + query
+# ===========================================================================
+
+
 
 # ===========================================================================
 # 10. COLLECTION LIFECYCLE — comprehensive

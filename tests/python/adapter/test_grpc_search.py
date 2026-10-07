@@ -1,6 +1,6 @@
 # 复制自 milvus-lite v3.2.1（43d1257）的 tests/adapter/test_grpc_search.py，Apache-2.0 许可。
-# 只保留 M1 范围内的用例（逐条状态见 INVENTORY.md），并删去随之不再使用的 import、helper 与分节标题。
-# 改动：HNSW 换成 FLAT（M1 只有 FLAT，用例少于 1 万行时 3.x 不会 flush，结果不变）。
+# 仅保留 INVENTORY.md 中已复用的用例；S1 表达式及断言保持上游原文。
+# HNSW 换成 FLAT 并去除 HNSW 参数；小数据集在 3.x 的 MemTable 上按相同度量检索。
 """Phase 10.4 — pymilvus search end-to-end tests.
 
 Validates the Search RPC: SearchRequest decoding (placeholder_group +
@@ -23,9 +23,7 @@ def _make_schema():
     return schema
 
 
-# 上游为 _hnsw_idx（HNSW，M=16、efConstruction=200）。M1 只有 FLAT；用例都少于 1 万行，
-# 3.x 不会 flush，一直在 memtable 上暴力检索，换成 FLAT 不改变结果。
-def _flat_idx(client):
+def _hnsw_idx(client):
     idx = client.prepare_index_params()
     idx.add_index(
         field_name="vec",
@@ -49,7 +47,7 @@ def _brute_idx(client, metric="L2"):
 
 @pytest.fixture
 def loaded_collection(milvus_client):
-    """Collection with 20 records, FLAT index, loaded ready for search."""
+    """Collection with 20 records, HNSW index, loaded ready for search."""
     milvus_client.create_collection("demo", schema=_make_schema())
     rows = [
         {
@@ -62,7 +60,7 @@ def loaded_collection(milvus_client):
         for i in range(20)
     ]
     milvus_client.insert("demo", rows)
-    milvus_client.create_index("demo", _flat_idx(milvus_client))
+    milvus_client.create_index("demo", _hnsw_idx(milvus_client))
     milvus_client.load_collection("demo")
     return milvus_client
 
@@ -131,8 +129,49 @@ def test_search_default_output_fields_is_empty(loaded_collection):
 
 
 # ---------------------------------------------------------------------------
+# Filter expression
+# ---------------------------------------------------------------------------
+
+def test_search_with_filter_active_only(loaded_collection):
+    res = loaded_collection.search(
+        "demo",
+        data=[[5.0, 6.0, 0.0, 0.0]],
+        limit=10,
+        filter="active == true",
+        output_fields=["active"],
+    )
+    for hit in res[0]:
+        assert hit["entity"]["active"] is True
+
+
+def test_search_with_complex_filter(loaded_collection):
+    res = loaded_collection.search(
+        "demo",
+        data=[[5.0, 6.0, 0.0, 0.0]],
+        limit=10,
+        filter="score > 0.5 and active == true",
+        output_fields=["score", "active"],
+    )
+    for hit in res[0]:
+        assert hit["entity"]["score"] > 0.5
+        assert hit["entity"]["active"] is True
+
+
+def test_search_with_filter_no_match(loaded_collection):
+    res = loaded_collection.search(
+        "demo",
+        data=[[5.0, 6.0, 0.0, 0.0]],
+        limit=5,
+        filter="id > 1000",
+    )
+    assert res[0] == [] or len(res[0]) == 0
+
+
+# ---------------------------------------------------------------------------
 # Loaded state guard
 # ---------------------------------------------------------------------------
+
+
 
 def test_search_after_release_raises(loaded_collection):
     loaded_collection.release_collection("demo")
@@ -183,3 +222,14 @@ def test_search_results_sorted_by_cosine_score_descending(loaded_collection):
     )
     distances = [hit["distance"] for hit in res[0]]
     assert distances == sorted(distances, reverse=True)
+
+
+# ---------------------------------------------------------------------------
+# Regression: search_params (ef) must reach the HNSW index
+# ---------------------------------------------------------------------------
+# execute_search_with_index used to (1) never forward `search_params` to
+# VectorIndex.search -- hard-wiring HNSW efSearch=64 regardless of what the
+# client sent -- and (2) always route through faiss's IDSelectorBatch even
+# when nothing was excluded, which independently bounds graph traversal.
+# Together they capped recall to ~1% of the collection for an out-of-cluster
+# query, at every `ef`. See docs/milvus-lite-hnsw-recall-bug.md upstream.

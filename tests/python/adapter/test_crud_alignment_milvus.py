@@ -1,5 +1,5 @@
 # 复制自 milvus-lite v3.2.1（43d1257）的 tests/adapter/test_crud_alignment_milvus.py，Apache-2.0 许可。
-# 只保留 M1 范围内的用例（逐条状态见 INVENTORY.md），并删去随之不再使用的 import、helper 与分节标题。
+# 仅保留 INVENTORY.md 中已复用的用例；S1 表达式及断言保持上游原文。
 """CRUD alignment tests adapted from upstream Milvus test suite.
 
 Each test is a self-contained adaptation of a specific Milvus pymilvus test
@@ -83,6 +83,101 @@ def _index_and_load(client, name):
 
 
 # ===================================================================
+# 1. Delete with filters
+#    Source: test_milvus_client_delete.py  lines 182-221
+#           test_milvus_client_delete_with_filters
+# ===================================================================
+
+
+def test_delete_with_filters(milvus_client):
+    """Adapted from test_milvus_client_delete_with_filters
+    (test_milvus_client_delete.py:182).
+
+    Validates that delete(filter="id < N") removes the correct rows, and
+    that subsequent search and query no longer return deleted entries.
+    """
+    name = "del_filter"
+    rows = _create_and_insert(milvus_client, name)
+    _index_and_load(milvus_client, name)
+
+    # Delete rows with id < 3
+    delete_num = 3
+    milvus_client.delete(name, filter=f"id < {delete_num}")
+
+    # Search -- deleted ids must not appear
+    rng = _rng()
+    query_vec = [list(rng.random(DIM).astype(float))]
+    search_results = milvus_client.search(
+        name,
+        data=query_vec,
+        limit=NB,
+        search_params={"metric_type": "COSINE"},
+        output_fields=["id"],
+    )
+    returned_ids = {hit["id"] for hit in search_results[0]}
+    for deleted_id in range(delete_num):
+        assert deleted_id not in returned_ids, (
+            f"deleted id {deleted_id} still appears in search results"
+        )
+    assert len(search_results[0]) == NB - delete_num
+
+    # Query -- verify remaining rows match
+    query_rows = milvus_client.query(
+        name,
+        filter="id >= 0",
+        output_fields=["id", "float_field", "varchar_field"],
+        limit=NB,
+    )
+    query_ids = {r["id"] for r in query_rows}
+    assert query_ids == set(range(delete_num, NB))
+
+    milvus_client.drop_collection(name)
+
+
+# ===================================================================
+# 2. Delete with filters on nullable vector field
+#    Source: test_milvus_client_delete.py  lines 224-275
+#           test_milvus_client_delete_with_filters_nullable_vector_field
+# ===================================================================
+
+
+
+
+# ===================================================================
+# 3. Count with expr
+#    Source: test_milvus_client_query.py  lines 4957-4989
+#           test_milvus_client_count_with_expr
+# ===================================================================
+
+
+def test_count_with_expr(milvus_client):
+    """Adapted from test_milvus_client_count_with_expr
+    (test_milvus_client_query.py:4957).
+
+    Validates that query(output_fields=['count(*)']) returns the correct
+    total count with a broad filter, and that a narrower 'in' filter returns
+    the correct subset count.
+    """
+    name = "cnt_expr"
+    _create_and_insert(milvus_client, name)
+    _index_and_load(milvus_client, name)
+
+    # count with id >= 0 (all rows)
+    result = milvus_client.query(
+        name, filter="id >= 0", output_fields=["count(*)"]
+    )
+    assert result[0]["count(*)"] == NB
+
+    # count with term expression (should return exactly 2)
+    result2 = milvus_client.query(
+        name, filter="id in [0, 1]", output_fields=["count(*)"]
+    )
+    assert result2[0]["count(*)"] == 2
+
+    milvus_client.drop_collection(name)
+
+
+# ===================================================================
 # 4. Get with output_fields
 #    Source: test_milvus_client_query.py  lines 4100-4126
 #           test_milvus_client_get_output_fields
@@ -116,6 +211,50 @@ def test_get_output_fields(milvus_client):
     # verify each requested field is present
     for field in output_fields:
         assert field in rows_list[0]
+
+    milvus_client.drop_collection(name)
+
+
+# ===================================================================
+# 5. Query output_fields=["*"] (all fields)
+#    Source: test_milvus_client_query.py  lines 1032-1091
+#           test_milvus_client_query_output_fields_all
+# ===================================================================
+
+
+def test_query_output_fields_all(milvus_client):
+    """Adapted from test_milvus_client_query_output_fields_all
+    (test_milvus_client_query.py:1032).
+
+    Validates that query(output_fields=['*']) returns all schema-defined
+    fields (id, vec, float_field, varchar_field) for each result row.
+    Tests both query-by-ids and query-by-filter code paths.
+    """
+    name = "qry_all_fields"
+    nb = 10
+    rows = _create_and_insert(milvus_client, name, nb=nb)
+    _index_and_load(milvus_client, name)
+
+    all_fields = {"id", "vec", "float_field", "varchar_field"}
+
+    # query by ids with wildcard output
+    result_by_ids = milvus_client.query(
+        name,
+        ids=[i for i in range(nb)],
+        output_fields=["*"],
+    )
+    assert len(result_by_ids) == nb
+    assert set(result_by_ids[0].keys()) == all_fields
+
+    # query by filter with wildcard output
+    result_by_filter = milvus_client.query(
+        name,
+        filter="id >= 0",
+        output_fields=["*"],
+        limit=nb,
+    )
+    assert len(result_by_filter) == nb
+    assert set(result_by_filter[0].keys()) == all_fields
 
     milvus_client.drop_collection(name)
 

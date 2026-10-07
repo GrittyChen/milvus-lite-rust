@@ -1,6 +1,6 @@
 # 复制自 milvus-lite v3.2.1（43d1257）的 tests/adapter/test_milvus_compat_v3.py，Apache-2.0 许可。
-# 只保留 M1 范围内的用例（逐条状态见 INVENTORY.md），并删去随之不再使用的 import、helper 与分节标题。
-# 改动：删去上游的 skipif（它导入了 3.x 内部模块，本文件的用例不用 HNSW）。
+# 仅保留 INVENTORY.md 中已复用的用例；S1 表达式及断言保持上游原文。
+# 直接导入依赖；FLAT 不需要 faiss，移除上游的 faiss 跳过条件。
 """Milvus compatibility tests v3 -- edge cases extracted from
 milvus-io/milvus python_client/milvus_client_v2/ test suite.
 
@@ -39,6 +39,8 @@ Skipped automatically when pymilvus / faiss-cpu is not installed.
 import numpy as np
 import pytest
 from pymilvus import DataType, MilvusClient
+
+
 
 DIM = 4
 NB = 30
@@ -95,6 +97,77 @@ def _create_simple(client, name, rows=None, dynamic=False):
 
 
 # ===========================================================================
+# 1. VARCHAR primary key with search and query filters
+# ===========================================================================
+
+class TestVarcharPK:
+    """Tests using VARCHAR as primary key -- adapted from
+    TestSearchStringVarcharPK in test_milvus_client_search_string.py."""
+
+    def _schema(self, client):
+        schema = MilvusClient.create_schema(auto_id=False)
+        schema.add_field("pk", DataType.VARCHAR, is_primary=True,
+                         max_length=64)
+        schema.add_field("vec", DataType.FLOAT_VECTOR, dim=DIM)
+        schema.add_field("score", DataType.FLOAT)
+        schema.add_field("label", DataType.VARCHAR, max_length=64)
+        return schema
+
+    def _rows(self, n=NB):
+        rng = _rng()
+        return [
+            {
+                "pk": f"doc_{i:03d}",
+                "vec": rng.standard_normal(DIM).astype(np.float32).tolist(),
+                "score": float(i) * 0.1,
+                "label": ["alpha", "beta", "gamma"][i % 3],
+            }
+            for i in range(n)
+        ]
+
+    def test_search_varchar_pk_equality(self, milvus_client):
+        """Search with filter on varchar PK (exact match).
+        Adapted from test_search_string_field_is_primary_true."""
+        rows = self._rows()
+        milvus_client.create_collection("vpk1", schema=self._schema(milvus_client))
+        milvus_client.insert("vpk1", rows)
+        _index_and_load(milvus_client, "vpk1")
+
+        q = _rng(42).standard_normal((1, DIM)).astype(np.float32).tolist()
+        res = milvus_client.search(
+            "vpk1", data=q, limit=NB,
+            filter='pk == "doc_005"',
+            output_fields=["pk", "score"],
+        )
+        assert len(res[0]) == 1
+        assert res[0][0]["entity"]["pk"] == "doc_005"
+        milvus_client.drop_collection("vpk1")
+
+
+    def test_upsert_varchar_pk(self, milvus_client):
+        """Upsert on VARCHAR PK overwrites existing row."""
+        rows = self._rows(10)
+        milvus_client.create_collection("vpk3", schema=self._schema(milvus_client))
+        milvus_client.insert("vpk3", rows)
+        _index_and_load(milvus_client, "vpk3")
+
+        milvus_client.upsert("vpk3", [{
+            "pk": "doc_005",
+            "vec": [1.0, 0.0, 0.0, 0.0],
+            "score": 999.0,
+            "label": "UPDATED",
+        }])
+        result = milvus_client.query(
+            "vpk3", filter='pk == "doc_005"',
+            output_fields=["score", "label"],
+        )
+        assert len(result) == 1
+        assert abs(result[0]["score"] - 999.0) < 1e-3
+        assert result[0]["label"] == "UPDATED"
+        milvus_client.drop_collection("vpk3")
+
+
+# ===========================================================================
 # 2. Pagination consistency -- offset pages match full search
 # ===========================================================================
 
@@ -141,6 +214,81 @@ class TestPaginationConsistency:
         assert len(res[0]) == 0
         milvus_client.drop_collection("pg2")
 
+    def test_search_pagination_with_filter(self, milvus_client):
+        """Pagination with scalar filter -- paginated results match
+        filtered full results.
+        Adapted from test_search_pagination_with_expression."""
+        _create_simple(milvus_client, "pg3")
+        q = _rng(99).standard_normal((1, DIM)).astype(np.float32).tolist()
+        expr = "val >= 10.0"
+
+        # Full filtered
+        full = milvus_client.search(
+            "pg3", data=q, limit=NB, filter=expr,
+            output_fields=["id"],
+        )
+        full_ids = [h["id"] for h in full[0]]
+
+        # Page 1: first 5
+        p1 = milvus_client.search(
+            "pg3", data=q, limit=5, filter=expr,
+            search_params={"metric_type": "COSINE", "offset": 0},
+            output_fields=["id"],
+        )
+        p1_ids = [h["id"] for h in p1[0]]
+
+        # The first 5 of full == page 1
+        assert p1_ids == full_ids[:5]
+        milvus_client.drop_collection("pg3")
+
+
+# ===========================================================================
+# 3. Partition-scoped pagination
+# ===========================================================================
+
+
+
+# ===========================================================================
+# 4. JSON field query and search filters
+# ===========================================================================
+
+
+
+# ===========================================================================
+# 5. Multiple nullable scalar types in one schema
+# ===========================================================================
+
+
+
+# ===========================================================================
+# 6. String IN filter
+# ===========================================================================
+
+
+
+# ===========================================================================
+# 7. Mixed int64 + varchar comparison filter in search
+# ===========================================================================
+
+class TestMixedFilter:
+    """Adapted from test_search_string_mix_expr."""
+
+    def test_search_mixed_int_varchar(self, milvus_client):
+        """Search with int + varchar combined filter."""
+        rows = _create_simple(milvus_client, "mx1")
+        q = _rng(42).standard_normal((1, DIM)).astype(np.float32).tolist()
+
+        res = milvus_client.search(
+            "mx1", data=q, limit=NB,
+            filter='val >= 10.0 and tag >= "tag_010"',
+            output_fields=["val", "tag"],
+        )
+        for hit in res[0]:
+            assert hit["entity"]["val"] >= 10.0
+            assert hit["entity"]["tag"] >= "tag_010"
+        milvus_client.drop_collection("mx1")
+
+
 # ===========================================================================
 # 8. Search distance ordering verification
 # ===========================================================================
@@ -171,6 +319,34 @@ class TestDistanceOrdering:
 
 
 # ===========================================================================
+# 9. Delete-all lifecycle with nullable fields
+# ===========================================================================
+
+
+
+# ===========================================================================
+# 10. Chained range expression
+# ===========================================================================
+
+class TestChainedRange:
+    """Adapted from test_milvus_client_e2e query_cases with range
+    filters like '100 <= int16_field < 200'."""
+
+    def test_query_range_both_bounds(self, milvus_client):
+        """val >= 10.0 AND val < 20.0 should match exactly 10 rows."""
+        _create_simple(milvus_client, "cr1")
+        result = milvus_client.query(
+            "cr1",
+            filter="val >= 10.0 and val < 20.0",
+            output_fields=["id", "val"],
+        )
+        for r in result:
+            assert 10.0 <= r["val"] < 20.0
+        assert len(result) == 10
+        milvus_client.drop_collection("cr1")
+
+
+# ===========================================================================
 # 11. Get with output_fields=["*"] (wildcard)
 # ===========================================================================
 
@@ -188,6 +364,35 @@ class TestGetWithOutputFields:
             assert "val" in r
             assert "tag" in r
         milvus_client.drop_collection("gw1")
+
+
+# ===========================================================================
+# 12. Search with filter matching zero rows
+# ===========================================================================
+
+class TestFilterZeroMatch:
+    """Edge case: filter expression eliminates all candidates."""
+
+    def test_search_filter_no_match(self, milvus_client):
+        """Search with filter that matches no rows returns empty."""
+        _create_simple(milvus_client, "zm1")
+        q = _rng(42).standard_normal((1, DIM)).astype(np.float32).tolist()
+
+        res = milvus_client.search(
+            "zm1", data=q, limit=10,
+            filter="val > 99999.0",
+        )
+        assert len(res[0]) == 0
+        milvus_client.drop_collection("zm1")
+
+    def test_query_filter_no_match(self, milvus_client):
+        """Query with filter matching no rows returns empty list."""
+        _create_simple(milvus_client, "zm2")
+        result = milvus_client.query(
+            "zm2", filter="val > 99999.0", output_fields=["id"],
+        )
+        assert len(result) == 0
+        milvus_client.drop_collection("zm2")
 
 
 # ===========================================================================
@@ -246,6 +451,23 @@ class TestMultiQuerySearch:
         assert res[1][0]["id"] == 10
         assert res[2][0]["id"] == 20
         milvus_client.drop_collection("mq1")
+
+
+# ===========================================================================
+# 15. Query with LIKE empty-string comparison
+# ===========================================================================
+
+class TestVarcharEmptyComparison:
+    """Adapted from test_search_string_field_not_primary_is_empty."""
+
+    def test_varchar_gte_empty_matches_all(self, milvus_client):
+        """Filter tag >= '' should match all rows (every string >= '')."""
+        _create_simple(milvus_client, "ve1")
+        result = milvus_client.query(
+            "ve1", filter='tag >= ""', output_fields=["tag"],
+        )
+        assert len(result) == NB
+        milvus_client.drop_collection("ve1")
 
 
 # ===========================================================================
