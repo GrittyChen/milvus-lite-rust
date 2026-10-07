@@ -543,7 +543,7 @@ def test_search_m1_unsupported(env):
     _, stub, _ = env
     basic(stub)
     seed(stub)
-    unimplemented(stub.Search, search_req(dsl="id > 0"))
+    unimplemented(stub.Search, search_req(dsl="id > 0 or id < 0"))
     unimplemented(stub.Search, search_req(params={"params": '{"radius": 1.0}'}))
     unimplemented(stub.Search, search_req(params={"group_by_field": "t"}))
     unimplemented(stub.Search, search_req(partition_names=["p"]))
@@ -615,11 +615,11 @@ def test_query_m1_unsupported(env):
     _, stub, _ = env
     basic(stub)
     seed(stub)
-    unimplemented(stub.Query, query_req(expr="id in [1]", output_fields=["count(*)"]))
+    unimplemented(stub.Query, query_req(expr="id > 0 or id < 0", output_fields=["count(*)"]))
     iterator = [common_pb2.KeyValuePair(key="iterator", value="False")]
     unimplemented(stub.Query, query_req(expr="id in [1]", query_params=iterator))
-    unimplemented(stub.Query, query_req(expr="id > 0"))
-    unimplemented(stub.Query, query_req(expr=""))
+    unimplemented(stub.Query, query_req(expr="id > 0 or id < 0"))
+    unimplemented(stub.Query, query_req(expr="not id > 0"))
     unimplemented(stub.Query, query_req(expr="id in [1]", partition_names=["p"]))
     timezone = [common_pb2.KeyValuePair(key="timezone", value="UTC")]
     unimplemented(stub.Query, query_req(expr="id in [1]", query_params=timezone))
@@ -770,7 +770,7 @@ def test_pymilvus_entry_points_remaining_unsupported(env):
         (lambda: client.rename_collection("q", "q2"), f"RenameCollection: {rpc}"),
         (lambda: client.hybrid_search("q", [AnnSearchRequest([[1, 0]], "vector", {}, 2)], RRFRanker(), limit=2),
          f"HybridSearch: {rpc}"),
-        (lambda: client.search("q", [[1, 0]], filter="id > 1"), f"filter expressions: {feature}"),
+        (lambda: client.search("q", [[1, 0]], filter="id > 1 or id < 0"), "filter expressions: only scalar field/literal comparisons joined by 'and', or a top-level primary-key 'in', are supported"),
         (lambda: client.search("q", [[1, 0]], ranker=decay), f"rerank and function chains: {feature}"),
         (lambda: client.query_iterator("q", batch_size=2).next(), f"query iterators: {feature}"),
         (lambda: client.compact("q"), f"ManualCompaction: {rpc}"),

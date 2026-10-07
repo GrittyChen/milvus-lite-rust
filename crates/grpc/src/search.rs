@@ -30,6 +30,7 @@ pub(crate) struct Parsed {
     offset: i64,
     round_decimal: i64,
     unsupported: Option<&'static str>,
+    expr: String,
 }
 
 /// `parsed` 由 [`parse`] 在取 collection 读锁之前得到。
@@ -48,7 +49,7 @@ pub(crate) fn search(
     let end = parsed.top_k.saturating_add(parsed.offset).max(0);
     let skip = parsed.offset.max(0);
     let limit = usize::try_from(end.saturating_sub(skip).max(0)).unwrap_or(usize::MAX);
-    let result = c.search(
+    let result = c.search_filtered(
         SearchRequest {
             anns_field: parsed.anns_field,
             vectors: parsed.vectors,
@@ -58,6 +59,7 @@ pub(crate) fn search(
             output_fields,
         },
         compute,
+        &parsed.expr,
     )?;
 
     let schema = c.schema();
@@ -203,9 +205,6 @@ pub(crate) fn parse(req: &svc::SearchRequest) -> Result<Parsed, EngineError> {
         }
     };
 
-    if !req.dsl.is_empty() {
-        note("filter expressions");
-    }
     if req.partition_names.iter().any(|p| p != "_default") {
         note("partitions other than '_default'");
     }
@@ -225,6 +224,7 @@ pub(crate) fn parse(req: &svc::SearchRequest) -> Result<Parsed, EngineError> {
         offset,
         round_decimal,
         unsupported: unsupported_feature,
+        expr: req.dsl.clone(),
     })
 }
 

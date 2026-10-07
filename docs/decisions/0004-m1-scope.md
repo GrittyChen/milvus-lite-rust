@@ -74,7 +74,7 @@ M1 的对外行为与 3.x 有阶段性差异，本文按 [AGENTS.md](../../AGENT
   - 刚写入的数据立即可见。
   - `search_params` 中的 `metric_type` 与索引度量不一致时，按请求的度量计算，见下文「决策」。
 - **与 3.x 一样忽略的参数**：Search 的 `ignore_growing`、`guarantee_timestamp`、`use_default_consistency`、`nq`、`namespace`、`order_by_fields` 与 `expr_template_values`，CreateCollection 的 `consistency_level`、`shards_num`、`num_partitions`、`description` 与 `is_clustering_key`，Load 系列 RPC 的 `partition_names`、`load_fields` 与 `replica_number`，以及空 `expr` 的 `count(*)` 的 `partition_names`。3.x 不读取这些参数，或读取后不改变结果；单进程内的读写本来就是强一致。这是与 3.x 对齐，不是新的行为差异。
-- **查询**：`Query` 只支持两种形式：
+- **查询**：M1 的 `Query` 只支持下列两种形式；M2 已扩展为 [0006 第 1 项](0006-m2-scope.md#决策项)的 S1、空表达式、分页与带过滤的 count，当前机制以 [0007](0007-m2-storage-engine.md#s1-过滤的当前实现与验收范围)为准：
   - `expr` 为空，且 `output_fields=["count(*)"]`；
   - `expr` 为 `<pk> in [字面量列表]`，`output_fields` 可以是 `['*']`、字段列表或动态字段；`partition_names` 为空或只含 `_default`。这种形式的识别规则见「决策」。
 
@@ -82,7 +82,7 @@ M1 的对外行为与 3.x 有阶段性差异，本文按 [AGENTS.md](../../AGENT
 
 下列功能都返回明确错误，绝不静默成功（不变量 15）。这些功能 3.x 都支持，M1 如果忽略相应参数，就会在不自知的情况下返回与 3.x 不同的结果，所以同样报错。错误形式与 3.x 的 `_unimplemented`（[servicer.py:1563](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/milvus_lite/adapter/grpc/servicer.py#L1563)）相同：gRPC 状态码 `UNIMPLEMENTED`，details 写成 `MilvusLite does not support <功能>: <说明>`，说明中注明当前阶段尚未实现。gRPC 状态非 OK 时响应体会被丢弃，3.x 在响应体里另放的 `Status` 客户端看不到（实测 pymilvus 只得到状态码与 details），因此不必复现。pymilvus 收到 `UNIMPLEMENTED` 时不重试。
 
-- **过滤**：除上面两种 `Query` 形式外，不支持任何 `filter` / `expr`，包括 `text_match`、JSON 路径与几何谓词；`expr` 为空且不含 `count(*)` 的 `Query`、`count(*)` 带非空 `expr`、以及 query iterator 也不支持。
+- **过滤**：M2 支持 [0006 第 1 项](0006-m2-scope.md#决策项)的 S1；其余过滤构造、`text_match`、JSON / 动态字段、数组与几何谓词仍不求值。query iterator 仍不支持，即使表达式落在 S1 内也显式拒绝。
 - **分区**：partition 相关 RPC；在检索、查询与写入中指定 `_default` 以外的分区；partition key。
 - **多数据库与别名**：`CreateDatabase` 等数据库 RPC，以及 alias。
 - **schema**：
@@ -166,8 +166,9 @@ M1 的对外行为与 3.x 有阶段性差异，本文按 [AGENTS.md](../../AGENT
 - **auto_id 取该行的 `_seq`。** 3.x 的 auto_id 与 `_seq` 是两个计数器：校验失败的 insert 也会消耗 auto_id，于是 auto_id 会超过该行的 `_seq`，违反 [0002](0002-data-dir-compat.md#共享状态的语义约束) 约束 4（0002「继承的 3.x 已知风险」）。本实现令 auto_id 等于所在行的 `_seq`，失败的 insert 不消耗任何编号。3.x 的 delete 每次消耗一个 `_seq` 而不消耗 auto_id（实测删除一次后下一个 auto_id 仍是 2），所以只有在同一会话内既没有失败的 insert、也没有 delete 这类只消耗 `_seq` 的操作时，生成的主键才与 3.x 相同。影响：失败的 insert 或 delete 之后再写入时生成的 auto_id；M1 没有 delete，引入 delete 时差分测试要按此处理。
 - **畸形的 JSON 与动态字段明确报错。** 3.x 把无法解析的 JSON 字段值原样存下（之后 pymilvus 读取时崩溃），静默丢弃不是 JSON 对象的 `$meta`，并让 `$meta` 中与 schema 字段同名的 key 覆盖该字段（实测主键被改写）。本实现对这三种输入都报 code 6 的校验错误；JSON 字段收到的不是 json_data 时同样报类型不符（3.x 对 VARCHAR 槽位的文本接受并存下，合法的 JSON 文本能正常读回，其他文本读回时 pymilvus 解析失败；其他槽位报 code 1），见下文「只能由手写请求构造的其他输入」。另外，JSON 的嵌套深度上限为 127 层（serde_json 的递归上限，用来防止恶意输入导致栈溢出），更深报 code 6；3.x 受 Python 递归限制，约 1000 层以内都能写入。这类输入只能由手写的 proto 请求构造，pymilvus 不会发出。M2 读取 3.x 写出的目录时，要能容忍 3.x 已存下的畸形值。
 - **JSON 字段接受任意 JSON 值并原样读回。** 3.x 把 JSON 字段存为字符串列：顶层是数字或布尔时 pyarrow 报 code 1 `Expected bytes, got a 'int' object`；顶层是字符串时能写入，但读回时丢了引号，pymilvus 解析失败。二者都能经 pymilvus 发出（例如 `{"j": 1}`、`{"j": '"abc"'}`）。本实现都接受并正确读回，与 Milvus 的语义一致；M2 落盘后 3.x 读取这些值时按字符串原样透传，pymilvus 仍能解析数字与布尔。影响：JSON 字段写入顶层标量的用例。
-- **按主键读取的表达式只识别部分非 ASCII 主键名。** 3.x 用 Python 的 `str.isalpha` / `str.isalnum` 切分标识符，结果随 Python 的 Unicode 版本变化。本实现的主键名只认 ASCII 字母、数字、下划线，以及在 Python 3.10–3.13 中逐码位核对过、全部判为字母的范围（Latin-1 与 Latin Extended-A 的字母、CJK 统一汉字 4E00–9FFC 与扩展 A、平假名、片假名、韩文音节）；数字只认 ASCII。其余情形返回 `UNIMPLEMENTED`，而 3.x 可能按主键读取。与 3.x 的差分模糊测试（约 110 万组输入）中，没有本实现接受而 3.x 拒绝、或主键列表不同的输入。影响：主键名含未收录字符的 collection 上的 `get`，以及含非 ASCII 数字的手写表达式。
-- **同时含 M1 不支持的功能与其他错误时，报错的先后不保证与 3.x 相同。** 3.x 翻译阶段对 M1 支持的参数所做的检查，以及 load 状态检查，先于 `UNIMPLEMENTED` 报告；写入时一列不支持不影响其后各列的解码错误先报出。3.x 对 M1 不支持的功能自身参数的校验不复现，这类请求报 `UNIMPLEMENTED`：例如 nullable 主键 3.x 报 code 6；rerank 函数的参数有误（如 boost 函数带了 `input_field_names`、未知的 reranker）3.x 报 code 6；过滤表达式的语法错误 3.x 报 code 6，本实现不解析过滤表达式。pymilvus 对含单引号、反斜杠、换行或回车的 VARCHAR 主键调用 `get` 时就会拼出语法错误的表达式（例如 `id in ['b'c']`）。影响：同时触发两类错误的请求。
+- **M1 的非 ASCII 主键识别限制已随 M2 完整解析注销。** 当前词法与 Unicode 版本边界以 [0006](0006-m2-scope.md#与-3x-的差异)及 [0007](0007-m2-storage-engine.md#s1-过滤的当前实现与验收范围)为准，不再通过 M1 的局部范围识别器分派。
+
+- **同时含 M1 不支持的功能与其他错误时，报错的先后不保证与 3.x 相同。** 3.x 翻译阶段对 M1 支持的参数所做的检查，以及 load 状态检查，先于 `UNIMPLEMENTED` 报告；写入时一列不支持不影响其后各列的解码错误先报出。3.x 对 M1 不支持的功能自身参数的校验不复现，这类请求报 `UNIMPLEMENTED`：例如 nullable 主键 3.x 报 code 6；rerank 函数的参数有误（如 boost 函数带了 `input_field_names`、未知的 reranker）3.x 报 code 6；M1 曾不解析过滤表达式；M2 完整解析语法并对齐语法错误，范围外构造的语义错误仍返回 UNIMPLEMENTED。pymilvus 对含单引号、反斜杠、换行或回车的 VARCHAR 主键调用 `get` 时就会拼出语法错误的表达式（例如 `id in ['b'c']`）。影响：同时触发两类错误的请求。
 - **按 Python `int()` / `float()` 解析的参数，只对齐合法输入与常见错误。** 涉及 search_params 的 `topk`、`offset`、`round_decimal`、`group_size`、`radius`、`range_filter`，以及 type_params 的 `dim`、`max_length`。整数、截断取整的浮点数、布尔，以及带空白、正负号或下划线的数字字符串，结果与 3.x 相同；非数字字符串、null、列表与对象的错误码与信息相同。NaN 与 Infinity（Python 的 `json.loads` 接受、serde_json 不接受）、非 ASCII 数字与超出 int64 的值，错误信息或结果可能不同，超出 int64 时按饱和处理。pymilvus 只发送整数，这些输入只能由手写请求构造。
 - **只能由手写请求构造的其他输入。**
 

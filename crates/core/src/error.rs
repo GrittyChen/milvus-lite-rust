@@ -104,18 +104,9 @@ pub fn py_repr(s: &str) -> String {
     out
 }
 
-/// 近似 Python 的 `str.isprintable`：控制字符、除空格外的空白、常见格式字符、私用区与非字符都不可打印。
-/// 未分配码位（Cn）没有逐一识别，这类字符在错误信息中原样输出。
+/// 与过滤词法共用 CPython 3.12 / Unicode 15.0 分类（0006 的版本边界）。
 fn py_printable(c: char) -> bool {
-    let n = u32::from(c);
-    let format = matches!(
-        n,
-        0xAD | 0x600..=0x605 | 0x61C | 0x6DD | 0x70F | 0x180E | 0x200B..=0x200F | 0x202A..=0x202E
-            | 0x2060..=0x2064 | 0x2066..=0x206F | 0xFEFF | 0xFFF9..=0xFFFB | 0xE0001 | 0xE0020..=0xE007F
-    );
-    let private_use = matches!(n, 0xE000..=0xF8FF | 0xF0000..=0xFFFFD | 0x100000..=0x10FFFD);
-    let noncharacter = (0xFDD0..=0xFDEF).contains(&n) || n & 0xFFFE == 0xFFFE;
-    !(c.is_control() || (c.is_whitespace() && c != ' ') || format || private_use || noncharacter)
+    crate::filter::printable_char(c)
 }
 
 /// Python `repr(list[str])`，用于 3.x 错误信息中的字段名列表。

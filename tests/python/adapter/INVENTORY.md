@@ -6,17 +6,18 @@
 
 | 状态 | 含义 | 条数 |
 | --- | --- | --- |
-| 已复制 | 原样复制到本目录 | 77 |
-| 改后复制 | 仅按 0004「验收」第 2 项与 0006 第 25 项授权的条件替换，逐条说明改动 | 41 |
-| 范围外 | 用到当前切片不支持的功能，不复制；未实现能力的代表性入口见「范围外功能的 `UNIMPLEMENTED` 断言」 | 175 |
+| 已复制 | 原样复制到本目录 | 88 |
+| 改后复制 | 仅按 0004「验收」第 2 项与 0006 第 25 项授权的条件替换，逐条说明改动 | 37 |
+| 范围外 | 用到当前切片不支持的功能，不复制；未实现能力的代表性入口见「范围外功能的 `UNIMPLEMENTED` 断言」 | 128 |
+| 待复用 | S1 已解除原过滤阻断，尚须核对 fixture 并迁移；不计入已运行套件 | 40 |
 | 依赖内部模块 | 导入或使用 3.x 的内部模块、内部对象，换成本实现后无法运行 | 33 |
 | 不运行 | 上游被同名定义覆盖，上游自己也不运行 | 1 |
 
 以上是逐条列出的 22 个文件中的 327 条；其余 25 个文件的 310 条整个文件记一行原因，见「整个文件不复用的文件」。
 
-「已复制」与「改后复制」共 118 个用例函数，参数化展开后 132 条；它们在本实现上通过（pymilvus 3.0.2 与 2.6.17 两条线）。其中本切片修改的 [test_grpc_crud.py](test_grpc_crud.py) 副本已在参照实现 3.x + pymilvus 3.0.2 上整文件通过（12 条）；新增 Delete / Upsert 路径另由 [差分测试](../../differential/test_scenarios.py) 在两条客户端线上对照。新增 4 条尚未用 pymilvus 2.6.17 对参照实现整文件复跑。
+「已复制」与「改后复制」共 125 个用例函数，参数化展开后 139 条。S1 恢复 [test_grpc_crud.py](test_grpc_crud.py) 中的原过滤表达式，并纳入除 LIKE 外的全部 19 条；它们在本实现与真实 3.x 上的两条客户端线均作为本切片验收。其他副本保留原替换，逐条状态仍是对实际复制内容的统计；S1 已解除原过滤阻断、但尚未迁移的用例明确标为「待复用」，不宣称它们已运行。
 
-HNSW 换成 FLAT、`== N` 换成 `in [N]` 的条件见 0004「验收」第 2 项及 0006 第 25 项；本切片两条 Delete 用例依 0006 第 25 项，用 get 对已知的 0–4 主键读回，只核对存活主键集合，过滤表达式本身留给 S1 验收。除此之外，复制时只删去随范围外用例一起不再使用的 import、helper 与空的分节标题；上游用于跳过的 `importorskip` 改为直接导入（本仓不允许因缺依赖静默跳过），上游因 HNSW 需要 faiss 而加的 `skipif` 随 HNSW 一起去掉。起服务的 fixture 与清理见 [conftest.py](conftest.py)。
+HNSW 换成 FLAT、`== N` 换成 `in [N]` 的条件见 0004「验收」第 2 项及 0006 第 25 项。已接通 S1 的 CRUD 副本不再替换表达式或读回方式。其余副本只删去随范围外用例一起不再使用的 import、helper 与空的分节标题；上游用于跳过的 `importorskip` 改为直接导入（本仓不允许因缺依赖静默跳过），上游因 HNSW 需要 faiss 而加的 `skipif` 随 HNSW 一起去掉。起服务的 fixture 与清理见 [conftest.py](conftest.py)。
 
 ## 逐条列出的文件
 
@@ -49,34 +50,35 @@ HNSW 换成 FLAT、`== N` 换成 `in [N]` 的条件见 0004「验收」第 2 项
 
 ### [test_grpc_crud.py](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_crud.py)（0004 候选文件）
 
-20 条：已复制 8，改后复制 4，范围外 8。
+20 条：已复制 19，范围外 1。
 
 | 用例 | 状态 | 说明 |
 | --- | --- | --- |
-| [`test_insert_returns_inserted_ids`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_crud.py#L59) | 已复制 |  |
-| [`test_insert_multiple_batches_accumulates`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_crud.py#L67) | 范围外 | 过滤表达式（`id >= 0`） |
-| [`test_insert_into_unknown_collection_raises`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_crud.py#L75) | 已复制 |  |
-| [`test_insert_round_trip_preserves_field_values`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_crud.py#L80) | 改后复制 | `== N` 换成 `in [N]` |
-| [`test_upsert_returns_upsert_count`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_crud.py#L95) | 已复制 |  |
-| [`test_upsert_overwrites_existing`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_crud.py#L102) | 改后复制 | `== N` 换成 `in [N]` |
-| [`test_query_by_id_in_list`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_crud.py#L120) | 已复制 |  |
-| [`test_query_by_id_with_output_fields`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_crud.py#L128) | 已复制 |  |
-| [`test_query_by_filter_expression`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_crud.py#L143) | 范围外 | 过滤表达式（`active == true`） |
-| [`test_query_with_complex_expression`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_crud.py#L151) | 范围外 | 过滤表达式（`score > 0.1 and active == true`） |
+| [`test_insert_returns_inserted_ids`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_crud.py#L59) | 已复制 | |
+| [`test_insert_multiple_batches_accumulates`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_crud.py#L67) | 已复制 | |
+| [`test_insert_into_unknown_collection_raises`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_crud.py#L75) | 已复制 | |
+| [`test_insert_round_trip_preserves_field_values`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_crud.py#L80) | 已复制 | |
+| [`test_upsert_returns_upsert_count`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_crud.py#L95) | 已复制 | |
+| [`test_upsert_overwrites_existing`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_crud.py#L102) | 已复制 | |
+| [`test_query_by_id_in_list`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_crud.py#L120) | 已复制 | |
+| [`test_query_by_id_with_output_fields`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_crud.py#L128) | 已复制 | |
+| [`test_query_by_filter_expression`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_crud.py#L143) | 已复制 | |
+| [`test_query_with_complex_expression`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_crud.py#L151) | 已复制 | |
 | [`test_query_with_like_pattern`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_crud.py#L162) | 范围外 | 过滤表达式（`title like 't%'`） |
-| [`test_query_with_no_matches`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_crud.py#L169) | 范围外 | 过滤表达式（`id > 1000`） |
-| [`test_query_unknown_collection_raises`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_crud.py#L176) | 范围外 | 过滤表达式（`id > 0`）；只断言抛出异常，`UNIMPLEMENTED` 也会通过 |
-| [`test_get_by_ids`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_crud.py#L185) | 已复制 |  |
-| [`test_get_by_ids_with_output_fields`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_crud.py#L191) | 已复制 |  |
-| [`test_get_missing_ids_returns_empty`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_crud.py#L198) | 已复制 |  |
-| [`test_delete_by_ids`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_crud.py#L207) | 改后复制 | 用 get 读回，S1 的 `id >= 0` 留待过滤切片 |
-| [`test_delete_idempotent`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_crud.py#L214) | 改后复制 | 用 get 读回，S1 的 `id >= 0` 留待过滤切片 |
-| [`test_delete_by_filter_active_true`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_crud.py#L226) | 范围外 | 过滤表达式（`active == true`）、delete |
-| [`test_delete_by_filter_no_match`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_crud.py#L235) | 范围外 | 过滤表达式（`id > 1000`）、delete |
+| [`test_query_with_no_matches`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_crud.py#L169) | 已复制 | |
+| [`test_query_unknown_collection_raises`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_crud.py#L176) | 已复制 | |
+| [`test_get_by_ids`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_crud.py#L185) | 已复制 | |
+| [`test_get_by_ids_with_output_fields`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_crud.py#L191) | 已复制 | |
+| [`test_get_missing_ids_returns_empty`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_crud.py#L198) | 已复制 | |
+| [`test_delete_by_ids`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_crud.py#L207) | 已复制 | |
+| [`test_delete_idempotent`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_crud.py#L214) | 已复制 | |
+| [`test_delete_by_filter_active_true`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_crud.py#L226) | 已复制 | |
+| [`test_delete_by_filter_no_match`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_crud.py#L235) | 已复制 | |
+
 
 ### [test_grpc_search.py](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_search.py)（0004 候选文件）
 
-15 条：已复制 2，改后复制 8，范围外 4，不运行 1。
+15 条：已复制 2，改后复制 8，范围外 1，待复用 3，不运行 1。
 
 | 用例 | 状态 | 说明 |
 | --- | --- | --- |
@@ -85,9 +87,9 @@ HNSW 换成 FLAT、`== N` 换成 `in [N]` 的条件见 0004「验收」第 2 项
 | [`test_search_self_query_returns_self_top1`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_search.py#L91) | 改后复制 | HNSW 换成 FLAT |
 | [`test_search_with_output_fields`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_search.py#L105) | 改后复制 | HNSW 换成 FLAT |
 | [`test_search_default_output_fields_is_empty`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_search.py#L117) | 改后复制 | HNSW 换成 FLAT |
-| [`test_search_with_filter_active_only`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_search.py#L132) | 范围外 | 过滤表达式（`active == true`）、HNSW |
-| [`test_search_with_complex_filter`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_search.py#L144) | 范围外 | 过滤表达式（`score > 0.5 and active == true`）、HNSW |
-| [`test_search_with_filter_no_match`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_search.py#L157) | 范围外 | 过滤表达式（`id > 1000`）、HNSW |
+| [`test_search_with_filter_active_only`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_search.py#L132) | 待复用 | S1 已接通 `active == true`；共享 fixture 与其余请求须复核后迁移 |
+| [`test_search_with_complex_filter`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_search.py#L144) | 待复用 | S1 已接通 `score > 0.5 and active == true`；共享 fixture 与其余请求须复核后迁移 |
+| [`test_search_with_filter_no_match`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_search.py#L157) | 待复用 | S1 已接通 `id > 1000`；共享 fixture 与其余请求须复核后迁移 |
 | [`test_search_after_release_raises`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_search.py#L171) | 不运行 | 被 [L184](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_search.py#L184) 的同名定义覆盖，上游也不运行 |
 | [`test_search_after_release_raises`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_search.py#L184) | 改后复制 | HNSW 换成 FLAT |
 | [`test_search_unknown_collection_raises`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_search.py#L190) | 已复制 |  |
@@ -111,7 +113,7 @@ HNSW 换成 FLAT、`== N` 换成 `in [N]` 的条件见 0004「验收」第 2 项
 
 ### [test_auto_id.py](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_auto_id.py)（0004 候选文件）
 
-12 条：已复制 3，范围外 1，依赖内部模块 8。
+12 条：已复制 3，待复用 1，依赖内部模块 8。
 
 | 用例 | 状态 | 说明 |
 | --- | --- | --- |
@@ -125,7 +127,7 @@ HNSW 换成 FLAT、`== N` 换成 `in [N]` 的条件见 0004「验收」第 2 项
 | [`TestAutoIdEngine::test_num_entities_with_auto_id`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_auto_id.py#L130) | 依赖内部模块 | 导入内部模块（[L27](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_auto_id.py#L27)、[L30](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_auto_id.py#L30)） |
 | [`test_grpc_auto_id_create_and_insert`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_auto_id.py#L146) | 已复制 |  |
 | [`test_grpc_auto_id_search`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_auto_id.py#L168) | 已复制 |  |
-| [`test_grpc_auto_id_query`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_auto_id.py#L195) | 范围外 | 过滤表达式（`tag == 10`） |
+| [`test_grpc_auto_id_query`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_auto_id.py#L195) | 待复用 | S1 已接通 `tag == 10`；共享 fixture 与其余请求须复核后迁移 |
 | [`test_grpc_auto_id_ids_increasing`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_auto_id.py#L225) | 已复制 |  |
 
 ### [test_grpc_quickstart.py](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_quickstart.py)（0004 候选文件）
@@ -155,13 +157,13 @@ HNSW 换成 FLAT、`== N` 换成 `in [N]` 的条件见 0004「验收」第 2 项
 
 ### [test_crud_alignment.py](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_crud_alignment.py)
 
-7 条：已复制 3，改后复制 1，范围外 3。
+7 条：已复制 3，改后复制 1，待复用 3。
 
 | 用例 | 状态 | 说明 |
 | --- | --- | --- |
-| [`test_delete_by_filter_without_load`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_crud_alignment.py#L41) | 范围外 | 过滤表达式（`score >= 50`）、delete |
-| [`test_query_count_star`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_crud_alignment.py#L65) | 范围外 | 过滤表达式（`id >= 0`） |
-| [`test_query_count_star_with_filter`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_crud_alignment.py#L76) | 范围外 | 过滤表达式（`score >= 50`） |
+| [`test_delete_by_filter_without_load`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_crud_alignment.py#L41) | 待复用 | S1 已接通 `score >= 50`；共享 fixture 与其余请求须复核后迁移 |
+| [`test_query_count_star`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_crud_alignment.py#L65) | 待复用 | S1 已接通 `id >= 0`；共享 fixture 与其余请求须复核后迁移 |
+| [`test_query_count_star_with_filter`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_crud_alignment.py#L76) | 待复用 | S1 已接通 `score >= 50`；共享 fixture 与其余请求须复核后迁移 |
 | [`test_query_count_star_no_filter`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_crud_alignment.py#L86) | 已复制 |  |
 | [`test_get_with_output_fields`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_crud_alignment.py#L100) | 已复制 |  |
 | [`test_search_round_decimal`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_crud_alignment.py#L119) | 已复制 |  |
@@ -169,15 +171,15 @@ HNSW 换成 FLAT、`== N` 换成 `in [N]` 的条件见 0004「验收」第 2 项
 
 ### [test_crud_alignment_milvus.py](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_crud_alignment_milvus.py)
 
-6 条：已复制 2，范围外 4。
+6 条：已复制 2，范围外 1，待复用 3。
 
 | 用例 | 状态 | 说明 |
 | --- | --- | --- |
-| [`test_delete_with_filters`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_crud_alignment_milvus.py#L90) | 范围外 | 过滤表达式（`id < N`）、delete |
+| [`test_delete_with_filters`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_crud_alignment_milvus.py#L90) | 待复用 | S1 已接通 `id < N`；共享 fixture 与其余请求须复核后迁移 |
 | [`test_delete_with_filters_nullable_vector_field`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_crud_alignment_milvus.py#L142) | 范围外 | 过滤表达式（`id in {ids_to_delete}`）、delete、nullable |
-| [`test_count_with_expr`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_crud_alignment_milvus.py#L208) | 范围外 | 过滤表达式（`id >= 0`） |
+| [`test_count_with_expr`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_crud_alignment_milvus.py#L208) | 待复用 | S1 已接通 `id >= 0`；共享 fixture 与其余请求须复核后迁移 |
 | [`test_get_output_fields`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_crud_alignment_milvus.py#L242) | 已复制 |  |
-| [`test_query_output_fields_all`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_crud_alignment_milvus.py#L280) | 范围外 | 过滤表达式（`id >= 0`） |
+| [`test_query_output_fields_all`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_crud_alignment_milvus.py#L280) | 待复用 | S1 已接通 `id >= 0`；共享 fixture 与其余请求须复核后迁移 |
 | [`test_search_round_decimal`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_crud_alignment_milvus.py#L325) | 已复制 |  |
 
 ### [test_dynamic_field_coverage.py](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_dynamic_field_coverage.py)
@@ -281,11 +283,11 @@ HNSW 换成 FLAT、`== N` 换成 `in [N]` 的条件见 0004「验收」第 2 项
 
 ### [test_issue_fixes.py](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_issue_fixes.py)
 
-9 条：已复制 3，改后复制 1，范围外 3，依赖内部模块 2。
+9 条：已复制 3，改后复制 1，范围外 2，待复用 1，依赖内部模块 2。
 
 | 用例 | 状态 | 说明 |
 | --- | --- | --- |
-| [`test_dynamic_field_query_output`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_issue_fixes.py#L19) | 范围外 | 过滤表达式（`id >= 1`） |
+| [`test_dynamic_field_query_output`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_issue_fixes.py#L19) | 待复用 | S1 已接通 `id >= 1`；共享 fixture 与其余请求须复核后迁移 |
 | [`test_multi_vector_fields`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_issue_fixes.py#L56) | 范围外 | 多个向量字段 |
 | [`test_ip_distance_sign`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_issue_fixes.py#L92) | 依赖内部模块 | 导入内部模块（[L94](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_issue_fixes.py#L94)、[L95](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_issue_fixes.py#L95)、[L96](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_issue_fixes.py#L96)） |
 | [`test_grpc_large_batch_insert`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_issue_fixes.py#L124) | 已复制 |  |
@@ -297,42 +299,42 @@ HNSW 换成 FLAT、`== N` 换成 `in [N]` 的条件见 0004「验收」第 2 项
 
 ### [test_milvus_compat.py](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py)
 
-40 条：已复制 4，改后复制 9，范围外 27。
+40 条：已复制 4，改后复制 9，范围外 11，待复用 16。
 
 | 用例 | 状态 | 说明 |
 | --- | --- | --- |
-| [`TestInsert::test_insert_and_count`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L88) | 范围外 | 过滤表达式（`id >= 0`）、HNSW |
+| [`TestInsert::test_insert_and_count`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L88) | 待复用 | S1 已接通 `id >= 0`；共享 fixture 与其余请求须复核后迁移 |
 | [`TestInsert::test_insert_string_pk`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L94) | 已复制 |  |
-| [`TestInsert::test_insert_multiple_batches`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L104) | 范围外 | 过滤表达式（`id >= 0`）、HNSW |
+| [`TestInsert::test_insert_multiple_batches`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L104) | 待复用 | S1 已接通 `id >= 0`；共享 fixture 与其余请求须复核后迁移 |
 | [`TestSearch::test_search_basic`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L127) | 改后复制 | HNSW 换成 FLAT |
 | [`TestSearch::test_search_self_query_l2`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L135) | 改后复制 | HNSW 换成 FLAT |
 | [`TestSearch::test_search_metric_types`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L145) | 改后复制 | HNSW 换成 FLAT |
-| [`TestSearch::test_search_with_filter_int`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L152) | 范围外 | 过滤表达式（`id >= 100`）、HNSW |
-| [`TestSearch::test_search_with_filter_bool`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L164) | 范围外 | 过滤表达式（`bool_field == true`）、HNSW |
+| [`TestSearch::test_search_with_filter_int`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L152) | 待复用 | S1 已接通 `id >= 100`；共享 fixture 与其余请求须复核后迁移 |
+| [`TestSearch::test_search_with_filter_bool`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L164) | 待复用 | S1 已接通 `bool_field == true`；共享 fixture 与其余请求须复核后迁移 |
 | [`TestSearch::test_search_with_filter_varchar_like`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L176) | 范围外 | 过滤表达式（`varchar like "str_01%"`）、HNSW |
 | [`TestSearch::test_search_with_filter_and_or`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L188) | 范围外 | 过滤表达式（`id >= 100 and (bool_field == true or float_field < 50.0)`）、HNSW |
-| [`TestSearch::test_search_with_filter_in`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L202) | 范围外 | 过滤表达式（`id in {target_ids}`）、HNSW |
+| [`TestSearch::test_search_with_filter_in`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L202) | 待复用 | S1 已接通 `id in {target_ids}`；共享 fixture 与其余请求须复核后迁移 |
 | [`TestSearch::test_search_with_filter_not`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L215) | 范围外 | 过滤表达式（`not (id < 100)`）、HNSW |
 | [`TestSearch::test_search_multi_query`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L227) | 改后复制 | HNSW 换成 FLAT |
 | [`TestSearch::test_search_with_output_fields`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L237) | 改后复制 | HNSW 换成 FLAT |
 | [`TestSearch::test_search_results_sorted_by_cosine_score_descending`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L249) | 改后复制 | HNSW 换成 FLAT |
-| [`TestQuery::test_query_all`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L263) | 范围外 | 过滤表达式（`id >= 0`）、HNSW |
-| [`TestQuery::test_query_with_limit`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L269) | 范围外 | 过滤表达式（`id >= 0`）、HNSW |
+| [`TestQuery::test_query_all`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L263) | 待复用 | S1 已接通 `id >= 0`；共享 fixture 与其余请求须复核后迁移 |
+| [`TestQuery::test_query_with_limit`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L269) | 待复用 | S1 已接通 `id >= 0`；共享 fixture 与其余请求须复核后迁移 |
 | [`TestQuery::test_query_id_in_list`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L275) | 改后复制 | HNSW 换成 FLAT |
-| [`TestQuery::test_query_range_expression`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L285) | 范围外 | 过滤表达式（`float_field >= 50.0 and float_field < 60.0`）、HNSW |
+| [`TestQuery::test_query_range_expression`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L285) | 待复用 | S1 已接通 `float_field >= 50.0 and float_field < 60.0`；共享 fixture 与其余请求须复核后迁移 |
 | [`TestQuery::test_query_varchar_like_prefix`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L296) | 范围外 | 过滤表达式（`varchar like "str_00%"`）、HNSW |
-| [`TestQuery::test_query_bool_filter`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L308) | 范围外 | 过滤表达式（`bool_field == false`）、HNSW |
+| [`TestQuery::test_query_bool_filter`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L308) | 待复用 | S1 已接通 `bool_field == false`；共享 fixture 与其余请求须复核后迁移 |
 | [`TestQuery::test_query_not_in`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L319) | 范围外 | 过滤表达式（`id not in [0, 1, 2]`）、HNSW |
 | [`TestQuery::test_get_by_ids`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L332) | 改后复制 | HNSW 换成 FLAT |
 | [`TestQuery::test_get_missing_ids_returns_empty`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L338) | 改后复制 | HNSW 换成 FLAT |
-| [`TestQuery::test_query_output_fields_subset`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L344) | 范围外 | 过滤表达式（`id < 5`）、HNSW |
-| [`TestDelete::test_delete_by_ids`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L361) | 范围外 | 过滤表达式（`id >= 0`）、delete、HNSW |
-| [`TestDelete::test_delete_by_filter`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L370) | 范围外 | 过滤表达式（`id < 10`）、delete、HNSW |
+| [`TestQuery::test_query_output_fields_subset`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L344) | 待复用 | S1 已接通 `id < 5`；共享 fixture 与其余请求须复核后迁移 |
+| [`TestDelete::test_delete_by_ids`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L361) | 待复用 | S1 已接通 `id >= 0`；共享 fixture 与其余请求须复核后迁移 |
+| [`TestDelete::test_delete_by_filter`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L370) | 待复用 | S1 已接通 `id < 10`；共享 fixture 与其余请求须复核后迁移 |
 | [`TestDelete::test_delete_then_search_excludes_deleted`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L379) | 范围外 | delete、HNSW |
-| [`TestDelete::test_delete_nonexistent_pk_no_error`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L388) | 范围外 | 过滤表达式（`id >= 0`）、delete、HNSW |
-| [`TestUpsert::test_upsert_existing_pk_overwrites`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L401) | 范围外 | 过滤表达式（`id == 10`）、upsert、HNSW |
-| [`TestUpsert::test_upsert_new_pk_inserts`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L418) | 范围外 | 过滤表达式（`id == {NB + 1}`）、upsert、HNSW |
-| [`TestUpsert::test_upsert_multiple_times`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L435) | 范围外 | 过滤表达式（`id == 0`）、upsert、HNSW |
+| [`TestDelete::test_delete_nonexistent_pk_no_error`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L388) | 待复用 | S1 已接通 `id >= 0`；共享 fixture 与其余请求须复核后迁移 |
+| [`TestUpsert::test_upsert_existing_pk_overwrites`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L401) | 待复用 | S1 已接通 `id == 10`；共享 fixture 与其余请求须复核后迁移 |
+| [`TestUpsert::test_upsert_new_pk_inserts`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L418) | 待复用 | S1 已接通 `id == {NB + 1}`；共享 fixture 与其余请求须复核后迁移 |
+| [`TestUpsert::test_upsert_multiple_times`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L435) | 待复用 | S1 已接通 `id == 0`；共享 fixture 与其余请求须复核后迁移 |
 | [`TestPartition::test_partition_lifecycle`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L459) | 范围外 | 分区 |
 | [`TestPartition::test_partition_insert_and_search_scoped`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L468) | 范围外 | 分区、HNSW |
 | [`TestIndexLifecycle::test_index_create_load_release_drop_cycle`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L507) | 范围外 | DropIndex；断言索引类型为 HNSW |
@@ -344,7 +346,7 @@ HNSW 换成 FLAT、`== N` 换成 `in [N]` 的条件见 0004「验收」第 2 项
 
 ### [test_milvus_compat_crud.py](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat_crud.py)
 
-52 条：已复制 2，改后复制 1，范围外 49。
+52 条：已复制 2，改后复制 1，范围外 48，待复用 1。
 
 | 用例 | 状态 | 说明 |
 | --- | --- | --- |
@@ -380,7 +382,7 @@ HNSW 换成 FLAT、`== N` 换成 `in [N]` 的条件见 0004「验收」第 2 项
 | [`TestQuery::test_query_like`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat_crud.py#L316) | 范围外 | 过滤表达式（`title like "doc_1%"`）、nullable |
 | [`TestQuery::test_query_dup_pk_returns_latest`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat_crud.py#L323) | 范围外 | 过滤表达式（`id == 1`）、nullable |
 | [`TestQuery::test_query_without_loading_raises`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat_crud.py#L335) | 范围外 | 过滤表达式（`id >= 0`）、nullable |
-| [`TestQuery::test_query_not_exist_collection_raises`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat_crud.py#L346) | 范围外 | 过滤表达式（`id >= 0`）；只断言抛出异常，`UNIMPLEMENTED` 也会通过 |
+| [`TestQuery::test_query_not_exist_collection_raises`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat_crud.py#L346) | 待复用 | S1 已接通 `id >= 0`；共享 fixture 与其余请求须复核后迁移 |
 | [`TestGet::test_get_basic`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat_crud.py#L357) | 范围外 | nullable |
 | [`TestGet::test_get_nonexistent_ids`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat_crud.py#L362) | 范围外 | nullable |
 | [`TestGet::test_get_output_fields`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat_crud.py#L367) | 范围外 | nullable |
@@ -403,7 +405,7 @@ HNSW 换成 FLAT、`== N` 换成 `in [N]` 的条件见 0004「验收」第 2 项
 
 ### [test_milvus_compat_search.py](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat_search.py)
 
-16 条：已复制 2，范围外 14。
+16 条：已复制 2，范围外 13，待复用 1。
 
 | 用例 | 状态 | 说明 |
 | --- | --- | --- |
@@ -413,7 +415,7 @@ HNSW 换成 FLAT、`== N` 换成 `in [N]` 的条件见 0004「验收」第 2 项
 | [`TestSearchJSON::test_query_json_nested_like`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat_search.py#L75) | 范围外 | 过滤表达式（`info["nested"]["b"] like "nested_1%"`） |
 | [`TestSearchPagination::test_paginated_search_matches_full`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat_search.py#L105) | 已复制 |  |
 | [`TestSearchPagination::test_search_offset_beyond_total`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat_search.py#L116) | 已复制 |  |
-| [`TestSearchPagination::test_search_pagination_with_filter`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat_search.py#L121) | 范围外 | 过滤表达式（`id >= 100`） |
+| [`TestSearchPagination::test_search_pagination_with_filter`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat_search.py#L121) | 待复用 | S1 已接通 `id >= 100`；共享 fixture 与其余请求须复核后迁移 |
 | [`TestSearchPagination::test_search_pagination_in_partition`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat_search.py#L134) | 范围外 | 分区 |
 | [`TestSearchTextMatch::test_search_with_text_match_single_token`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat_search.py#L180) | 范围外 | 过滤表达式（`text_match(text, "python")`）、全文检索 |
 | [`TestSearchTextMatch::test_search_with_text_match_multi_token`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat_search.py#L188) | 范围外 | 过滤表达式（`text_match(text, "programming")`）、全文检索 |
@@ -426,16 +428,16 @@ HNSW 换成 FLAT、`== N` 换成 `in [N]` 的条件见 0004「验收」第 2 项
 
 ### [test_milvus_compat_v3.py](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat_v3.py)
 
-26 条：已复制 9，范围外 17。
+26 条：已复制 9，范围外 9，待复用 8。
 
 | 用例 | 状态 | 说明 |
 | --- | --- | --- |
-| [`TestVarcharPK::test_search_varchar_pk_equality`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat_v3.py#L129) | 范围外 | 过滤表达式（`pk == "doc_005"`） |
+| [`TestVarcharPK::test_search_varchar_pk_equality`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat_v3.py#L129) | 待复用 | S1 已接通 `pk == "doc_005"`；共享 fixture 与其余请求须复核后迁移 |
 | [`TestVarcharPK::test_query_varchar_pk_like_prefix`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat_v3.py#L147) | 范围外 | 过滤表达式（`pk like "doc_00%"`） |
-| [`TestVarcharPK::test_upsert_varchar_pk`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat_v3.py#L165) | 范围外 | 过滤表达式（`pk == "doc_005"`）、upsert |
+| [`TestVarcharPK::test_upsert_varchar_pk`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat_v3.py#L165) | 待复用 | S1 已接通 `pk == "doc_005"`；共享 fixture 与其余请求须复核后迁移 |
 | [`TestPaginationConsistency::test_paginated_search_matches_full`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat_v3.py#L195) | 已复制 |  |
 | [`TestPaginationConsistency::test_offset_beyond_count_returns_empty`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat_v3.py#L222) | 已复制 |  |
-| [`TestPaginationConsistency::test_search_pagination_with_filter`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat_v3.py#L235) | 范围外 | 过滤表达式（`val >= 10.0`） |
+| [`TestPaginationConsistency::test_search_pagination_with_filter`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat_v3.py#L235) | 待复用 | S1 已接通 `val >= 10.0`；共享 fixture 与其余请求须复核后迁移 |
 | [`TestPartitionPagination::test_search_in_partition_returns_only_partition_data`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat_v3.py#L270) | 范围外 | 分区 |
 | [`TestJsonFieldFilters::test_query_json_nested_field`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat_v3.py#L330) | 范围外 | 过滤表达式（`meta['count'] < 10`） |
 | [`TestJsonFieldFilters::test_search_json_string_filter`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat_v3.py#L346) | 范围外 | 过滤表达式（`meta["label"] == "item_0"`） |
@@ -443,23 +445,23 @@ HNSW 换成 FLAT、`== N` 换成 `in [N]` 的条件见 0004「验收」第 2 项
 | [`TestMultiNullableTypes::test_query_or_with_nullable`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat_v3.py#L419) | 范围外 | 过滤表达式（`int_val is null or float_val > 2.0`）、nullable |
 | [`TestStringInFilter::test_search_varchar_in_list`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat_v3.py#L452) | 范围外 | 检索带过滤表达式（`tag in ["tag_001", "tag_003"]`） |
 | [`TestStringInFilter::test_query_varchar_not_in`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat_v3.py#L467) | 范围外 | 过滤表达式（`tag not in ["tag_000", "tag_001", "tag_002"]`） |
-| [`TestMixedFilter::test_search_mixed_int_varchar`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat_v3.py#L489) | 范围外 | 过滤表达式（`val >= 10.0 and tag >= "tag_010"`） |
+| [`TestMixedFilter::test_search_mixed_int_varchar`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat_v3.py#L489) | 待复用 | S1 已接通 `val >= 10.0 and tag >= "tag_010"`；共享 fixture 与其余请求须复核后迁移 |
 | [`TestDistanceOrdering::test_cosine_scores_descending`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat_v3.py#L512) | 已复制 |  |
 | [`TestDistanceOrdering::test_self_query_cosine_score_near_one`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat_v3.py#L523) | 已复制 |  |
 | [`TestDeleteAllNullable::test_delete_all_then_verify_empty`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat_v3.py#L541) | 范围外 | 过滤表达式（`id >= 0`）、delete、nullable |
-| [`TestChainedRange::test_query_range_both_bounds`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat_v3.py#L590) | 范围外 | 过滤表达式（`val >= 10.0 and val < 20.0`） |
+| [`TestChainedRange::test_query_range_both_bounds`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat_v3.py#L590) | 待复用 | S1 已接通 `val >= 10.0 and val < 20.0`；共享 fixture 与其余请求须复核后迁移 |
 | [`TestGetWithOutputFields::test_get_explicit_fields`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat_v3.py#L611) | 已复制 |  |
-| [`TestFilterZeroMatch::test_search_filter_no_match`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat_v3.py#L631) | 范围外 | 过滤表达式（`val > 99999.0`） |
-| [`TestFilterZeroMatch::test_query_filter_no_match`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat_v3.py#L643) | 范围外 | 过滤表达式（`val > 99999.0`） |
+| [`TestFilterZeroMatch::test_search_filter_no_match`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat_v3.py#L631) | 待复用 | S1 已接通 `val > 99999.0`；共享 fixture 与其余请求须复核后迁移 |
+| [`TestFilterZeroMatch::test_query_filter_no_match`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat_v3.py#L643) | 待复用 | S1 已接通 `val > 99999.0`；共享 fixture 与其余请求须复核后迁移 |
 | [`TestAutoIdViaGrpc::test_auto_id_insert_returns_ids`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat_v3.py#L660) | 已复制 |  |
 | [`TestMultiQuerySearch::test_multi_nq_self_query`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat_v3.py#L698) | 已复制 |  |
-| [`TestVarcharEmptyComparison::test_varchar_gte_empty_matches_all`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat_v3.py#L718) | 范围外 | 过滤表达式（`tag >= ""`） |
+| [`TestVarcharEmptyComparison::test_varchar_gte_empty_matches_all`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat_v3.py#L718) | 待复用 | S1 已接通 `tag >= ""`；共享 fixture 与其余请求须复核后迁移 |
 | [`TestGetPartialMiss::test_get_mixed_existing_and_missing`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat_v3.py#L736) | 已复制 |  |
 | [`TestGetPartialMiss::test_get_all_missing`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat_v3.py#L744) | 已复制 |  |
 
 ### [test_milvus_lite_compat.py](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_lite_compat.py)
 
-7 条：已复制 4，范围外 2，依赖内部模块 1。
+7 条：已复制 4，待复用 2，依赖内部模块 1。
 
 | 用例 | 状态 | 说明 |
 | --- | --- | --- |
@@ -467,13 +469,13 @@ HNSW 换成 FLAT、`== N` 换成 `in [N]` 的条件见 0004「验收」第 2 项
 | [`TestServerManager::test_reuse_same_path`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_lite_compat.py#L36) | 已复制 |  |
 | [`TestServerManager::test_different_paths`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_lite_compat.py#L47) | 已复制 |  |
 | [`TestServerManager::test_release_server`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_lite_compat.py#L57) | 依赖内部模块 | 断言私有属性 `mgr._servers`（[L63](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_lite_compat.py#L63)） |
-| [`TestPymilvusIntegration::test_full_lifecycle_via_server_manager`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_lite_compat.py#L69) | 范围外 | 过滤表达式（`id < 3`）、delete |
+| [`TestPymilvusIntegration::test_full_lifecycle_via_server_manager`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_lite_compat.py#L69) | 待复用 | S1 已接通 `id < 3`；共享 fixture 与其余请求须复核后迁移 |
 | [`TestPymilvusIntegration::test_shorthand_create_collection`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_lite_compat.py#L134) | 已复制 |  |
-| [`TestPymilvusIntegration::test_dot_db_uri_via_pymilvus`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_lite_compat.py#L155) | 范围外 | 过滤表达式（`id >= 2`）、delete |
+| [`TestPymilvusIntegration::test_dot_db_uri_via_pymilvus`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_lite_compat.py#L155) | 待复用 | S1 已接通 `id >= 2`；共享 fixture 与其余请求须复核后迁移 |
 
 ### [test_offset.py](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_offset.py)
 
-8 条：已复制 2，范围外 1，依赖内部模块 5。
+8 条：已复制 2，待复用 1，依赖内部模块 5。
 
 | 用例 | 状态 | 说明 |
 | --- | --- | --- |
@@ -483,7 +485,7 @@ HNSW 换成 FLAT、`== N` 换成 `in [N]` 的条件见 0004「验收」第 2 项
 | [`TestOffsetEngine::test_query_offset`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_offset.py#L71) | 依赖内部模块 | 导入内部模块（[L26](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_offset.py#L26)、[L29](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_offset.py#L29)） |
 | [`TestOffsetEngine::test_query_offset_without_limit`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_offset.py#L83) | 依赖内部模块 | 导入内部模块（[L26](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_offset.py#L26)、[L29](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_offset.py#L29)） |
 | [`test_grpc_search_offset`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_offset.py#L111) | 已复制 |  |
-| [`test_grpc_query_offset`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_offset.py#L124) | 范围外 | 过滤表达式（`id >= 0`） |
+| [`test_grpc_query_offset`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_offset.py#L124) | 待复用 | S1 已接通 `id >= 0`；共享 fixture 与其余请求须复核后迁移 |
 | [`test_grpc_search_offset_empty`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_offset.py#L135) | 已复制 |  |
 
 ### [test_p0_features.py](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_p0_features.py)
@@ -508,7 +510,7 @@ HNSW 换成 FLAT、`== N` 换成 `in [N]` 的条件见 0004「验收」第 2 项
 
 | 功能 | 用例 |
 | --- | --- |
-| 过滤表达式（检索的 `filter`、`<主键> in [...]` 以外的 `expr`、带 `expr` 的 `count(*)`、空 `expr` 且不含 `count(*)`） | [test_grpc_translation.py](../test_grpc_translation.py) 的 `test_search_m1_unsupported`、`test_query_m1_unsupported`、`test_pymilvus_entry_points_remaining_unsupported` |
+| S1 之外的过滤构造（如 `or`、`not`、JSON / 动态字段与 LIKE） | [test_grpc_translation.py](../test_grpc_translation.py) 的 `test_search_m1_unsupported`、`test_query_m1_unsupported`、`test_pymilvus_entry_points_remaining_unsupported` |
 | query iterator；search iterator 的第二批起 | `test_query_m1_unsupported`、`test_pymilvus_entry_points_remaining_unsupported` |
 | 分区 RPC；写入、检索、查询指定 `_default` 以外的分区；partition key | `test_insert_m1_unsupported`、`test_search_m1_unsupported`、`test_query_m1_unsupported`、`test_pymilvus_entry_points_remaining_unsupported` |
 | 数据库 RPC、alias | `test_pymilvus_entry_points_remaining_unsupported` |

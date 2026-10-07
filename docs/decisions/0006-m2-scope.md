@@ -473,7 +473,7 @@ M1 证明了整条链路可行，但数据只在内存中，不发布（[0004](0
   - 第 8–12 项的失败语义，以及第 19 项的保证。
 - **打开已有数据目录**：3.x 写的与本实现写的都能打开；collection 懒打开，不支持的内容按第 14–18 项处理。
 - **删除**：
-  - `delete(ids=...)` 沿用 M1 的主键识别，`delete(filter=...)` 支持 S1；
+  - `delete(ids=...)` 由完整解析识别主键快路径，`delete(filter=...)` 支持 S1；
   - 返回值、分区语义与 `_seq` 的消耗与 3.x 相同，包括快路径中主键类型转换失败时也消耗一个 `_seq`；
   - 快路径中主键类型不符或溢出时，与 3.x 一样报 code 1、error_code 0，错误原文照搬 pyarrow 与 CPython 的三种文案（M1 的 `pyint` 已有复现 Python 报错原文的先例）。
 - **upsert**：按第 2 项。
@@ -542,6 +542,8 @@ M1 证明了整条链路可行，但数据只在内存中，不发布（[0004](0
 | 差异 | 3.x | 本实现 | 理由 | 影响的用例 |
 | --- | --- | --- | --- | --- |
 | 已登记句柄的 collection 目录或 schema 被外部删除 / 移走，再显式 drop | schema 不存在时直接返回，保留旧内存句柄；仅重建同名 collection 才替换，期间直接访问可能仍返回旧行 | 同步仍持有的原 WAL File 成功后撤销旧句柄；旧快照有效，后续按名字访问报不存在，同名 create 使用空的新实例；同步失败保留句柄并报错 | drop 的生命周期必须包含已登记句柄，不能因目录早已不存在就留下可写旧实例；不改变正常目录提交协议，见 [0007](0007-m2-storage-engine.md#dropcreate-与关闭) | 已打开、目录删除 / 移走、drop、同名重建、重开；两侧在 drop 到 create 之间的结果分别断言 |
+| 过滤表达式与错误 repr 的 Unicode 分类、递归边界 | 分类随运行 Python 的 Unicode 版本变化；嵌套限制与错误尾句取决于 Python 调用栈 | 词法与错误 repr 固定 CPython 3.12 / Unicode 15.0 分类；解析嵌套计数上限 128，超出报 code 1 `maximum recursion depth exceeded`；平面长链使用 arena，不按链长递归析构 | 固定可复核的词法真值并防止服务输入导致 Rust 栈溢出，不绑定 Python；见 [0007](0007-m2-storage-engine.md#s1-过滤的当前实现与验收范围) | 非 ASCII 数字 / 字段名、深括号 / unary / 函数嵌套；Unicode 与语法语料可重生成核验 |
+| Search 过滤后没有候选时的非法维度 / 度量 | 不进入距离计算，可能返回空成功结果 | 仍返回 code 1，检查查询向量维度及度量枚举；过滤的语法与类型错误先报告 | 沿用 [0004](0004-m1-scope.md#决策) 对查询向量与请求参数的严格校验，不让相同非法请求的结果取决于是否有命中；格式未变 | [test_filter_s1.py](../../tests/differential/test_filter_s1.py) 的手写 Search 请求分别固定两侧结果；topk 为零时仍编译表达式，但不触发数据求值的数值错误 |
 | 提交之后、删除 WAL 之前崩溃 | 重开后数据重复：行数计两次，get 返回旧版本而 query 返回新版本，upsert 与旧行合并，带 limit 的顺序不同 | 不重复：回放时跳过已被已提交状态覆盖的操作 | 缺陷 a | 该崩溃点之后的读取 |
 | 提交点之后失败（例如目录 fsync 失败） | 忽略目录 fsync 的错误，照常删除 WAL | 保留这一代的 WAL，之后的写入先重试完成提交，失败则拒绝；重试一直失败时，3.x 打开会重复计数 | 第 8 项 | 目录 fsync 失败 |
 | manifest 已提交后的 WAL 清理失败 | flush 报错；触发它的写入报 code 1，已提交的数据在重开前不可见 | 显式 Flush 报错，触发自动 flush 的写入仍成功且数据可见；后续写入不因清理失败而受阻，下一次提交、显式 Flush 或关闭重试清理 | [0007「提交之后」](0007-m2-storage-engine.md#flush)；写入已越过提交点 | WAL 文件 unlink 或 `wal/` 同步失败；关闭时仍有残留 WAL，3.x 打开可能重复计数 |
@@ -568,7 +570,7 @@ M1 证明了整条链路可行，但数据只在内存中，不发布（[0004](0
 | drop 目录已移走而 `aliases.json` 写入失败 | 报错，旧别名可能悬空 | 报错并说明目录已移走；同名 drop 重试、同名 create 或后续写 `aliases.json` 时清理悬空别名；仅重开不清理 | 规则 5、[0007](0007-m2-storage-engine.md) | drop 后立即重试或同名 create |
 | 只差大小写或 Unicode 规范化不同的 collection 名 | 另开一个实例指向同一目录；drop 会删掉真实的 collection；HFS+ 上非 ASCII 的名字按路径能找到 | 访问与 drop 都按「collection 不存在」处理，新建时报「已存在」 | 第 18 项 | 不区分大小写或做规范化的文件系统 |
 | INVERTED 定义的字段上的过滤 | 结果取决于数据在 segment 还是 memtable，以及后台索引是否建好 | 按扫描求值 | 3.x 自身不一致 | 3.x 写的、带 INVERTED 定义的目录 |
-| 整数列对浮点字面量、数据超出 2^53 | 已删除或已被覆盖的旧版本也会触发 code 1 | 只看存活行 | 3.x 的结果随 compaction 时机变化 | 主键或标量超出 2^53 的 collection |
+| S1 求值的数值转换与字面量范围检查（含整数列对浮点字面量、数据超出 2^53） | 物理 segment 中已删除或已被覆盖的旧版本仍参与求值，可能触发 code 1；没有存活 MemTable 行时不调用 Arrow | 只对有存活行的块求值；空块不触发求值阶段的转换或字面量范围错误，语法与 schema 检查仍执行 | 3.x 的结果随 compaction 时机变化，不能让不存在的候选行决定结果；沿用第 13 项与 0007 的有效位边界 | 主键或标量超出 2^53、FLOAT 与整数字面量超过 2^24、字面量超出 int64；[test_filter_s1.py](../../tests/differential/test_filter_s1.py) 对空 MemTable 与全失效 segment 分别固定两侧结果 |
 | `field_ops` 非空的 upsert | 静默按替换处理 | UNIMPLEMENTED | 不变量 15 | 使用 `field_ops` 的 upsert |
 | JSON 字段的浮点形式数字超出有限 float64 范围（raw gRPC，如 `{"a":1e999}`） | 接受写入；raw Query 可返回 code 0 和含 `Infinity` 的非标准 JSON，pymilvus 解码失败 | 在 JSON 归一化时返回 code 1、明确的有限 float64 范围错误，不推进序号或追加 WAL | 不复制参照实现接受写入但无法由客户端读回的行为；宽整数和字符串不受此限制，`pyjson` 的兼容输出规则不改 | [test_reopen.py](../../tests/differential/test_reopen.py) 的 raw 插入拒绝、两侧响应与有限输入重试用例；正常值在写前、发布后、重开后的字节一致 |
 | 同一批内重复主键的部分 upsert | 每行都与调用前的旧行合并，后一行会丢掉前一行新增但自己未提供的字段 | 每行与该主键在本批中的上一版本合并，后一行保留前一行新增的字段 | [0007「写入」](0007-m2-storage-engine.md#写入) 的批内顺序合同；避免同一次原子写入丢字段 | 同批重复主键且各行提供不同字段；`tests/differential/test_scenarios.py` 固定两边结果 |
@@ -582,7 +584,6 @@ M1 证明了整条链路可行，但数据只在内存中，不发布（[0004](0
 | 含不支持内容的 collection | 能使用 | 列出；DescribeCollection 与 drop 照常，其余返回 UNIMPLEMENTED | 第 14 项 | 用 3.x 的其他功能写过的目录 |
 | 已有的别名与其他数据库 | 能使用 | UNIMPLEMENTED | 第 15 项 | 经别名或 `db_name` 的访问 |
 | 带 limit 的过滤结果顺序 | 后台 compaction 之后改变 | 不做 compaction，不变 | 第 3 项 | 带 limit 且文件数不少于 4 的过滤 |
-| `delete(ids=["bad"])` 对 INT64 主键生成的无引号表达式 | 解析时报 code 6，指出 `bad` 不是字面量 | 当前仅识别主键 `in` 快路径，返回 UNIMPLEMENTED；S1 过滤解析接入时对齐原文 | 第 1 项的 S1 解析尚未接入 | 非数字字符串传给 INT64 的 `delete(ids=...)` |
 | ManualCompaction 与 GetCompactionState | 返回成功，恒为 Completed | UNIMPLEMENTED | 第 3 项，不变量 15 | `client.compact()`、`optimize()` |
 | 被覆盖的旧版本与已删除的行 | compaction 回收 | 不回收 | 第 3 项 | 长期运行的写入 |
 

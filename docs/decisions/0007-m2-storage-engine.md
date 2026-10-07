@@ -240,9 +240,7 @@ WAL 追加（每次写入调用一个 batch，dim 128）：
 - **get、`count(*)`**：
   - get 查主键索引，持读锁的时间很短；
   - 空 expr 的 `count(*)` 取存活行计数。
-- **`delete(filter)` 的隔离方式**：在第 4 步实现 S1 时定。可选的做法有两种：
-  - 在快照上求值、再按主键删除，与 3.x 一样不是原子的，可能删掉求值之后才写入的新版本；
-  - 在写锁内求值，是原子的，但持锁 O(总行数)。
+- **`delete(filter)` 的隔离方式**：采用 3.x 的快照求值、再按主键删除。求值不持状态锁，可能删掉求值之后才写入的同主键新版本。整个操作沿用一次共享写入许可和同一个句柄，不能在删除阶段按名字重新解析到同名重建后的 collection；不把共享许可升级为独占。Delete 不要求 load，仅在自己的视图上绕过 load 校验，不临时修改共享 load 状态。空命中不消耗 `_seq`，非空命中经既有 WAL-first 批删除协议。写锁内求值会扩大持锁时间并改变并发语义，因此不采用。
 - **计算池的先进先出排队、停服时取消长检索**：仍作为残余风险，不在 M2 实现。
   - 快照之后，锁不再把后到的请求挡在长检索之后，剩下的只是计算池内的排队，0005 已测量并接受。
   - 取消与轮转等到出现需要它们的测量结果时再设计。
@@ -447,7 +445,7 @@ WAL 追加（每次写入调用一个 batch，dim 128）：
 - collection 单测核对共享数据块与只钉住 Get 命中块；VARCHAR 主键用例另核对跨块重映射、重复与缺失主键，以及覆盖、删除、flush 与 drop 后旧投影不变。[service.rs](../../crates/grpc/src/service.rs) 与 [query.rs](../../crates/grpc/src/query.rs) 的测试分别暂停真实 Search RPC 与主键 Query 的锁外阶段，要求 drop 或删除与 flush 先完成，再核对旧响应。
 - [test_read_snapshot.py](../../tests/differential/test_read_snapshot.py) 以真实 3.x 核对覆盖、删除后重插、flush 与部分 Upsert 前后的主键读取、投影、计数和非截断的并列检索顺序。
 
-读快照切片保留既有列式视图，不改变落盘格式与发布协议；后续接通的数据源映射与块合并以[下节](#数据源映射与块合并的当前实现与验收范围)为准。S1 过滤查询仍待实现，按名字并行打开的范围见下文。快照测试不替代完整的并发崩溃矩阵或性能基准，不能据此声明吞吐或延迟提升。
+读快照切片保留既有列式视图，不改变落盘格式与发布协议；后续接通的数据源映射与块合并以[下节](#数据源映射与块合并的当前实现与验收范围)为准。S1 的接入以 [S1 过滤](#s1-过滤的当前实现与验收范围)为准，按名字并行打开的范围见下文。快照测试不替代完整的并发崩溃矩阵或性能基准，不能据此声明吞吐或延迟提升。
 
 ### 数据源映射与块合并的当前实现与验收范围
 
@@ -465,7 +463,7 @@ WAL 追加（每次写入调用一个 batch，dim 128）：
 - [read_snapshot.rs](../../crates/core/tests/read_snapshot.rs) 在锁外构建写出批次后、提交与锁内发布前暂停 flush，下一代穿插覆盖、删除、Upsert 和重插；发布前后新视图相同，旧快照不变，再次 flush 与重开结果一致。暂停钩子的通道断开也须归类为提交点前失败，manifest 不变且可重试。
 - [test_read_snapshot.py](../../tests/differential/test_read_snapshot.py) 的小批量差分核对多代发布前后的主键读取、计数、JSON 原始 RPC 字节与非截断并列顺序；参照实现保持最多三个 data 文件，并断言文件数量，避免将四文件触发的 compaction 重排混入本切片。[test_reopen.py](../../tests/differential/test_reopen.py) 另固定两侧关闭重开后的非截断并列顺序、原物理行号与 JSON RPC 字节。
 
-本切片不实施 compaction 或 S1 过滤；完整并发崩溃矩阵、Parquet 读取 panic、平台行为与最终性能基准仍待后续验收。块合并对写锁、复制与快照保留内存的实际代价尚未量化，不声明性能提升。
+数据源映射切片自身不实施 compaction 或 S1；后续 S1 的接入以 [S1 过滤](#s1-过滤的当前实现与验收范围)为准；完整并发崩溃矩阵、Parquet 读取 panic、平台行为与最终性能基准仍待后续验收。块合并对写锁、复制与快照保留内存的实际代价尚未量化，不声明性能提升。
 
 ### 按名字懒打开与失败缓存的当前实现与验收范围
 
@@ -477,3 +475,17 @@ WAL 追加（每次写入调用一个 batch，dim 128）：
 - [重开差分](../../tests/differential/test_reopen.py) 固定并发 Rust 首次读取与参照实现串行真值的一致性、同名重建及无关 collection 的可见行，并对外部修复后的两侧缓存差异分别断言；首次打开失败且未登记句柄时，目录删除/移走后的 has/describe/load state/stats 均按不存在处理，移回后恢复原缓存判定。3.x 没有首次打开互斥，不能用其并发打开缺陷生成真值。
 
 本切片不调整读取文件的格式、发布、别名维护或恢复策略，不代替完整并发崩溃矩阵、跨平台实测或性能基准。aliases 文件目前仍由 create/drop 的目录变更锁串行维护，独立 aliases 锁与全组件 debug 锁序断言仍待后续收敛。
+
+### S1 过滤的当前实现与验收范围
+
+求值范围以 [0006 第 1 项](0006-m2-scope.md#决策项)为准：[filter](../../crates/core/src/filter.rs) 完整解析参照实现 v3.2.1（43d1257）的语法，再拒绝范围外构造；只绑定标量字段与字面量的六种比较、and、括号，以及顶层主键 in。字面量在左侧和 `&&` 归约为相同构造。`or`、`not`、LIKE、算术、字段间比较、独立布尔谓词、JSON / 动态字段、数组、时间、全文与几何谓词只解析，不求值。范围外构造的语义错误不复现；语法错误仍逐字对齐。原 M1 主键识别器已由完整解析取代，快路径仍保留请求的主键顺序、重复与类型转换语义。
+
+- 查询和检索的 load/deleted 检查、字段绑定、过滤与投影使用同一次状态视图。Query 的 schema 无关解析先在状态锁外产生 `ParsedFilter`，load 校验后才传播解析错误；通用路径与主键分派复用该结果，不再二次解析。每个块按列及既有有效位生成掩码，计算期间不做逐行版本查找；无过滤时复用原位图，不额外复制块表。and 的各操作数都求值，不能因先前谓词为假屏蔽转换错误；仅失效旧行不参与转换（0006 第 13 项）。FLOAT 与整数字面量使用 float32 的 ±2^24 安全转换范围，DOUBLE 或浮点字面量使用 float64 的 ±2^53 范围，错误原文与 Arrow 一致。
+- 通用 Query 按数据源序、segment 物理行序或 memtable 位次排序，再执行 3.x 的 limit / offset；主键 in 的 get 快路径继续忽略分页。零 / 负 limit、负 offset 与无效字符串参数保留参照实现的实际行为，不新增校验。带 expr 的 count 使用同一过滤掩码、不使用分页；空 expr 的 count 保留不检查 load 与分区的短锁路径。query iterator 仍显式拒绝。
+- 主键 `in` 的数值集合按 Arrow 的实际转换路径求值：先构建 value_set，再尝试完整转成 int64；成功时不把列转为 double，失败时才按 double 位模式查集合，因此非整数浮点集合中的 `-0.0` 不匹配整数零。普通比较仍将正负零判为相等。整浮混合的集合构造错误、宽整数列的安全转换错误和边界饱和行为均由真实 3.x 的 Query/count/Search/Delete、发布与重开用例固定，不另登记数学语义差异。列式存储上的逐行标量分派开销留待最终基准核对，本切片不据此声明性能改善。
+- [filter_s1.rs](../../crates/core/tests/filter_s1.rs) 固定旧快照在发布、过滤删除、drop 与同名重建后仍不变，失效旧行的数值边界，以及过滤失败不改变行集、序号与 WAL。Delete 取得视图之前仍先检查毒化与待重试提交，存储失败的错误优先级由注入用例固定。[db.rs](../../crates/core/src/db.rs) 的受控用例暂停求值结束后的 Delete，覆盖同时写入新版本与 release 的行为。S1 不改变 WAL、manifest 或失败重试协议。
+- [test_filter_s1.py](../../tests/differential/test_filter_s1.py) 通过真实客户端对照八类标量、六种比较的两个方向、and、Query/count/Search/Delete、分页参数、错误码与原文、主键两种类型和关闭重开后的顺序；顺序用例显式限制参照实现的 data 文件数小于四，排除 compaction 重排。原 [CRUD 副本](../../tests/python/adapter/test_grpc_crud.py) 恢复原过滤表达式，并复用除 LIKE 外的十九条上游用例；其余尚未迁移的 S1 用例在 [INVENTORY](../../tests/python/adapter/INVENTORY.md) 标为待复用，不计作执行证据。
+- 语法真值通过 [生成脚本](../../tests/differential/generate_filter_parse_fixtures.py) 从真实 3.x 导出，[语料](../../tests/differential/fixtures/filter_parse_v321.json)覆盖语法分支、截断与固定种子的词法变异；`--verify` 可核验。Unicode 字符分类按 CPython 3.12 / Unicode 15.0 固定，[生成脚本](../../tests/differential/generate_filter_unicode.py) 可核验分类表。嵌套深度另有明确服务上限，差异见 0006。
+- ISO 时间与偏移共用按 [CPython 3.12.14 的 C 解析器](https://github.com/python/cpython/blob/v3.12.14/Modules/_datetimemodule.c) `parse_hh_mm_ss_ff` / `parse_isoformat_time` 推进的扫描器：覆盖紧凑与冒号形态、无分隔符的小数、六位微秒截断、逻辑时区边界与实际尾字节、零秒偏移忽略小数的规则；日期与 INTERVAL 不在本次重写范围。固定语料保留此前的全部 2857 条，并增加时间与偏移的长度/尾字节矩阵。另以[直接模糊对照器](../../tests/differential/fuzz_temporal.py)把结构生成与字符变异的表达式交给真实 3.x `parse_expr` 与 [Rust 解析入口](../../crates/core/examples/filter_parse_probe.rs)，逐字比较接受结果及诊断，不依赖 gRPC 或固定语料；每次输出覆盖计数与反例报告，任何分歧返回失败。真实入口仍由 Query/Search/Delete 的差分用例固定；时间求值仍属范围外。
+
+本切片不实施过滤索引或表达式缓存，不声明吞吐、延迟或内存改善；完整并发崩溃矩阵、debug 锁序断言、Parquet 读取 panic、跨平台实测与最终性能基准仍待后续验收。

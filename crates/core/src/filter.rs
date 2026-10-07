@@ -1,7 +1,68 @@
-//! 过滤表达式。M1 只识别 `<主键> in [字面量, ...]` 这一种形式（0004「范围」），规则与 3.x 在
-//! `_extract_pks_from_expr` 中用完整 filter parser 得到的结果一致：凡本模块接受的输入，3.x 都走按主键
-//! 读取且得到相同的主键列表；本模块拒绝而 3.x 接受的输入只有非 ASCII 数字与未收录字符的主键名，
-//! 见 0004「决策」。
+//! 3.x 完整过滤语法与 S1 的列式求值；范围与拒绝边界见 0006 第 1 项。
+
+mod eval;
+mod parser;
+mod temporal;
+mod unicode;
+pub(crate) use eval::Predicate;
+
+/// 错误字符串与词法必须使用同一版 Unicode 属性，避免未分配码位的 repr 漂移。
+pub(crate) fn printable_char(c: char) -> bool {
+    unicode::printable(c)
+}
+
+use crate::error::Result;
+
+/// 与 schema 无关的解析结果；适配层可在取状态锁之前解析，再保留原来的校验错误优先级。
+pub struct ParsedFilter {
+    source: String,
+    ast: Option<parser::Ast>,
+}
+impl ParsedFilter {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.ast.is_none()
+    }
+    pub fn parse(source: &str) -> Result<Self> {
+        Ok(Self {
+            source: source.into(),
+            ast: if source.is_empty() {
+                None
+            } else {
+                Some(parser::parse(source)?)
+            },
+        })
+    }
+    /// 非主键快路径仍须绑定 schema 并做语义检查；不得把无法识别当成无过滤。
+    pub fn primary_keys(&self, pk: &str) -> Option<Vec<PkLiteral>> {
+        use parser::{Kind, Literal};
+        let ast = self.ast.as_ref()?;
+        let Kind::In {
+            field,
+            list,
+            negate: false,
+        } = ast.nodes[ast.root].kind
+        else {
+            return None;
+        };
+        if !matches!(&ast.nodes[field].kind,Kind::Field(name) if name==pk) {
+            return None;
+        }
+        let Kind::List(elements) = &ast.nodes[list].kind else {
+            return None;
+        };
+        let mut out = Vec::with_capacity(elements.len());
+        for &id in elements {
+            match &ast.nodes[id].kind {
+                Kind::Lit(Literal::Int(s)) => {
+                    out.push(s.parse().map_or(PkLiteral::IntOutOfRange, PkLiteral::Int))
+                }
+                Kind::Lit(Literal::String(s)) => out.push(PkLiteral::Str(s.clone())),
+                _ => return None,
+            }
+        }
+        Some(out)
+    }
+}
 
 /// 列表中的一个字面量。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -12,209 +73,8 @@ pub enum PkLiteral {
     Str(String),
 }
 
-/// 3.x 词法中的关键字与布尔字面量，按 `str.lower()` 比较。
-const RESERVED: [&str; 12] = [
-    "and", "or", "not", "in", "like", "is", "null", "exists", "iso", "interval", "true", "false",
-];
-/// 3.x 的整数字面量经 Python `int()` 解析，超过 4300 位（含前导零）时报错，于是不走按主键读取。
+#[cfg(test)]
 const MAX_INT_DIGITS: usize = 4300;
-
-/// 空白只认这四个字符（3.x `tokens.py`），不能用 `char::is_whitespace`。
-fn is_ws(c: char) -> bool {
-    matches!(c, ' ' | '\t' | '\r' | '\n')
-}
-
-/// 3.x 用 `str.isalpha` / `str.isalnum` 切分标识符，其结果随 Python 的 Unicode 版本变化。这里只收录
-/// 在 Python 3.10–3.13（Unicode 13.0–15.1）中逐码位核对过、全部判为字母的范围。
-fn is_ident_letter(c: char) -> bool {
-    matches!(c,
-        'A'..='Z' | 'a'..='z' | '_'
-        | '\u{C0}'..='\u{D6}' | '\u{D8}'..='\u{F6}' | '\u{F8}'..='\u{17F}'
-        | '\u{3041}'..='\u{3096}' | '\u{309D}'..='\u{309F}'
-        | '\u{30A1}'..='\u{30FA}' | '\u{30FC}'..='\u{30FF}'
-        | '\u{3400}'..='\u{4DBF}' | '\u{4E00}'..='\u{9FFC}'
-        | '\u{AC00}'..='\u{D7A3}')
-}
-
-/// 主键名能否在 3.x 中被切分为单个标识符、且不是关键字。
-fn pk_name_is_identifier(pk: &str) -> bool {
-    let mut chars = pk.chars();
-    let Some(first) = chars.next() else {
-        return false;
-    };
-    is_ident_letter(first)
-        && chars.all(|c| is_ident_letter(c) || c.is_ascii_digit())
-        && !RESERVED.contains(&pk.to_lowercase().as_str())
-}
-
-/// 识别 `<pk> in [...]`：不是这个形式时返回 None；否则按原顺序返回字面量，保留重复。
-///
-/// 形式：空白与括号可以包住整个表达式，也可以包住主键本身；`in` 不区分大小写；元素是整数（可带
-/// 负号，负号后可有空白）或单 / 双引号字符串（只有 `\" \' \\ \n \r \t` 六种转义）；允许一个结尾逗号。
-pub fn parse_pk_in(expr: &str, pk: &str) -> Option<Vec<PkLiteral>> {
-    if !pk_name_is_identifier(pk) {
-        return None;
-    }
-    let mut p = Cursor { s: expr, i: 0 };
-    p.ws();
-    let mut opens = 0usize;
-    while p.eat('(') {
-        opens += 1;
-        p.ws();
-    }
-    if !p.rest().starts_with(pk) {
-        return None;
-    }
-    p.i += pk.len();
-    // 标识符取最长匹配：主键之后必须是空白或右括号。
-    match p.peek() {
-        Some(c) if is_ws(c) || c == ')' => {}
-        _ => return None,
-    }
-    p.ws();
-    let mut lhs_closes = 0usize;
-    while lhs_closes < opens && p.eat(')') {
-        lhs_closes += 1;
-        p.ws();
-    }
-    let keyword = p.rest().get(..2)?;
-    if !keyword.eq_ignore_ascii_case("in") {
-        return None;
-    }
-    p.i += 2;
-    match p.peek() {
-        Some(c) if is_ws(c) || c == '[' => {}
-        _ => return None,
-    }
-    p.ws();
-    if !p.eat('[') {
-        return None;
-    }
-    let literals = p.list()?;
-    p.ws();
-    let mut closes = 0usize;
-    while p.eat(')') {
-        closes += 1;
-        p.ws();
-    }
-    (p.i == expr.len() && closes == opens - lhs_closes).then_some(literals)
-}
-
-struct Cursor<'a> {
-    s: &'a str,
-    i: usize,
-}
-
-impl<'a> Cursor<'a> {
-    fn rest(&self) -> &'a str {
-        &self.s[self.i..]
-    }
-
-    fn peek(&self) -> Option<char> {
-        self.rest().chars().next()
-    }
-
-    fn eat(&mut self, c: char) -> bool {
-        if self.peek() == Some(c) {
-            self.i += c.len_utf8();
-            true
-        } else {
-            false
-        }
-    }
-
-    fn ws(&mut self) {
-        while self.peek().is_some_and(is_ws) {
-            self.i += 1;
-        }
-    }
-
-    /// `[` 之后的部分，直到并包括 `]`。
-    fn list(&mut self) -> Option<Vec<PkLiteral>> {
-        let mut out = Vec::new();
-        self.ws();
-        if self.eat(']') {
-            return Some(out);
-        }
-        loop {
-            out.push(self.literal()?);
-            self.ws();
-            if self.eat(',') {
-                self.ws();
-                if self.eat(']') {
-                    return Some(out);
-                }
-                continue;
-            }
-            return self.eat(']').then_some(out);
-        }
-    }
-
-    fn literal(&mut self) -> Option<PkLiteral> {
-        match self.peek()? {
-            '-' => {
-                self.i += 1;
-                self.ws();
-                self.int(true)
-            }
-            '0'..='9' => self.int(false),
-            q @ ('\'' | '"') => {
-                self.i += 1;
-                self.string(q)
-            }
-            _ => None,
-        }
-    }
-
-    fn int(&mut self, negative: bool) -> Option<PkLiteral> {
-        let digits_len = self.rest().bytes().take_while(u8::is_ascii_digit).count();
-        if digits_len == 0 || digits_len > MAX_INT_DIGITS {
-            return None;
-        }
-        let digits = &self.rest()[..digits_len];
-        self.i += digits_len;
-        match self.peek() {
-            None => {}
-            Some(c) if is_ws(c) || c == ',' || c == ']' => {}
-            Some(_) => return None,
-        }
-        let text = if negative {
-            format!("-{digits}")
-        } else {
-            digits.to_owned()
-        };
-        Some(match text.parse::<i64>() {
-            Ok(v) => PkLiteral::Int(v),
-            Err(_) => PkLiteral::IntOutOfRange,
-        })
-    }
-
-    fn string(&mut self, quote: char) -> Option<PkLiteral> {
-        let mut buf = String::new();
-        loop {
-            let c = self.peek()?;
-            self.i += c.len_utf8();
-            match c {
-                c if c == quote => return Some(PkLiteral::Str(buf)),
-                '\\' => {
-                    let escaped = match self.peek()? {
-                        '"' => '"',
-                        '\'' => '\'',
-                        '\\' => '\\',
-                        'n' => '\n',
-                        'r' => '\r',
-                        't' => '\t',
-                        _ => return None,
-                    };
-                    self.i += 1;
-                    buf.push(escaped);
-                }
-                '\r' | '\n' => return None,
-                c => buf.push(c),
-            }
-        }
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -222,7 +82,9 @@ mod tests {
     use PkLiteral::{Int, IntOutOfRange as Oor, Str};
 
     fn p(expr: &str) -> Option<Vec<PkLiteral>> {
-        parse_pk_in(expr, "id")
+        ParsedFilter::parse(expr)
+            .ok()
+            .and_then(|parsed| parsed.primary_keys("id"))
     }
 
     fn s(v: &str) -> PkLiteral {
@@ -274,6 +136,7 @@ mod tests {
             ),
             ("id in ['a','b',]", vec![s("a"), s("b")]),
             ("id in [1, 'a']", vec![Int(1), s("a")]),
+            ("id in [٣, １２, 1٣]", vec![Int(3), Int(12), Int(13)]),
             ("(id in [1])", vec![Int(1)]),
             ("((id in [1]))", vec![Int(1)]),
             ("( id in [1] )", vec![Int(1)]),
@@ -347,9 +210,6 @@ mod tests {
             "id in [²]",
             "id in [1²]",
             "id in [①]",
-            "id in [٣]",
-            "id in [１２]",
-            "id in [1٣]",
             "id in ['\\x41']",
             "id in ['\\u4e2d']",
             "id in ['\\0']",
@@ -403,9 +263,14 @@ mod tests {
             "ユーザー",
             "사용자",
             "ſ",
+            "नम",
+            "x²",
+            "\u{9ffd}",
         ] {
             assert_eq!(
-                parse_pk_in(&format!("{pk} in [1]"), pk),
+                ParsedFilter::parse(&format!("{pk} in [1]"))
+                    .ok()
+                    .and_then(|parsed| parsed.primary_keys(pk)),
                 Some(vec![Int(1)]),
                 "{pk}"
             );
@@ -433,11 +298,15 @@ mod tests {
             "a b",
             "1a",
             "my.id",
-            "x²",
             "",
-            "\u{9ffd}",
         ] {
-            assert_eq!(parse_pk_in(&format!("{pk} in [1]"), pk), None, "{pk:?}");
+            assert_eq!(
+                ParsedFilter::parse(&format!("{pk} in [1]"))
+                    .ok()
+                    .and_then(|parsed| parsed.primary_keys(pk)),
+                None,
+                "{pk:?}"
+            );
         }
     }
 }

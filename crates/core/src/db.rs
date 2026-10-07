@@ -15,13 +15,18 @@ use crate::compute::Compute;
 use crate::data::{InsertBatch, Pk};
 use crate::data_dir::DataDir;
 use crate::error::{EngineError, Result, py_repr};
-use crate::filter::parse_pk_in;
+use crate::filter::ParsedFilter;
 use crate::index::IndexRequest;
 use crate::schema::CollectionSchema;
 use crate::storage::{fs_commit, recovery, runtime, schema_file::SchemaFile};
 
 /// 每个 collection 一把读写锁：写入互斥、读取并发，仍是「单 collection 单写者」（不变量 7）。
 pub type CollectionHandle = Arc<RwLock<Collection>>;
+
+#[cfg(test)]
+thread_local! {
+    static AFTER_DELETE_QUERY: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
 
 #[derive(Debug, Clone)]
 enum OpenFailure {
@@ -842,29 +847,67 @@ impl Db {
         expr: &str,
         partition: &str,
     ) -> Result<(Vec<Pk>, bool)> {
-        self.mutate(database, name, |collection| {
-            let varchar = collection.schema().fields.iter().any(|field| {
-                field.is_primary && field.data_type == crate::schema::DataType::VarChar
-            });
-            let pk = collection
-                .schema()
-                .fields
-                .iter()
-                .find(|field| field.is_primary)
-                .ok_or_else(|| EngineError::schema("schema has no primary key field"))?;
-            let literals = parse_pk_in(expr, &pk.name).ok_or_else(|| {
-                EngineError::unsupported(
-                    "filter expressions other than '<primary key> in [...]'",
-                    "",
-                )
-            })?;
-            if !literals.is_empty() && !matches!(partition, "" | "_default") {
-                return Err(EngineError::unsupported(
-                    "partitions other than '_default'",
-                    "",
+        require_database(database)?;
+        let blocked = self.write_gate.read();
+        if *blocked {
+            return Err(storage(
+                "database writes are blocked after an unconfirmed directory change",
+            ));
+        }
+        let handle = self.collection_inner(name)?;
+        let snapshot = loop {
+            let collection = handle.read();
+            if collection.is_deleted() {
+                return Err(EngineError::CollectionNotFound(name.to_owned()));
+            }
+            if collection.persistent().is_some_and(|p| p.poisoned()) {
+                return Err(storage(
+                    "collection state is unusable after a storage failure",
                 ));
             }
-            let pks = collection.delete_literals_from_db(&literals)?;
+            if collection.persistent().is_some_and(|p| p.needs_retry()) {
+                drop(collection);
+                Self::flush_handle(&handle, false)?;
+                continue;
+            }
+            break collection.read_snapshot();
+        };
+        let pk = snapshot
+            .schema()
+            .fields
+            .iter()
+            .find(|field| field.is_primary)
+            .ok_or_else(|| EngineError::schema("schema has no primary key field"))?;
+        let varchar = pk.data_type == crate::schema::DataType::VarChar;
+        let parsed = ParsedFilter::parse(expr)?;
+        let literals = parsed.primary_keys(&pk.name);
+        if let Some(literals) = literals {
+            return self.mutate_handle(&handle, name, |collection| {
+                if !literals.is_empty() && !matches!(partition, "" | "_default") {
+                    return Err(EngineError::unsupported(
+                        "partitions other than '_default'",
+                        "",
+                    ));
+                }
+                Ok((collection.delete_literals_from_db(&literals)?, varchar))
+            });
+        }
+        let pks = snapshot.query_for_delete(&parsed)?;
+        #[cfg(test)]
+        AFTER_DELETE_QUERY.with(|hook| {
+            if let Some(pause) = hook.borrow_mut().take() {
+                pause();
+            }
+        });
+        if !pks.is_empty() && !matches!(partition, "" | "_default") {
+            return Err(EngineError::unsupported(
+                "partitions other than '_default'",
+                "",
+            ));
+        }
+        // 与 3.x 的 query → delete 相同：之后写入的同主键新版本也会被删除；不升级共享许可。
+        self.mutate_handle(&handle, name, |collection| {
+            collection.delete_from_db(&pks)?;
             Ok((pks, varchar))
         })
     }
@@ -883,6 +926,15 @@ impl Db {
             ));
         }
         let handle = self.collection_inner(name)?;
+        self.mutate_handle(&handle, name, apply)
+    }
+
+    fn mutate_handle<T>(
+        &self,
+        handle: &CollectionHandle,
+        name: &str,
+        apply: impl FnOnce(&mut Collection) -> Result<T>,
+    ) -> Result<T> {
         let mut collection = loop {
             let collection = handle.write();
             if collection.persistent().is_some_and(|p| p.poisoned()) {
@@ -892,7 +944,7 @@ impl Db {
             }
             if collection.persistent().is_some_and(|p| p.needs_retry()) {
                 drop(collection);
-                Self::flush_handle(&handle, false)?;
+                Self::flush_handle(handle, false)?;
                 continue;
             }
             break collection;
@@ -904,7 +956,7 @@ impl Db {
                     .persistent()
                     .is_some_and(|p| p.has_pending_generation());
                 drop(collection);
-                if pending && let Err(flush_error) = Self::flush_handle(&handle, false) {
+                if pending && let Err(flush_error) = Self::flush_handle(handle, false) {
                     eprintln!("WAL failure recovery flush of {name:?} failed: {flush_error}");
                 }
                 return Err(error);
@@ -923,7 +975,7 @@ impl Db {
         drop(collection);
         if auto_flush {
             // 写入已经落 WAL 并在内存中可见；之后的提交故障由下一次写入先重试。
-            if let Err(error) = Self::flush_handle(&handle, false) {
+            if let Err(error) = Self::flush_handle(handle, false) {
                 eprintln!("automatic flush of {name:?} failed after accepted mutation: {error}");
             }
         }
@@ -1389,6 +1441,70 @@ mod tests {
             DataDir::open(path).unwrap(),
             Compute::new(std::num::NonZeroUsize::MIN).unwrap(),
         )
+    }
+
+    #[test]
+    fn filter_delete_uses_one_handle_and_deletes_the_snapshot_keys_after_concurrent_overwrite() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let root = tempfile::tempdir().unwrap();
+        let db = Arc::new(test_db(root.path()));
+        db.create_collection("", "c", basic_schema()).unwrap();
+        db.create_index(
+            "",
+            "c",
+            "v",
+            IndexRequest {
+                index_type: "FLAT".into(),
+                metric_type: Some("L2".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let batch = |ids: Vec<i64>| InsertBatch {
+            num_rows: ids.len(),
+            columns: vec![
+                ("id".into(), InputValues::Int(ids.clone())),
+                (
+                    "v".into(),
+                    InputValues::FloatVector {
+                        dim: 2,
+                        values: [1.0, 0.0].repeat(ids.len()),
+                    },
+                ),
+            ],
+        };
+        db.insert("", "c", batch(vec![1])).unwrap();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let reader = Arc::clone(&db);
+        let worker = std::thread::spawn(move || {
+            AFTER_DELETE_QUERY.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    ready_tx.send(()).unwrap();
+                    resume_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                }))
+            });
+            reader.delete_expr("", "c", "id>=0", "").unwrap()
+        });
+        ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        db.upsert_with_pk_type("", "c", batch(vec![1, 2])).unwrap();
+        db.collection("", "c").unwrap().write().release();
+        resume_tx.send(()).unwrap();
+        assert_eq!(worker.join().unwrap().0, [Pk::Int64(1)]);
+        let handle = db.collection("", "c").unwrap();
+        assert_eq!(handle.read().load_state(), LoadState::Released);
+        handle.write().load();
+        assert_eq!(
+            handle
+                .read()
+                .get(&[Pk::Int64(1), Pk::Int64(2)], &[])
+                .unwrap()
+                .rows
+                .pks,
+            [Pk::Int64(2)]
+        );
+        db.close();
     }
 
     fn seed_lazy_collections(path: &std::path::Path) {

@@ -41,6 +41,10 @@ impl SourceBits {
         self.bits[row / 64] & (1_u64 << (row % 64)) != 0
     }
 
+    pub(crate) fn any_live(&self) -> bool {
+        self.bits.iter().any(|word| *word != 0)
+    }
+
     pub(crate) fn set(&mut self, row: usize, live: bool) {
         let word = &mut Arc::make_mut(&mut self.bits)[row / 64];
         let mask = 1_u64 << (row % 64);

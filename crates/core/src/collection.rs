@@ -122,11 +122,31 @@ impl ReadSnapshot {
         self.search_in_blocks(req, compute, rows_per_block)
     }
 
+    pub fn search_filtered(
+        &self,
+        req: SearchRequest,
+        compute: &Compute,
+        expr: &str,
+    ) -> Result<SearchResult> {
+        let rows_per_block = (BLOCK_ELEMS / field_dim(&self.schema.fields[self.vector_pos])).max(1);
+        self.search_filtered_in_blocks(req, compute, rows_per_block, expr)
+    }
+
     fn search_in_blocks(
         &self,
         req: SearchRequest,
         compute: &Compute,
         rows_per_block: usize,
+    ) -> Result<SearchResult> {
+        self.search_filtered_in_blocks(req, compute, rows_per_block, "")
+    }
+
+    fn search_filtered_in_blocks(
+        &self,
+        req: SearchRequest,
+        compute: &Compute,
+        rows_per_block: usize,
+        expr: &str,
     ) -> Result<SearchResult> {
         let projection = Projection::new(&self.schema, &req.output_fields, ApiKind::Search);
         // 3.x：没有查询向量时在一切检查之前返回空结果。
@@ -156,6 +176,18 @@ impl ReadSnapshot {
                 ));
             }
         };
+        let predicate = if expr.is_empty() {
+            None
+        } else {
+            Some(crate::filter::Predicate::compile(expr, &self.schema)?)
+        };
+        let take = req.limit.saturating_add(req.offset);
+        // 3.x 编译过滤后才处理 topk<=0，但此时不会进入数据求值或数值转换。
+        let chunks = if take > 0 {
+            self.filtered_chunks_compiled(predicate.as_ref())?
+        } else {
+            std::borrow::Cow::Borrowed(self.chunks.as_slice())
+        };
         let metric = match &req.metric_type {
             Some(m) => Metric::parse(m)?,
             None => self.default_metric(&field.name)?,
@@ -173,13 +205,12 @@ impl ReadSnapshot {
         }
         // M1 只允许一个 FLOAT_VECTOR 字段，范数只为它计算。
         debug_assert_eq!(field_pos, self.vector_pos);
-        let take = req.limit.saturating_add(req.offset);
         let queries: Vec<flat::Query> = vectors
             .iter()
             .map(|v| flat::Query::new(metric, v))
             .collect();
         let mut tops: Vec<TopK> = queries.iter().map(|_| TopK::new(metric, take)).collect();
-        let blocks = row_blocks(&self.chunks, rows_per_block);
+        let blocks = row_blocks(&chunks, rows_per_block);
         if take > 0 && !blocks.is_empty() {
             let groups: Vec<&[flat::Query]> = queries.chunks(flat::BATCH).collect();
             let per_wave = groups_per_wave(compute.threads(), blocks.len());
@@ -196,7 +227,7 @@ impl ReadSnapshot {
                 compute.for_each(&mut leaves, |leaf| {
                     let queries = groups[leaf.group];
                     leaf.tops = queries.iter().map(|_| TopK::new(metric, take)).collect();
-                    scan(&self.chunks, leaf.block, field_pos, queries, &mut leaf.tops);
+                    scan(&chunks, leaf.block, field_pos, queries, &mut leaf.tops);
                     leaf.tops.iter_mut().for_each(TopK::shrink);
                 });
                 for leaf in leaves {
@@ -223,6 +254,133 @@ impl ReadSnapshot {
             metric: Some(metric),
             hits,
         })
+    }
+
+    fn filtered_chunks_parsed(
+        &self,
+        parsed: &crate::filter::ParsedFilter,
+    ) -> Result<std::borrow::Cow<'_, [Chunk]>> {
+        let predicate = crate::filter::Predicate::from_parsed(parsed, &self.schema)?;
+        // 无过滤不复制块表；terms 为空只可能是空表达式（编译拒绝了独立 bool 谓词）。
+        if parsed.is_empty() {
+            return Ok(std::borrow::Cow::Borrowed(&self.chunks));
+        }
+        self.filtered_chunks_compiled(Some(&predicate))
+    }
+
+    fn filtered_chunks_compiled(
+        &self,
+        predicate: Option<&crate::filter::Predicate>,
+    ) -> Result<std::borrow::Cow<'_, [Chunk]>> {
+        let Some(predicate) = predicate else {
+            return Ok(std::borrow::Cow::Borrowed(&self.chunks));
+        };
+        let mut chunks = self.chunks.clone();
+        for chunk in &mut chunks {
+            chunk.live = predicate.evaluate(&chunk.columns, &chunk.live)?;
+        }
+        Ok(std::borrow::Cow::Owned(chunks))
+    }
+
+    pub fn count_filtered(&self, expr: &str) -> Result<usize> {
+        self.require_loaded()?;
+        self.count_filtered_parsed(&crate::filter::ParsedFilter::parse(expr)?)
+    }
+
+    pub fn count_filtered_parsed(&self, parsed: &crate::filter::ParsedFilter) -> Result<usize> {
+        self.require_loaded()?;
+        let chunks = self.filtered_chunks_parsed(parsed)?;
+        Ok(chunks
+            .iter()
+            .map(|chunk| {
+                (0..chunk.live.len)
+                    .filter(|&row| chunk.live.get(row))
+                    .count()
+            })
+            .sum())
+    }
+
+    pub fn query(
+        &self,
+        expr: &str,
+        output_fields: &[String],
+        limit: Option<i64>,
+        offset: i64,
+    ) -> Result<QueryResult> {
+        self.require_loaded()?;
+        self.query_parsed(
+            &crate::filter::ParsedFilter::parse(expr)?,
+            output_fields,
+            limit,
+            offset,
+        )
+    }
+
+    pub fn query_parsed(
+        &self,
+        parsed: &crate::filter::ParsedFilter,
+        output_fields: &[String],
+        limit: Option<i64>,
+        offset: i64,
+    ) -> Result<QueryResult> {
+        self.require_loaded()?;
+        self.query_loaded(parsed, output_fields, limit, offset)
+    }
+
+    /// Delete 不要求 load；只在自己的不可变视图上绕过 load 检查，不临时改动共享状态。
+    pub(crate) fn query_for_delete(&self, parsed: &crate::filter::ParsedFilter) -> Result<Vec<Pk>> {
+        if self.deleted {
+            return Err(EngineError::CollectionNotFound(self.name.clone()));
+        }
+        if self.unusable {
+            return Err(EngineError::Storage(
+                "collection publication is poisoned".into(),
+            ));
+        }
+        let pk = self.schema.fields[self.pk_pos].name.clone();
+        Ok(self.query_loaded(parsed, &[pk], None, 0)?.rows.pks)
+    }
+
+    fn query_loaded(
+        &self,
+        parsed: &crate::filter::ParsedFilter,
+        output_fields: &[String],
+        limit: Option<i64>,
+        offset: i64,
+    ) -> Result<QueryResult> {
+        let chunks = self.filtered_chunks_parsed(parsed)?;
+        let projection = Projection::new(&self.schema, output_fields, ApiKind::Query);
+        let mut refs = Vec::new();
+        for (index, chunk) in chunks.iter().enumerate() {
+            for row in 0..chunk.live.len {
+                if chunk.live.get(row) {
+                    refs.push(RowRef {
+                        chunk: index,
+                        row,
+                        order: if chunk.generation == 0 {
+                            (chunk.row_start + row) as u64
+                        } else {
+                            chunk.orders[row]
+                        },
+                    });
+                }
+            }
+        }
+        refs.sort_by_key(|r| (chunks[r.chunk].source_rank, r.order));
+        // 3.x 在追加第一条后才判断 effective_limit，故 0 / 负 limit 也可能保留一条。
+        if let Some(limit) = limit {
+            let end = (i128::from(offset) + i128::from(limit)).max(1);
+            refs.truncate(usize::try_from(end).unwrap_or(usize::MAX));
+        }
+        let start = if offset < 0 {
+            usize::try_from((refs.len() as i128 + i128::from(offset)).max(0)).unwrap_or(0)
+        } else {
+            usize::try_from(offset)
+                .unwrap_or(usize::MAX)
+                .min(refs.len())
+        };
+        let rows = self.gather(&refs[start..], &projection);
+        Ok(QueryResult { projection, rows })
     }
 
     /// 3.x `_require_loaded`：检索与按主键读取之前的 load 状态检查。
