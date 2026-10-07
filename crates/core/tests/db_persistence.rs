@@ -4,7 +4,7 @@
 
 use milvus_lite_core::{
     CollectionSchema, Compute, DataDir, DataType, Db, EngineError, FieldSchema, IndexRequest,
-    InputValues, InsertBatch, LoadState, Pk,
+    InputValues, InsertBatch, LoadState, Pk, QueryVectors, SearchRequest,
 };
 
 fn compute() -> Compute {
@@ -37,6 +37,135 @@ fn batch(ids: &[i64]) -> InsertBatch {
             ),
         ],
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn drop_displaced_open_collection_retires_wal_and_old_handle_before_recreate() {
+    for remove in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("displaced.db");
+        let db = Db::new(DataDir::open(&path).unwrap(), compute());
+        db.create_collection("", "c", schema()).unwrap();
+        db.insert("", "c", batch(&[1, 2])).unwrap();
+        db.delete("", "c", &[Pk::Int64(1)]).unwrap();
+        let old = db.collection("", "c").unwrap();
+        let old_view = old.read().read_snapshot();
+        let collection_dir = path.join("collections/c");
+        if remove {
+            std::fs::remove_dir_all(&collection_dir).unwrap();
+        } else {
+            std::fs::rename(&collection_dir, root.path().join("moved")).unwrap();
+        }
+        db.drop_collection("", "c").unwrap();
+        assert!(matches!(
+            old.read().require_loaded(),
+            Err(EngineError::CollectionNotFound(_))
+        ));
+        assert_eq!(
+            old_view
+                .search(
+                    SearchRequest {
+                        anns_field: None,
+                        vectors: QueryVectors::Dense(vec![vec![1.0, 0.0]]),
+                        metric_type: Some("L2".into()),
+                        limit: 10,
+                        offset: 0,
+                        output_fields: vec![]
+                    },
+                    db.compute()
+                )
+                .unwrap()
+                .hits[0]
+                .rows
+                .pks,
+            [Pk::Int64(2)]
+        );
+        assert!(!collection_dir.exists());
+        db.create_collection("", "c", schema()).unwrap();
+        let new = db.collection("", "c").unwrap();
+        assert!(!std::sync::Arc::ptr_eq(&old, &new));
+        assert_eq!(new.read().count(), 0);
+        db.insert("", "c", batch(&[9])).unwrap();
+        db.flush_collection("", "c").unwrap();
+        db.close();
+        let reopened = Db::new(DataDir::open(&path).unwrap(), compute());
+        assert_eq!(
+            reopened
+                .collection("", "c")
+                .unwrap()
+                .read()
+                .get(&[Pk::Int64(9)], &[])
+                .unwrap()
+                .rows
+                .pks,
+            [Pk::Int64(9)]
+        );
+        reopened.close();
+    }
+}
+
+#[cfg(all(unix, feature = "fault-injection"))]
+#[test]
+fn displaced_drop_sync_failure_retains_handle_and_retries_without_creating_files() {
+    use milvus_lite_core::storage::runtime::{
+        RetainedWalSyncFault, inject_retained_wal_sync_failure_once,
+    };
+    for fault in [RetainedWalSyncFault::Data, RetainedWalSyncFault::Delta] {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("displaced-failure.db");
+        let db = Db::new(DataDir::open(&path).unwrap(), compute());
+        db.create_collection("", "c", schema()).unwrap();
+        db.insert("", "c", batch(&[1, 2])).unwrap();
+        db.delete("", "c", &[Pk::Int64(1)]).unwrap();
+        let old = db.collection("", "c").unwrap();
+        std::fs::rename(path.join("collections/c"), root.path().join("moved")).unwrap();
+        inject_retained_wal_sync_failure_once(fault);
+        assert!(
+            db.drop_collection("", "c")
+                .unwrap_err()
+                .to_string()
+                .contains("injected retained WAL sync")
+        );
+        assert!(std::sync::Arc::ptr_eq(
+            &old,
+            &db.collection("", "c").unwrap()
+        ));
+        assert!(!path.join("collections/c").exists());
+        db.drop_collection("", "c").unwrap();
+        assert!(matches!(
+            old.read().require_loaded(),
+            Err(EngineError::CollectionNotFound(_))
+        ));
+        db.create_collection("", "c", schema()).unwrap();
+        db.close();
+    }
+}
+
+#[test]
+fn drop_missing_schema_retires_the_open_handle_without_removing_the_residual_directory() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("missing-schema.db");
+    let db = Db::new(DataDir::open(&path).unwrap(), compute());
+    db.create_collection("", "c", schema()).unwrap();
+    db.insert("", "c", batch(&[1])).unwrap();
+    let old = db.collection("", "c").unwrap();
+    let collection = path.join("collections/c");
+    let wal = collection.join("wal/wal_data_000001.arrow");
+    let before = std::fs::read(&wal).unwrap();
+    std::fs::remove_file(collection.join("schema.json")).unwrap();
+    db.drop_collection("", "c").unwrap();
+    assert!(matches!(
+        old.read().require_loaded(),
+        Err(EngineError::CollectionNotFound(_))
+    ));
+    assert!(collection.exists());
+    assert!(matches!(
+        db.create_collection("", "c", schema()),
+        Err(EngineError::CollectionAlreadyExists(_))
+    ));
+    db.close();
+    assert_eq!(std::fs::read(wal).unwrap(), before);
 }
 
 #[test]

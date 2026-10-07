@@ -584,6 +584,27 @@ impl Db {
             Err(error) => return Err(storage(error)),
         };
         if !exists || !self.exact_collection_name(name)? {
+            let handle = self.collections.read().get(name).cloned();
+            let flush_lock = handle
+                .as_ref()
+                .and_then(|h| h.read().persistent().map(|p| p.flush_lock()));
+            let _flush = flush_lock.as_ref().map(|lock| lock.lock());
+            if let Some(handle) = &handle {
+                let mut collection = handle.write();
+                if let Some(persistent) = collection.persistent_mut() {
+                    // 只有整个原目录不在时才退役原 File；schema 缺失等残留仍用通常同步协议。
+                    match fs::symlink_metadata(&target) {
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                            persistent.sync_displaced_wal().map_err(storage)?
+                        }
+                        Err(error) => return Err(storage(error)),
+                        Ok(_) => persistent.sync_retained_wal().map_err(storage)?,
+                    }
+                }
+                collection.mark_deleted(true);
+                // collection 表是叶子锁：所有读者先释放表锁再取句柄锁；此处保持 deleted 与撤表同一临界区。
+                self.collections.write().remove(name);
+            }
             self.open_failures.write().remove(name);
             self.remove_aliases_for(name, aliases)?;
             return Ok(());

@@ -557,6 +557,45 @@ impl PersistentCollection {
         Ok(())
     }
 
+    /// 外部移走整个 collection 后只能同步仍持有的原句柄；不创建目录，也不追踪移走后的路径。
+    /// 这不放宽正常关闭对 wal/ 缺失的判定，调用方须先确认原 collection 目录已不存在。
+    pub(crate) fn sync_displaced_wal(&mut self) -> Result<(), String> {
+        for (kind, writer) in [
+            (WalKind::Data, &self.data_wal),
+            (WalKind::Delta, &self.delta_wal),
+        ] {
+            if let Some(writer) = writer {
+                #[cfg(feature = "fault-injection")]
+                retained_wal_sync_fault(match kind {
+                    WalKind::Data => RetainedWalSyncFault::Data,
+                    WalKind::Delta => RetainedWalSyncFault::Delta,
+                })?;
+                #[cfg(not(feature = "fault-injection"))]
+                let _kind = kind;
+                writer.sync().map_err(err)?;
+            }
+        }
+        for generation in &self.pending {
+            let files = generation.wal_files.lock();
+            for (kind, file) in files.iter() {
+                #[cfg(feature = "fault-injection")]
+                retained_wal_sync_fault(match kind {
+                    WalKind::Data => RetainedWalSyncFault::Data,
+                    WalKind::Delta => RetainedWalSyncFault::Delta,
+                })?;
+                #[cfg(not(feature = "fault-injection"))]
+                let _kind = kind;
+                file.sync_all().map_err(err)?;
+            }
+        }
+        self.data_wal = None;
+        self.delta_wal = None;
+        for generation in &self.pending {
+            generation.wal_files.lock().clear();
+        }
+        Ok(())
+    }
+
     pub fn has_wal(&self) -> Result<bool, String> {
         let dir = self.dir.join("wal");
         match fs::read_dir(dir) {
@@ -691,6 +730,76 @@ fn err(error: impl std::fmt::Display) -> String {
 #[cfg(all(test, feature = "fault-injection"))]
 mod retained_wal_tests {
     use super::*;
+    #[cfg(unix)]
+    #[test]
+    fn displaced_collection_syncs_active_and_frozen_original_files_before_closing_any() {
+        use crate::{CollectionSchema, DataType, FieldSchema};
+        let root = tempfile::tempdir().unwrap();
+        let mut pk = FieldSchema::new("id", DataType::Int64);
+        pk.is_primary = true;
+        let schema = CollectionSchema {
+            fields: vec![pk],
+            enable_dynamic_field: false,
+            properties: vec![],
+        };
+        for active in [false, true] {
+            for fault in [RetainedWalSyncFault::Data, RetainedWalSyncFault::Delta] {
+                let dir = root.path().join(format!("{active}-{fault:?}"));
+                fs::create_dir_all(dir.join("wal")).unwrap();
+                let mut persistent = PersistentCollection::new(dir.clone()).unwrap();
+                persistent.data_wal = Some(
+                    WalWriter::create(
+                        &dir.join("wal"),
+                        WalKind::Data,
+                        1,
+                        &arrow_data::wal_data_schema(&schema).unwrap(),
+                    )
+                    .unwrap(),
+                );
+                persistent.delta_wal = Some(
+                    WalWriter::create(
+                        &dir.join("wal"),
+                        WalKind::Delta,
+                        1,
+                        &arrow_data::wal_delta_schema(&schema).unwrap(),
+                    )
+                    .unwrap(),
+                );
+                persistent.freeze_active(true).unwrap();
+                let frozen = persistent.front().unwrap();
+                if active {
+                    persistent.data_wal = Some(
+                        WalWriter::create(
+                            &dir.join("wal"),
+                            WalKind::Data,
+                            2,
+                            &arrow_data::wal_data_schema(&schema).unwrap(),
+                        )
+                        .unwrap(),
+                    );
+                    persistent.delta_wal = Some(
+                        WalWriter::create(
+                            &dir.join("wal"),
+                            WalKind::Delta,
+                            2,
+                            &arrow_data::wal_delta_schema(&schema).unwrap(),
+                        )
+                        .unwrap(),
+                    );
+                }
+                fs::remove_dir_all(&dir).unwrap();
+                inject_retained_wal_sync_failure_once(fault);
+                assert!(persistent.sync_displaced_wal().is_err());
+                assert_eq!(frozen.wal_files.lock().len(), 2);
+                assert_eq!(persistent.data_wal.is_some(), active);
+                assert_eq!(persistent.delta_wal.is_some(), active);
+                persistent.sync_displaced_wal().unwrap();
+                assert!(frozen.wal_files.lock().is_empty());
+                assert!(persistent.data_wal.is_none() && persistent.delta_wal.is_none());
+                assert!(!dir.exists());
+            }
+        }
+    }
     #[test]
     fn failed_sync_keeps_both_active_writers() {
         use crate::{CollectionSchema, DataType, FieldSchema};

@@ -182,6 +182,10 @@ impl WalWriter {
     pub fn into_file(self) -> File {
         self.file
     }
+
+    pub(crate) fn sync(&self) -> io::Result<()> {
+        self.file.sync_all()
+    }
 }
 
 #[derive(Debug)]
