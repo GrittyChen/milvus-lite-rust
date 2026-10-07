@@ -25,6 +25,12 @@ use crate::storage::wal::{WalKind, WalWriter};
 #[cfg(feature = "fault-injection")]
 thread_local! {
     static BEFORE_COMMIT_PAUSE: std::cell::RefCell<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>> = const { std::cell::RefCell::new(None) };
+    static PREPARE_PANIC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(feature = "fault-injection")]
+pub fn inject_flush_prepare_panic_once() {
+    PREPARE_PANIC.with(|slot| slot.set(true));
 }
 
 #[cfg(feature = "fault-injection")]
@@ -45,11 +51,27 @@ pub enum RetainedWalSyncFault {
 #[cfg(feature = "fault-injection")]
 thread_local! { static RETAINED_WAL_SYNC_FAULT: std::cell::Cell<Option<RetainedWalSyncFault>> = const { std::cell::Cell::new(None) }; }
 #[cfg(feature = "fault-injection")]
+thread_local! { static RETAINED_WAL_SYNC_PANIC: std::cell::Cell<Option<RetainedWalSyncFault>> = const { std::cell::Cell::new(None) }; }
+#[cfg(feature = "fault-injection")]
+pub fn inject_retained_wal_sync_panic_once(point: RetainedWalSyncFault) {
+    RETAINED_WAL_SYNC_PANIC.with(|slot| slot.set(Some(point)));
+}
+#[cfg(feature = "fault-injection")]
 pub fn inject_retained_wal_sync_failure_once(fault: RetainedWalSyncFault) {
     RETAINED_WAL_SYNC_FAULT.with(|slot| slot.set(Some(fault)));
 }
 #[cfg(feature = "fault-injection")]
 fn retained_wal_sync_fault(point: RetainedWalSyncFault) -> Result<(), String> {
+    if RETAINED_WAL_SYNC_PANIC.with(|slot| {
+        if slot.get() == Some(point) {
+            slot.set(None);
+            true
+        } else {
+            false
+        }
+    }) {
+        panic!("injected retained WAL sync panic: {point:?}");
+    }
     if RETAINED_WAL_SYNC_FAULT.with(|slot| {
         if slot.get() == Some(point) {
             slot.set(None);
@@ -100,13 +122,14 @@ impl FrozenGeneration {
         if files.is_empty() {
             return Ok(());
         }
-        for (_kind, file) in files.iter() {
+        for (kind, file) in files.iter() {
             #[cfg(feature = "fault-injection")]
-            retained_wal_sync_fault(match _kind {
+            retained_wal_sync_fault(match kind {
                 WalKind::Data => RetainedWalSyncFault::Data,
                 WalKind::Delta => RetainedWalSyncFault::Delta,
             })?;
-            file.sync_all().map_err(err)?;
+            fs_commit::sync_file(file, &dir.join("wal").join(kind.file_name(self.number)))
+                .map_err(err)?;
         }
         #[cfg(feature = "fault-injection")]
         retained_wal_sync_fault(RetainedWalSyncFault::Directory)?;
@@ -147,7 +170,7 @@ pub struct PersistentCollection {
     inherited_synced: bool,
     poisoned: bool,
     /// 与状态写锁分开：Parquet 写入、fsync 和 manifest 提交不阻塞读者。
-    flush_lock: Arc<Mutex<()>>,
+    flush_lock: Arc<crate::lock_order::Mutex<(), 4>>,
 }
 
 impl std::fmt::Debug for PersistentCollection {
@@ -182,7 +205,7 @@ impl PersistentCollection {
             last_failure: None,
             inherited_synced: false,
             poisoned: false,
-            flush_lock: Arc::new(Mutex::new(())),
+            flush_lock: Arc::new(crate::lock_order::Mutex::new(())),
         })
     }
 
@@ -204,11 +227,11 @@ impl PersistentCollection {
             last_failure: None,
             inherited_synced: false,
             poisoned: false,
-            flush_lock: Arc::new(Mutex::new(())),
+            flush_lock: Arc::new(crate::lock_order::Mutex::new(())),
         }
     }
 
-    pub fn flush_lock(&self) -> Arc<Mutex<()>> {
+    pub fn flush_lock(&self) -> Arc<crate::lock_order::Mutex<(), 4>> {
         Arc::clone(&self.flush_lock)
     }
 
@@ -364,6 +387,10 @@ impl PersistentCollection {
             .ok_or("source ID space exhausted")?;
         self.visibility.add_source(new_source, 0).map_err(err)?;
         let old = std::mem::replace(&mut self.active, MemTable::new(new_source));
+        // 视图构建若 panic，原 writer 必须仍由 self 持有，不能随局部 File 容器析构。
+        let frozen = old.freeze(&self.visibility);
+        #[cfg(feature = "fault-injection")]
+        crate::db::state_panic(crate::db::StatePanicPoint::Freeze);
         let mut wal_files = Vec::new();
         if let Some(writer) = self.data_wal.take() {
             wal_files.push((WalKind::Data, writer.into_file()));
@@ -373,7 +400,7 @@ impl PersistentCollection {
         }
         self.pending.push_back(Arc::new(FrozenGeneration {
             number: self.generation,
-            table: old.freeze(&self.visibility),
+            table: frozen,
             wal_files: Mutex::new(wal_files),
         }));
         self.generation = next_generation;
@@ -394,6 +421,8 @@ impl PersistentCollection {
         }
         match fs_commit::commit_manifest(&self.dir, &self.manifest) {
             Ok(_) => {
+                #[cfg(feature = "fault-injection")]
+                crate::db::state_panic(crate::db::StatePanicPoint::Recommit);
                 self.retry_manifest = false;
                 self.last_failure = None;
                 if let Err(error) = self.cleanup_committed_wal() {
@@ -541,8 +570,9 @@ impl PersistentCollection {
                         retained_wal_sync_fault(RetainedWalSyncFault::Delta)?;
                     }
                 }
-                File::open(entry.path())
-                    .and_then(|file| file.sync_all())
+                let path = entry.path();
+                File::open(&path)
+                    .and_then(|file| fs_commit::sync_file(&file, &path))
                     .map_err(err)?;
             }
         }
@@ -585,7 +615,11 @@ impl PersistentCollection {
                 })?;
                 #[cfg(not(feature = "fault-injection"))]
                 let _kind = kind;
-                file.sync_all().map_err(err)?;
+                fs_commit::sync_file(
+                    file,
+                    &self.dir.join("wal").join(kind.file_name(generation.number)),
+                )
+                .map_err(err)?;
             }
         }
         self.data_wal = None;
@@ -613,72 +647,93 @@ pub fn flush_one(
     schema: &CollectionSchema,
     sync_inherited_files: bool,
 ) -> Result<FlushOutcome, FlushError> {
-    let materialized = generation
-        .table
-        .materialize(schema)
-        .map_err(|error| FlushError {
-            path: dir.to_path_buf(),
-            phase: CommitPhase::BeforeReplace,
-            reason: error.to_string(),
-            committed_manifest: None,
-            cleanup_failed: false,
-        })?;
-    let data = materialized
-        .data
-        .as_ref()
-        .map(|batch| arrow_data::decode_data_batch(schema, batch))
-        .transpose()
-        .map_err(|error| FlushError {
-            path: dir.to_path_buf(),
-            phase: CommitPhase::BeforeReplace,
-            reason: error.to_string(),
-            committed_manifest: None,
-            cleanup_failed: false,
-        })?;
-    let norms = match &data {
-        None => Vec::new(),
-        Some(decoded) => decoded
-            .columns
-            .iter()
-            .find_map(|column| {
-                if let ColumnData::FloatVector { dim, values } = column {
-                    Some(values.chunks_exact(*dim).map(crate::flat::norm).collect())
-                } else {
-                    None
-                }
-            })
-            .ok_or_else(|| FlushError {
-                path: dir.to_path_buf(),
-                phase: CommitPhase::BeforeReplace,
-                reason: "published data has no dense vector column".to_owned(),
-                committed_manifest: None,
-                cleanup_failed: false,
-            })?,
-    };
-    // 钩子的诊断失败必须落在提交点之前，不能跳过已提交数据的锁内发布。
-    #[cfg(feature = "fault-injection")]
-    BEFORE_COMMIT_PAUSE.with(|slot| -> Result<(), FlushError> {
-        if let Some((entered, resume)) = slot.borrow_mut().take() {
-            let error = |reason: String| FlushError {
-                path: dir.to_path_buf(),
-                phase: CommitPhase::BeforeReplace,
-                reason,
-                committed_manifest: None,
-                cleanup_failed: false,
+    let (materialized, data, norms) =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            #[cfg(feature = "fault-injection")]
+            if PREPARE_PANIC.with(|slot| slot.replace(false)) {
+                panic!("injected flush preparation panic");
+            }
+            let materialized =
+                generation
+                    .table
+                    .materialize(schema)
+                    .map_err(|error| FlushError {
+                        path: dir.to_path_buf(),
+                        phase: CommitPhase::BeforeReplace,
+                        reason: error.to_string(),
+                        committed_manifest: None,
+                        cleanup_failed: false,
+                    })?;
+            let data = materialized
+                .data
+                .as_ref()
+                .map(|batch| arrow_data::decode_data_batch(schema, batch))
+                .transpose()
+                .map_err(|error| FlushError {
+                    path: dir.to_path_buf(),
+                    phase: CommitPhase::BeforeReplace,
+                    reason: error.to_string(),
+                    committed_manifest: None,
+                    cleanup_failed: false,
+                })?;
+            let norms = match &data {
+                None => Vec::new(),
+                Some(decoded) => decoded
+                    .columns
+                    .iter()
+                    .find_map(|column| {
+                        if let ColumnData::FloatVector { dim, values } = column {
+                            Some(values.chunks_exact(*dim).map(crate::flat::norm).collect())
+                        } else {
+                            None
+                        }
+                    })
+                    .ok_or_else(|| FlushError {
+                        path: dir.to_path_buf(),
+                        phase: CommitPhase::BeforeReplace,
+                        reason: "published data has no dense vector column".to_owned(),
+                        committed_manifest: None,
+                        cleanup_failed: false,
+                    })?,
             };
-            entered.send(()).map_err(|cause| error(cause.to_string()))?;
-            resume.recv().map_err(|cause| error(cause.to_string()))?;
-        }
-        Ok(())
-    })?;
-    generation
-        .sync_and_close_wal(dir)
-        .map_err(|reason| FlushError {
-            path: dir.join("wal"),
-            phase: CommitPhase::BeforeReplace,
-            reason,
-            committed_manifest: None,
-            cleanup_failed: false,
+            // 钩子的诊断失败必须落在提交点之前，不能跳过已提交数据的锁内发布。
+            #[cfg(feature = "fault-injection")]
+            BEFORE_COMMIT_PAUSE.with(|slot| -> Result<(), FlushError> {
+                if let Some((entered, resume)) = slot.borrow_mut().take() {
+                    let error = |reason: String| FlushError {
+                        path: dir.to_path_buf(),
+                        phase: CommitPhase::BeforeReplace,
+                        reason,
+                        committed_manifest: None,
+                        cleanup_failed: false,
+                    };
+                    entered.send(()).map_err(|cause| error(cause.to_string()))?;
+                    resume.recv().map_err(|cause| error(cause.to_string()))?;
+                }
+                Ok(())
+            })?;
+            generation
+                .sync_and_close_wal(dir)
+                .map_err(|reason| FlushError {
+                    path: dir.join("wal"),
+                    phase: CommitPhase::BeforeReplace,
+                    reason,
+                    committed_manifest: None,
+                    cleanup_failed: false,
+                })?;
+            Ok::<_, FlushError>((materialized, data, norms))
+        }))
+        .unwrap_or_else(|payload| {
+            Err(FlushError {
+                path: dir.to_path_buf(),
+                phase: CommitPhase::BeforeReplace,
+                reason: format!(
+                    "flush preparation panicked: {}",
+                    crate::error::panic_description(payload.as_ref())
+                ),
+                committed_manifest: None,
+                cleanup_failed: false,
+            })
         })?;
     match flush::flush_generation_with_inherited_sync(
         dir,
@@ -863,46 +918,58 @@ mod retained_wal_tests {
             RetainedWalSyncFault::Delta,
             RetainedWalSyncFault::Directory,
         ] {
-            for close_all in [false, true] {
-                let dir = root.path().join(format!("{fault:?}-{close_all}"));
-                std::fs::create_dir_all(dir.join("wal")).unwrap();
-                let mut persistent = PersistentCollection::new(dir.clone()).unwrap();
-                persistent.data_wal = Some(
-                    WalWriter::create(
-                        &dir.join("wal"),
-                        WalKind::Data,
-                        1,
-                        &arrow_data::wal_data_schema(&schema).unwrap(),
-                    )
-                    .unwrap(),
-                );
-                persistent.delta_wal = Some(
-                    WalWriter::create(
-                        &dir.join("wal"),
-                        WalKind::Delta,
-                        1,
-                        &arrow_data::wal_delta_schema(&schema).unwrap(),
-                    )
-                    .unwrap(),
-                );
-                persistent.freeze_active(true).unwrap();
-                let frozen = persistent.front().unwrap();
-                assert!(persistent.data_wal.is_none() && persistent.delta_wal.is_none());
-                assert_eq!(frozen.wal_files.lock().len(), 2);
-                inject_retained_wal_sync_failure_once(fault);
-                let result = if close_all {
-                    persistent.sync_retained_wal()
-                } else {
-                    frozen.sync_and_close_wal(&dir)
-                };
-                assert!(result.is_err());
-                assert_eq!(frozen.wal_files.lock().len(), 2);
-                if close_all {
-                    persistent.sync_retained_wal().unwrap();
-                } else {
-                    frozen.sync_and_close_wal(&dir).unwrap();
+            for panic in [false, true] {
+                for close_all in [false, true] {
+                    let dir = root.path().join(format!("{fault:?}-{close_all}-{panic}"));
+                    std::fs::create_dir_all(dir.join("wal")).unwrap();
+                    let mut persistent = PersistentCollection::new(dir.clone()).unwrap();
+                    persistent.data_wal = Some(
+                        WalWriter::create(
+                            &dir.join("wal"),
+                            WalKind::Data,
+                            1,
+                            &arrow_data::wal_data_schema(&schema).unwrap(),
+                        )
+                        .unwrap(),
+                    );
+                    persistent.delta_wal = Some(
+                        WalWriter::create(
+                            &dir.join("wal"),
+                            WalKind::Delta,
+                            1,
+                            &arrow_data::wal_delta_schema(&schema).unwrap(),
+                        )
+                        .unwrap(),
+                    );
+                    persistent.freeze_active(true).unwrap();
+                    let frozen = persistent.front().unwrap();
+                    assert!(persistent.data_wal.is_none() && persistent.delta_wal.is_none());
+                    assert_eq!(frozen.wal_files.lock().len(), 2);
+                    if panic {
+                        inject_retained_wal_sync_panic_once(fault);
+                    } else {
+                        inject_retained_wal_sync_failure_once(fault);
+                    }
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        if close_all {
+                            persistent.sync_retained_wal()
+                        } else {
+                            frozen.sync_and_close_wal(&dir)
+                        }
+                    }));
+                    if panic {
+                        assert!(result.is_err());
+                    } else {
+                        assert!(result.unwrap().is_err());
+                    }
+                    assert_eq!(frozen.wal_files.lock().len(), 2);
+                    if close_all {
+                        persistent.sync_retained_wal().unwrap();
+                    } else {
+                        frozen.sync_and_close_wal(&dir).unwrap();
+                    }
+                    assert!(frozen.wal_files.lock().is_empty());
                 }
-                assert!(frozen.wal_files.lock().is_empty());
             }
         }
     }

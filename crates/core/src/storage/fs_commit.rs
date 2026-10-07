@@ -7,9 +7,79 @@ use std::path::{Path, PathBuf};
 use crate::storage::manifest::Manifest;
 
 #[cfg(feature = "fault-injection")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FsAction {
+    SyncFile,
+    SyncDir,
+    Rename,
+    Unlink,
+}
+#[cfg(feature = "fault-injection")]
+#[derive(Debug, Clone)]
+pub struct FsEvent {
+    pub action: FsAction,
+    pub path: PathBuf,
+}
+#[cfg(feature = "fault-injection")]
+thread_local! { static FS_TRACE: std::cell::RefCell<Option<Vec<FsEvent>>> = const { std::cell::RefCell::new(None) }; }
+#[cfg(feature = "fault-injection")]
+pub fn begin_fs_trace() {
+    FS_TRACE.with(|slot| {
+        assert!(slot.borrow().is_none());
+        *slot.borrow_mut() = Some(Vec::new());
+    });
+}
+#[cfg(feature = "fault-injection")]
+pub fn finish_fs_trace() -> Vec<FsEvent> {
+    FS_TRACE.with(|slot| match slot.borrow_mut().take() {
+        Some(events) => events,
+        None => panic!("filesystem trace was not started"),
+    })
+}
+#[cfg(feature = "fault-injection")]
+pub(crate) fn record_fs(action: FsAction, path: &Path) {
+    FS_TRACE.with(|slot| {
+        if let Some(events) = slot.borrow_mut().as_mut() {
+            events.push(FsEvent {
+                action,
+                path: path.to_path_buf(),
+            });
+        }
+    });
+}
+
+pub(crate) fn sync_file(file: &File, path: &Path) -> io::Result<()> {
+    file.sync_all()?;
+    #[cfg(feature = "fault-injection")]
+    record_fs(FsAction::SyncFile, path);
+    #[cfg(not(feature = "fault-injection"))]
+    let _ = path;
+    Ok(())
+}
+
+#[cfg(feature = "fault-injection")]
 thread_local! {
     static FAIL_NEXT_MANIFEST_DIR_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static EXIT_AT_MANIFEST_REPLACE: std::cell::Cell<Option<CommitPhase>> = const { std::cell::Cell::new(None) };
+    static PANIC_AT_MANIFEST_REPLACE: std::cell::Cell<Option<CommitPhase>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(feature = "fault-injection")]
+pub fn inject_manifest_panic_once(phase: CommitPhase) {
+    PANIC_AT_MANIFEST_REPLACE.with(|slot| slot.set(Some(phase)));
+}
+#[cfg(feature = "fault-injection")]
+fn panic_at_manifest_replace(phase: CommitPhase) {
+    if PANIC_AT_MANIFEST_REPLACE.with(|slot| {
+        if slot.get() == Some(phase) {
+            slot.set(None);
+            true
+        } else {
+            false
+        }
+    }) {
+        panic!("injected manifest commit panic: {phase:?}");
+    }
 }
 
 /// 仅测试构建可用；发布 wheel 默认不含故障注入点。
@@ -74,7 +144,10 @@ impl CommitError {
 
 /// Linux/macOS 上目录项的持久化边界；不把 EINVAL/ENOTSUP 当成功。
 pub fn sync_dir(path: &Path) -> io::Result<()> {
-    File::open(path)?.sync_all()
+    File::open(path)?.sync_all()?;
+    #[cfg(feature = "fault-injection")]
+    record_fs(FsAction::SyncDir, path);
+    Ok(())
 }
 
 /// 逐级创建缺失的目录，并在每次创建之后同步其父目录。
@@ -119,7 +192,7 @@ pub fn write_new_schema(path: &Path, bytes: &[u8]) -> Result<(), CommitError> {
         .open(&tmp)
         .map_err(|source| CommitError::before(&tmp, source))?;
     file.write_all(bytes)
-        .and_then(|()| file.sync_all())
+        .and_then(|()| sync_file(&file, &tmp))
         .map_err(|source| CommitError::before(&tmp, source))?;
     drop(file);
     fs::rename(&tmp, path).map_err(|source| CommitError::before(path, source))?;
@@ -140,6 +213,32 @@ pub struct ManifestCommit {
 
 /// 与 3.x 相同的五步提交，replace 是逻辑提交点；目录 sync 失败单独标为提交后错误。
 pub fn commit_manifest(dir: &Path, manifest: &Manifest) -> Result<ManifestCommit, CommitError> {
+    let mut replaced = false;
+    // panic 与 I/O 必须使用实际 replace 状态分类，不能让上层误把已提交数据当成未提交。
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        commit_manifest_inner(dir, manifest, &mut replaced)
+    })) {
+        Ok(result) => result,
+        Err(payload) => Err(CommitError {
+            path: dir.join("manifest.json"),
+            phase: if replaced {
+                CommitPhase::AfterReplace
+            } else {
+                CommitPhase::BeforeReplace
+            },
+            source: io::Error::other(format!(
+                "manifest commit panicked: {}",
+                crate::error::panic_description(payload.as_ref())
+            )),
+        }),
+    }
+}
+
+fn commit_manifest_inner(
+    dir: &Path,
+    manifest: &Manifest,
+    replaced: &mut bool,
+) -> Result<ManifestCommit, CommitError> {
     let target = dir.join("manifest.json");
     let prev = dir.join("manifest.json.prev");
     let tmp = dir.join("manifest.json.tmp");
@@ -168,7 +267,7 @@ pub fn commit_manifest(dir: &Path, manifest: &Manifest) -> Result<ManifestCommit
         .open(&tmp)
         .map_err(|source| CommitError::before(&tmp, source))?;
     file.write_all(&bytes)
-        .and_then(|()| file.sync_all())
+        .and_then(|()| sync_file(&file, &tmp))
         .map_err(|source| CommitError::before(&tmp, source))?;
     drop(file);
     let prev_copy_error = match fs::symlink_metadata(&target) {
@@ -200,9 +299,16 @@ pub fn commit_manifest(dir: &Path, manifest: &Manifest) -> Result<ManifestCommit
     };
     #[cfg(feature = "fault-injection")]
     exit_at_manifest_replace(CommitPhase::BeforeReplace);
+    #[cfg(feature = "fault-injection")]
+    panic_at_manifest_replace(CommitPhase::BeforeReplace);
     fs::rename(&tmp, &target).map_err(|source| CommitError::before(&target, source))?;
+    *replaced = true;
+    #[cfg(feature = "fault-injection")]
+    record_fs(FsAction::Rename, &target);
     #[cfg(feature = "fault-injection")]
     exit_at_manifest_replace(CommitPhase::AfterReplace);
+    #[cfg(feature = "fault-injection")]
+    panic_at_manifest_replace(CommitPhase::AfterReplace);
     #[cfg(feature = "fault-injection")]
     if FAIL_NEXT_MANIFEST_DIR_SYNC.with(|flag| flag.replace(false)) {
         return Err(CommitError::after(

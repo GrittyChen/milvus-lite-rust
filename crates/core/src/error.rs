@@ -180,10 +180,30 @@ pub fn py_json_repr(value: &Value) -> String {
     }
 }
 
+pub(crate) fn panic_description(payload: &(dyn std::any::Any + Send)) -> &str {
+    payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied())
+        .unwrap_or("non-string panic payload")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    #[test]
+    fn panic_diagnostics_accept_both_string_payloads_and_opaque_values() {
+        assert_eq!(
+            super::panic_description(&String::from("owned diagnostic")),
+            "owned diagnostic"
+        );
+        assert_eq!(
+            super::panic_description(&"static diagnostic"),
+            "static diagnostic"
+        );
+        assert_eq!(super::panic_description(&7_u32), "non-string panic payload");
+    }
     #[test]
     fn repr_matches_python() {
         assert_eq!(py_repr("abc"), "'abc'");

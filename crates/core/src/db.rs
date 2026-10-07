@@ -8,7 +8,9 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 
-use parking_lot::{Condvar, Mutex, RwLock};
+use crate::lock_order::{Mutex as OrderedMutex, RwLock};
+use parking_lot::{Condvar, Mutex};
+type NameMutex = OrderedMutex<(), 3>;
 
 use crate::collection::{Collection, LoadState};
 use crate::compute::Compute;
@@ -21,7 +23,43 @@ use crate::schema::CollectionSchema;
 use crate::storage::{fs_commit, recovery, runtime, schema_file::SchemaFile};
 
 /// 每个 collection 一把读写锁：写入互斥、读取并发，仍是「单 collection 单写者」（不变量 7）。
-pub type CollectionHandle = Arc<RwLock<Collection>>;
+pub type CollectionHandle = Arc<RwLock<Collection, 5>>;
+
+#[cfg(feature = "fault-injection")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatePanicPoint {
+    Mutation,
+    Freeze,
+    Publish,
+    Index,
+    Recommit,
+}
+#[cfg(feature = "fault-injection")]
+thread_local! {
+    static STATE_PANIC: std::cell::Cell<Option<StatePanicPoint>> = const { std::cell::Cell::new(None) };
+    static CLOSE_PANIC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+#[cfg(feature = "fault-injection")]
+pub fn inject_close_finish_panic_once() {
+    CLOSE_PANIC.with(|slot| slot.set(true));
+}
+#[cfg(feature = "fault-injection")]
+pub fn inject_state_panic_once(point: StatePanicPoint) {
+    STATE_PANIC.with(|slot| slot.set(Some(point)));
+}
+#[cfg(feature = "fault-injection")]
+pub(crate) fn state_panic(point: StatePanicPoint) {
+    if STATE_PANIC.with(|slot| {
+        if slot.get() == Some(point) {
+            slot.set(None);
+            true
+        } else {
+            false
+        }
+    }) {
+        panic!("injected collection state panic: {point:?}");
+    }
+}
 
 #[cfg(test)]
 thread_local! {
@@ -68,14 +106,14 @@ impl OpenFailure {
 
 // 等待者也持强引用；只有最后一个使用者退出后才移除名字，不能在 drop 时换一把锁。
 struct NameLease<'a> {
-    registry: &'a Mutex<BTreeMap<String, Weak<Mutex<()>>>>,
+    registry: &'a OrderedMutex<BTreeMap<String, Weak<NameMutex>>, 6>,
     name: String,
-    lock: Option<Arc<Mutex<()>>>,
+    lock: Option<Arc<NameMutex>>,
 }
 
 impl NameLease<'_> {
     #[allow(clippy::expect_used)] // 名字锁守卫的借用先结束，析构才能独占租约并取走强引用。
-    fn mutex(&self) -> &Arc<Mutex<()>> {
+    fn mutex(&self) -> &Arc<NameMutex> {
         self.lock.as_ref().expect("name lease is live")
     }
 }
@@ -167,6 +205,7 @@ pub enum DirectoryPoint {
     CollectionsSync,
     StagingSync,
     Aliases,
+    AliasesAfterRename,
 }
 #[cfg(feature = "fault-injection")]
 #[derive(Clone, Copy, Debug)]
@@ -255,18 +294,19 @@ fn sync_directory_change(
 #[derive(Debug)]
 pub struct Db {
     /// 按名字排序，list 的顺序与 3.x 的 `sorted(names)`（码点序）一致。
-    collections: RwLock<BTreeMap<String, CollectionHandle>>,
+    collections: RwLock<BTreeMap<String, CollectionHandle>, 6>,
     gate: Mutex<Gate>,
     idle: Condvar,
     /// 服务的计算池（0005）。服务的运行状态与每个在途的 RPC 都持有 `Arc<Db>`，
     /// 所以它在最后一个在途任务结束之后才析构。
     compute: Compute,
     path: PathBuf,
-    namespace: Mutex<()>,
-    name_locks: Mutex<BTreeMap<String, Weak<Mutex<()>>>>,
-    open_failures: RwLock<BTreeMap<String, OpenFailure>>,
+    namespace: OrderedMutex<(), 2>,
+    aliases: OrderedMutex<(), 6>,
+    name_locks: OrderedMutex<BTreeMap<String, Weak<NameMutex>>, 6>,
+    open_failures: RwLock<BTreeMap<String, OpenFailure>, 6>,
     /// create/drop 与 collection 的写入/flush 互斥；目录提交点后失败时封锁后续写入。
-    write_gate: RwLock<bool>,
+    write_gate: RwLock<bool, 1>,
 }
 
 /// 关闭闸门（0003「进程退出」第 2、3 步）：关闭后不再接受新任务，在途任务全部结束后才释放 LOCK，
@@ -310,8 +350,9 @@ impl Db {
             idle: Condvar::new(),
             compute,
             path,
-            namespace: Mutex::new(()),
-            name_locks: Mutex::new(BTreeMap::new()),
+            namespace: OrderedMutex::new(()),
+            aliases: OrderedMutex::new(()),
+            name_locks: OrderedMutex::new(BTreeMap::new()),
             open_failures: RwLock::new(BTreeMap::new()),
             write_gate: RwLock::new(false),
         }
@@ -398,6 +439,36 @@ impl Db {
     }
 
     fn finish_storage(&self, flush: bool) {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            #[cfg(feature = "fault-injection")]
+            if CLOSE_PANIC.with(|slot| slot.replace(false)) {
+                panic!("injected storage close panic");
+            }
+            self.finish_storage_inner(flush);
+        }));
+        if let Err(payload) = result {
+            eprintln!(
+                "storage close panicked: {}",
+                crate::error::panic_description(payload.as_ref())
+            );
+            // 关闭已经不可逆；停止 manifest 提交，只同步原 WAL，再让关闭闸门完成并释放 LOCK。
+            let handles: Vec<_> = self.collections.read().values().cloned().collect();
+            for handle in handles {
+                let result = state_change(&mut handle.write(), |collection| {
+                    if let Some(persistent) = collection.persistent_mut() {
+                        persistent.poison();
+                        persistent.sync_retained_wal().map_err(storage)?;
+                    }
+                    Ok(())
+                });
+                if let Err(error) = result {
+                    eprintln!("cannot sync WAL after close panic: {error}");
+                }
+            }
+        }
+    }
+
+    fn finish_storage_inner(&self, flush: bool) {
         // 目录改名的持久化未确认时，任何 manifest 提交都可能固定错误的目录状态。
         let flush = flush && !*self.write_gate.read();
         let handles: Vec<_> = self.collections.read().values().cloned().collect();
@@ -473,17 +544,20 @@ impl Db {
                 Err(error) => return Err(storage(error)),
             }
         }
-        let mut aliases = self.read_aliases()?;
-        let old_alias_count = aliases.len();
-        aliases.retain(|_, target_name| {
-            validate_filesystem_name(target_name, "collection").is_ok()
-                && self.collection_path(target_name).exists()
-        });
-        if aliases.len() != old_alias_count {
-            self.save_aliases(&aliases, true)?;
-        }
-        if aliases.contains_key(name) {
-            return Err(EngineError::CollectionAlreadyExists(name.to_owned()));
+        {
+            let _aliases = self.aliases.lock();
+            let mut aliases = self.read_aliases_unlocked()?;
+            let old_alias_count = aliases.len();
+            aliases.retain(|_, target_name| {
+                validate_filesystem_name(target_name, "collection").is_ok()
+                    && self.collection_path(target_name).exists()
+            });
+            if aliases.len() != old_alias_count {
+                self.save_aliases(&aliases, true)?;
+            }
+            if aliases.contains_key(name) {
+                return Err(EngineError::CollectionAlreadyExists(name.to_owned()));
+            }
         }
         let bytes = SchemaFile::from_core(name, collection.schema())
             .to_bytes()
@@ -504,14 +578,12 @@ impl Db {
             cleanup_failed_staging(&staging);
             return Err(storage(error));
         }
-        #[cfg(feature = "fault-injection")]
-        if let Err(error) =
-            directory_fault(DirectoryOperation::Create, DirectoryPoint::BeforeRename)
-        {
-            cleanup_failed_staging(&staging);
-            return Err(storage(error));
-        }
-        if let Err(error) = fs::rename(&staging, &target) {
+        let rename = guarded_io(|| {
+            #[cfg(feature = "fault-injection")]
+            directory_fault(DirectoryOperation::Create, DirectoryPoint::BeforeRename)?;
+            fs::rename(&staging, &target)
+        });
+        if let Err(error) = rename {
             cleanup_failed_staging(&staging);
             return Err(storage(error));
         }
@@ -582,7 +654,7 @@ impl Db {
         let lease = self.name_lease(name);
         let _name = lease.mutex().lock();
         let target = self.collection_path(name);
-        let aliases = self.read_aliases()?;
+        self.read_aliases()?;
         let exists = match fs::symlink_metadata(&target) {
             Ok(meta) => meta.file_type().is_dir() && target.join("schema.json").is_file(),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
@@ -596,22 +668,25 @@ impl Db {
             let _flush = flush_lock.as_ref().map(|lock| lock.lock());
             if let Some(handle) = &handle {
                 let mut collection = handle.write();
-                if let Some(persistent) = collection.persistent_mut() {
-                    // 只有整个原目录不在时才退役原 File；schema 缺失等残留仍用通常同步协议。
-                    match fs::symlink_metadata(&target) {
-                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                            persistent.sync_displaced_wal().map_err(storage)?
+                state_change(&mut collection, |collection| {
+                    if let Some(persistent) = collection.persistent_mut() {
+                        // 只有整个原目录不在时才退役原 File；schema 缺失等残留仍用通常同步协议。
+                        match fs::symlink_metadata(&target) {
+                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                                persistent.sync_displaced_wal().map_err(storage)?
+                            }
+                            Err(error) => return Err(storage(error)),
+                            Ok(_) => persistent.sync_retained_wal().map_err(storage)?,
                         }
-                        Err(error) => return Err(storage(error)),
-                        Ok(_) => persistent.sync_retained_wal().map_err(storage)?,
                     }
-                }
-                collection.mark_deleted(true);
+                    collection.mark_deleted(true);
+                    Ok(())
+                })?;
                 // collection 表是叶子锁：所有读者先释放表锁再取句柄锁；此处保持 deleted 与撤表同一临界区。
                 self.collections.write().remove(name);
             }
             self.open_failures.write().remove(name);
-            self.remove_aliases_for(name, aliases)?;
+            self.remove_aliases_for(name)?;
             return Ok(());
         }
         let root = self.path.join("collections");
@@ -624,13 +699,16 @@ impl Db {
         let _flush = flush_lock.as_ref().map(|lock| lock.lock());
         if let Some(handle) = &handle {
             let mut collection = handle.write();
-            collection.mark_deleted(true);
-            if let Some(persistent) = collection.persistent_mut()
-                && let Err(error) = persistent.sync_retained_wal()
-            {
-                collection.mark_deleted(false);
-                return Err(storage(error));
-            }
+            state_change(&mut collection, |collection| {
+                collection.mark_deleted(true);
+                if let Some(persistent) = collection.persistent_mut()
+                    && let Err(error) = persistent.sync_retained_wal()
+                {
+                    collection.mark_deleted(false);
+                    return Err(storage(error));
+                }
+                Ok(())
+            })?;
         }
         let staging = staging_root.join(format!(
             "drop-{}-{}",
@@ -642,13 +720,16 @@ impl Db {
             directory_fault(DirectoryOperation::Drop, DirectoryPoint::BeforeRename)?;
             fs::rename(&target, &staging)
         };
-        if let Err(error) = rename() {
+        if let Err(error) = guarded_io(rename) {
             if let Some(handle) = &handle {
                 let mut collection = handle.write();
-                collection.mark_deleted(false);
-                if let Some(persistent) = collection.persistent_mut() {
-                    persistent.freeze_active(true).map_err(storage)?;
-                }
+                state_change(&mut collection, |collection| {
+                    collection.mark_deleted(false);
+                    if let Some(persistent) = collection.persistent_mut() {
+                        persistent.freeze_active(true).map_err(storage)?;
+                    }
+                    Ok(())
+                })?;
             }
             return Err(storage(error));
         }
@@ -661,7 +742,7 @@ impl Db {
             )));
         }
         *blocked = false;
-        self.remove_aliases_for(name, aliases).map_err(|error| {
+        self.remove_aliases_for(name).map_err(|error| {
             storage(format!(
                 "collection was removed, but aliases cleanup is pending: {error}"
             ))
@@ -696,6 +777,12 @@ impl Db {
     }
 
     fn read_aliases(&self) -> Result<BTreeMap<String, String>> {
+        let _aliases = self.aliases.lock();
+        self.read_aliases_unlocked()
+    }
+
+    fn read_aliases_unlocked(&self) -> Result<BTreeMap<String, String>> {
+        self.aliases.assert_held();
         let path = self.path.join("aliases.json");
         let bytes = match fs::read(&path) {
             Ok(bytes) => bytes,
@@ -716,7 +803,9 @@ impl Db {
         Ok(result)
     }
 
-    fn remove_aliases_for(&self, name: &str, mut aliases: BTreeMap<String, String>) -> Result<()> {
+    fn remove_aliases_for(&self, name: &str) -> Result<()> {
+        let _aliases = self.aliases.lock();
+        let mut aliases = self.read_aliases_unlocked()?;
         let len = aliases.len();
         aliases.retain(|_, target| target != name);
         if aliases.len() == len {
@@ -726,6 +815,15 @@ impl Db {
     }
 
     fn save_aliases(&self, aliases: &BTreeMap<String, String>, creating: bool) -> Result<()> {
+        self.aliases.assert_held();
+        guarded_io(|| self.save_aliases_inner(aliases, creating)).map_err(storage)
+    }
+
+    fn save_aliases_inner(
+        &self,
+        aliases: &BTreeMap<String, String>,
+        creating: bool,
+    ) -> std::io::Result<()> {
         #[cfg(feature = "fault-injection")]
         directory_fault(
             if creating {
@@ -734,8 +832,7 @@ impl Db {
                 DirectoryOperation::Drop
             },
             DirectoryPoint::Aliases,
-        )
-        .map_err(storage)?;
+        )?;
         #[cfg(not(feature = "fault-injection"))]
         let _creating = creating;
         let path = self.path.join("aliases.json");
@@ -755,30 +852,35 @@ impl Db {
                     live_aliases.insert(alias, target);
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(storage(error)),
+                Err(error) => return Err(error),
             }
         }
-        let bytes = serde_json::to_vec_pretty(&live_aliases).map_err(storage)?;
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)
-            .map_err(storage)?;
+        let bytes = serde_json::to_vec_pretty(&live_aliases).map_err(std::io::Error::other)?;
+        let mut file = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
         if let Err(error) = file.write_all(&bytes).and_then(|()| file.sync_all()) {
             drop(file);
             if let Err(cleanup) = fs::remove_file(&tmp) {
                 eprintln!("cannot clean failed aliases temp file {tmp:?}: {cleanup}");
             }
-            return Err(storage(error));
+            return Err(error);
         }
         drop(file);
         if let Err(error) = fs::rename(&tmp, &path) {
             if let Err(cleanup) = fs::remove_file(&tmp) {
                 eprintln!("cannot clean failed aliases temp file {tmp:?}: {cleanup}");
             }
-            return Err(storage(error));
+            return Err(error);
         }
-        fs_commit::sync_dir(&self.path).map_err(storage)
+        #[cfg(feature = "fault-injection")]
+        directory_fault(
+            if creating {
+                DirectoryOperation::Create
+            } else {
+                DirectoryOperation::Drop
+            },
+            DirectoryPoint::AliasesAfterRename,
+        )?;
+        fs_commit::sync_dir(&self.path)
     }
 
     pub fn collection(&self, database: &str, name: &str) -> Result<CollectionHandle> {
@@ -949,7 +1051,12 @@ impl Db {
             }
             break collection;
         };
-        let outcome = match apply(&mut collection) {
+        let outcome = match state_change(&mut collection, |collection| {
+            let result = apply(collection)?;
+            #[cfg(feature = "fault-injection")]
+            state_panic(StatePanicPoint::Mutation);
+            Ok(result)
+        }) {
             Ok(outcome) => outcome,
             Err(error) => {
                 let pending = collection
@@ -965,12 +1072,22 @@ impl Db {
         let auto_flush = collection
             .persistent()
             .is_some_and(|p| p.should_auto_flush());
-        if auto_flush {
-            collection
-                .persistent_mut()
-                .ok_or_else(|| storage("persistent state missing"))?
-                .freeze_active(false)
-                .map_err(storage)?;
+        if auto_flush
+            && let Err(error) = state_change(&mut collection, |collection| {
+                collection
+                    .persistent_mut()
+                    .ok_or_else(|| storage("persistent state missing"))?
+                    .freeze_active(false)
+                    .map_err(storage)?;
+                Ok(())
+            })
+        {
+            if let Some(persistent) = collection.persistent_mut() {
+                persistent.poison();
+            }
+            // 本次追加与内存应用已完成；后续冻结失败不能撤销已经生效的写入。
+            eprintln!("automatic freeze of {name:?} failed after accepted mutation: {error}");
+            return Ok(outcome);
         }
         drop(collection);
         if auto_flush {
@@ -1016,7 +1133,12 @@ impl Db {
             .ok_or_else(|| storage("persistent state missing"))?
             .flush_lock();
         let _flush = lock.lock();
-        handle.write().create_index_from_db(field, request)
+        state_change(&mut handle.write(), |collection| {
+            collection.create_index_from_db(field, request)?;
+            #[cfg(feature = "fault-injection")]
+            state_panic(StatePanicPoint::Index);
+            Ok(())
+        })
     }
 
     fn flush_handle(handle: &CollectionHandle, include_active: bool) -> Result<()> {
@@ -1050,10 +1172,24 @@ impl Db {
                 )));
             }
             if persistent.retry_manifest() {
-                persistent.recommit().map_err(storage)?;
+                state_change(&mut collection, |collection| {
+                    collection
+                        .persistent_mut()
+                        .ok_or_else(|| storage("persistent state missing"))?
+                        .recommit()
+                        .map_err(storage)?;
+                    Ok(())
+                })?;
             }
             if include_active {
-                persistent.freeze_active(false).map_err(storage)?;
+                state_change(&mut collection, |collection| {
+                    collection
+                        .persistent_mut()
+                        .ok_or_else(|| storage("persistent state missing"))?
+                        .freeze_active(false)
+                        .map_err(storage)?;
+                    Ok(())
+                })?;
             }
         }
         loop {
@@ -1088,14 +1224,19 @@ impl Db {
                         Some(runtime::PostCommitError::Durability(_))
                     );
                     let mut collection = handle.write();
-                    collection.publish_generation(
-                        &work,
-                        outcome.manifest,
-                        &outcome.mapping,
-                        outcome.data,
-                        outcome.norms,
-                        retry_manifest,
-                    )?;
+                    state_change(&mut collection, |collection| {
+                        collection.publish_generation(
+                            &work,
+                            outcome.manifest,
+                            &outcome.mapping,
+                            outcome.data,
+                            outcome.norms,
+                            retry_manifest,
+                        )?;
+                        #[cfg(feature = "fault-injection")]
+                        state_panic(StatePanicPoint::Publish);
+                        Ok(())
+                    })?;
                     let persistent = collection
                         .persistent_mut()
                         .ok_or_else(|| storage("persistent state missing"))?;
@@ -1136,7 +1277,7 @@ impl Db {
         let lock = match registry.get(name).and_then(Weak::upgrade) {
             Some(lock) => lock,
             None => {
-                let lock = Arc::new(Mutex::new(()));
+                let lock = Arc::new(NameMutex::new(()));
                 registry.insert(name.to_owned(), Arc::downgrade(&lock));
                 lock
             }
@@ -1287,6 +1428,32 @@ fn storage(error: impl std::fmt::Display) -> EngineError {
     EngineError::Storage(error.to_string())
 }
 
+fn guarded_io<T>(action: impl FnOnce() -> std::io::Result<T>) -> std::io::Result<T> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(action)).unwrap_or_else(|payload| {
+        Err(std::io::Error::other(format!(
+            "directory operation panicked: {}",
+            crate::error::panic_description(payload.as_ref())
+        )))
+    })
+}
+
+// parking_lot 不会中毒；必须在状态锁放开之前封锁可能已被部分更新的 collection。
+fn state_change<T>(
+    collection: &mut Collection,
+    apply: impl FnOnce(&mut Collection) -> Result<T>,
+) -> Result<T> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| apply(collection))) {
+        Ok(result) => result,
+        Err(payload) => {
+            if let Some(persistent) = collection.persistent_mut() {
+                persistent.poison();
+            }
+            let reason = crate::error::panic_description(payload.as_ref());
+            Err(storage(format!("collection state panicked: {reason}")))
+        }
+    }
+}
+
 fn unopened_load_state(dir: &std::path::Path) -> LoadState {
     use crate::storage::manifest::Manifest;
 
@@ -1424,6 +1591,49 @@ mod tests {
     use crate::data::InputValues;
     use crate::schema::{DataType, FieldSchema};
 
+    #[test]
+    fn aliases_leaf_lock_covers_real_read_modify_replace_transactions() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let root = tempfile::tempdir().unwrap();
+        let db = Arc::new(test_db(root.path()));
+        for name in ["a", "b", "live"] {
+            db.create_collection("", name, basic_schema()).unwrap();
+        }
+        let path = root.path().join("aliases.json");
+        let bytes = br#"{"aa":"a","bb":"b","keep":"live"}"#;
+        std::fs::write(&path, bytes).unwrap();
+        let held = db.aliases.lock();
+        let (tx, rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let mut workers = vec![];
+        for name in ["a", "b"] {
+            let db = Arc::clone(&db);
+            let tx = tx.clone();
+            let done = done_tx.clone();
+            workers.push(std::thread::spawn(move || {
+                tx.send(()).unwrap();
+                db.remove_aliases_for(name).unwrap();
+                done.send(()).unwrap();
+            }));
+        }
+        for _ in 0..2 {
+            rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
+        assert!(matches!(
+            done_rx.recv_timeout(Duration::from_millis(100)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        drop(held);
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        let aliases: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(aliases, serde_json::json!({"keep":"live"}));
+        db.close();
+    }
     fn basic_schema() -> CollectionSchema {
         let mut pk = FieldSchema::new("id", DataType::Int64);
         pk.is_primary = true;
@@ -2212,8 +2422,8 @@ mod tests {
             opener.collection("", "c").unwrap();
         });
         entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        assert!(db.write_gate.try_write().is_none());
-        assert!(db.namespace.try_lock().is_some());
+        assert!(!db.write_gate.available());
+        assert!(db.namespace.available());
         let lease = db.name_lease("c");
         assert!(lease.mutex().try_lock().is_none());
         resume_tx.send(()).unwrap();
@@ -2256,7 +2466,7 @@ mod tests {
                 )
             });
             let deadline = Instant::now() + Duration::from_secs(5);
-            while db.write_gate.try_write().is_some() {
+            while db.write_gate.available() {
                 assert!(Instant::now() < deadline);
                 std::thread::sleep(Duration::from_millis(1));
             }
@@ -2286,7 +2496,7 @@ mod tests {
                 done_rx.recv_timeout(Duration::from_millis(100)),
                 Err(mpsc::RecvTimeoutError::Timeout)
             ));
-            assert!(db.namespace.try_lock().is_some());
+            assert!(db.namespace.available());
             drop(state);
             writing.join().unwrap().unwrap();
             assert!(

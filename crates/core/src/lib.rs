@@ -9,6 +9,7 @@ pub mod error;
 pub mod filter;
 mod flat;
 pub mod index;
+pub mod lock_order;
 pub mod projection;
 pub mod pyjson;
 pub mod schema;

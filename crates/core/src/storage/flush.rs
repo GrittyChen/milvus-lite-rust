@@ -16,6 +16,31 @@ thread_local! {
     static FAIL_NEXT_WAL_UNLINK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static INHERITED_SYNC_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static EXIT_AFTER_NEXT_WAL_UNLINK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static PANIC_NEXT_WAL_UNLINK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FLUSH_WORKER_PANIC: std::cell::Cell<Option<CommitPhase>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(feature = "fault-injection")]
+pub fn inject_flush_worker_panic_once(phase: CommitPhase) {
+    FLUSH_WORKER_PANIC.with(|slot| slot.set(Some(phase)));
+}
+#[cfg(feature = "fault-injection")]
+fn panic_at_flush_boundary(phase: CommitPhase) {
+    if FLUSH_WORKER_PANIC.with(|slot| {
+        if slot.get() == Some(phase) {
+            slot.set(None);
+            true
+        } else {
+            false
+        }
+    }) {
+        panic!("injected flush worker panic: {phase:?}");
+    }
+}
+
+#[cfg(feature = "fault-injection")]
+pub fn inject_wal_unlink_panic_once() {
+    PANIC_NEXT_WAL_UNLINK.with(|slot| slot.set(true));
 }
 
 #[cfg(feature = "fault-injection")]
@@ -108,104 +133,130 @@ pub(crate) fn flush_generation_with_inherited_sync(
     delta: Option<&RecordBatch>,
     sync_inherited_files: bool,
 ) -> Result<Manifest, FlushError> {
-    let next_wal = generation
-        .checked_add(1)
-        .ok_or_else(|| FlushError::before(collection_dir, "WAL number space exhausted"))?;
-    let data_range = data
-        .filter(|batch| batch.num_rows() > 0)
-        .map(|batch| seq_range(batch, "_seq"))
-        .transpose()?;
-    let delta_range = delta
-        .filter(|batch| batch.num_rows() > 0)
-        .map(|batch| seq_range(batch, "_seq"))
-        .transpose()?;
-    if data_range.is_some_and(|(_, max)| max > frozen_max_seq)
-        || delta_range.is_some_and(|(_, max)| max > frozen_max_seq)
-    {
-        return Err(FlushError::before(
-            collection_dir,
-            "frozen max_seq is below a row written by this generation",
-        ));
-    }
-    let partition = collection_dir.join("partitions/_default");
-    let data_dir = partition.join("data");
-    let delta_dir = partition.join("delta");
-    if (data.is_some_and(|batch| batch.num_rows() > 0)
-        || delta.is_some_and(|batch| batch.num_rows() > 0))
-        && collect_wal(&collection_dir.join("wal"), generation)
-            .map_err(|error| FlushError::before(collection_dir, error))?
-            .is_empty()
-    {
-        return Err(FlushError::before(
-            collection_dir,
-            "nonempty flush has no WAL for recovery",
-        ));
-    }
-    fs_commit::create_dir_synced(&data_dir)
-        .map_err(|error| FlushError::before(&data_dir, error))?;
-    fs_commit::create_dir_synced(&delta_dir)
-        .map_err(|error| FlushError::before(&delta_dir, error))?;
-    let pinned = snapshot::load_pins(collection_dir)
-        .map_err(|error| FlushError::before(collection_dir, error))?;
-    if sync_inherited_files {
-        sync_inherited(collection_dir, old_manifest)?;
-    }
-    let mut candidate = old_manifest.clone();
-    let files = candidate
-        .partitions
-        .get_mut("_default")
-        .ok_or_else(|| FlushError::before(collection_dir, "default partition missing"))?;
-    if let (Some(batch), Some((min, max))) = (data, data_range) {
-        let name = output_name(&data_dir, "data", min, max, &files.data_files, &pinned.data)?;
-        let path = data_dir.join(&name);
-        parquet_file::write_new(&path, batch).map_err(|error| FlushError::before(&path, error))?;
-        files.data_files.push(format!("data/{name}"));
-    }
-    if let (Some(batch), Some((min, max))) = (delta, delta_range) {
-        let name = output_name(
-            &delta_dir,
-            "delta",
-            min,
-            max,
-            &files.delta_files,
-            &pinned.delta,
-        )?;
-        let path = delta_dir.join(&name);
-        parquet_file::write_new(&path, batch).map_err(|error| FlushError::before(&path, error))?;
-        files.delta_files.push(format!("delta/{name}"));
-    }
-    fs_commit::sync_dir(&data_dir).map_err(|error| FlushError::before(&data_dir, error))?;
-    fs_commit::sync_dir(&delta_dir).map_err(|error| FlushError::before(&delta_dir, error))?;
-    candidate.current_seq = old_manifest.current_seq.max(frozen_max_seq);
-    candidate.active_wal_number = Some(next_wal);
-    candidate.version = candidate
-        .version
-        .checked_add(1)
-        .ok_or_else(|| FlushError::before(collection_dir, "manifest version space exhausted"))?;
-    match fs_commit::commit_manifest(collection_dir, &candidate) {
-        Ok(report) => {
-            if let Some(error) = report.prev_copy_error {
-                // `.prev` 不是真值；调用方必须记录这项非致命 I/O 故障。
-                eprintln!("manifest backup copy failed for {collection_dir:?}: {error}");
+    let mut committed = None;
+    let mut cleanup_started = false;
+    // 锁外任何一步 unwind 都必须按实际提交点分类，日志或第三方写入器也不能绕过发布。
+    let attempted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        #[cfg(feature = "fault-injection")]
+        panic_at_flush_boundary(CommitPhase::BeforeReplace);
+        let next_wal = generation
+            .checked_add(1)
+            .ok_or_else(|| FlushError::before(collection_dir, "WAL number space exhausted"))?;
+        let data_range = data
+            .filter(|batch| batch.num_rows() > 0)
+            .map(|batch| seq_range(batch, "_seq"))
+            .transpose()?;
+        let delta_range = delta
+            .filter(|batch| batch.num_rows() > 0)
+            .map(|batch| seq_range(batch, "_seq"))
+            .transpose()?;
+        if data_range.is_some_and(|(_, max)| max > frozen_max_seq)
+            || delta_range.is_some_and(|(_, max)| max > frozen_max_seq)
+        {
+            return Err(FlushError::before(
+                collection_dir,
+                "frozen max_seq is below a row written by this generation",
+            ));
+        }
+        let partition = collection_dir.join("partitions/_default");
+        let data_dir = partition.join("data");
+        let delta_dir = partition.join("delta");
+        if (data.is_some_and(|batch| batch.num_rows() > 0)
+            || delta.is_some_and(|batch| batch.num_rows() > 0))
+            && collect_wal(&collection_dir.join("wal"), generation)
+                .map_err(|error| FlushError::before(collection_dir, error))?
+                .is_empty()
+        {
+            return Err(FlushError::before(
+                collection_dir,
+                "nonempty flush has no WAL for recovery",
+            ));
+        }
+        fs_commit::create_dir_synced(&data_dir)
+            .map_err(|error| FlushError::before(&data_dir, error))?;
+        fs_commit::create_dir_synced(&delta_dir)
+            .map_err(|error| FlushError::before(&delta_dir, error))?;
+        let pinned = snapshot::load_pins(collection_dir)
+            .map_err(|error| FlushError::before(collection_dir, error))?;
+        if sync_inherited_files {
+            sync_inherited(collection_dir, old_manifest)?;
+        }
+        let mut candidate = old_manifest.clone();
+        let files = candidate
+            .partitions
+            .get_mut("_default")
+            .ok_or_else(|| FlushError::before(collection_dir, "default partition missing"))?;
+        if let (Some(batch), Some((min, max))) = (data, data_range) {
+            let name = output_name(&data_dir, "data", min, max, &files.data_files, &pinned.data)?;
+            let path = data_dir.join(&name);
+            parquet_file::write_new(&path, batch)
+                .map_err(|error| FlushError::before(&path, error))?;
+            files.data_files.push(format!("data/{name}"));
+        }
+        if let (Some(batch), Some((min, max))) = (delta, delta_range) {
+            let name = output_name(
+                &delta_dir,
+                "delta",
+                min,
+                max,
+                &files.delta_files,
+                &pinned.delta,
+            )?;
+            let path = delta_dir.join(&name);
+            parquet_file::write_new(&path, batch)
+                .map_err(|error| FlushError::before(&path, error))?;
+            files.delta_files.push(format!("delta/{name}"));
+        }
+        fs_commit::sync_dir(&data_dir).map_err(|error| FlushError::before(&data_dir, error))?;
+        fs_commit::sync_dir(&delta_dir).map_err(|error| FlushError::before(&delta_dir, error))?;
+        candidate.current_seq = old_manifest.current_seq.max(frozen_max_seq);
+        candidate.active_wal_number = Some(next_wal);
+        candidate.version = candidate.version.checked_add(1).ok_or_else(|| {
+            FlushError::before(collection_dir, "manifest version space exhausted")
+        })?;
+        match fs_commit::commit_manifest(collection_dir, &candidate) {
+            Ok(report) => {
+                committed = Some(candidate.clone());
+                if let Some(error) = report.prev_copy_error {
+                    // `.prev` 不是真值；调用方必须记录这项非致命 I/O 故障。
+                    eprintln!("manifest backup copy failed for {collection_dir:?}: {error}");
+                }
+            }
+            Err(error) if error.phase == CommitPhase::BeforeReplace => {
+                return Err(FlushError::before(&error.path, error.source));
+            }
+            Err(error) => {
+                committed = Some(candidate.clone());
+                let reason = match sync_retained_wal(&collection_dir.join("wal"), generation) {
+                    Ok(()) => error.source.to_string(),
+                    Err(wal_error) => {
+                        format!("{}; retained WAL sync failed: {wal_error}", error.source)
+                    }
+                };
+                return Err(FlushError::after(&error.path, reason, candidate));
             }
         }
-        Err(error) if error.phase == CommitPhase::BeforeReplace => {
-            return Err(FlushError::before(&error.path, error.source));
+        #[cfg(feature = "fault-injection")]
+        panic_at_flush_boundary(CommitPhase::AfterReplace);
+        cleanup_started = true;
+        if let Err(error) = cleanup_wal(&collection_dir.join("wal"), generation) {
+            return Err(FlushError::cleanup(collection_dir, error, candidate));
         }
-        Err(error) => {
-            let reason = match sync_retained_wal(&collection_dir.join("wal"), generation) {
-                Ok(()) => error.source.to_string(),
-                Err(wal_error) => {
-                    format!("{}; retained WAL sync failed: {wal_error}", error.source)
-                }
-            };
-            return Err(FlushError::after(&error.path, reason, candidate));
-        }
-    }
-    if let Err(error) = cleanup_wal(&collection_dir.join("wal"), generation) {
-        return Err(FlushError::cleanup(collection_dir, error, candidate));
-    }
-    Ok(candidate)
+        Ok(candidate)
+    }));
+    attempted.unwrap_or_else(|payload| {
+        let reason = format!(
+            "flush worker panicked: {}",
+            crate::error::panic_description(payload.as_ref())
+        );
+        Err(match committed {
+            None => FlushError::before(collection_dir, reason),
+            Some(manifest) if cleanup_started => {
+                FlushError::cleanup(collection_dir, reason, manifest)
+            }
+            Some(manifest) => FlushError::after(collection_dir, reason, manifest),
+        })
+    })
 }
 
 fn output_name(
@@ -335,7 +386,7 @@ pub(crate) fn sync_inherited(collection_dir: &Path, manifest: &Manifest) -> Resu
             return Err(FlushError::before(&path, "referenced file is not regular"));
         }
         File::open(&path)
-            .and_then(|file| file.sync_all())
+            .and_then(|file| fs_commit::sync_file(&file, &path))
             .map_err(|error| FlushError::before(&path, error))?;
     }
     let schema = collection_dir.join("schema.json");
@@ -344,7 +395,7 @@ pub(crate) fn sync_inherited(collection_dir: &Path, manifest: &Manifest) -> Resu
         return Err(FlushError::before(&schema, "schema is not a regular file"));
     }
     File::open(&schema)
-        .and_then(|file| file.sync_all())
+        .and_then(|file| fs_commit::sync_file(&file, &schema))
         .map_err(|error| FlushError::before(&schema, error))?;
     // 3.x 不同步 Parquet 及多层目录；第一次由本实现提交前须从数据目录根的上级补齐。
     let mut dirs: Vec<PathBuf> = Vec::new();
@@ -371,14 +422,32 @@ pub(crate) fn sync_inherited(collection_dir: &Path, manifest: &Manifest) -> Resu
 
 /// 一趟升序删除已提交代的 WAL；每个 unlink 后同步目录，断电时仍保留编号后缀。
 pub fn cleanup_wal(wal_dir: &Path, up_to: u64) -> io::Result<()> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        cleanup_wal_inner(wal_dir, up_to)
+    })) {
+        Ok(result) => result,
+        Err(payload) => Err(io::Error::other(format!(
+            "WAL cleanup panicked: {}",
+            crate::error::panic_description(payload.as_ref())
+        ))),
+    }
+}
+
+fn cleanup_wal_inner(wal_dir: &Path, up_to: u64) -> io::Result<()> {
     for path in collect_wal(wal_dir, up_to)? {
-        File::open(&path)?.sync_all()?;
+        fs_commit::sync_file(&File::open(&path)?, &path)?;
         #[cfg(feature = "fault-injection")]
         if FAIL_NEXT_WAL_UNLINK.with(|flag| flag.replace(false)) {
             return Err(io::Error::other("injected WAL unlink failure"));
         }
         fs::remove_file(&path)?;
+        #[cfg(feature = "fault-injection")]
+        fs_commit::record_fs(fs_commit::FsAction::Unlink, &path);
         fs_commit::sync_dir(wal_dir)?;
+        #[cfg(feature = "fault-injection")]
+        if PANIC_NEXT_WAL_UNLINK.with(|slot| slot.replace(false)) {
+            panic!("injected WAL unlink panic");
+        }
         #[cfg(feature = "fault-injection")]
         if EXIT_AFTER_NEXT_WAL_UNLINK.with(|flag| flag.replace(false)) {
             std::process::exit(87);
@@ -389,7 +458,7 @@ pub fn cleanup_wal(wal_dir: &Path, up_to: u64) -> io::Result<()> {
 
 fn sync_retained_wal(wal_dir: &Path, up_to: u64) -> io::Result<()> {
     for path in collect_wal(wal_dir, up_to)? {
-        File::open(&path)?.sync_all()?;
+        fs_commit::sync_file(&File::open(&path)?, &path)?;
     }
     if wal_dir.is_dir() {
         fs_commit::sync_dir(wal_dir)?;

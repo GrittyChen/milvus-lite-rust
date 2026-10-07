@@ -14,6 +14,26 @@ use arrow_schema::{ArrowError, Schema, SchemaRef};
 #[cfg(feature = "fault-injection")]
 thread_local! {
     static FAIL_NEXT_APPEND_AFTER_BYTES: std::cell::Cell<Option<(usize, bool)>> = const { std::cell::Cell::new(None) };
+    static AFTER_APPEND_IO: std::cell::RefCell<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>> = const { std::cell::RefCell::new(None) };
+}
+
+/// 观察真实 File 写出之后、append 尚未返回的窗口，供进程崩溃模型使用。
+#[cfg(feature = "fault-injection")]
+pub fn pause_append_after_io_once(
+    entered: std::sync::mpsc::Sender<()>,
+    resume: std::sync::mpsc::Receiver<()>,
+) {
+    AFTER_APPEND_IO.with(|slot| *slot.borrow_mut() = Some((entered, resume)));
+}
+#[cfg(feature = "fault-injection")]
+fn after_append_io() -> io::Result<()> {
+    AFTER_APPEND_IO.with(|slot| {
+        if let Some((entered, resume)) = slot.borrow_mut().take() {
+            entered.send(()).map_err(io::Error::other)?;
+            resume.recv().map_err(io::Error::other)?;
+        }
+        Ok(())
+    })
 }
 
 /// 仅测试构建可用；模拟 File 写出一部分 batch 后报错。
@@ -147,6 +167,9 @@ impl WalWriter {
                 });
             }
             self.poisoned = true;
+            if let Err(error) = after_append_io() {
+                panic!("WAL pause interrupted after partial write: {error}");
+            }
             return Err(WalError::Io {
                 path: self.path.clone(),
                 source: if storage_full {
@@ -174,6 +197,12 @@ impl WalWriter {
                 source,
             });
         }
+        #[cfg(feature = "fault-injection")]
+        if let Err(error) = after_append_io() {
+            // 已完整写出后不能伪造普通 I/O 失败；断连属于测试中断，走 panic 协议。
+            self.poisoned = true;
+            panic!("WAL pause interrupted after complete write: {error}");
+        }
         Ok(())
     }
 
@@ -184,7 +213,7 @@ impl WalWriter {
     }
 
     pub(crate) fn sync(&self) -> io::Result<()> {
-        self.file.sync_all()
+        crate::storage::fs_commit::sync_file(&self.file, &self.path)
     }
 }
 
@@ -336,6 +365,28 @@ mod tests {
             })
             .collect();
         assert_eq!(ids, [10, 20]);
+    }
+
+    #[cfg(feature = "fault-injection")]
+    #[test]
+    fn disconnected_append_pause_is_not_reported_as_a_partial_io_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = schema();
+        let mut writer = WalWriter::create(dir.path(), WalKind::Data, 1, &schema).unwrap();
+        let (entered, receiver) = std::sync::mpsc::channel();
+        drop(receiver);
+        let (_resume, waiting) = std::sync::mpsc::channel();
+        pause_append_after_io_once(entered, waiting);
+        assert!(catch_unwind(AssertUnwindSafe(|| writer.append(&batch(&schema, 1, 10)))).is_err());
+        assert_eq!(read_prefix(writer.path()).unwrap().batches.len(), 1);
+        let before = std::fs::read(writer.path()).unwrap();
+        assert!(matches!(
+            writer.append(&batch(&schema, 2, 20)),
+            Err(WalError::Poisoned { .. })
+        ));
+        assert_eq!(std::fs::read(writer.path()).unwrap(), before);
+        writer.sync().unwrap();
+        drop(writer.into_file());
     }
 
     #[test]

@@ -103,11 +103,11 @@ WAL 追加（每次写入调用一个 batch，dim 128）：
   - 名字锁是 db 级的、每个名字一把：打开、drop、create 都持有它。
   - flush 锁是每个 collection 一把互斥锁：串行化所有写 manifest 的操作（flush、CreateIndex 等）与 drop。
   - 状态读写锁保护 collection 的全部可变状态。
-- 叶子锁：collection 表锁、aliases 锁、关闭闸门的锁。持有任何锁时都可以取叶子锁，持有叶子锁时不取任何其他锁。
+- 叶子锁：collection 表锁、名字锁注册表、失败判定缓存、aliases 锁、关闭闸门与 WAL 文件锁。持有任何锁时都可以取叶子锁，持有叶子锁时不取任何其他锁。
   - collection 表锁只保护查表、登记与移除。打开时持名字锁登记句柄、drop 在移出句柄时已持有外层的数据库写入闸门、目录变更锁、名字锁与 collection 锁，都是这种用法。
-  - aliases 锁是 db 级的一把，保护 `aliases.json` 的读改写与改名全过程。并发 drop 两个带别名的 collection 时，没有它会丢失一处更新；两边共用一个固定的 tmp 文件名时，还可能写出半个 JSON，而 3.x 读到损坏的 `aliases.json` 时，整个数据库的 RPC 都报 code 1（实测）。tmp 用 `create_new` 的唯一名字。
+  - aliases 叶子锁独立保护 `aliases.json` 的完整读改写与原子改名；create 在该叶子临界区内清理悬空别名并判断名字，随后释放它；drop 在目录提交后重新取得它、重新读取别名并清理目标。前置元数据校验只短暂持锁，不能跨 flush 锁或状态锁持有叶子锁。create/drop 的数据库独占许可与目录变更锁仍保留，两个别名事务的串行与不丢更新分别有用例。tmp 用 `create_new` 的唯一名字，避免共享 tmp 覆盖。
 - 0005 的计算池任务不取任何锁，不变。
-- 完整 M2 要在 debug 构建中断言取锁的方向，禁止同线程把共享许可升级为独占许可；这是尚待实施的验收要求，当前实现以结构与受控并发测试守住该顺序，不能据此宣称已有运行时锁序断言。
+- [lock_order](../../crates/core/src/lock_order.rs) 在 debug 构建中检查五层锁及 collection 表、名字锁注册表、判定缓存与 aliases 的叶子锁；反向、同层嵌套与同锁重入在阻塞之前报错，禁止共享许可升级。失败的非阻塞探测不登记临界区；测试观察锁占用使用不构造业务守卫的独立接口。release 不注册线程局部状态或执行顺序断言。关闭闸门和 `wal_files` 的内部锁仍由结构保证叶子性质，不在该包装器内；其临界区不得获取五层锁。
 
 ### 写入
 
@@ -212,8 +212,8 @@ WAL 追加（每次写入调用一个 batch，dim 128）：
 - **CreateIndex 等写 manifest 的操作**：
   - 在提交点之前失败：报错，内存状态不变；
   - 在提交点之后失败：按已提交处理，返回成功，进入「待完成的重新提交」，与第 9 项 (i) 的原则相同：生效的写入都返回成功。
-- **锁内的 panic**（持状态写锁的各段：写入的应用、冻结、块的合并、锁内发布、CreateIndex 的内存更新，都是实现缺陷）：内存状态可能只改了一半，不能再用。
-  - **在放开写锁之前**把 collection 标记为损坏：写锁的作用域内放一个守卫，析构时若 `std::thread::panicking()` 就置位。parking_lot 的锁没有中毒语义，unwind 时锁会先被放开；若等到 RPC 边界再置位，排在写锁上的写者会基于改了一半的状态写入并返回成功。
+- **锁内的 panic**（持状态写锁的各段：写入的应用、冻结、块的合并、锁内发布、CreateIndex 的内存更新，以及 drop 的标记与 WAL 同步、manifest 重新提交，都是实现缺陷）：内存状态可能只改了一半，不能再用。
+  - **在放开写锁之前**把 collection 标记为损坏：持状态写锁调用 `state_change`，在该边界用 `catch_unwind` 捕获 panic，并在返回错误前显式调用 `persistent.poison()`。parking_lot 的锁没有中毒语义，unwind 时锁会先被放开；若等到 RPC 边界再置位，排在写锁上的写者会基于改了一半的状态写入并返回成功。
   - 之后的请求在取锁后看到这个标记就报错；flush 锁的持有者看到它就停下（见「flush」）。
   - **损坏的 collection 在这个服务实例内不再可用，直到服务重启**（进程重启，或 `release_server` 之后重新打开，0003），不在服务内从盘上重开：重开要与仍在锁外写盘的旧 flush 协调，否则同一目录上会同时有两个句柄。重启时照常从盘上恢复，已写进 WAL 与已提交的都在。
   - 残余风险（规则 6）：
@@ -435,7 +435,7 @@ WAL 追加（每次写入调用一个 batch，dim 128）：
 - [db_persistence.rs](../../crates/core/tests/db_persistence.rs)：insert/upsert/delete 的首次与已有 writer、零字节/头部/批末 ENOSPC，失败后内存不变，停止或继续写入后正常关闭重开；auto_id 在进程内不复用失败序号，重开仅从可恢复序号继续；读取 I/O 失败保留文件且懒打开可重试；flush 预同步分别在 data/delta/目录处失败时保持 BeforeReplace、manifest 与行集不变，同步失败的 collection 在重试窗口内拒绝写入，无关 collection 不受影响，显式 Flush 可立即完成重试并恢复写入。窗口断言使用仅测试构建可用的线程局部护栏，不依赖机器执行速度。
 - [runtime.rs](../../crates/core/src/storage/runtime.rs)：冻结代保留原 WAL File；文件与目录同步任一点失败均不关闭其中任何句柄，全成功后才关闭；Unix 上删除 wal/ 后仍持有活跃或冻结句柄时同步报错，确实没有句柄时允许目录不存在。
 - [crash_recovery.rs](../../crates/core/tests/crash_recovery.rs) 与 [互通用例](../../tests/storage_interop/test_cross_implementation.py)：ENOSPC 报错后停止或继续写入，再由独立进程立即退出；Rust 恢复结果与成功操作一致。3.x 与 Rust 的真实客户端分别读取两类目录：追加失败后恢复 flush 已完成、失败 WAL 已清理；以及注入恢复 flush 的 WAL 预同步失败，令半截 WAL 保留在盘上再退出。用例先断言实际 WAL 文件集合，再核对 count、get、主键 query、search 与向量；参考实现及 pyarrow 15/25 逐字节读取 Rust WAL，与 Rust 的完整批前缀及值一致。
-- 边界：ENOSPC 是 File 层错误注入，并未填满宿主磁盘；本节不代表完成并发写入后崩溃、Parquet 读取 panic、全部 fs 操作顺序或跨平台验证。仍有效的载荷位翻转不由格式校验检出，继承风险见 [0002](0002-data-dir-compat.md#继承的-3x-已知风险)。
+- 边界：ENOSPC 是 File 层错误注入，并未填满宿主磁盘；本节自身不覆盖并发写入后崩溃、Parquet 读取 panic 或文件系统顺序；后续证据见[验收记录](../testing/m2-correctness.md)，不推断跨平台行为。仍有效的载荷位翻转不由格式校验检出，继承风险见 [0002](0002-data-dir-compat.md#继承的-3x-已知风险)。
 
 ### 读快照的当前实现与验收范围
 
@@ -463,7 +463,7 @@ WAL 追加（每次写入调用一个 batch，dim 128）：
 - [read_snapshot.rs](../../crates/core/tests/read_snapshot.rs) 在锁外构建写出批次后、提交与锁内发布前暂停 flush，下一代穿插覆盖、删除、Upsert 和重插；发布前后新视图相同，旧快照不变，再次 flush 与重开结果一致。暂停钩子的通道断开也须归类为提交点前失败，manifest 不变且可重试。
 - [test_read_snapshot.py](../../tests/differential/test_read_snapshot.py) 的小批量差分核对多代发布前后的主键读取、计数、JSON 原始 RPC 字节与非截断并列顺序；参照实现保持最多三个 data 文件，并断言文件数量，避免将四文件触发的 compaction 重排混入本切片。[test_reopen.py](../../tests/differential/test_reopen.py) 另固定两侧关闭重开后的非截断并列顺序、原物理行号与 JSON RPC 字节。
 
-数据源映射切片自身不实施 compaction 或 S1；后续 S1 的接入以 [S1 过滤](#s1-过滤的当前实现与验收范围)为准；完整并发崩溃矩阵、Parquet 读取 panic、平台行为与最终性能基准仍待后续验收。块合并对写锁、复制与快照保留内存的实际代价尚未量化，不声明性能提升。
+数据源映射切片自身不实施 compaction 或 S1；后续 S1 的接入以 [S1 过滤](#s1-过滤的当前实现与验收范围)为准；并发与故障的后续证据见[验收记录](../testing/m2-correctness.md)；平台行为与最终性能基准仍待验证。块合并对写锁、复制与快照保留内存的实际代价尚未量化，不声明性能提升。
 
 ### 按名字懒打开与失败缓存的当前实现与验收范围
 
@@ -474,7 +474,7 @@ WAL 追加（每次写入调用一个 batch，dim 128）：
 - [db_persistence.rs](../../crates/core/tests/db_persistence.rs) 的真实 WAL I/O 失败用例仍证明文件不变、首次访问报错、下一次访问重试成功；core 分类用例覆盖各读取层的 I/O 错误及 Parquet 包装的 I/O 来源，清理扫描故障不缓存。清理钩子断连也不会成为永久判定。
 - [重开差分](../../tests/differential/test_reopen.py) 固定并发 Rust 首次读取与参照实现串行真值的一致性、同名重建及无关 collection 的可见行，并对外部修复后的两侧缓存差异分别断言；首次打开失败且未登记句柄时，目录删除/移走后的 has/describe/load state/stats 均按不存在处理，移回后恢复原缓存判定。3.x 没有首次打开互斥，不能用其并发打开缺陷生成真值。
 
-本切片不调整读取文件的格式、发布、别名维护或恢复策略，不代替完整并发崩溃矩阵、跨平台实测或性能基准。aliases 文件目前仍由 create/drop 的目录变更锁串行维护，独立 aliases 锁与全组件 debug 锁序断言仍待后续收敛。
+本切片不调整读取文件的格式、发布、别名维护或恢复策略，不代替完整并发崩溃矩阵、跨平台实测或性能基准。aliases 文件的完整读改写事务由独立叶子锁保护；debug 锁序检查与故障组合的后续证据见[验收记录](../testing/m2-correctness.md)。
 
 ### S1 过滤的当前实现与验收范围
 
@@ -484,8 +484,8 @@ WAL 追加（每次写入调用一个 batch，dim 128）：
 - 通用 Query 按数据源序、segment 物理行序或 memtable 位次排序，再执行 3.x 的 limit / offset；主键 in 的 get 快路径继续忽略分页。零 / 负 limit、负 offset 与无效字符串参数保留参照实现的实际行为，不新增校验。带 expr 的 count 使用同一过滤掩码、不使用分页；空 expr 的 count 保留不检查 load 与分区的短锁路径。query iterator 仍显式拒绝。
 - 主键 `in` 的数值集合按 Arrow 的实际转换路径求值：先构建 value_set，再尝试完整转成 int64；成功时不把列转为 double，失败时才按 double 位模式查集合，因此非整数浮点集合中的 `-0.0` 不匹配整数零。普通比较仍将正负零判为相等。整浮混合的集合构造错误、宽整数列的安全转换错误和边界饱和行为均由真实 3.x 的 Query/count/Search/Delete、发布与重开用例固定，不另登记数学语义差异。列式存储上的逐行标量分派开销留待最终基准核对，本切片不据此声明性能改善。
 - [filter_s1.rs](../../crates/core/tests/filter_s1.rs) 固定旧快照在发布、过滤删除、drop 与同名重建后仍不变，失效旧行的数值边界，以及过滤失败不改变行集、序号与 WAL。Delete 取得视图之前仍先检查毒化与待重试提交，存储失败的错误优先级由注入用例固定。[db.rs](../../crates/core/src/db.rs) 的受控用例暂停求值结束后的 Delete，覆盖同时写入新版本与 release 的行为。S1 不改变 WAL、manifest 或失败重试协议。
-- [test_filter_s1.py](../../tests/differential/test_filter_s1.py) 通过真实客户端对照八类标量、六种比较的两个方向、and、Query/count/Search/Delete、分页参数、错误码与原文、主键两种类型和关闭重开后的顺序；顺序用例显式限制参照实现的 data 文件数小于四，排除 compaction 重排。原 [CRUD 副本](../../tests/python/adapter/test_grpc_crud.py) 恢复原过滤表达式，并复用除 LIKE 外的十九条上游用例；此前标为待复用的其余 40 条 S1 用例已迁移并双线对照，[INVENTORY](../../tests/python/adapter/INVENTORY.md) 已同步实际状态。
+- [test_filter_s1.py](../../tests/differential/test_filter_s1.py) 通过真实客户端对照八类标量、六种比较的两个方向、and、Query/count/Search/Delete、分页参数、错误码与原文、主键两种类型和关闭重开后的顺序；顺序用例显式限制参照实现的 data 文件数小于四，排除 compaction 重排。原 [CRUD 副本](../../tests/python/adapter/test_grpc_crud.py) 恢复原过滤表达式，并复用除 LIKE 外的十九条上游用例；此前标为待复用的其余 40 条 S1 用例已在[后续验收](../testing/m2-correctness.md)迁移并双线对照，[INVENTORY](../../tests/python/adapter/INVENTORY.md) 已同步实际状态。
 - 语法真值通过 [生成脚本](../../tests/differential/generate_filter_parse_fixtures.py) 从真实 3.x 导出，[语料](../../tests/differential/fixtures/filter_parse_v321.json)覆盖语法分支、截断与固定种子的词法变异；`--verify` 可核验。Unicode 字符分类按 CPython 3.12 / Unicode 15.0 固定，[生成脚本](../../tests/differential/generate_filter_unicode.py) 可核验分类表。嵌套深度另有明确服务上限，差异见 0006。
 - ISO 时间与偏移共用按 [CPython 3.12.14 的 C 解析器](https://github.com/python/cpython/blob/v3.12.14/Modules/_datetimemodule.c) `parse_hh_mm_ss_ff` / `parse_isoformat_time` 推进的扫描器：覆盖紧凑与冒号形态、无分隔符的小数、六位微秒截断、逻辑时区边界与实际尾字节、零秒偏移忽略小数的规则；日期与 INTERVAL 不在本次重写范围。固定语料保留此前的全部 2857 条，并增加时间与偏移的长度/尾字节矩阵。另以[直接模糊对照器](../../tests/differential/fuzz_temporal.py)把结构生成与字符变异的表达式交给真实 3.x `parse_expr` 与 [Rust 解析入口](../../crates/core/examples/filter_parse_probe.rs)，逐字比较接受结果及诊断，不依赖 gRPC 或固定语料；每次输出覆盖计数与反例报告，任何分歧返回失败。真实入口仍由 Query/Search/Delete 的差分用例固定；时间求值仍属范围外。
 
-本切片不实施过滤索引或表达式缓存，不声明吞吐、延迟或内存改善；完整并发崩溃矩阵、debug 锁序断言、Parquet 读取 panic、跨平台实测与最终性能基准仍待后续验收。
+本切片不实施过滤索引或表达式缓存，不声明吞吐、延迟或内存改善；S1 用例复用、并发故障与 Parquet 读取的后续证据见[验收记录](../testing/m2-correctness.md)；跨平台实测与最终性能基准另行验收。
