@@ -563,16 +563,18 @@ impl Collection {
 
     pub(crate) fn from_recovered(
         name: &str,
-        recovered: RecoveredCollection,
+        mut recovered: RecoveredCollection,
         dir: std::path::PathBuf,
     ) -> Result<Self> {
         let mut collection = Self::new(name, recovered.schema.clone())?;
         collection.next_seq = recovered.next_seq;
         let snapshot = recovered.visibility.snapshot();
-        for segment in &recovered.segments {
+        // 已提交批只供读块使用；在登记前移交独占列，避免恢复时同时保留两份全量数据。
+        for segment in std::mem::take(&mut recovered.segments) {
             let mut row = 0;
-            for batch in &segment.batches {
-                let live = (0..batch.seqs.len())
+            for batch in segment.batches {
+                let rows = batch.seqs.len();
+                let live = (0..rows)
                     .map(|offset| {
                         snapshot
                             .is_live(segment.source, row + offset)
@@ -584,7 +586,7 @@ impl Collection {
                     })
                     .collect::<Result<Vec<_>>>()?;
                 collection.append_recovered(batch, 0, segment.source, row, live, None)?;
-                row += batch.seqs.len();
+                row += rows;
             }
         }
         let active = &recovered.active_memtable;
@@ -618,7 +620,8 @@ impl Collection {
                 })
                 .collect::<Result<Vec<_>>>()?;
             collection.append_recovered(
-                batch,
+                // 活跃 WAL 的原批还用于冻结与 flush，不移走 memtable 的列。
+                batch.as_ref().clone(),
                 recovered.next_wal_number,
                 active.source,
                 row_start,
@@ -648,7 +651,7 @@ impl Collection {
 
     fn append_recovered(
         &mut self,
-        decoded: &DecodedData,
+        decoded: DecodedData,
         generation: u64,
         source: SourceId,
         row_start: usize,
@@ -657,6 +660,7 @@ impl Collection {
     ) -> Result<()> {
         let n = decoded.seqs.len();
         let (dim, vectors) = vector_values(&decoded.columns[self.vector_pos]);
+        let norms = vectors.chunks_exact(dim).map(flat::norm).collect();
         let orders = if let Some(orders) = orders {
             orders
         } else {
@@ -670,10 +674,10 @@ impl Collection {
         self.next_chunk += 1;
         let chunk = Chunk {
             data: Arc::new(ChunkData {
-                columns: decoded.columns.clone(),
-                meta: decoded.meta.clone(),
-                norms: vectors.chunks_exact(dim).map(flat::norm).collect(),
-                seqs: decoded.seqs.clone(),
+                columns: decoded.columns,
+                meta: decoded.meta,
+                norms,
+                seqs: decoded.seqs,
                 orders,
             }),
             live: SourceBits::from_live(&live),
@@ -2077,6 +2081,143 @@ fn check_loaded(name: &str, state: LoadState, deleted: bool, unusable: bool) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recovered_segments_move_buffers_into_read_blocks_while_wal_keeps_its_batch() {
+        use crate::storage::recovery::load_committed;
+        use crate::{DataDir, Db};
+        let root = tempfile::tempdir().unwrap();
+        let mut id = FieldSchema::new("id", DataType::Int64);
+        id.is_primary = true;
+        let mut vector = FieldSchema::new("v", DataType::FloatVector);
+        vector.dim = Some(2);
+        let mut tag = FieldSchema::new("tag", DataType::VarChar);
+        tag.max_length = Some(100);
+        let schema = CollectionSchema {
+            fields: vec![id, vector, tag, FieldSchema::new("json", DataType::Json)],
+            enable_dynamic_field: true,
+            properties: vec![],
+        };
+        let db = Db::new(
+            DataDir::open(root.path()).unwrap(),
+            Compute::for_host().unwrap(),
+        );
+        db.create_collection("", "c", schema).unwrap();
+        for ids in [vec![1, 2], vec![3, 4]] {
+            db.insert(
+                "",
+                "c",
+                InsertBatch {
+                    num_rows: 2,
+                    columns: vec![
+                        ("id".into(), InputValues::Int(ids)),
+                        (
+                            "v".into(),
+                            InputValues::FloatVector {
+                                dim: 2,
+                                values: vec![1.0, 0.0, 2.0, 0.0],
+                            },
+                        ),
+                        (
+                            "tag".into(),
+                            InputValues::Str(vec!["中文".into(), "é".into()]),
+                        ),
+                        (
+                            "json".into(),
+                            InputValues::Json(vec![br#"{"wide":9007199254740993}"#.to_vec(); 2]),
+                        ),
+                        (
+                            "$meta".into(),
+                            InputValues::Json(vec![br#"{"x":"dynamic"}"#.to_vec(); 2]),
+                        ),
+                    ],
+                },
+            )
+            .unwrap();
+            db.flush_collection("", "c").unwrap();
+        }
+        db.close();
+        let dir = root.path().join("collections/c");
+        let mut recovered = load_committed(&dir).unwrap();
+        fn addresses(
+            columns: &[ColumnData],
+            seqs: &[u64],
+            meta: &Option<Vec<Map<String, Value>>>,
+        ) -> [usize; 5] {
+            let ColumnData::FloatVector { values, .. } = &columns[1] else {
+                panic!("vector")
+            };
+            let ColumnData::VarChar(tags) = &columns[2] else {
+                panic!("tag")
+            };
+            let ColumnData::Json(json) = &columns[3] else {
+                panic!("json")
+            };
+            [
+                values.as_ptr() as usize,
+                tags[0].as_ptr() as usize,
+                json[0].as_ptr() as usize,
+                seqs.as_ptr() as usize,
+                meta.as_ref().unwrap().as_ptr() as usize,
+            ]
+        }
+        let original = recovered
+            .segments
+            .iter()
+            .flat_map(|s| &s.batches)
+            .map(|b| addresses(&b.columns, &b.seqs, &b.meta))
+            .collect::<Vec<_>>();
+        assert_eq!(original.len(), 2);
+        let mut wal = recovered.segments[0].batches[0].clone();
+        wal.seqs = vec![5, 6];
+        wal.columns[0] = ColumnData::Int64(vec![5, 6]);
+        recovered
+            .active_memtable
+            .apply_data(&recovered.schema, wal, &mut recovered.visibility)
+            .unwrap();
+        recovered.next_seq = 7;
+        let active = Arc::clone(&recovered.active_memtable.read_batches()[0]);
+        let active_addresses = addresses(&active.columns, &active.seqs, &active.meta);
+        let c = Collection::from_recovered("c", recovered, dir).unwrap();
+        for (chunk, expected) in c
+            .chunks
+            .values()
+            .filter(|c| c.generation == 0)
+            .zip(&original)
+        {
+            assert_eq!(
+                addresses(&chunk.columns, &chunk.seqs, &chunk.meta),
+                *expected
+            );
+            assert_eq!(
+                chunk.norms,
+                vec![flat::norm(&[1.0, 0.0]), flat::norm(&[2.0, 0.0])]
+            );
+        }
+        assert_eq!(
+            c.chunks.values().filter(|c| c.generation == 0).count(),
+            original.len()
+        );
+        let retained = &c.persistent().unwrap().active.read_batches()[0];
+        assert!(Arc::ptr_eq(&active, retained));
+        assert_eq!(
+            addresses(&retained.columns, &retained.seqs, &retained.meta),
+            active_addresses
+        );
+        let wal_chunk = c.chunks.values().find(|c| c.generation != 0).unwrap();
+        assert_ne!(
+            addresses(&wal_chunk.columns, &wal_chunk.seqs, &wal_chunk.meta)[0],
+            active_addresses[0]
+        );
+        assert_eq!(c.count(), 6);
+        assert_eq!(
+            c.get(&[Pk::Int64(1), Pk::Int64(5)], &["tag".into()])
+                .unwrap()
+                .rows
+                .pks,
+            vec![Pk::Int64(1), Pk::Int64(5)]
+        );
+    }
 
     #[test]
     fn recovery_requires_a_position_for_live_rows_but_allows_dead_row_placeholders() {
