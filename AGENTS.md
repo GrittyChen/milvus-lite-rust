@@ -161,6 +161,9 @@ cd <work_dir> && MILVUS_LITE_3X_PYTHON=<3.x 的 venv>/bin/python v26/bin/python 
 | 3.x 耗时归属 | `<work_dir>/v3/bin/python benchmarks/baseline/profile_v3.py <3.x 的库>` |
 | 为本仓的 Rust 实现建第三套环境 | `benchmarks/baseline/setup_rs.sh <work_dir>` |
 | M1 口径三方对照（每轮轮换顺序，跑 3 轮后汇总；完整命令见基准 README） | `benchmarks/baseline/run.sh <work_dir> <N> 128 m1.jsonl rs:FLAT:inproc:m1 v2:FLAT:inproc:m1 v3:FLAT:inproc:m1` |
+| M2 持久化三方对照（轮换三轮；RSS 另跑 `memory`，完整口径见基准 README） | `benchmarks/baseline/run.sh <work_dir> <N> 128 m2.jsonl rs:FLAT:inproc:m2 v2:FLAT:inproc:m2 v3:FLAT:inproc:m2` |
+| 基准脚本自检（失败传播、吞吐分母与多轮汇总） | `.venv/bin/python -m pytest tests/benchmarks` |
+| Linux 容器的 LOCK 与 strace 验收 | 环境、非 root 执行与命令见 [tests/platform/README.md](tests/platform/README.md) |
 
 参照实现侧（生成真值时用，在 [references/milvus-lite/](references/milvus-lite/) 内执行）：
 

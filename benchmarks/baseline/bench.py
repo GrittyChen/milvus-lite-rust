@@ -6,23 +6,27 @@
   phase = m1     : M1 口径（0004「验收」第 4 项）：与 build 相同的建表、写入、建索引与 load，之后只测
                    无过滤检索、空 expr 的 count(*)、按主键 get，以及同一进程内多线程、多进程的并发检索；
                    三个实现（2.5.1、3.x、本仓的 Rust 实现）都可运行
+  phase = m2     : 持久化完整操作、线程/进程并发、持续 upsert 时的检索 p99、显式 Flush
+  phase = memory : 写入并 Flush 后检索预热，只测服务端 RSS，不做删除或并发写入
   mode  = inproc : MilvusClient("<db>.db")，即用户实际的本地用法（默认）
-          server : 仅 3.x，独立进程 `milvus-lite server`，用于只统计服务端内存并排除客户端同进程 GIL 干扰
+          server : 独立辅助进程内启动服务，用于只统计服务端内存，不依赖 CLI
 输出一行 JSON。
 """
 import importlib.metadata
+import hashlib
 import json
 import math
 import multiprocessing as mp
 import multiprocessing.connection
 import os
-import signal
-import socket
+import platform
+import selectors
 import subprocess
 import sys
 import threading
 import time
 import warnings
+from pathlib import Path
 
 warnings.filterwarnings("ignore")
 # grpc 会让 127.0.0.1 的连接也走 http_proxy 等变量指定的代理（no_proxy 未设时），3.x 与 Rust 实现经 TCP
@@ -55,23 +59,37 @@ C = "bench"
 rng = np.random.default_rng(42)
 queries = rng.random((200, DIM), dtype=np.float32)
 # 本基准覆盖的索引类型：2.5.1 只有 FLAT / IVF_FLAT（HNSW 被注释掉）；AUTOINDEX 会被映射成其他类型，不纳入；
-# Rust 实现在 M1 只有 FLAT（0002「结论」）
+# Rust 当前只实现 FLAT（0002「结论」）
 SUPPORTED_INDEX = {"2.5": ("FLAT", "IVF_FLAT"), "3.x": ("FLAT", "HNSW", "IVF_FLAT"), "rs": ("FLAT",)}
 # 各索引的检索参数；reopen 阶段沿用，保证两阶段的检索延迟可比
 SEARCH_PARAMS = {"metric_type": "L2", "params": {"HNSW": {"ef": 64}, "IVF_FLAT": {"nprobe": 16}}.get(IDX, {})}
 out = {"ver": VER, "N": N, "dim": DIM, "index": IDX, "phase": PHASE, "mode": MODE}
+SERVER_PID = None
+SERVER_URI = None
 
 
 def rss_mb():
     # 只统计服务端进程：2.5.1 与 3.x server 模式的服务端是子进程；
     # 3.x 与 Rust 的 inproc 与客户端同进程，只能记整进程 RSS（含客户端数据，数值偏大）。
-    pids = [os.getpid()] if MODE == "inproc" and not IS_V2 else []
-    kids = subprocess.run(["pgrep", "-P", str(os.getpid())], capture_output=True, text=True).stdout.split()
-    pids += [int(k) for k in kids]
+    root = SERVER_PID if MODE == "server" else os.getpid()
+    pids = [] if IS_V2 else [root]
+    pending = [root]
+    while pending:
+        parent = pending.pop()
+        result = subprocess.run(["pgrep", "-P", str(parent)], capture_output=True, text=True)
+        if result.returncode not in (0, 1):
+            raise RuntimeError(f"pgrep 失败: {result.stderr}")
+        kids = [int(k) for k in result.stdout.split()]
+        pids.extend(kids)
+        pending.extend(kids)
     total = 0
     for p in pids:
-        r = subprocess.run(["ps", "-o", "rss=", "-p", str(p)], capture_output=True, text=True).stdout.strip()
-        total += int(r or 0)
+        r = subprocess.run(["ps", "-o", "rss=", "-p", str(p)], capture_output=True, text=True, check=True).stdout.strip()
+        if not r:
+            raise RuntimeError(f"服务端进程 {p} 没有 RSS 样本")
+        total += int(r)
+    if not pids:
+        raise RuntimeError("没有找到服务端进程")
     return round(total / 1024, 1)
 
 
@@ -80,40 +98,39 @@ def timed(fn):
 
 
 def lat(fn, n):
+    if PHASE == "m2":
+        fn()
     xs = sorted(timed(fn) * 1000 for _ in range(n))
     p99 = xs[min(n - 1, math.ceil(0.99 * n) - 1)]
     return {"p50_ms": round(xs[n // 2], 2), "p99_ms": round(p99, 2), "mean_ms": round(sum(xs) / n, 2), "n": n}
 
 
-def free_port():
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
-
-
 def start_server():
-    port = free_port()
-    proc = subprocess.Popen([os.path.join(os.path.dirname(sys.executable), "milvus-lite"), "server", "--data-dir", db, "--port", str(port)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    deadline = time.time() + 120
-    while True:
-        if proc.poll() is not None:
-            raise RuntimeError("milvus-lite server 启动失败")
-        try:
-            socket.create_connection(("127.0.0.1", port), 0.2).close()
-            return proc, port
-        except OSError:
-            if time.time() > deadline:
-                raise RuntimeError("milvus-lite server 启动超时")
-            time.sleep(0.05)
+    proc = subprocess.Popen([sys.executable, str(Path(__file__).with_name("server_process.py")), db],
+                            stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+    try:
+        with selectors.DefaultSelector() as selector:
+            selector.register(proc.stdout, selectors.EVENT_READ)
+            if not selector.select(120):
+                raise RuntimeError("服务端握手超时")
+            line = proc.stdout.readline()
+        if not line:
+            raise RuntimeError(f"服务端握手失败，退出码 {proc.wait()}")
+        return proc, json.loads(line)["uri"]
+    except BaseException:
+        proc.kill()
+        proc.wait()
+        raise
 
 
 def stop_server(proc, graceful):
-    # 3.x server 只在 KeyboardInterrupt 时执行 db.close()（落盘 memtable、写索引）；
-    # SIGTERM 会直接结束进程，reopen 阶段就会测到 WAL 回放后的未落盘状态。
+    # EOF 让辅助进程执行正常停止与持久化；直接 kill 会测到未完成关闭的状态。
     if proc.poll() is not None:
+        if graceful:
+            raise RuntimeError(f"服务端在停止握手前退出: {proc.returncode}")
         return
     if graceful:
-        proc.send_signal(signal.SIGINT)
+        proc.stdin.close()
         try:
             rc = proc.wait(timeout=300)
         except subprocess.TimeoutExpired:
@@ -173,16 +190,17 @@ def build(cli):
     out["get_100_ids"] = lat(lambda: cli.get(C, ids=ids), 50)
 
     # 均匀随机数据对 ANN 是最坏情况，召回只用于同索引纵向对比
-    out["recall@10"] = recall_at_10(cli, data, sp)
+    out["recall@10"] = recall_at_10(cli, data, sp, np.float64 if PHASE == "m2" else np.float32)
 
     out["delete_1000_ids_s"] = round(timed(lambda: cli.delete(C, ids=list(range(1000)))), 4)
     up = [{"id": j, "vec": data[j].tolist(), "cat": 0, "tag": "u"} for j in range(1000, 2000)]
     out["upsert_1000_s"] = round(timed(lambda: cli.upsert(C, up)), 4)
     out["rss_mb_after_build"] = rss_mb()
+    return data
 
 
 def recall_at_10(cli, data, sp, dtype=np.float32):
-    # 召回以 numpy 精确 L2 为真值；m1 用 float64，免得第 10 与第 11 名接近并列时真值本身有误
+    # m1/m2 用 float64 真值，避免第 10 与第 11 名接近并列时真值本身有误。
     q = queries[:50].astype(dtype)
     data = data.astype(dtype, copy=False)
     d = (q * q).sum(1)[:, None] - 2 * q @ data.T + (data * data).sum(1)[None, :]
@@ -192,7 +210,9 @@ def recall_at_10(cli, data, sp, dtype=np.float32):
 
 
 CONCURRENCY = (1, 2, 4, 8)
-CONCURRENCY_S = 8.0
+CONCURRENCY_S = float(os.environ.get("MILVUS_BENCH_SECONDS", "8"))
+if not math.isfinite(CONCURRENCY_S) or CONCURRENCY_S <= 0:
+    raise ValueError("MILVUS_BENCH_SECONDS 必须是有限正数")
 
 
 def search_loop(uri, seed, start):
@@ -292,7 +312,8 @@ def concurrent(uri, k, processes):
     elapsed = max(e for _, e in results)
     xs = sorted(x for l, _ in results for x in l)
     return {"qps": round(len(xs) / elapsed, 1), "p50_ms": round(xs[len(xs) // 2], 2),
-            "p99_ms": round(xs[min(len(xs) - 1, math.ceil(0.99 * len(xs)) - 1)], 2)}
+            "p99_ms": round(xs[min(len(xs) - 1, math.ceil(0.99 * len(xs)) - 1)], 2),
+            "completed_requests": len(xs), "elapsed_s": elapsed}
 
 
 def m1(cli):
@@ -320,13 +341,140 @@ def m1(cli):
         raise RuntimeError(f"FLAT 的 recall@10 为 {recall}，应为 1.0")
     out["recall@10"] = recall
     # 进程内服务的 URI：pymilvus 打开 .db 时同样经 server_manager 取得，同一路径返回已启动的服务
-    from milvus_lite.server_manager import server_manager_instance
-    uri = server_manager_instance.start_and_get_uri(db)
+    uri = service_uri()
     if uri is None:
         raise RuntimeError("取不到进程内服务的 URI")
     # 同一进程内多线程：0004「验收」第 4 项的口径；多进程：每个客户端一个进程，与 0001 并发表的客户端形态相同，作为补充
     for kind, processes in (("threads", False), ("processes", True)):
         out[f"concurrency_{kind}"] = {f"k{k}": concurrent(uri, k, processes) for k in CONCURRENCY}
+
+
+def service_uri():
+    if MODE == "server":
+        return SERVER_URI
+    from milvus_lite.server_manager import server_manager_instance
+
+    return server_manager_instance.start_and_get_uri(db)
+
+
+def _mixed_worker(uri, start, conn, rows):
+    client = None
+    try:
+        client = MilvusClient(uri=uri, dedicated=True)
+        if rows is None:
+            client.search(C, [queries[0].tolist()], limit=10, search_params=SEARCH_PARAMS)
+        start.wait(timeout=120)
+        begin = time.perf_counter()
+        end = begin + CONCURRENCY_S
+        latencies, writes, i = [], 0, 0
+        while time.perf_counter() < end:
+            t = time.perf_counter()
+            if rows is None:
+                client.search(C, [queries[i % len(queries)].tolist()], limit=10, search_params=SEARCH_PARAMS)
+                latencies.append((time.perf_counter() - t) * 1000)
+            else:
+                result = client.upsert(C, rows)
+                if result["upsert_count"] != len(rows):
+                    raise RuntimeError(f"部分 upsert: {result}")
+                writes += len(rows)
+                # 固定目标写入速率，慢实现不补发积压；实际吞吐另记，不能把目标当结果。
+                time.sleep(max(0.0, min(0.1 - (time.perf_counter() - t), end - time.perf_counter())))
+            i += 1
+        conn.send(("ok", {"latencies": latencies, "writes": writes,
+                          "begin": begin, "end": time.perf_counter()}))
+    except BaseException as error:
+        start.abort()
+        conn.send(("error", f"{type(error).__name__}: {error}"))
+        raise
+    finally:
+        if client is not None:
+            client.close()
+        conn.close()
+
+
+def mixed(uri, rows):
+    """不同客户端进程并发：一个检索者与一个每批 100 行、目标 1000 行/秒的写者。"""
+    ctx = mp.get_context("spawn")
+    start = ctx.Barrier(2)
+    pipes = [ctx.Pipe(duplex=False) for _ in range(2)]
+    workers = [ctx.Process(target=_mixed_worker, args=(uri, start, w, batch))
+               for (_, w), batch in zip(pipes, (None, rows))]
+    pending, results = [r for r, _ in pipes], []
+    try:
+        for worker in workers:
+            worker.start()
+        for _, w in pipes:
+            w.close()
+        deadline = time.monotonic() + CONCURRENCY_S + 120
+        while pending:
+            ready = mp.connection.wait(pending, timeout=max(0.0, deadline - time.monotonic()))
+            if not ready:
+                raise RuntimeError("持续写入与检索客户端超时")
+            for reader in ready:
+                pending.remove(reader)
+                kind, result = reader.recv()
+                if kind != "ok":
+                    raise RuntimeError(f"持续写入与检索失败: {result}")
+                results.append(result)
+        for worker in workers:
+            worker.join(timeout=10)
+            if worker.exitcode != 0:
+                raise RuntimeError(f"持续写入与检索客户端退出码 {worker.exitcode}")
+        search = next(r for r in results if r["latencies"])
+        writer = next(r for r in results if r["writes"])
+        overlap = min(search["end"], writer["end"]) - max(search["begin"], writer["begin"])
+        if overlap <= 0:
+            raise RuntimeError("写入与检索没有时间重叠")
+        xs = sorted(search["latencies"])
+        elapsed = max(r["end"] for r in results) - min(r["begin"] for r in results)
+        return {"p50_ms": round(xs[len(xs) // 2], 2),
+                "p99_ms": round(xs[math.ceil(0.99 * len(xs)) - 1], 2),
+                "n": len(xs), "search_qps": round(len(xs) / elapsed, 1),
+                "written_rows": writer["writes"], "write_rows_per_s": round(writer["writes"] / elapsed, 1),
+                "target_write_rows_per_s": 1000, "overlap_s": round(overlap, 3), "elapsed_s": round(elapsed, 3)}
+    finally:
+        start.abort()
+        for worker in workers:
+            if worker.pid is not None and worker.is_alive():
+                worker.kill()
+            if worker.pid is not None:
+                worker.join(timeout=10)
+        for r, w in pipes:
+            r.close()
+            w.close()
+
+
+def m2(cli):
+    data = build(cli)
+    if out["recall@10"] != 1.0:
+        raise RuntimeError("M2 的 FLAT recall@10 必须为 1")
+    expected = N - 1000
+    if cli.query(C, filter="", output_fields=["count(*)"])[0]["count(*)"] != expected:
+        raise RuntimeError("删除/upsert 后行数不符")
+    out["query_count_empty_expr"] = lat(lambda: cli.query(C, filter="", output_fields=["count(*)"]), 10)
+    uri = service_uri()
+    if uri is None:
+        raise RuntimeError("无法取得服务 URI")
+    for kind, processes in (("threads", False), ("processes", True)):
+        out[f"concurrency_{kind}"] = {f"k{k}": concurrent(uri, k, processes) for k in CONCURRENCY}
+    rows = [{"id": j, "vec": data[j].tolist(), "cat": 0, "tag": "u"} for j in range(1000, 1100)]
+    out["search_during_writes"] = mixed(uri, rows)
+    out["flush_s"] = round(timed(lambda: cli.flush(C)), 4)
+    actual = cli.query(C, filter="", output_fields=["count(*)"])[0]["count(*)"]
+    if actual != expected:
+        raise RuntimeError(f"持续写入改变行数: {actual} != {expected}")
+    out["confirmed_rows"] = actual
+    out["rss_mb_after_flush"] = rss_mb()
+
+
+def memory(cli):
+    prepare(cli)
+    cli.flush(C)
+    cli.search(C, [queries[0].tolist()], limit=10, search_params=SEARCH_PARAMS)
+    out["rss_mb_after_flush"] = rss_mb()
+    out["confirmed_rows"] = cli.query(C, filter="", output_fields=["count(*)"])[0]["count(*)"]
+    if out["confirmed_rows"] != N:
+        raise RuntimeError("内存基准行数不符")
 
 
 def reopen(cli):
@@ -337,19 +485,23 @@ def reopen(cli):
     out["first_search_ms"] = round(timed(lambda: cli.search(C, [queries[0].tolist()], limit=10, search_params=SEARCH_PARAMS)) * 1000, 1)
     out["search_nq1_top10"] = lat(lambda: cli.search(C, [queries[1].tolist()], limit=10, search_params=SEARCH_PARAMS), 100)
     out["rss_mb_after_reopen"] = rss_mb()
+    out["confirmed_rows"] = cli.query(C, filter="", output_fields=["count(*)"])[0]["count(*)"]
+    if out["confirmed_rows"] != N - 1000:
+        raise RuntimeError("关闭重开后的行数不符")
 
 
 def main():
+    global SERVER_PID, SERVER_URI
     # 空或拼错的 mode 会让 rss_mb 漏记 3.x inproc 的自身进程，内存列静默变成 0
     if MODE not in ("inproc", "server"):
         sys.exit(f"未知 mode: {MODE!r}（应为 inproc 或 server）")
-    if MODE == "server" and VER != "3.x":
-        sys.exit("server 模式只适用于 3.x")
-    if PHASE not in ("build", "reopen", "m1"):
-        sys.exit(f"未知 phase: {PHASE!r}（应为 build、reopen 或 m1）")
-    # Rust 实现在 M1 不落盘，reopen 读不到 build 写入的数据，build 中的过滤、删除与 upsert 也不支持
-    if VER == "rs" and PHASE != "m1":
-        sys.exit("Rust 实现在 M1 只支持 m1 阶段")
+    if PHASE not in ("build", "reopen", "m1", "m2", "memory"):
+        sys.exit(f"未知 phase: {PHASE!r}（应为 build、reopen、m1、m2 或 memory）")
+    minimum = 2000 if PHASE in ("build", "m2", "reopen") else 10 if PHASE == "m1" else 1
+    if N < minimum or DIM < 1:
+        sys.exit(f"{PHASE} 要求 N >= {minimum}、dim >= 1")
+    if PHASE == "m2" and IDX != "FLAT":
+        sys.exit("M2 三方对照只接受 FLAT")
     # 3.x 的 create_index 会原样登记未知类型，要到某个 segment 需要建索引时才报错；
     # 数据若还在 memtable，build 阶段会按暴力检索跑完并被误标为该索引，所以事先限定
     if IDX not in SUPPORTED_INDEX[VER]:
@@ -359,12 +511,14 @@ def main():
     try:
         s0 = time.perf_counter()
         if MODE == "server":
-            srv, port = start_server()
-            cli = MilvusClient(uri=f"http://127.0.0.1:{port}")
+            srv, uri = start_server()
+            SERVER_PID = srv.pid
+            SERVER_URI = uri
+            cli = MilvusClient(uri=uri)
         else:
             cli = MilvusClient(db)
         out["connect_s"] = round(time.perf_counter() - s0, 3)
-        {"build": build, "reopen": reopen, "m1": m1}[PHASE](cli)
+        {"build": build, "reopen": reopen, "m1": m1, "m2": m2, "memory": memory}[PHASE](cli)
         cli.close()
         ok = True
     finally:
@@ -379,6 +533,15 @@ def main():
         with open(commit_file) as f:
             out["versions"]["build_commit"] = f.read().strip()
     out["load_avg"] = [round(x, 2) for x in os.getloadavg()]
+    out["concurrency_duration_s"] = CONCURRENCY_S
+    digest = hashlib.sha256()
+    for source in sorted(p for p in Path(__file__).parent.iterdir() if p.suffix in (".py", ".sh")):
+        digest.update(source.name.encode())
+        digest.update(source.read_bytes())
+    out["benchmark_sha256"] = digest.hexdigest()
+    out["rss_scope"] = "server" if MODE == "server" or IS_V2 else "client_and_server"
+    out["machine"] = {"platform": platform.platform(), "cpu_count": os.cpu_count()}
+    out["round"] = os.environ.get("MILVUS_BENCH_ROUND")
     print(json.dumps(out, ensure_ascii=False))
 
 

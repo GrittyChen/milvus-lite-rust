@@ -2,7 +2,7 @@
 
 对照 milvus-lite **2.5.1**（C++，内嵌 Milvus segcore + knowhere）与 **3.x**（纯 Python，LSM + Parquet + FAISS）的同负载基准。两者都由同一版本的 `pymilvus` 驱动，指标口径一致。重构基线的决策与数据解读见 [0001-重构基线选择](../../docs/decisions/0001-refactor-baseline.md)。
 
-本仓的 Rust 实现作为第三个对照臂接入（M1 口径，见下文），性能声明以本目录的测量结果为准（见 [AGENTS.md](../../AGENTS.md) 规则 7）。
+本仓的 Rust 实现作为第三个对照臂接入（M1 / M2 口径，见下文），性能声明以本目录的测量结果为准（见 [AGENTS.md](../../AGENTS.md) 规则 7）。
 
 ## 前置条件
 
@@ -65,6 +65,7 @@ $W/v3/bin/python benchmarks/baseline/summarize.py $W/m1.jsonl
 | [setup_rs.sh](setup_rs.sh) | 用本仓构建的 wheel 建 rs 环境，并记下构建所用的 commit（工作区有未提交改动时附改动内容的指纹） |
 | [run.sh](run.sh) | 顺序执行每个配置的各阶段：默认 `build` + `reopen`，配置可用第 4 段指定阶段（如 `rs:FLAT:inproc:m1`） |
 | [bench.py](bench.py) | 单个配置的基准：写入、建索引、检索（含过滤 / 批量）、查询、`count(*)`、点查、召回、删除、upsert、冷启动、服务端内存；`m1` 阶段只测 M1 口径 |
+| [server_process.py](server_process.py) | 在独立进程内启动三方服务，回报实际 URI、stdin 关闭后正常停止；不依赖 Rust 尚未提供的 CLI |
 | [concurrency.py](concurrency.py) | 服务端独立进程 + 多客户端进程的检索吞吐（0001 并发表所用，口径早于 `m1` 阶段，差别见 [0001](../../docs/decisions/0001-refactor-baseline.md) 该表的说明） |
 | [profile_v3.py](profile_v3.py) | 3.x 嵌入式引擎的 cProfile，拆分计算与 Python 胶水的耗时 |
 | [summarize.py](summarize.py) | jsonl → markdown 表；`m1` 阶段按配置汇总各轮的中位数与最小–最大 |
@@ -73,9 +74,9 @@ $W/v3/bin/python benchmarks/baseline/summarize.py $W/m1.jsonl
 
 ## 口径与注意事项
 
-- **模式**：`inproc` 即 `MilvusClient("x.db")`，是用户实际用法；`server` 仅 3.x，服务端独立进程，用于只统计服务端内存。2.5.1 的服务端本来就是 C++ 子进程，`inproc` 下内存已只含服务端。
-- **server 模式的退出**：3.x 服务端只在收到 SIGINT 时才正常 close（落盘 memtable、写索引）。脚本正常结束时发 SIGINT 并等待其退出；如果用 SIGTERM 或直接 kill，reopen 阶段就会测到 WAL 回放后的未落盘状态。
-- **内存**：3.x `inproc` 的 RSS 含客户端进程自身（测试数据等），数值偏大；比较内存时用 3.x `server` 模式。
+- **模式**：`inproc` 即 `MilvusClient("x.db")`，是用户实际用法；`server` 用独立辅助进程启动服务，三方均可运行。2.5.1 的服务端本来就是 C++ 子进程，`inproc` 下内存已只含服务端。
+- **server 模式的退出**：辅助进程收到 stdin EOF 后正常停止；3.x 的 gRPC stop 与 db.close、Rust NativeServer.stop 的错误均使辅助进程非零退出，本轮不输出结果行。2.5.1 沿用它的 Server.stop。
+- **内存**：3.x 与 Rust 的 `inproc` RSS 含客户端及测试数据，不用于内存目标判断。`server` 下 3.x/Rust 统计辅助进程及其后代、2.5.1 只统计 C++ 子进程，均不含发请求的客户端；Python 进程内服务不可分离的解释器/绑定开销计入 RSS，不减空进程基线。RSS 用 MiB（1024² 字节），页缓存不计入；查询预热后取样。
 - **reopen**：新起进程后执行 `load_collection`。`reopen_total_to_ready_s` = `connect_s`（含拉起服务端子进程）+ `reopen_load_s`，不含首次检索（首次检索单列为 `first_search_ms`）。页缓存仍是热的，测到的是进程级冷启动，不是磁盘冷启动。3.x 会在这一阶段为末尾未建索引的 segment 补建索引。
 - **N 的取值**：3.x 每 1 万行 flush 一次 memtable。N 不是 1 万的整数倍时，build 阶段有部分数据留在 memtable，检索会明显变慢，不同 N 之间不能直接比较。
 - **数据**：均匀随机向量。它对 ANN 索引是最坏情况，召回偏低，因此不同 ANN 索引之间的延迟不可直接比较；FLAT 对 FLAT 与召回无关的操作可以直接比较。
@@ -91,7 +92,7 @@ $W/v3/bin/python benchmarks/baseline/summarize.py $W/m1.jsonl
 - **与 build 相同的部分**：schema（含 `cat` / `tag` 两个标量字段）、随机数的消耗顺序、每批 1000 行的写入、FLAT 索引与 load、各项的采样次数，因此写入吞吐可以与 0001 的表对照。
 - **只测 M1 支持的操作**：无过滤检索（nq=1 与 nq=100）、空 expr 的 `count(*)`、按主键 get 100 条，以及并发检索；不测过滤、删除、upsert 与 reopen。
 - **空 expr 的 `count(*)`**（`query_count_empty_expr`）与 build 的 `query_count`（带过滤，0001 的口径）不是同一个操作：3.x 前者走 `num_entities`，不能与 0001 的 `count(*)` 放在同一行比较。
-- **写入吞吐不是同口径**：2.5.1 与 3.x 每次写入都要落盘（SQLite、WAL），Rust 实现在 M1 不落盘，写入目标要到 M2 才能验证。
+- **历史 M1 的写入吞吐不是同口径**：2.5.1 与 3.x 每次写入都要落盘（SQLite、WAL），Rust 的历史 M1 构建不落盘，写入目标要到 M2 才能验证。`m1` 只限定测量操作，不关闭引擎持久化；当前 M2 构建运行该阶段仍会写 WAL，不能从阶段名推断其存储保证。
 - **预热**：每项先调用一次再计时。
 - **recall@10 必须为 1**：三个实现都是暴力检索，否则 `bench.py` 报错，不输出结果行。
 - **并发**：
@@ -104,3 +105,33 @@ $W/v3/bin/python benchmarks/baseline/summarize.py $W/m1.jsonl
 - **轮次与顺序**：各跑 3 轮，每轮轮换各实现的先后，汇总报中位数与最小–最大；每行结果记录 load average、版本号与 Rust 实现的构建 commit。
 - **代理环境变量**：grpc 对 127.0.0.1 也遵守 `http_proxy` 等变量（未设 `no_proxy` 时），经 TCP 连接的 3.x 与 Rust 实现会多一跳代理，2.5.1 走 Unix socket 则不会；`bench.py` 启动时清掉这些变量，客户端子进程继承清过的环境。
 - **2.5.1 的 socket 路径**：2.5.1 在临时目录下创建 UDS socket，macOS 限制 socket 路径不超过 104 字节，`TMPDIR` 过长时 2.5.1 无法启动，保持默认的 `TMPDIR`。
+
+### M2 口径（`m2` + `reopen` 与独立 `memory` 阶段）
+
+M2 执行完整 build 操作，保留原 1000 行一批的 schema、随机种子与采样数；FLAT 的召回用 float64 真值核对且必须为 1。删除 1000 行后，原主键 upsert 不改变行数；随后执行 M1 已有的 1/2/4/8 线程及客户端进程并发口径，再以两个客户端进程分别执行检索和持续 upsert。写者每批 100 行、目标 1000 行/秒，慢请求不补发积压；同时报告实际吞吐、请求数、检索 p99 和时间重叠，不将目标速率冒充完成量。正常测量各档 8 秒；`MILVUS_BENCH_SECONDS` 只供冒烟调整，结果与汇总记录该值并隔离不同配置。
+
+M2 的每个 `lat` 指标额外执行一次不计时预热；历史 build 阶段没有该预热，二者同名指标不能直接混合比较。写入、删除、upsert 等 `timed` 指标不增加预热。M2 使用 `_m2.db` 后缀，M1/memory 分别使用 `_m1.db` / `_mem.db`，不会删除默认 build 阶段的数据库。
+
+持续 upsert 只替换现有 100 行且保持向量与标量不变，避免不断增长的行数混入延迟；这仍产生 WAL、覆盖与自动 flush，3.x 可能执行后台 compaction，属于其真实持续写入成本。写完后显式 Flush，并断言关闭前与独立进程 reopen 后行数为 N−1000。基准的非过滤 count 与过滤 count 分开报告。`memory` 另建 N 行的健康库，显式 Flush 和单条检索预热后取独立服务端 RSS，不做删除和写入压力。
+
+```bash
+# 三轮轮换顺序；原始输出和数据目录始终在仓库外。
+for order in "rs v2 v3" "v2 v3 rs" "v3 rs v2"; do
+  for n in 100000 1000000; do
+    for e in $order; do
+      benchmarks/baseline/run.sh "$W" "$n" 128 m2.jsonl "$e:FLAT:inproc:m2"
+      benchmarks/baseline/run.sh "$W" "$n" 128 memory.jsonl "$e:FLAT:server:memory"
+    done
+  done
+done
+"$W/v3/bin/python" benchmarks/baseline/summarize.py "$W/m2.jsonl"
+"$W/v3/bin/python" benchmarks/baseline/summarize.py "$W/memory.jsonl"
+```
+
+M2/reopen/memory 按构建 commit、基准脚本内容指纹和测量时长分组，报告各轮中位数与最小–最大，不能用最后一轮覆盖前两轮。Rust 构建身份只计算引擎及打包输入；基准脚本另有完整指纹，本地工作日志不进入身份。脚本自检见 [test_m2_benchmark.py](../../tests/benchmarks/test_m2_benchmark.py)。性能目标与最终验收按 [0006](../../docs/decisions/0006-m2-scope.md#验收)，未达到目标须如实报告，不降低持久化或召回来优化数字。
+
+### 历史测量脚本的指纹复核
+
+0001 中的 `00947bbc…` 是测量当时九个 `.py` / `.sh` 文件按名字及字节计算的 SHA256，不是当前脚本的指纹。测量后修正了 M1 小数据量参数验证、两处注释及 M2 数据目录后缀，不能拿当前文件直接复算历史值；历史表中的 `06f6d66+b79c01cd` 同样是当时的 native 输入身份，不代表之后继续修订的工作区。
+
+[measured-20261008.patch](measured-20261008.patch) 仅保存把当前脚本恢复成测量版本的源码差异，不含结果或数据。复制九个脚本到仓库外的新空目录，在该目录执行 `git apply <此补丁的绝对路径>`，然后按 `bench.py` 的 `benchmark_sha256` 算法对 `.py` / `.sh` 排序并逐个拼入文件名与文件字节，即得到完整历史值 `00947bbcd41dcdce36ef8ddea529309e11b60386b3411a7662bb6b39d0893d5a`。自检独立执行了恢复和复算；不在工作区原地应用历史补丁。历史 M2 脚本尚未隔离 build 的数据库路径，重跑历史口径也必须使用新的仓库外工作目录。

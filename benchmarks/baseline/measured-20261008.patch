@@ -1,0 +1,30 @@
+--- a/bench.py
++++ b/bench.py
+@@ -126,3 +126,4 @@
+ def stop_server(proc, graceful):
+-    # EOF 让辅助进程执行正常停止与持久化；直接 kill 会测到未完成关闭的状态。
++    # 3.x server 只在 KeyboardInterrupt 时执行 db.close()（落盘 memtable、写索引）；
++    # SIGTERM 会直接结束进程，reopen 阶段就会测到 WAL 回放后的未落盘状态。
+     if proc.poll() is not None:
+@@ -202,3 +203,3 @@
+ def recall_at_10(cli, data, sp, dtype=np.float32):
+-    # m1/m2 用 float64 真值，避免第 10 与第 11 名接近并列时真值本身有误。
++    # 召回以 numpy 精确 L2 为真值；m1 用 float64，免得第 10 与第 11 名接近并列时真值本身有误
+     q = queries[:50].astype(dtype)
+@@ -499,5 +500,4 @@
+         sys.exit(f"未知 phase: {PHASE!r}（应为 build、reopen、m1、m2 或 memory）")
+-    minimum = 2000 if PHASE in ("build", "m2", "reopen") else 10 if PHASE == "m1" else 1
+-    if N < minimum or DIM < 1:
+-        sys.exit(f"{PHASE} 要求 N >= {minimum}、dim >= 1")
++    if N < 2000 or DIM < 1:
++        sys.exit("基准要求 N >= 2000、dim >= 1")
+     if PHASE == "m2" and IDX != "FLAT":
+--- a/run.sh
++++ b/run.sh
+@@ -24,5 +24,4 @@
+   fi
+-  # 各阶段拥有独立库，避免跨阶段测量删除已有 build 产物。
++  # m1 的库放在单独的路径：不删掉 build 产生、供 concurrency.py 复用的库
+   suffix=""; [[ "$phases" == m1 ]] && suffix="_m1"
+-  [[ "$phases" == "m2 reopen" ]] && suffix="_m2"
+   [[ "$phases" == memory ]] && suffix="_mem"

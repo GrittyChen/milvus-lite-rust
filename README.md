@@ -6,6 +6,8 @@ The unofficial milvus-lite developed with Rust.
 
 M2 崩溃矩阵已覆盖混合 data/delta WAL 写入后的进程退出、flush 与 CreateIndex 的 manifest replace 前后，以及同一代两类 WAL 删除之间及 create/drop 目录改名两侧的崩溃；并发、panic 与文件操作顺序的证据见 [M2 功能与故障验收记录](docs/testing/m2-correctness.md)。真实断电、平台行为与性能基准不由进程崩溃测试推断。
 
+M2 最终验收候选与 Linux LOCK/strace 证据见[验收记录](docs/testing/m2-acceptance.md)，三方性能及修后复测见 [0001](docs/decisions/0001-refactor-baseline.md#m2-三方基准)。性能目标只部分达到，当前候选已通过范围内复审；这不代表首次发布或生产可用。
+
 ## 文档
 
 | 内容 | 位置 |

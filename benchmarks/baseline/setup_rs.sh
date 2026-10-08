@@ -15,9 +15,10 @@ uv venv -q -p 3.12 --clear "$WORK/rs"
 uv pip install -q -p "$WORK/rs/bin/python" "pymilvus==$PYMILVUS" numpy "$WORK"/wheels_rs/milvus_lite_rust-*.whl
 # 包的版本号区分不了构建，记下构建所用的 commit，bench.py 把它写进结果、summarize.py 按它分组。
 # 工作区有未提交改动时附上改动内容的指纹：同一 commit 上的不同版本才不会被汇总成一组
-commit=$(git -C "$REPO" rev-parse --short HEAD)
-if [ -n "$(git -C "$REPO" status --porcelain)" ]; then
-  fp=$( (git -C "$REPO" diff HEAD; git -C "$REPO" ls-files -o --exclude-standard -z | (cd "$REPO" && xargs -0 cat)) | shasum -a 256 | cut -c1-8)
+commit=$(git -C "$REPO" rev-parse HEAD)
+# 构建身份只取引擎与打包输入，基准或本地工作日志不会改变 native 产物。
+if [ -n "$(git -C "$REPO" status --porcelain -- Cargo.toml Cargo.lock crates)" ]; then
+  fp=$( (git -C "$REPO" diff HEAD -- Cargo.toml Cargo.lock crates; git -C "$REPO" ls-files -o --exclude-standard -z -- crates | (cd "$REPO" && xargs -0 cat)) | shasum -a 256 | cut -c1-8)
   commit="$commit+$fp"
 fi
 echo "$commit" > "$WORK/rs/BUILD_COMMIT"
