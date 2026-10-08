@@ -103,6 +103,64 @@ db.close()
     return json.loads(run([python, "-c", code, str(root)], cwd=root.parent))
 
 
+@pytest.mark.parametrize("reader", ["rust", "reference"])
+@pytest.mark.parametrize("entry", ["index_first", "query_first", "empty_flush", "close_only"])
+def test_data_only_reference_directory_supports_first_metadata_and_empty_commits(tmp_path, interpreters, reader, entry):
+    root = tmp_path / "data-only.db"
+    writer = f"""
+import sys
+from milvus_lite.db import MilvusLite
+{REF_SCHEMA}
+db = MilvusLite(sys.argv[1])
+collection = db.create_collection('c', schema)
+collection.insert([{{'id': 1, 'vector': [1.0, 2.0]}}, {{'id': 2, 'vector': [3.0, 4.0]}}])
+collection.flush()
+db.close()
+"""
+    run([interpreters[PYTHONS[0]], "-c", writer, str(root)], cwd=tmp_path)
+    collection = root / "collections/c"
+    partition = collection / "partitions/_default"
+    assert partition.joinpath("data").is_dir()
+    assert not partition.joinpath("delta").exists()
+    old_manifest = json.loads(collection.joinpath("manifest.json").read_text())
+    assert old_manifest["partitions"]["_default"]["data_files"]
+    assert old_manifest["partitions"]["_default"]["delta_files"] == []
+    originals = {path.name: path.read_bytes() for path in partition.joinpath("data").glob("*.parquet")}
+    verify = """
+import sys
+from pathlib import Path
+from pymilvus import MilvusClient
+from milvus_lite.server_manager import server_manager_instance
+path, entry = sys.argv[1:]
+client = MilvusClient(path, dedicated=True)
+try:
+    if entry == 'query_first':
+        client.load_collection('c')
+        assert client.search('c', [[1.0, 2.0]], limit=2, search_params={'metric_type': 'L2'})[0][0]['id'] == 1
+    if entry in ('index_first', 'query_first'):
+        indexes = client.prepare_index_params()
+        indexes.add_index('vector', index_type='FLAT', metric_type='L2')
+        client.create_index('c', indexes)
+        assert not Path(path).joinpath('collections/c/partitions/_default/delta').exists()
+    elif entry == 'empty_flush':
+        client.flush('c')
+    client.load_collection('c')
+    rows = list(client.get('c', ids=[1, 2], output_fields=['id', 'vector']))
+    assert rows == [{'id': 1, 'vector': [1.0, 2.0]}, {'id': 2, 'vector': [3.0, 4.0]}], rows
+    assert list(client.query('c', filter='', output_fields=['count(*)'])) == [{'count(*)': 2}]
+    assert client.search('c', [[1.0, 2.0]], limit=2, search_params={'metric_type': 'L2'})[0][0]['id'] == 1
+finally:
+    client.close()
+    server_manager_instance.release_server(path)
+"""
+    python = sys.executable if reader == "rust" else interpreters[PYTHONS[0]]
+    run([python, "-c", verify, str(root), entry], cwd=tmp_path)
+    assert {path.name: path.read_bytes() for path in partition.joinpath("data").glob("*.parquet")} == originals
+    final_manifest = json.loads(collection.joinpath("manifest.json").read_text())
+    assert final_manifest["partitions"]["_default"]["data_files"] == old_manifest["partitions"]["_default"]["data_files"]
+    assert final_manifest["partitions"]["_default"]["delta_files"] == []
+
+
 def test_rust_delete_and_upsert_files_open_in_reference(tmp_path, interpreters):
     root = tmp_path / "mutations.db"
     rust_code = """

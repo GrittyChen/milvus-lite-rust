@@ -402,20 +402,42 @@ pub(crate) fn sync_inherited(collection_dir: &Path, manifest: &Manifest) -> Resu
     let mut current = Some(collection_dir);
     for _ in 0..4 {
         if let Some(dir) = current {
+            if dir.as_os_str().is_empty() {
+                dirs.push(PathBuf::from("."));
+                break;
+            }
             dirs.push(dir.to_path_buf());
             current = dir.parent();
         }
     }
     dirs.reverse();
-    dirs.extend([
-        partition.clone(),
-        partition.join("data"),
-        partition.join("delta"),
-    ]);
     for dir in dirs {
-        if dir.is_dir() {
-            fs_commit::sync_dir(&dir).map_err(|error| FlushError::before(&dir, error))?;
+        fs_commit::sync_dir(&dir).map_err(|error| FlushError::before(&dir, error))?;
+    }
+    // 3.x 按文件种类懒建目录：只插入时 delta 可不存在，不能让 data 引用
+    // 把未使用的 delta 目录变成必需项。存在的路径仍确认类型并同步，真实 I/O 不跳过。
+    let has_data = !files.data_files.is_empty();
+    let has_delta = !files.delta_files.is_empty();
+    for (dir, required) in [
+        (collection_dir.join("partitions"), has_data || has_delta),
+        (partition.clone(), has_data || has_delta),
+        (partition.join("data"), has_data),
+        (partition.join("delta"), has_delta),
+    ] {
+        match fs::symlink_metadata(&dir) {
+            Ok(meta) if meta.file_type().is_dir() => {}
+            Ok(_) => {
+                return Err(FlushError::before(
+                    &dir,
+                    "inherited path is not a directory",
+                ));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound && !required => {
+                continue;
+            }
+            Err(error) => return Err(FlushError::before(&dir, error)),
         }
+        fs_commit::sync_dir(&dir).map_err(|error| FlushError::before(&dir, error))?;
     }
     Ok(())
 }
@@ -530,6 +552,148 @@ mod tests {
 
     use super::*;
 
+    #[cfg(feature = "fault-injection")]
+    #[test]
+    fn inherited_sync_accepts_sparse_data_and_delta_directory_layouts_without_creating_them() {
+        use crate::storage::fs_commit::{FsAction, begin_fs_trace, finish_fs_trace};
+
+        for (data, delta) in [(false, false), (true, false), (false, true), (true, true)] {
+            let root = tempfile::tempdir().unwrap();
+            let collection = root.path().join("sparse.db/collections/c");
+            fs::create_dir_all(&collection).unwrap();
+            fs::write(
+                collection.join("schema.json"),
+                include_bytes!("../../tests/fixtures/schema_3x.json"),
+            )
+            .unwrap();
+            let partition = collection.join("partitions/_default");
+            let mut manifest = Manifest::default();
+            let files = manifest.partitions.get_mut("_default").unwrap();
+            for (present, kind, name, bytes, references) in [
+                (
+                    data,
+                    "data",
+                    "data_000001_000002.parquet",
+                    include_bytes!("../../tests/fixtures/data_3x.parquet").as_slice(),
+                    &mut files.data_files,
+                ),
+                (
+                    delta,
+                    "delta",
+                    "delta_000003_000003.parquet",
+                    include_bytes!("../../tests/fixtures/delta_3x.parquet").as_slice(),
+                    &mut files.delta_files,
+                ),
+            ] {
+                if present {
+                    fs::create_dir_all(partition.join(kind)).unwrap();
+                    fs::write(partition.join(kind).join(name), bytes).unwrap();
+                    references.push(format!("{kind}/{name}"));
+                }
+            }
+            begin_fs_trace();
+            sync_inherited(&collection, &manifest).unwrap();
+            let events = finish_fs_trace();
+            for (present, kind) in [(data, "data"), (delta, "delta")] {
+                assert_eq!(partition.join(kind).exists(), present);
+                assert_eq!(
+                    events.iter().any(|event| event.action == FsAction::SyncDir
+                        && event.path == partition.join(kind)),
+                    present
+                );
+            }
+            if data || delta {
+                for dir in [collection.join("partitions"), partition.clone()] {
+                    assert!(
+                        events
+                            .iter()
+                            .any(|event| event.action == FsAction::SyncDir && event.path == dir)
+                    );
+                }
+                let kind = if data { "data" } else { "delta" };
+                let name = manifest.partitions["_default"]
+                    .data_files
+                    .iter()
+                    .chain(&manifest.partitions["_default"].delta_files)
+                    .next()
+                    .unwrap();
+                fs::remove_file(partition.join(name)).unwrap();
+                fs::remove_dir(partition.join(kind)).unwrap();
+                let error = sync_inherited(&collection, &manifest).unwrap_err();
+                assert_eq!(error.phase, CommitPhase::BeforeReplace);
+                assert!(!partition.join(kind).exists());
+            }
+        }
+    }
+
+    #[cfg(feature = "fault-injection")]
+    #[test]
+    fn inherited_layout_syncs_every_directory_that_owns_a_referenced_entry() {
+        use crate::storage::fs_commit::{FsAction, begin_fs_trace, finish_fs_trace};
+
+        let root = tempfile::tempdir().unwrap();
+        let database = root.path().join("inherited.db");
+        let collection = database.join("collections/c");
+        let partition = collection.join("partitions/_default");
+        // 参照实现已创建各级目录；不能依赖它曾经同步过父目录项。
+        std::fs::create_dir_all(partition.join("data")).unwrap();
+        std::fs::create_dir_all(partition.join("delta")).unwrap();
+        std::fs::write(
+            collection.join("schema.json"),
+            include_bytes!("../../tests/fixtures/schema_3x.json"),
+        )
+        .unwrap();
+        begin_fs_trace();
+        super::sync_inherited(&collection, &super::Manifest::default()).unwrap();
+        let events = finish_fs_trace();
+        for directory in [
+            root.path().to_path_buf(),
+            database.clone(),
+            database.join("collections"),
+            collection.clone(),
+            collection.join("partitions"),
+            partition.clone(),
+            partition.join("data"),
+            partition.join("delta"),
+        ] {
+            assert!(
+                events
+                    .iter()
+                    .any(|event| event.action == FsAction::SyncDir && event.path == directory),
+                "inherited directory entry has no durability boundary: {directory:?}; {events:?}"
+            );
+        }
+    }
+
+    #[cfg(feature = "fault-injection")]
+    #[test]
+    fn inherited_relative_root_syncs_the_current_directory_and_wrong_directory_types_fail() {
+        use crate::storage::fs_commit::{FsAction, begin_fs_trace, finish_fs_trace};
+
+        let cwd = std::env::current_dir().unwrap();
+        let root = tempfile::tempdir_in(&cwd).unwrap();
+        let collection = PathBuf::from(root.path().file_name().unwrap()).join("collections/c");
+        let partition = collection.join("partitions/_default");
+        fs::create_dir_all(partition.join("data")).unwrap();
+        fs::create_dir_all(partition.join("delta")).unwrap();
+        fs::write(
+            collection.join("schema.json"),
+            include_bytes!("../../tests/fixtures/schema_3x.json"),
+        )
+        .unwrap();
+        begin_fs_trace();
+        sync_inherited(&collection, &Manifest::default()).unwrap();
+        assert!(
+            finish_fs_trace()
+                .iter()
+                .any(|event| { event.action == FsAction::SyncDir && event.path == Path::new(".") })
+        );
+        fs::remove_dir(partition.join("data")).unwrap();
+        fs::write(partition.join("data"), b"not a directory").unwrap();
+        let error = sync_inherited(&collection, &Manifest::default()).unwrap_err();
+        assert_eq!(error.phase, CommitPhase::BeforeReplace);
+        assert_eq!(error.path, partition.join("data"));
+    }
     #[test]
     fn flush_data_and_delete_then_recover() {
         let root = tempfile::tempdir().unwrap();

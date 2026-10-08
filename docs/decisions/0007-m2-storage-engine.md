@@ -164,6 +164,7 @@ WAL 追加（每次写入调用一个 batch，dim 128）：
        - 被 manifest 或 snapshot 引用的，绝不覆盖，而是向外放宽 seq_max 取新名。这对 GC 是安全的，3.x compaction 的 `_pick_unique_seq_range` 也这样做；seq_min 不改（0002 约束 2）。3.x 缺陷 e 的目录中两条操作可能共用一个 `_seq`，回放出的一代可能恰好与已引用的文件同名，不能因此卡死。
   2. fsync 新文件、它们所在的目录，以及本次新建目录的各级上级（第 19 项）。
      - 本进程对该 collection 的第一次 manifest 提交之前（包括空提交或 CreateIndex），还要 fsync manifest 已引用、但不是本进程写出的文件，以及从数据目录根的上级到 collection 与这些文件所在目录的各级。3.x 不 fsync Parquet；本进程的 create 若在改名后目录 fsync 失败，会报「已创建、持久化未确认」，并进入下文的写入封锁状态，本服务实例不再做 manifest 提交。正常路径必须在 replace 之前补齐这些 sync；若失败，本次仍处于提交点之前，manifest 不得引用新的文件。
+     - 目录链包含 `partitions/`、`partitions/_default/` 与 data/delta；相对数据目录的空父路径按当前目录同步。按目录自身的引用判断 NotFound：没有 data 引用时 data/ 可缺失，没有 delta 引用时 delta/ 可缺失；两者都没有引用时 partitions/ 与 _default/ 也可尚未创建。CreateIndex 的继承同步不创建未使用的目录；正常 flush 仍在写文件之前按已有流程创建 data/delta。存在但类型不符的路径与 metadata/sync 的真实 I/O 错误均向上传递，引用的文件缺失也仍拒绝提交。目录祖先与稀疏形态回归见 [flush.rs](../../crates/core/src/storage/flush.rs) 和 [互通用例](../../tests/storage_interop/test_cross_implementation.py)。
   3. 提交 manifest：写 tmp 并 fsync、复制 `.prev`、replace、fsync 目录。
      - 新的 manifest 只含已提交的状态：`current_seq` 取 `max(已提交的值, 冻结代的 max_seq)`，不得改用写出 Parquet 的最大 `_seq`（[0002 约束 4](0002-data-dir-compat.md#共享状态的语义约束)）；空的一代不会让它变小（3.x 的 setter 遇到更小的值会报错）；`active_wal_number` 取这一代的编号加 1，空的一代同样推进。
      - 复制 `.prev` 失败与 3.x 一样只写日志、不算失败：本实现从不读 `.prev`（第 11 项）。

@@ -74,14 +74,109 @@ fn lifecycle() {
 
 #[test]
 fn names_are_case_sensitive() {
-    // 不区分大小写的文件系统上，同一物理目录不能创建第二个句柄。
-    let (_root, db) = db();
+    let (root, db) = db();
     db.create_collection("", "Case", schema()).unwrap();
-    assert!(matches!(
-        db.create_collection("default", "case", schema()),
-        Err(EngineError::CollectionAlreadyExists(_))
-    ));
+    // 不敏感卷将两种拼写映射到同一物理目录；敏感卷允许两个独立的名字。
+    if root.path().join("collections/case").exists() {
+        assert!(matches!(
+            db.create_collection("default", "case", schema()),
+            Err(EngineError::CollectionAlreadyExists(_))
+        ));
+    } else {
+        db.create_collection("default", "case", schema()).unwrap();
+        assert!(db.collection("", "Case").is_ok());
+        assert!(db.collection("", "case").is_ok());
+        db.drop_collection("", "case").unwrap();
+        assert!(db.collection("", "Case").is_ok());
+        assert!(db.collection("", "case").is_err());
+    }
     assert!(db.collection("", "CASE").is_err());
+}
+
+#[test]
+fn data_only_reference_directory_accepts_first_index_and_first_empty_flush() {
+    use milvus_lite_core::IndexRequest;
+    use milvus_lite_core::storage::manifest::Manifest;
+
+    for index_first in [true, false] {
+        let root = tempfile::tempdir().unwrap();
+        let collection = root.path().join("collections/c");
+        let partition = collection.join("partitions/_default");
+        std::fs::create_dir_all(partition.join("data")).unwrap();
+        std::fs::write(
+            collection.join("schema.json"),
+            include_bytes!("fixtures/schema_3x.json"),
+        )
+        .unwrap();
+        let filename = "data/data_000001_000002.parquet";
+        std::fs::write(
+            partition.join(filename),
+            include_bytes!("fixtures/data_3x.parquet"),
+        )
+        .unwrap();
+        let mut manifest = Manifest {
+            current_seq: 2,
+            active_wal_number: Some(2),
+            ..Manifest::default()
+        };
+        manifest
+            .partitions
+            .get_mut("_default")
+            .unwrap()
+            .data_files
+            .push(filename.into());
+        std::fs::write(
+            collection.join("manifest.json"),
+            manifest.to_bytes().unwrap(),
+        )
+        .unwrap();
+        let db = Db::new(DataDir::open(root.path()).unwrap(), compute());
+        assert!(!partition.join("delta").exists());
+        if index_first {
+            db.create_index(
+                "",
+                "c",
+                "vector",
+                IndexRequest {
+                    index_type: "FLAT".into(),
+                    metric_type: Some("L2".into()),
+                    ..IndexRequest::default()
+                },
+            )
+            .unwrap();
+            // 建定义不需要伪造一个未被引用的 delta 目录。
+            assert!(!partition.join("delta").exists());
+        } else {
+            let before = std::fs::read(collection.join("manifest.json")).unwrap();
+            db.flush_collection("", "c").unwrap();
+            // 没有活跃写入或残留 WAL 时，Db 的显式 Flush 合法地不产生提交。
+            assert_eq!(
+                std::fs::read(collection.join("manifest.json")).unwrap(),
+                before
+            );
+            assert!(!partition.join("delta").exists());
+            // 另固定真正空代提交原语：它沿用先创建 data/delta、再同步继承输入的顺序。
+            milvus_lite_core::storage::flush::flush_generation(
+                &collection,
+                &manifest,
+                2,
+                2,
+                None,
+                None,
+            )
+            .unwrap();
+            assert!(partition.join("delta").is_dir());
+        }
+        assert_eq!(db.collection("", "c").unwrap().read().count(), 2);
+        assert_eq!(
+            std::fs::read(partition.join(filename)).unwrap(),
+            include_bytes!("fixtures/data_3x.parquet")
+        );
+        db.close();
+        let reopened = Db::new(DataDir::open(root.path()).unwrap(), compute());
+        assert_eq!(reopened.collection("", "c").unwrap().read().count(), 2);
+        reopened.close();
+    }
 }
 
 #[test]
