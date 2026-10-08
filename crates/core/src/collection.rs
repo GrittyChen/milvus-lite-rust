@@ -1755,6 +1755,7 @@ impl TopK {
         }
     }
 
+    #[inline(always)]
     fn push(&mut self, score: f32, pos: RankedRow) {
         let candidate = (score, pos);
         if self.take == 0

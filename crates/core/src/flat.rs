@@ -174,35 +174,41 @@ fn product_lanes(a: &[f32], b: &[f32]) -> Lanes {
     acc
 }
 
+// 显式复用同一候选元素；每条查询的 16 路累加顺序和原归约保持不变。
 #[inline(never)]
 fn diff_sq_lanes_batch(qs: &[&[f32]; BATCH], b: &[f32]) -> [Lanes; BATCH] {
-    let mut acc = [[0.0; LANES]; BATCH];
-    let qs = qs.map(|q| q.as_chunks::<LANES>().0);
+    let [q0, q1, q2, q3] = qs.map(|q| q.as_chunks::<LANES>().0);
+    let (mut a0, mut a1, mut a2, mut a3) = ([0.0; LANES], [0.0; LANES], [0.0; LANES], [0.0; LANES]);
     for (k, y) in b.as_chunks::<LANES>().0.iter().enumerate() {
-        for j in 0..BATCH {
-            let x = &qs[j][k];
-            for i in 0..LANES {
-                let d = x[i] - y[i];
-                acc[j][i] += d * d;
-            }
+        let (x0, x1, x2, x3) = (&q0[k], &q1[k], &q2[k], &q3[k]);
+        for i in 0..LANES {
+            let d0 = x0[i] - y[i];
+            let d1 = x1[i] - y[i];
+            let d2 = x2[i] - y[i];
+            let d3 = x3[i] - y[i];
+            a0[i] += d0 * d0;
+            a1[i] += d1 * d1;
+            a2[i] += d2 * d2;
+            a3[i] += d3 * d3;
         }
     }
-    acc
+    [a0, a1, a2, a3]
 }
 
 #[inline(never)]
 fn product_lanes_batch(qs: &[&[f32]; BATCH], b: &[f32]) -> [Lanes; BATCH] {
-    let mut acc = [[0.0; LANES]; BATCH];
-    let qs = qs.map(|q| q.as_chunks::<LANES>().0);
+    let [q0, q1, q2, q3] = qs.map(|q| q.as_chunks::<LANES>().0);
+    let (mut a0, mut a1, mut a2, mut a3) = ([0.0; LANES], [0.0; LANES], [0.0; LANES], [0.0; LANES]);
     for (k, y) in b.as_chunks::<LANES>().0.iter().enumerate() {
-        for j in 0..BATCH {
-            let x = &qs[j][k];
-            for i in 0..LANES {
-                acc[j][i] += x[i] * y[i];
-            }
+        let (x0, x1, x2, x3) = (&q0[k], &q1[k], &q2[k], &q3[k]);
+        for i in 0..LANES {
+            a0[i] += x0[i] * y[i];
+            a1[i] += x1[i] * y[i];
+            a2[i] += x2[i] * y[i];
+            a3[i] += x3[i] * y[i];
         }
     }
-    acc
+    [a0, a1, a2, a3]
 }
 
 #[cfg(test)]
@@ -307,6 +313,79 @@ mod tests {
                 let batch = score_batch(&queries, &c, norm(&c));
                 for i in 0..BATCH {
                     assert_eq!(batch[i].to_bits(), queries[i].score(&c, norm(&c)).to_bits());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn expanded_batch_kernel_matches_original_loops_including_special_values_and_tails() {
+        let mut seed = 0x1a93_7d81_u32;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            (seed as f32 / u32::MAX as f32 - 0.5) * 2000.0
+        };
+        for dim in [1, 15, 16, 17, 33, 128, 257, 1024, 32768] {
+            let mut vectors: [Vec<f32>; BATCH] =
+                std::array::from_fn(|_| (0..dim).map(|_| next()).collect());
+            let mut candidate: Vec<f32> = (0..dim).map(|_| next()).collect();
+            for special in [false, true] {
+                if special {
+                    let values = [
+                        0.0,
+                        -0.0,
+                        f32::INFINITY,
+                        f32::NEG_INFINITY,
+                        f32::from_bits(0x7fc0_0123),
+                        1e8,
+                        -1e8,
+                    ];
+                    for (i, value) in candidate.iter_mut().enumerate() {
+                        *value = values[i % values.len()];
+                    }
+                    for (qi, vector) in vectors.iter_mut().enumerate() {
+                        for (i, value) in vector.iter_mut().enumerate() {
+                            *value = values[(i + qi) % values.len()];
+                        }
+                    }
+                }
+                for metric in [Metric::L2, Metric::Ip, Metric::Cosine] {
+                    let queries = std::array::from_fn(|i| Query::new(metric, &vectors[i]));
+                    let mut old = [[0.0; LANES]; BATCH];
+                    for (k, row) in candidate.as_chunks::<LANES>().0.iter().enumerate() {
+                        for qi in 0..BATCH {
+                            let query = &vectors[qi].as_chunks::<LANES>().0[k];
+                            for i in 0..LANES {
+                                old[qi][i] += if metric == Metric::L2 {
+                                    let d = query[i] - row[i];
+                                    d * d
+                                } else {
+                                    query[i] * row[i]
+                                };
+                            }
+                        }
+                    }
+                    let op = if metric == Metric::L2 {
+                        diff_sq
+                    } else {
+                        product
+                    };
+                    let expected: [f32; BATCH] = std::array::from_fn(|i| {
+                        queries[i].to_score(
+                            finish(old[i], &vectors[i], &candidate, op),
+                            norm(&candidate),
+                        )
+                    });
+                    let got = score_batch(&queries, &candidate, norm(&candidate));
+                    for i in 0..BATCH {
+                        assert_eq!(
+                            got[i].to_bits(),
+                            expected[i].to_bits(),
+                            "dim={dim}, metric={metric:?}, special={special}, query={i}"
+                        );
+                    }
                 }
             }
         }

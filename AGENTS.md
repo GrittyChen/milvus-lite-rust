@@ -164,6 +164,7 @@ cd <work_dir> && MILVUS_LITE_3X_PYTHON=<3.x 的 venv>/bin/python v26/bin/python 
 | M2 持久化三方对照（轮换三轮；RSS 另跑 `memory`，完整口径见基准 README） | `benchmarks/baseline/run.sh <work_dir> <N> 128 m2.jsonl rs:FLAT:inproc:m2 v2:FLAT:inproc:m2 v3:FLAT:inproc:m2` |
 | 基准脚本自检（失败传播、吞吐分母与多轮汇总） | `.venv/bin/python -m pytest tests/benchmarks` |
 | 恢复内存与进程冷启动专项（已有健康库、独立服务；口径见 [专项 README](benchmarks/recovery/README.md)） | `<实现的 python> benchmarks/recovery/run.py <existing.db> --rows 1000000 --dim 128 --round 1 --build <artifact-identity>` |
+| 批量 FLAT 检索专项（真值准备与计时分开；口径见 [专项 README](benchmarks/batch-search/README.md)） | `<实现的 python> benchmarks/batch-search/run.py --database <existing.db> --truth <truth_dir> --rows 1000000 --dim 128 --round 1 --build <artifact-identity>` |
 | S1 过滤性能专项（优化前后与两代参照，顺序三轮、结果逐次校验） | 环境、数据与命令见 [benchmarks/s1/README.md](benchmarks/s1/README.md) |
 | Linux 容器的 LOCK 与 strace 验收 | 环境、非 root 执行与命令见 [tests/platform/README.md](tests/platform/README.md) |
 
