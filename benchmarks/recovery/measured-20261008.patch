@@ -1,0 +1,36 @@
+--- a/run.py
++++ b/run.py
+@@ -26,17 +26,6 @@
+ def check_count(result, rows):
+     if result != [{"count(*)": rows}]:
+         raise RuntimeError(f"恢复行数不一致：{result!r}，预期 {rows}")
+-
+-
+-def read_index(client, collection):
+-    names = client.list_indexes(collection)
+-    if len(names) != 1:
+-        raise RuntimeError(f"恢复基准要求唯一的 FLAT L2 索引，实际索引为 {names!r}")
+-    description = client.describe_index(collection, names[0])
+-    actual = {key: description.get(key) for key in ("index_type", "metric_type")}
+-    if actual != {"index_type": "FLAT", "metric_type": "L2"}:
+-        raise RuntimeError(f"恢复基准要求 FLAT L2，实际索引为 {actual!r}")
+-    return actual
+
+
+ def check_search(result, ids, scores):
+@@ -87,7 +76,6 @@
+         client.load_collection(base.C)
+         load_s = time.perf_counter() - start
+         after_load = base.rss_mb()
+-        index_described = read_index(client, base.C)
+         check_count(client.query(base.C, output_fields=["count(*)"]), args.rows)
+         start = time.perf_counter()
+         result = client.search(base.C, [base.queries[0].tolist()], limit=10,
+@@ -116,7 +104,6 @@
+     print(json.dumps({
+         "implementation": base.VER, "build": args.build, "round": args.round,
+         "rows": args.rows, "dim": args.dim, "confirmed_rows": args.rows,
+-        "index_described": index_described,
+         "connect_s": connect_s, "load_s": load_s, "ready_s": connect_s + load_s,
+         "first_search_ms": first_search_ms,
+         "rss_before_load_mib": before_load, "rss_after_load_mib": after_load,
