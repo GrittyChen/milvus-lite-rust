@@ -5,6 +5,7 @@ MILVUS_LITE_3X_PYTHON 指定它的 python，经 server3x.py 在独立进程中�
 """
 
 import os
+from contextlib import ExitStack
 import shutil
 import subprocess
 import sys
@@ -85,11 +86,16 @@ def rust_uri(workdir):
 
 @pytest.fixture
 def diff(rust_uri, ref_uri):
-    rust, ref = MilvusClient(uri=rust_uri), MilvusClient(uri=ref_uri)
-    try:
-        yield Diff(rust, ref)
-    finally:
-        for client in (rust, ref):
-            for name in client.list_collections():
-                client.drop_collection(name)
-            client.close()
+    # 默认共享池在 close 后仍保留闲置连接；跨重开用例的 keepalive 会触发
+    # 3.x 的 Too many pings。fixture 自己拥有连接，清理时立即释放。
+    with ExitStack() as clients:
+        rust = MilvusClient(uri=rust_uri, dedicated=True)
+        clients.callback(rust.close)
+        ref = MilvusClient(uri=ref_uri, dedicated=True)
+        clients.callback(ref.close)
+        try:
+            yield Diff(rust, ref)
+        finally:
+            for client in (rust, ref):
+                for name in client.list_collections():
+                    client.drop_collection(name)

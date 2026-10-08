@@ -46,7 +46,10 @@ class ReopenPair:
             rust_uri = self.manager.start_and_get_uri(self.rust_path)
             assert rust_uri is not None
             self.uris = (rust_uri, f"http://127.0.0.1:{port}")
-            self.clients = tuple(MilvusClient(uri=uri) for uri in self.uris)
+            self.clients = []
+            for uri in self.uris:
+                self.clients.append(MilvusClient(uri=uri, dedicated=True))
+            self.clients = tuple(self.clients)
             return Diff(*self.clients)
         except BaseException:
             # 启动失败的退出码属于原始错误；清理时不再用它覆盖诊断。
