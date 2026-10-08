@@ -13,7 +13,7 @@ enum Operand {
 #[derive(Debug)]
 enum Term {
     Compare {
-        op: String,
+        op: Comparison,
         left: Operand,
         right: Operand,
     },
@@ -21,6 +21,40 @@ enum Term {
         column: usize,
         values: Vec<Literal>,
     },
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Comparison {
+    Equal,
+    NotEqual,
+    Less,
+    LessEqual,
+    Greater,
+    GreaterEqual,
+}
+
+impl Comparison {
+    fn parse(op: &str) -> Result<Self> {
+        match op {
+            "==" => Ok(Self::Equal),
+            "!=" => Ok(Self::NotEqual),
+            "<" => Ok(Self::Less),
+            "<=" => Ok(Self::LessEqual),
+            ">" => Ok(Self::Greater),
+            ">=" => Ok(Self::GreaterEqual),
+            _ => Err(unsupported()),
+        }
+    }
+
+    fn reversed(self) -> Self {
+        match self {
+            Self::Less => Self::Greater,
+            Self::LessEqual => Self::GreaterEqual,
+            Self::Greater => Self::Less,
+            Self::GreaterEqual => Self::LessEqual,
+            other => other,
+        }
+    }
 }
 #[derive(Debug)]
 pub(crate) struct Predicate {
@@ -366,7 +400,7 @@ impl Predicate {
                         return Err(unsupported());
                     }
                     terms.push(Term::Compare {
-                        op: op.clone(),
+                        op: Comparison::parse(op)?,
                         left: operand(*a)?,
                         right: operand(*b)?,
                     });
@@ -418,21 +452,20 @@ impl Predicate {
                     } else {
                         None
                     };
-                    for row in 0..live.len {
-                        if live.get(row) {
-                            let a = match constant_left {
-                                Some(v) => v,
-                                None => value(left, columns, row, float)?,
-                            };
-                            let b = match constant_right {
-                                Some(v) => v,
-                                None => value(right, columns, row, float)?,
-                            };
-                            if !compare(&a, &b, op) {
-                                out.set(row, false);
-                            }
+                    let (column, constant, op) = match (left, right) {
+                        (Operand::Column(i), Operand::Literal(_)) => (*i, constant_right, *op),
+                        (Operand::Literal(_), Operand::Column(i)) => {
+                            (*i, constant_left, op.reversed())
                         }
-                    }
+                        _ => return Err(unsupported()),
+                    };
+                    compare_column(
+                        &columns[column],
+                        constant.ok_or_else(unsupported)?,
+                        op,
+                        live,
+                        &mut out,
+                    )?;
                 }
                 Term::In { column, values } => {
                     for lit in values {
@@ -581,11 +614,7 @@ fn value<'a>(
         } else {
             9_007_199_254_740_992
         };
-        if !(-bound..=bound).contains(&i) {
-            return Err(EngineError::invalid(format!(
-                "Integer value {i} not in range: -{bound} to {bound}"
-            )));
-        }
+        check_integer_range(i, bound)?;
         return Ok(Scalar::Float(if float == 32 {
             f64::from(i as f32)
         } else {
@@ -594,27 +623,287 @@ fn value<'a>(
     }
     Ok(scalar)
 }
-fn compare(a: &Scalar<'_>, b: &Scalar<'_>, op: &str) -> bool {
-    let order = match (a, b) {
-        (Scalar::Int(a), Scalar::Int(b)) => Some(a.cmp(b)),
-        (Scalar::Float(a), Scalar::Float(b)) => a.partial_cmp(b),
-        (Scalar::String(a), Scalar::String(b)) => Some(a.cmp(b)),
-        (Scalar::Bool(a), Scalar::Bool(b)) => Some(a.cmp(b)),
-        _ => None,
-    };
+// 列类型、比较操作与常量在逐行循环之外绑定；浮点安全转换仍检查原来的全部活行。
+fn compare_column(
+    column: &ColumnData,
+    constant: Scalar<'_>,
+    op: Comparison,
+    live: &SourceBits,
+    out: &mut SourceBits,
+) -> Result<()> {
+    macro_rules! integer {
+        ($values:expr) => {{
+            let values = $values;
+            match constant {
+                Scalar::Int(constant) => {
+                    compare_values(values, constant, |v| i64::from(*v), op, live, out);
+                }
+                Scalar::Float(constant) => {
+                    // S1 只比较字段与字面量；整数列只有配 float64 字面量才会提升。
+                    for row in live.live_rows() {
+                        check_integer_range(i64::from(values[row]), 9_007_199_254_740_992)?;
+                    }
+                    compare_values(values, constant, |v| i64::from(*v) as f64, op, live, out);
+                }
+                _ => return Err(unsupported()),
+            }
+        }};
+    }
+    match column {
+        ColumnData::Int8(values) => integer!(values),
+        ColumnData::Int16(values) => integer!(values),
+        ColumnData::Int32(values) => integer!(values),
+        ColumnData::Int64(values) => integer!(values),
+        ColumnData::Float(values) => {
+            let Scalar::Float(constant) = constant else {
+                return Err(unsupported());
+            };
+            compare_values(values, constant, |v| f64::from(*v), op, live, out);
+        }
+        ColumnData::Double(values) => {
+            let Scalar::Float(constant) = constant else {
+                return Err(unsupported());
+            };
+            compare_values(values, constant, |v| *v, op, live, out);
+        }
+        ColumnData::Bool(values) => {
+            let Scalar::Bool(constant) = constant else {
+                return Err(unsupported());
+            };
+            compare_values(values, constant, |v| *v, op, live, out);
+        }
+        ColumnData::VarChar(values) => {
+            let Scalar::String(constant) = constant else {
+                return Err(unsupported());
+            };
+            compare_values(values, constant, |v| v.as_str(), op, live, out);
+        }
+        _ => return Err(unsupported()),
+    }
+    Ok(())
+}
+
+fn check_integer_range(value: i64, bound: i64) -> Result<()> {
+    if !(-bound..=bound).contains(&value) {
+        return Err(EngineError::invalid(format!(
+            "Integer value {value} not in range: -{bound} to {bound}"
+        )));
+    }
+    Ok(())
+}
+
+fn compare_values<'a, T, U: PartialOrd + Copy>(
+    values: &'a [T],
+    constant: U,
+    convert: impl Fn(&'a T) -> U,
+    op: Comparison,
+    live: &SourceBits,
+    out: &mut SourceBits,
+) {
     match op {
-        "==" => order == Some(std::cmp::Ordering::Equal),
-        "!=" => order != Some(std::cmp::Ordering::Equal),
-        "<" => order == Some(std::cmp::Ordering::Less),
-        "<=" => matches!(
-            order,
-            Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)
-        ),
-        ">" => order == Some(std::cmp::Ordering::Greater),
-        ">=" => matches!(
-            order,
-            Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal)
-        ),
-        _ => false,
+        Comparison::Equal => out.intersect_matching(live, |row| convert(&values[row]) == constant),
+        Comparison::NotEqual => {
+            out.intersect_matching(live, |row| convert(&values[row]) != constant)
+        }
+        Comparison::Less => out.intersect_matching(live, |row| convert(&values[row]) < constant),
+        Comparison::LessEqual => {
+            out.intersect_matching(live, |row| convert(&values[row]) <= constant)
+        }
+        Comparison::Greater => out.intersect_matching(live, |row| convert(&values[row]) > constant),
+        Comparison::GreaterEqual => {
+            out.intersect_matching(live, |row| convert(&values[row]) >= constant)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::schema::FieldSchema;
+
+    // 独立保留优化前的逐行标量模型，防止列特化在浮点提升、反向比较或稀疏位图上偏移。
+    fn scalar_model(
+        predicate: &Predicate,
+        columns: &[ColumnData],
+        live: &SourceBits,
+    ) -> Result<SourceBits> {
+        let mut out = live.clone();
+        if !live.any_live() {
+            return Ok(out);
+        }
+        for term in &predicate.terms {
+            let Term::Compare { op, left, right } = term else {
+                return Err(unsupported());
+            };
+            validate_literal(left)?;
+            validate_literal(right)?;
+            let precision = operand_precision(left, columns).max(operand_precision(right, columns));
+            let a = if matches!(left, Operand::Literal(_)) {
+                Some(value(left, columns, 0, precision)?)
+            } else {
+                None
+            };
+            let b = if matches!(right, Operand::Literal(_)) {
+                Some(value(right, columns, 0, precision)?)
+            } else {
+                None
+            };
+            for row in 0..live.len {
+                if !live.get(row) {
+                    continue;
+                }
+                let a = a
+                    .map(Ok)
+                    .unwrap_or_else(|| value(left, columns, row, precision))?;
+                let b = b
+                    .map(Ok)
+                    .unwrap_or_else(|| value(right, columns, row, precision))?;
+                let order = match (a, b) {
+                    (Scalar::Int(a), Scalar::Int(b)) => Some(a.cmp(&b)),
+                    (Scalar::Float(a), Scalar::Float(b)) => a.partial_cmp(&b),
+                    (Scalar::String(a), Scalar::String(b)) => Some(a.cmp(b)),
+                    (Scalar::Bool(a), Scalar::Bool(b)) => Some(a.cmp(&b)),
+                    _ => None,
+                };
+                use std::cmp::Ordering::{Equal, Greater, Less};
+                let pass = match op {
+                    Comparison::Equal => order == Some(Equal),
+                    Comparison::NotEqual => order != Some(Equal),
+                    Comparison::Less => order == Some(Less),
+                    Comparison::LessEqual => matches!(order, Some(Less | Equal)),
+                    Comparison::Greater => order == Some(Greater),
+                    Comparison::GreaterEqual => matches!(order, Some(Greater | Equal)),
+                };
+                if !pass {
+                    out.set(row, false);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    #[test]
+    fn typed_comparisons_match_scalar_model_for_all_types_operators_and_sparse_masks() {
+        for len in [0_usize, 1, 63, 64, 65, 129] {
+            let ints: Vec<_> = (0..len).map(|row| (row % 19) as i64 - 9).collect();
+            let floats: Vec<_> = (0..len)
+                .map(|row| match row % 13 {
+                    0 => f64::NAN,
+                    1 => -0.0,
+                    2 => f64::INFINITY,
+                    3 => f64::NEG_INFINITY,
+                    _ => (row % 19) as f64 / 4.0 - 2.0,
+                })
+                .collect();
+            let cases = [
+                (
+                    DataType::Int8,
+                    ColumnData::Int8(ints.iter().map(|v| *v as i8).collect()),
+                    vec!["-2", "2.5", "-0.0"],
+                ),
+                (
+                    DataType::Int16,
+                    ColumnData::Int16(ints.iter().map(|v| *v as i16).collect()),
+                    vec!["-2", "2.5"],
+                ),
+                (
+                    DataType::Int32,
+                    ColumnData::Int32(ints.iter().map(|v| *v as i32).collect()),
+                    vec!["-2", "2.5"],
+                ),
+                (
+                    DataType::Int64,
+                    ColumnData::Int64(ints),
+                    vec!["-2", "2.5", "1e999", "9223372036854775808"],
+                ),
+                (
+                    DataType::Float,
+                    ColumnData::Float(floats.iter().map(|v| *v as f32).collect()),
+                    vec!["-2", "2.5", "16777217", "-0.0"],
+                ),
+                (
+                    DataType::Double,
+                    ColumnData::Double(floats),
+                    vec!["-2", "2.5", "9007199254740993", "-0.0"],
+                ),
+                (
+                    DataType::Bool,
+                    ColumnData::Bool((0..len).map(|row| row % 3 == 0).collect()),
+                    vec!["false", "true"],
+                ),
+                (
+                    DataType::VarChar,
+                    ColumnData::VarChar((0..len).map(|row| format!("三{}", row % 7)).collect()),
+                    vec!["'三3'", "''"],
+                ),
+            ];
+            for (dtype, column, literals) in cases {
+                let schema = CollectionSchema {
+                    fields: vec![FieldSchema::new("x", dtype)],
+                    enable_dynamic_field: false,
+                    properties: vec![],
+                };
+                for stride in [1, 3, 70] {
+                    let live = SourceBits::from_live(
+                        &(0..len).map(|row| row % stride == 0).collect::<Vec<_>>(),
+                    );
+                    for literal in &literals {
+                        for op in ["==", "!=", "<", "<=", ">", ">="] {
+                            for expr in [format!("x {op} {literal}"), format!("{literal} {op} x")] {
+                                let predicate = Predicate::compile(&expr, &schema).unwrap();
+                                let columns = std::slice::from_ref(&column);
+                                let actual = predicate
+                                    .evaluate(columns, &live)
+                                    .map(|bits| bits.live_rows().collect::<Vec<_>>())
+                                    .map_err(|err| err.to_string());
+                                let expected = scalar_model(&predicate, columns, &live)
+                                    .map(|bits| bits.live_rows().collect::<Vec<_>>())
+                                    .map_err(|err| err.to_string());
+                                assert_eq!(actual, expected, "{dtype:?}, {len}, {stride}, {expr}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn typed_cast_rejects_live_wide_integers_even_after_a_false_term() {
+        let schema = CollectionSchema {
+            fields: vec![FieldSchema::new("x", DataType::Int64)],
+            enable_dynamic_field: false,
+            properties: vec![],
+        };
+        let columns = [ColumnData::Int64(vec![
+            0,
+            9_007_199_254_740_992,
+            9_007_199_254_740_993,
+            i64::MIN,
+            i64::MAX,
+        ])];
+        for active in [
+            vec![true; 5],
+            vec![true, true, false, false, false],
+            vec![false; 5],
+        ] {
+            let live = SourceBits::from_live(&active);
+            for expr in [
+                "x > 1.0",
+                "1.0 < x",
+                "x < 0 and x > 1.0",
+                "x > 9223372036854775808",
+            ] {
+                let predicate = Predicate::compile(expr, &schema).unwrap();
+                let actual = predicate
+                    .evaluate(&columns, &live)
+                    .map(|b| b.live_rows().collect::<Vec<_>>())
+                    .map_err(|e| e.to_string());
+                let expected = scalar_model(&predicate, &columns, &live)
+                    .map(|b| b.live_rows().collect::<Vec<_>>())
+                    .map_err(|e| e.to_string());
+                assert_eq!(actual, expected, "{expr}, {active:?}");
+            }
+        }
     }
 }

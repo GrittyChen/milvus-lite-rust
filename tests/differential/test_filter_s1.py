@@ -89,6 +89,53 @@ def row(pk, age, varchar=False):
             "i8": age, "i16": age, "i32": age, "age": age, "f": age / 4,
             "d": age / 4, "title": f"三{age}", "active": age % 2 == 0}
 
+
+def test_column_kernels_keep_word_boundary_visibility_pagination_and_late_errors(pair):
+    diff = pair.open()
+    name = "s1_words"
+    diff.step("create", lambda c: c.create_collection(name, schema=schema(), index_params=index("L2")))
+    diff.step("first_word", lambda c: c.insert(name, [row(i, i % 11) for i in range(65)]))
+    diff.step("flush", lambda c: c.flush(name))
+    diff.step("tail_words", lambda c: c.insert(name, [row(i, i % 11) for i in range(65, 130)]))
+    diff.step("overwrite", lambda c: c.upsert(name, [row(64, 7), row(65, 8)]))
+    diff.step("delete_edges", lambda c: c.delete(name, ids=[0, 63, 66, 127, 129]))
+
+    model = {i: row(i, i % 11) for i in range(130)}
+    model.update({64: row(64, 7), 65: row(65, 8)})
+    for pk in [0, 63, 66, 127, 129]:
+        del model[pk]
+    candidates = {i: r["vector"] for i, r in model.items() if r["age"] < 5 and r["active"]}
+
+    def check(stage):
+        for expr in ["age >= 0", "age < 5 and active == true", "5 <= age and title != '三8'",
+                     "f >= 0.0 and d < 2.5", "id < 0 and age >= 0"]:
+            diff.step(stage + expr + "_count", lambda c: c.query(name, filter=expr, output_fields=["count(*)"]))
+            for offset, limit in [(0, 1), (1, 63), (63, 65), (64, 130)]:
+                diff.step(f"{stage}_{expr}_{offset}_{limit}",
+                          lambda c: c.query(name, filter=expr, output_fields=["id", "title"],
+                                            offset=offset, limit=limit))
+        diff.step(stage + "_search", lambda c: c.search(name, data=[[1, 0]], limit=130,
+                  filter="age < 5 and active == true"),
+                  check=hits("L2", [[1, 0]], candidates, k=len(candidates)))
+
+    check("active")
+    diff.step("flush_all", lambda c: c.flush(name))
+    pair.close()
+    diff = pair.open()
+    diff.step("load", lambda c: c.load_collection(name))
+    check("reopened")
+    wide = row(130, 1)
+    wide["age"] = 9007199254740993
+    diff.step("late_wide", lambda c: c.insert(name, [wide]))
+    before_failed_delete = diff.step("rows_before_failed_delete", lambda c: c.query(name, output_fields=["id", "age", "title"]))
+    for expr in ["id < 0 and age > 1.0", "id >= 0 and age > 1.0"]:
+        # 返回上限和已经归零的掩码都不能跳过末尾活行的转换错误。
+        diff.step(expr + "_limit", lambda c: c.query(name, filter=expr, output_fields=["id"], limit=1), error=True)
+        diff.step(expr + "_count", lambda c: c.query(name, filter=expr, output_fields=["count(*)"]), error=True)
+        diff.step(expr + "_delete", lambda c: c.delete(name, filter=expr), error=True)
+        assert diff.step(expr + "_delete_preserves_count", lambda c: c.query(name, output_fields=["count(*)"])) == ("ok", [{"count(*)": len(model) + 1}])
+        assert diff.step(expr + "_delete_preserves_rows", lambda c: c.query(name, output_fields=["id", "age", "title"])) == before_failed_delete
+
 @pytest.mark.parametrize("varchar", [False, True])
 def test_scalar_comparisons_and_conjunctions_across_query_count_search_and_delete(diff, varchar):
     name = "s1_varchar" if varchar else "s1_int"

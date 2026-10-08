@@ -290,14 +290,7 @@ impl ReadSnapshot {
     pub fn count_filtered_parsed(&self, parsed: &crate::filter::ParsedFilter) -> Result<usize> {
         self.require_loaded()?;
         let chunks = self.filtered_chunks_parsed(parsed)?;
-        Ok(chunks
-            .iter()
-            .map(|chunk| {
-                (0..chunk.live.len)
-                    .filter(|&row| chunk.live.get(row))
-                    .count()
-            })
-            .sum())
+        Ok(chunks.iter().map(|chunk| chunk.live.count_live()).sum())
     }
 
     pub fn query(
@@ -352,18 +345,16 @@ impl ReadSnapshot {
         let projection = Projection::new(&self.schema, output_fields, ApiKind::Query);
         let mut refs = Vec::new();
         for (index, chunk) in chunks.iter().enumerate() {
-            for row in 0..chunk.live.len {
-                if chunk.live.get(row) {
-                    refs.push(RowRef {
-                        chunk: index,
-                        row,
-                        order: if chunk.generation == 0 {
-                            (chunk.row_start + row) as u64
-                        } else {
-                            chunk.orders[row]
-                        },
-                    });
-                }
+            for row in chunk.live.live_rows() {
+                refs.push(RowRef {
+                    chunk: index,
+                    row,
+                    order: if chunk.generation == 0 {
+                        (chunk.row_start + row) as u64
+                    } else {
+                        chunk.orders[row]
+                    },
+                });
             }
         }
         refs.sort_by_key(|r| (chunks[r.chunk].source_rank, r.order));

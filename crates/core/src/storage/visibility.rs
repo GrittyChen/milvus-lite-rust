@@ -45,6 +45,51 @@ impl SourceBits {
         self.bits.iter().any(|word| *word != 0)
     }
 
+    pub(crate) fn count_live(&self) -> usize {
+        self.bits
+            .iter()
+            .map(|word| word.count_ones() as usize)
+            .sum()
+    }
+
+    pub(crate) fn live_rows(&self) -> impl Iterator<Item = usize> + '_ {
+        self.bits.iter().enumerate().flat_map(|(index, &word)| {
+            let mut remaining = word;
+            std::iter::from_fn(move || {
+                if remaining == 0 {
+                    return None;
+                }
+                let row = index * 64 + remaining.trailing_zeros() as usize;
+                remaining &= remaining - 1;
+                Some(row)
+            })
+        })
+    }
+
+    /// 每个 and 操作数遍历原有效位，不能用累计掩码屏蔽后续操作数的转换错误。
+    pub(crate) fn intersect_matching(&mut self, live: &Self, test: impl Fn(usize) -> bool) {
+        for (index, &word) in live.bits.iter().enumerate() {
+            let mut matches = 0_u64;
+            if word == u64::MAX {
+                // 完整活字直接连续读列；稀疏字仍只访问活行，尾部填充位保持为零。
+                for bit in 0..64 {
+                    matches |= u64::from(test(index * 64 + bit)) << bit;
+                }
+            } else {
+                let mut remaining = word;
+                while remaining != 0 {
+                    let bit = remaining.trailing_zeros() as usize;
+                    matches |= u64::from(test(index * 64 + bit)) << bit;
+                    remaining &= remaining - 1;
+                }
+            }
+            let matches = matches & self.bits[index];
+            if matches != self.bits[index] {
+                Arc::make_mut(&mut self.bits)[index] = matches;
+            }
+        }
+    }
+
     pub(crate) fn set(&mut self, row: usize, live: bool) {
         let word = &mut Arc::make_mut(&mut self.bits)[row / 64];
         let mask = 1_u64 << (row % 64);
@@ -367,6 +412,70 @@ mod tests {
                     assert_eq!(snapshot.get(row), *expected);
                     assert_eq!(bits.get(row), !expected);
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn packed_filter_count_and_iteration_preserve_tail_bits_and_original_candidates() {
+        for len in [0_usize, 1, 63, 64, 65, 127, 129] {
+            for divisor in [1, 3, 70] {
+                let live = SourceBits::from_live(
+                    &(0..len).map(|row| row % divisor == 0).collect::<Vec<_>>(),
+                );
+                let original: Vec<_> = (0..len).filter(|row| row % divisor == 0).collect();
+                assert_eq!(live.live_rows().collect::<Vec<_>>(), original);
+                assert_eq!(live.count_live(), original.len());
+                let mut filtered = live.clone();
+                filtered.intersect_matching(&live, |row| row % 2 == 0);
+                let expected: Vec<_> = original
+                    .iter()
+                    .copied()
+                    .filter(|row| row % 2 == 0)
+                    .collect();
+                assert_eq!(filtered.live_rows().collect::<Vec<_>>(), expected);
+                assert_eq!(filtered.count_live(), expected.len());
+                let visited = std::cell::RefCell::new(Vec::new());
+                filtered.intersect_matching(&live, |row| {
+                    visited.borrow_mut().push(row);
+                    false
+                });
+                assert_eq!(*visited.borrow(), original);
+                assert_eq!(filtered.count_live(), 0);
+                assert_eq!(live.live_rows().collect::<Vec<_>>(), original);
+            }
+        }
+    }
+
+    #[test]
+    fn dense_and_sparse_words_visit_original_live_rows_once_without_reading_padding() {
+        for len in [63, 64, 65, 127, 128, 129, 255, 256, 257] {
+            let values: Vec<_> = (0..len)
+                .map(|row| match row / 64 % 3 {
+                    0 => true,
+                    1 => row % 2 == 0,
+                    _ => false,
+                })
+                .collect();
+            let live = SourceBits::from_live(&values);
+            let expected: Vec<_> = (0..len).filter(|&row| values[row]).collect();
+            let mut filtered = live.clone();
+            for divisor in [3, 2, 1] {
+                let visited = std::cell::RefCell::new(Vec::new());
+                filtered.intersect_matching(&live, |row| {
+                    assert!(row < len && values[row]);
+                    visited.borrow_mut().push(row);
+                    row % divisor == 0
+                });
+                assert_eq!(*visited.borrow(), expected);
+                let matches: Vec<_> = expected
+                    .iter()
+                    .copied()
+                    .filter(|row| row % 3 == 0 && (divisor == 3 || row % 2 == 0))
+                    .collect();
+                assert_eq!(filtered.live_rows().collect::<Vec<_>>(), matches);
+                assert_eq!(filtered.count_live(), matches.len());
+                assert_eq!(live.live_rows().collect::<Vec<_>>(), expected);
             }
         }
     }
