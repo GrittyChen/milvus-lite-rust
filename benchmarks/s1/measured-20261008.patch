@@ -1,0 +1,45 @@
+--- a/run.py
++++ b/run.py
+@@ -4,7 +4,6 @@
+ """
+ import argparse
+ import hashlib
+-import importlib.metadata
+ import importlib.util
+ import json
+ import os
+@@ -35,23 +34,8 @@
+     import numpy as np
+     if len(result) != 1 or [hit["id"] for hit in result[0]] != ids:
+         raise RuntimeError("过滤 Search 的候选或排序与 float64 FLAT 真值不一致")
+-    actual = np.asarray([hit["distance"] for hit in result[0]], dtype=np.float64)
+-    expected = np.asarray(scores, dtype=np.float64)
+-    tolerance = np.maximum(1e-5 * np.abs(expected), 1e-6)
+-    if (actual.shape != expected.shape or not np.isfinite(actual).all()
+-            or not np.isfinite(expected).all() or not (np.abs(actual - expected) <= tolerance).all()):
++    if not np.allclose([hit["distance"] for hit in result[0]], scores, rtol=1e-5, atol=1e-5):
+         raise RuntimeError("过滤 Search 的距离超出 0004 的 L2 误差范围")
+-
+-
+-def dependency_versions(implementation):
+-    versions = {"python": sys.version.split()[0], "impl": implementation,
+-                "pymilvus": importlib.metadata.version("pymilvus"),
+-                "numpy": importlib.metadata.version("numpy")}
+-    try:
+-        versions["pyarrow"] = importlib.metadata.version("pyarrow")
+-    except importlib.metadata.PackageNotFoundError:
+-        pass
+-    return versions
+
+
+ def main():
+@@ -130,7 +114,8 @@
+                       "native_sha256": (hashlib.sha256(Path(importlib.import_module("milvus_lite._native").__file__).read_bytes()).hexdigest()
+                                         if base.VER == "rs" else None),
+                       "machine": {"platform": platform.platform(), "cpu_count": os.cpu_count()},
+-                      "versions": dependency_versions(base.PKG_VERSION)}, ensure_ascii=False))
++                      "versions": {"python": sys.version.split()[0], "impl": base.PKG_VERSION,
++                                   "pymilvus": base.importlib.metadata.version("pymilvus")}}, ensure_ascii=False))
+
+
+ if __name__ == "__main__":

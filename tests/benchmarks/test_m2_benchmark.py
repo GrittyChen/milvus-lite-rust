@@ -5,11 +5,11 @@ import hashlib
 from pathlib import Path
 import runpy
 import subprocess
-import shutil
 import sys
 
 import pytest
 
+from history import copy_baseline_snapshot
 
 ROOT = Path(__file__).resolve().parents[2]
 BENCH = ROOT / "benchmarks/baseline/bench.py"
@@ -122,15 +122,17 @@ def test_m2_keeps_build_database_and_uses_its_own_path(tmp_path):
     assert all(Path(row["db"]).name == "r_v3_FLAT_inproc_2000_4_m2.db" for row in rows)
 
 
-def test_measured_source_patch_restores_historical_fingerprint(tmp_path):
-    source = ROOT / "benchmarks/baseline"
-    for path in source.iterdir():
-        if path.suffix in (".py", ".sh"):
-            shutil.copy2(path, tmp_path / path.name)
-    subprocess.run(["git", "apply", str(source / "measured-20261008.patch")], cwd=tmp_path, check=True,
+def assert_m2_historical_fingerprint(repo, destination):
+    source = repo / "benchmarks/baseline"
+    copy_baseline_snapshot(repo, destination)
+    subprocess.run(["git", "apply", str(source / "measured-20261008.patch")], cwd=destination, check=True,
                    capture_output=True, text=True)
     digest = hashlib.sha256()
-    for path in sorted(tmp_path.iterdir()):
+    for path in sorted(destination.iterdir()):
         digest.update(path.name.encode())
         digest.update(path.read_bytes())
     assert digest.hexdigest() == "00947bbcd41dcdce36ef8ddea529309e11b60386b3411a7662bb6b39d0893d5a"
+
+
+def test_measured_source_patch_restores_historical_fingerprint(tmp_path):
+    assert_m2_historical_fingerprint(ROOT, tmp_path)
