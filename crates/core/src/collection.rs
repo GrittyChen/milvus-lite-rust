@@ -8,7 +8,7 @@ use serde_json::{Map, Value};
 
 use crate::compute::Compute;
 use crate::data::{
-    ColumnData, InputValues, InsertBatch, META_FIELD, Pk, Rows, check_column_len, field_dim,
+    ColumnData, InputValues, InsertBatch, META_FIELD, Pk, PkMap, Rows, check_column_len, field_dim,
 };
 use crate::error::{EngineError, Result, py_float_repr, py_json_repr, py_repr, py_repr_list};
 use crate::filter::PkLiteral;
@@ -497,7 +497,7 @@ pub struct Collection {
     vector_pos: usize,
     chunks: BTreeMap<usize, Chunk>,
     next_chunk: usize,
-    pk_index: HashMap<Pk, RowRef>,
+    pk_index: PkMap<RowRef>,
     /// 下一个 `_seq`。auto_id 取所在行的 `_seq`（0004「决策」），因此 auto_id 不超过 `_seq`（0002 约束 4）。
     next_seq: u64,
     /// 按创建顺序。
@@ -530,7 +530,7 @@ impl Collection {
             vector_pos,
             chunks: BTreeMap::new(),
             next_chunk: 0,
-            pk_index: HashMap::new(),
+            pk_index: PkMap::default(),
             next_seq: 1,
             indexes: Vec::new(),
             // 3.x：新建的 collection 没有索引定义，初始即为 loaded。
@@ -569,6 +569,11 @@ impl Collection {
         let mut collection = Self::new(name, recovered.schema.clone())?;
         collection.next_seq = recovered.next_seq;
         let snapshot = recovered.visibility.snapshot();
+        // 活行数已由恢复确定；一次预留避免建表时同时保留扩容前后的两张哈希表。
+        collection.pk_index.reserve(
+            collection.schema.fields[collection.pk_pos].data_type,
+            snapshot.live_count,
+        );
         // 已提交批只供读块使用；在登记前移交独占列，避免恢复时同时保留两份全量数据。
         for segment in std::mem::take(&mut recovered.segments) {
             let mut row = 0;
@@ -2432,7 +2437,7 @@ mod tests {
                 if chunk.live.get(row) {
                     live_count += 1;
                     let pk = pk_at(&chunk.columns[c.pk_pos], row);
-                    let at = c.pk_index[&pk];
+                    let at = *c.pk_index.get(&pk).unwrap();
                     assert_eq!((at.chunk, at.row), (id, row));
                     let stored = persistent.visibility.latest_data(&pk).unwrap();
                     assert_eq!(
@@ -2698,7 +2703,7 @@ mod tests {
         for (old, current) in snapshot.chunks.iter().zip(c.chunks.values()) {
             assert!(Arc::ptr_eq(&old.data, &current.data));
         }
-        let at = c.pk_index[&Pk::Int64(1)];
+        let at = *c.pk_index.get(&Pk::Int64(1)).unwrap();
         let get = c
             .prepare_get(&[Pk::Int64(1), Pk::Int64(1), Pk::Int64(-1)], &[])
             .unwrap();

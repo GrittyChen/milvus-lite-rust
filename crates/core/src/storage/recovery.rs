@@ -417,57 +417,61 @@ pub fn load_committed(collection_dir: &Path) -> Result<RecoveredCollection, Reco
             manifest.current_seq
         )));
     }
-    let committed = visibility.clone();
     let mut wal_warnings = Vec::new();
     let wal_paths = scan_wal(&collection_dir.join("wal"))?;
+    // 无 WAL 文件就不会回放，不需要复制提交态的全量主键判定表。
+    let committed = (!wal_paths.is_empty()).then(|| visibility.clone());
     let max_wal_number = wal_paths.keys().next_back().copied().unwrap_or(0);
     let active_source = SourceId(segments.len() as u64 + 1);
     visibility.add_source(active_source, 0)?;
     let mut active_memtable = MemTable::new(active_source);
-    for (_number, (data_path, delta_path)) in wal_paths {
-        let mut operations = Vec::new();
-        if let Some(path) = data_path {
-            regular_file(&path)?;
-            let recovered = wal::read_prefix(&path)?;
-            if let Some(reason) = recovered.stopped_at {
-                wal_warnings.push(format!("{path:?}: {reason}"));
-            }
-            for batch in recovered.batches {
-                let decoded = arrow_data::decode_wal_data_batch(&schema, &batch)?;
-                if let Some(&first_seq) = decoded.seqs.first() {
-                    operations.push((first_seq, WalOperation::Data(decoded)));
+    if let Some(committed) = committed {
+        for (_number, (data_path, delta_path)) in wal_paths {
+            let mut operations = Vec::new();
+            if let Some(path) = data_path {
+                regular_file(&path)?;
+                let recovered = wal::read_prefix(&path)?;
+                if let Some(reason) = recovered.stopped_at {
+                    wal_warnings.push(format!("{path:?}: {reason}"));
                 }
-            }
-        }
-        if let Some(path) = delta_path {
-            regular_file(&path)?;
-            let recovered = wal::read_prefix(&path)?;
-            if let Some(reason) = recovered.stopped_at {
-                wal_warnings.push(format!("{path:?}: {reason}"));
-            }
-            for batch in recovered.batches {
-                let decoded = arrow_data::decode_wal_delta_batch(&schema, &batch)?;
-                if let Some(&first_seq) = decoded.seqs.first() {
-                    operations.push((first_seq, WalOperation::Delete(decoded)));
-                }
-            }
-        }
-        // 参照实现按每个编号内 batch 的首个 `_seq` 稳定排序；data 同序号时先于 delta。
-        operations.sort_by_key(|(first_seq, _)| *first_seq);
-        for (_, operation) in operations {
-            match operation {
-                WalOperation::Data(decoded) => {
-                    let filtered = filter_committed_rows(&schema, decoded, &committed)?;
-                    if !filtered.seqs.is_empty() {
-                        active_memtable.apply_data(&schema, filtered, &mut visibility)?;
+                for batch in recovered.batches {
+                    let decoded = arrow_data::decode_wal_data_batch(&schema, &batch)?;
+                    if let Some(&first_seq) = decoded.seqs.first() {
+                        operations.push((first_seq, WalOperation::Data(decoded)));
                     }
                 }
-                WalOperation::Delete(delta) => {
-                    for (pk, seq) in delta.pks.into_iter().zip(delta.seqs) {
-                        let seg_max = committed.latest_data(&pk).map(|loc| loc.seq).unwrap_or(0);
-                        let delta_max = committed.latest_delete(&pk).unwrap_or(0);
-                        if seq > seg_max.max(delta_max) {
-                            active_memtable.apply_delete(&[pk], seq, &mut visibility)?;
+            }
+            if let Some(path) = delta_path {
+                regular_file(&path)?;
+                let recovered = wal::read_prefix(&path)?;
+                if let Some(reason) = recovered.stopped_at {
+                    wal_warnings.push(format!("{path:?}: {reason}"));
+                }
+                for batch in recovered.batches {
+                    let decoded = arrow_data::decode_wal_delta_batch(&schema, &batch)?;
+                    if let Some(&first_seq) = decoded.seqs.first() {
+                        operations.push((first_seq, WalOperation::Delete(decoded)));
+                    }
+                }
+            }
+            // 参照实现按每个编号内 batch 的首个 `_seq` 稳定排序；data 同序号时先于 delta。
+            operations.sort_by_key(|(first_seq, _)| *first_seq);
+            for (_, operation) in operations {
+                match operation {
+                    WalOperation::Data(decoded) => {
+                        let filtered = filter_committed_rows(&schema, decoded, &committed)?;
+                        if !filtered.seqs.is_empty() {
+                            active_memtable.apply_data(&schema, filtered, &mut visibility)?;
+                        }
+                    }
+                    WalOperation::Delete(delta) => {
+                        for (pk, seq) in delta.pks.into_iter().zip(delta.seqs) {
+                            let seg_max =
+                                committed.latest_data(&pk).map(|loc| loc.seq).unwrap_or(0);
+                            let delta_max = committed.latest_delete(&pk).unwrap_or(0);
+                            if seq > seg_max.max(delta_max) {
+                                active_memtable.apply_delete(&[pk], seq, &mut visibility)?;
+                            }
                         }
                     }
                 }
@@ -1037,6 +1041,101 @@ mod tests {
     #[test]
     fn empty_referenced_delta_file_fails_closed() {
         assert_empty_referenced_file_fails_closed("delta");
+    }
+
+    #[test]
+    fn missing_empty_and_schema_only_wal_keep_committed_rows_and_scan_errors_propagate() {
+        for state in 0..4 {
+            let root = tempfile::tempdir().unwrap();
+            let collection = root.path().join("c");
+            let data_dir = collection.join("partitions/_default/data");
+            fs::create_dir_all(&data_dir).unwrap();
+            let schema_bytes = include_bytes!("../../tests/fixtures/schema_3x.json");
+            let data_bytes = include_bytes!("../../tests/fixtures/data_3x.parquet");
+            fs::write(collection.join("schema.json"), schema_bytes).unwrap();
+            let data_path = data_dir.join("data_000001_000002.parquet");
+            fs::write(&data_path, data_bytes).unwrap();
+            let mut manifest = Manifest {
+                current_seq: 2,
+                ..Manifest::default()
+            };
+            manifest
+                .partitions
+                .get_mut("_default")
+                .unwrap()
+                .data_files
+                .push("data/data_000001_000002.parquet".to_owned());
+            let manifest_bytes = manifest.to_bytes().unwrap();
+            fs::write(collection.join("manifest.json"), &manifest_bytes).unwrap();
+            let wal_dir = collection.join("wal");
+            if state == 1 || state == 2 {
+                fs::create_dir(&wal_dir).unwrap();
+            }
+            let mut wal_bytes = Vec::new();
+            if state == 2 {
+                let schema = SchemaFile::read(&collection.join("schema.json"))
+                    .unwrap()
+                    .to_core()
+                    .unwrap();
+                let mut stream = arrow_ipc::writer::StreamWriter::try_new(
+                    Vec::new(),
+                    &arrow_data::wal_data_schema(&schema).unwrap(),
+                )
+                .unwrap();
+                stream.finish().unwrap();
+                wal_bytes = stream.into_inner().unwrap();
+                fs::write(wal_dir.join("wal_data_000001.arrow"), &wal_bytes).unwrap();
+            } else if state == 3 {
+                fs::write(&wal_dir, b"not a directory").unwrap();
+            }
+            let result = load_committed(&collection);
+            if state == 3 {
+                assert!(matches!(result, Err(RecoveryError::Io { path, .. }) if path == wal_dir));
+                assert_eq!(fs::read(&wal_dir).unwrap(), b"not a directory");
+            } else {
+                let recovered = result.unwrap();
+                assert_eq!(recovered.visibility.live_count(), 2);
+                assert_eq!(
+                    recovered
+                        .visibility
+                        .latest_data(&Pk::Int64(10))
+                        .unwrap()
+                        .seq,
+                    1
+                );
+                assert_eq!(
+                    recovered
+                        .visibility
+                        .latest_data(&Pk::Int64(20))
+                        .unwrap()
+                        .seq,
+                    2
+                );
+                assert_eq!(recovered.active_memtable.physical_rows(), 0);
+                assert_eq!(recovered.next_seq, 3);
+                assert_eq!(recovered.next_wal_number, if state == 2 { 2 } else { 1 });
+                assert!(recovered.wal_warnings.is_empty());
+                if state == 0 {
+                    assert!(!wal_dir.exists());
+                } else if state == 1 {
+                    assert_eq!(fs::read_dir(&wal_dir).unwrap().count(), 0);
+                } else {
+                    assert_eq!(
+                        fs::read(wal_dir.join("wal_data_000001.arrow")).unwrap(),
+                        wal_bytes
+                    );
+                }
+            }
+            assert_eq!(fs::read(data_path).unwrap(), data_bytes);
+            assert_eq!(
+                fs::read(collection.join("schema.json")).unwrap(),
+                schema_bytes
+            );
+            assert_eq!(
+                fs::read(collection.join("manifest.json")).unwrap(),
+                manifest_bytes
+            );
+        }
     }
 
     #[test]

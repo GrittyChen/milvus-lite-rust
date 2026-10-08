@@ -57,6 +57,60 @@ pub struct InsertBatch {
     pub columns: Vec<(String, InputValues)>,
 }
 
+/// 按主键类型保存键，避免 Int64 条目承担 String 变体的空间；不改变两类键的区分。
+#[derive(Debug, Clone)]
+pub(crate) struct PkMap<V> {
+    ints: std::collections::HashMap<i64, V>,
+    strings: std::collections::HashMap<String, V>,
+}
+
+impl<V> Default for PkMap<V> {
+    fn default() -> Self {
+        Self {
+            ints: std::collections::HashMap::new(),
+            strings: std::collections::HashMap::new(),
+        }
+    }
+}
+
+impl<V> PkMap<V> {
+    pub(crate) fn get(&self, key: &Pk) -> Option<&V> {
+        match key {
+            Pk::Int64(k) => self.ints.get(k),
+            Pk::VarChar(k) => self.strings.get(k.as_str()),
+        }
+    }
+    pub(crate) fn get_mut(&mut self, key: &Pk) -> Option<&mut V> {
+        match key {
+            Pk::Int64(k) => self.ints.get_mut(k),
+            Pk::VarChar(k) => self.strings.get_mut(k.as_str()),
+        }
+    }
+    pub(crate) fn insert(&mut self, key: Pk, value: V) -> Option<V> {
+        match key {
+            Pk::Int64(k) => self.ints.insert(k, value),
+            Pk::VarChar(k) => self.strings.insert(k, value),
+        }
+    }
+    pub(crate) fn remove(&mut self, key: &Pk) -> Option<V> {
+        match key {
+            Pk::Int64(k) => self.ints.remove(k),
+            Pk::VarChar(k) => self.strings.remove(k.as_str()),
+        }
+    }
+    pub(crate) fn len(&self) -> usize {
+        self.ints.len() + self.strings.len()
+    }
+    pub(crate) fn reserve(&mut self, kind: DataType, additional: usize) {
+        match kind {
+            DataType::Int64 => self.ints.reserve(additional),
+            DataType::VarChar => self.strings.reserve(additional),
+            // 仅在 CollectionSchema 校验主键类型之后调用。
+            _ => unreachable!("validated primary key is Int64 or VarChar"),
+        }
+    }
+}
+
 /// 按字段类型存储的一列。
 #[derive(Debug, Clone, PartialEq)]
 pub enum ColumnData {
@@ -199,4 +253,77 @@ pub fn check_column_len(name: &str, values: &InputValues, n: usize) -> Result<()
         )));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[test]
+    fn typed_primary_map_matches_enum_keyed_map_for_mixed_keys_and_mutations() {
+        let keys = [
+            Pk::Int64(i64::MIN),
+            Pk::Int64(-1),
+            Pk::Int64(0),
+            Pk::Int64(7),
+            Pk::Int64(i64::MAX),
+            Pk::VarChar(String::new()),
+            Pk::VarChar("0".into()),
+            Pk::VarChar("7".into()),
+            Pk::VarChar("é/東京".into()),
+            Pk::VarChar("a".repeat(1000)),
+        ];
+        let mut actual = PkMap::default();
+        let mut expected = HashMap::new();
+        let mut seed = 0x91f0_u64;
+        for step in 0..2000_i64 {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let key = &keys[((seed >> 16) as usize) % keys.len()];
+            match (seed >> 32) % 4 {
+                0 => assert_eq!(
+                    actual.insert(key.clone(), step),
+                    expected.insert(key.clone(), step)
+                ),
+                1 => assert_eq!(actual.remove(key), expected.remove(key)),
+                2 => assert_eq!(
+                    actual.get_mut(key).map(|v| {
+                        *v += 1;
+                        *v
+                    }),
+                    expected.get_mut(key).map(|v| {
+                        *v += 1;
+                        *v
+                    }),
+                ),
+                _ => {
+                    let mut clone = actual.clone();
+                    assert_eq!(clone.remove(key), expected.get(key).copied());
+                    assert_eq!(clone.get(key), None);
+                }
+            }
+            assert_eq!(actual.len(), expected.len());
+            for key in &keys {
+                assert_eq!(actual.get(key), expected.get(key));
+            }
+        }
+    }
+
+    #[test]
+    fn primary_reservation_selects_one_key_table_and_strings_move_without_copy() {
+        let mut ints = PkMap::<usize>::default();
+        ints.reserve(DataType::Int64, 100);
+        assert!(ints.ints.capacity() >= 100);
+        assert_eq!(ints.strings.capacity(), 0);
+        let mut strings = PkMap::<usize>::default();
+        strings.reserve(DataType::VarChar, 100);
+        assert!(strings.strings.capacity() >= 100);
+        assert_eq!(strings.ints.capacity(), 0);
+        let key = "é/東京".to_owned();
+        let original = key.as_ptr();
+        strings.insert(Pk::VarChar(key), 3);
+        assert_eq!(strings.strings.keys().next().unwrap().as_ptr(), original);
+        assert_eq!(strings.get(&Pk::VarChar("é/東京".into())), Some(&3));
+        assert!(std::mem::size_of::<(i64, usize)>() < std::mem::size_of::<(Pk, usize)>());
+    }
 }

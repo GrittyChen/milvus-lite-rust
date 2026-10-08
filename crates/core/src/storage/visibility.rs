@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
-use crate::data::Pk;
+use crate::data::{Pk, PkMap};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SourceId(pub u64);
@@ -148,7 +148,7 @@ pub struct Visibility {
     sources: BTreeMap<SourceId, SourceBits>,
     source_order: Vec<SourceId>,
     /// 最新的数据行；即使已被 tombstone 隐藏，仍保留它的 `_seq` 以处理乱序回放。
-    latest_data: HashMap<Pk, RowLocation>,
+    latest_data: PkMap<RowLocation>,
     /// 已提交或活跃的删除中的最大 `_seq`。
     latest_delete: HashMap<Pk, u64>,
     live_count: usize,
