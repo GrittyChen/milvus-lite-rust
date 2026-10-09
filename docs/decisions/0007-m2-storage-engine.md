@@ -491,3 +491,5 @@ WAL 追加（每次写入调用一个 batch，dim 128）：
 - ISO 时间与偏移共用按 [CPython 3.12.14 的 C 解析器](https://github.com/python/cpython/blob/v3.12.14/Modules/_datetimemodule.c) `parse_hh_mm_ss_ff` / `parse_isoformat_time` 推进的扫描器：覆盖紧凑与冒号形态、无分隔符的小数、六位微秒截断、逻辑时区边界与实际尾字节、零秒偏移忽略小数的规则；日期与 INTERVAL 不在本次重写范围。固定语料保留此前的全部 2857 条，并增加时间与偏移的长度/尾字节矩阵。另以[直接模糊对照器](../../tests/differential/fuzz_temporal.py)把结构生成与字符变异的表达式交给真实 3.x `parse_expr` 与 [Rust 解析入口](../../crates/core/examples/filter_parse_probe.rs)，逐字比较接受结果及诊断，不依赖 gRPC 或固定语料；每次输出覆盖计数与反例报告，任何分歧返回失败。真实入口仍由 Query/Search/Delete 的差分用例固定；时间求值仍属范围外。
 
 S1 不实施过滤索引或表达式缓存；初始化切片本身不声明性能改善，后续列求值优化的测量范围单独记录在 [S1 性能专项](../testing/s1-performance.md)。S1 用例复用、并发故障与 Parquet 读取的证据见[正确性记录](../testing/m2-correctness.md)；平台实测与 M2 性能基准见[验收记录](../testing/m2-acceptance.md)。
+
+首发阶段的后续顶层动态字段过滤以 [0009](0009-top-level-dynamic-filter.md) 为准；上节记录 S1 的原始范围。新增路径按完整数据源绑定类型，复用不可变快照和有效位，不更改本决策的锁、落盘或提交协议。

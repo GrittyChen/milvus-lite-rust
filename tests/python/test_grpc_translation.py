@@ -770,7 +770,7 @@ def test_pymilvus_entry_points_remaining_unsupported(env):
         (lambda: client.rename_collection("q", "q2"), f"RenameCollection: {rpc}"),
         (lambda: client.hybrid_search("q", [AnnSearchRequest([[1, 0]], "vector", {}, 2)], RRFRanker(), limit=2),
          f"HybridSearch: {rpc}"),
-        (lambda: client.search("q", [[1, 0]], filter="id > 1 or id < 0"), "filter expressions: only scalar field/literal comparisons joined by 'and', or a top-level primary-key 'in', are supported"),
+        (lambda: client.search("q", [[1, 0]], filter="id > 1 or id < 0"), "filter expressions: only scalar or top-level dynamic field/literal comparisons joined by 'and', dynamic field 'in', or a top-level primary-key 'in', are supported"),
         (lambda: client.search("q", [[1, 0]], ranker=decay), f"rerank and function chains: {feature}"),
         (lambda: client.query_iterator("q", batch_size=2).next(), f"query iterators: {feature}"),
         (lambda: client.compact("q"), f"ManualCompaction: {rpc}"),

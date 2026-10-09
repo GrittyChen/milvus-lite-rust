@@ -5,26 +5,27 @@ use crate::error::{EngineError, Result, py_repr, py_repr_list};
 use crate::schema::{CollectionSchema, DataType};
 use crate::storage::visibility::SourceBits;
 
-#[derive(Debug)]
-enum Operand {
+#[derive(Debug, Clone)]
+pub(super) enum Operand {
     Column(usize),
+    Dynamic(String),
     Literal(Literal),
 }
-#[derive(Debug)]
-enum Term {
+#[derive(Debug, Clone)]
+pub(super) enum Term {
     Compare {
         op: Comparison,
         left: Operand,
         right: Operand,
     },
     In {
-        column: usize,
+        operand: Operand,
         values: Vec<Literal>,
     },
 }
 
 #[derive(Debug, Clone, Copy)]
-enum Comparison {
+pub(super) enum Comparison {
     Equal,
     NotEqual,
     Less,
@@ -58,17 +59,21 @@ impl Comparison {
 }
 #[derive(Debug)]
 pub(crate) struct Predicate {
-    terms: Vec<Term>,
+    pub(super) terms: Vec<Term>,
+    pub(super) field_names: Option<Vec<String>>,
 }
 
 fn unsupported() -> EngineError {
     EngineError::unsupported(
         "filter expressions",
-        "only scalar field/literal comparisons joined by 'and', or a top-level primary-key 'in', are supported",
+        "only scalar or top-level dynamic field/literal comparisons joined by 'and', dynamic field 'in', or a top-level primary-key 'in', are supported",
     )
 }
 fn compatible(a: &str, b: &str) -> bool {
-    a == b || matches!((a, b), ("int", "float") | ("float", "int"))
+    a == b
+        || a == "dynamic"
+        || b == "dynamic"
+        || matches!((a, b), ("int", "float") | ("float", "int"))
 }
 fn sem(dtype: DataType) -> Option<&'static str> {
     match dtype {
@@ -145,6 +150,15 @@ fn field_error(name: &str, pos: usize, source: &str, schema: &CollectionSchema) 
     } else {
         format!("unknown field {}", py_repr(name))
     };
+    field_diagnostic(&message, name, pos, source, schema)
+}
+fn field_diagnostic(
+    message: &str,
+    name: &str,
+    pos: usize,
+    source: &str,
+    schema: &CollectionSchema,
+) -> EngineError {
     let mut names: Vec<&str> = schema.fields.iter().map(|f| f.name.as_str()).collect();
     names.sort();
     let mut tail = format!("available fields: {}", py_repr_list(names.iter().copied()));
@@ -156,7 +170,7 @@ fn field_error(name: &str, pos: usize, source: &str, schema: &CollectionSchema) 
     if let Some((_, best)) = best {
         tail.push_str(&format!("\ndid you mean {}?", py_repr(best)));
     }
-    parser::diagnostic(&message, source, pos, name.chars().count(), Some(&tail))
+    parser::diagnostic(message, source, pos, name.chars().count(), Some(&tail))
 }
 fn describe(ast: &Ast, id: usize, t: &str) -> String {
     match &ast.nodes[id].kind {
@@ -176,7 +190,10 @@ impl Predicate {
     ) -> Result<Self> {
         let source = parsed.source.as_str();
         let Some(ast) = &parsed.ast else {
-            return Ok(Self { terms: Vec::new() });
+            return Ok(Self {
+                terms: Vec::new(),
+                field_names: None,
+            });
         };
         // 语法总是完整检查；范围外构造优先 UNIMPLEMENTED，不执行其语义检查（0006 第 1 项）。
         if ast.nodes.iter().any(|node| {
@@ -203,7 +220,10 @@ impl Predicate {
             if let Kind::Cmp(_, a, b) = &node.kind
                 && matches!(
                     (&ast.nodes[*a].kind, &ast.nodes[*b].kind),
-                    (Kind::Field(_), Kind::Field(_)) | (Kind::Lit(_), Kind::Lit(_))
+                    (
+                        Kind::Field(_) | Kind::Meta(_),
+                        Kind::Field(_) | Kind::Meta(_)
+                    ) | (Kind::Lit(_), Kind::Lit(_))
                 )
             {
                 return Err(unsupported());
@@ -213,7 +233,7 @@ impl Predicate {
                     && !matches!(name.as_str(), "_seq" | "_partition" | "$meta")
                     && !schema.fields.iter().any(|f| &f.name == name)
                 {
-                    return Err(unsupported());
+                    continue;
                 }
                 if schema
                     .fields
@@ -224,12 +244,16 @@ impl Predicate {
                     return Err(unsupported());
                 }
             }
-            if let Kind::In { field, negate, .. } = &node.kind
-                && (*negate
-                    || !matches!(&ast.nodes[*field].kind,Kind::Field(name) if schema.fields.iter().any(|f|f.is_primary && &f.name==name))
-                    || !std::ptr::eq(node, &ast.nodes[ast.root]))
-            {
-                return Err(unsupported());
+            if let Kind::In { field, negate, .. } = &node.kind {
+                let dynamic = matches!(&ast.nodes[*field].kind, Kind::Meta(_))
+                    || matches!(&ast.nodes[*field].kind, Kind::Field(name) if !matches!(name.as_str(), "_seq" | "_partition" | "$meta") && !schema.fields.iter().any(|f| &f.name == name));
+                if *negate
+                    || (!dynamic
+                        && (!matches!(&ast.nodes[*field].kind, Kind::Field(name) if schema.fields.iter().any(|f| f.is_primary && &f.name == name))
+                            || !std::ptr::eq(node, &ast.nodes[ast.root])))
+                {
+                    return Err(unsupported());
+                }
             }
         }
         let mut types = vec![""; ast.nodes.len()];
@@ -278,16 +302,28 @@ impl Predicate {
             }
             let t = match &node.kind {
                 Kind::Lit(lit) => lit.sem(),
+                Kind::Meta(_) => {
+                    if !schema.enable_dynamic_field {
+                        return Err(field_diagnostic(
+                            "$meta access requires schema enable_dynamic_field=True",
+                            "$meta",
+                            node.pos,
+                            source,
+                            schema,
+                        ));
+                    }
+                    "dynamic"
+                }
                 Kind::Field(name) => {
                     if matches!(name.as_str(), "_seq" | "_partition" | "$meta") {
                         return Err(field_error(name, node.pos, source, schema));
                     }
-                    let field = schema
-                        .fields
-                        .iter()
-                        .find(|f| &f.name == name)
-                        .ok_or_else(|| field_error(name, node.pos, source, schema))?;
-                    sem(field.data_type).ok_or_else(unsupported)?
+                    let field = schema.fields.iter().find(|f| &f.name == name);
+                    match field {
+                        Some(field) => sem(field.data_type).ok_or_else(unsupported)?,
+                        None if schema.enable_dynamic_field => "dynamic",
+                        None => return Err(field_error(name, node.pos, source, schema)),
+                    }
                 }
                 Kind::Cmp(op, left, right) => {
                     let (a, b) = (types[*left], types[*right]);
@@ -376,13 +412,12 @@ impl Predicate {
         }
         let operand = |id: usize| -> Result<Operand> {
             match &ast.nodes[id].kind {
-                Kind::Field(name) => Ok(Operand::Column(
-                    schema
-                        .fields
-                        .iter()
-                        .position(|f| &f.name == name)
-                        .ok_or_else(unsupported)?,
-                )),
+                Kind::Field(name) => Ok(match schema.fields.iter().position(|f| &f.name == name) {
+                    Some(i) => Operand::Column(i),
+                    None if schema.enable_dynamic_field => Operand::Dynamic(name.clone()),
+                    None => return Err(unsupported()),
+                }),
+                Kind::Meta(key) => Ok(Operand::Dynamic(key.clone())),
                 Kind::Lit(lit) => Ok(Operand::Literal(lit.clone())),
                 _ => Err(unsupported()),
             }
@@ -395,7 +430,8 @@ impl Predicate {
                 Kind::Cmp(op, a, b) => {
                     if !matches!(
                         (&ast.nodes[*a].kind, &ast.nodes[*b].kind),
-                        (Kind::Field(_), Kind::Lit(_)) | (Kind::Lit(_), Kind::Field(_))
+                        (Kind::Field(_) | Kind::Meta(_), Kind::Lit(_))
+                            | (Kind::Lit(_), Kind::Field(_) | Kind::Meta(_))
                     ) {
                         return Err(unsupported());
                     }
@@ -406,9 +442,7 @@ impl Predicate {
                     });
                 }
                 Kind::In { field, list, .. } => {
-                    let Operand::Column(column) = operand(*field)? else {
-                        return Err(unsupported());
-                    };
+                    let operand = operand(*field)?;
                     let Kind::List(ids) = &ast.nodes[*list].kind else {
                         return Err(unsupported());
                     };
@@ -419,15 +453,72 @@ impl Predicate {
                             _ => Err(unsupported()),
                         })
                         .collect::<Result<Vec<_>>>()?;
-                    terms.push(Term::In { column, values });
+                    terms.push(Term::In { operand, values });
                 }
                 _ => return Err(unsupported()),
             }
         }
-        Ok(Self { terms })
+        let dynamic = terms.iter().any(|term| match term {
+            Term::Compare { left, right, .. } => {
+                matches!(left, Operand::Dynamic(_)) || matches!(right, Operand::Dynamic(_))
+            }
+            Term::In { operand, .. } => matches!(operand, Operand::Dynamic(_)),
+        });
+        Ok(Self {
+            terms,
+            field_names: dynamic.then(|| schema.fields.iter().map(|f| f.name.clone()).collect()),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn evaluate_with_meta(
+        &self,
+        columns: &[ColumnData],
+        meta: Option<&[serde_json::Map<String, serde_json::Value>]>,
+        live: &SourceBits,
+    ) -> Result<SourceBits> {
+        if self.field_names.is_some() {
+            let rows: Vec<_> = live
+                .live_rows()
+                .map(|row| super::dynamic::DynamicRow {
+                    columns,
+                    meta: meta.map(|rows| &rows[row]),
+                    row,
+                })
+                .collect();
+            let matching = super::dynamic::evaluate_rows(self, &rows)?;
+            let mut out = live.clone();
+            for (index, row) in live.live_rows().enumerate() {
+                if !matching.get(index) {
+                    out.set(row, false);
+                }
+            }
+            Ok(out)
+        } else {
+            self.evaluate(columns, live)
+        }
+    }
+
+    pub(crate) fn has_dynamic_fields(&self) -> bool {
+        self.field_names.is_some()
+    }
+
+    pub(crate) fn evaluate_source_rows(
+        &self,
+        rows: &[super::dynamic::DynamicRow<'_>],
+    ) -> Result<SourceBits> {
+        super::dynamic::evaluate_rows(self, rows)
     }
 
     pub(crate) fn evaluate(&self, columns: &[ColumnData], live: &SourceBits) -> Result<SourceBits> {
+        self.evaluate_columns(columns, live)
+    }
+
+    pub(super) fn evaluate_columns<C: std::ops::Index<usize, Output = ColumnData> + ?Sized>(
+        &self,
+        columns: &C,
+        live: &SourceBits,
+    ) -> Result<SourceBits> {
         // MemTable 没有存活行时 3.x 不调用 Arrow；已提交旧行的差异按 0006 第 13 项登记。
         // 解析和 schema 检查已在 compile 完成，此处只跳过没有候选行的数据求值。
         if !live.any_live() {
@@ -467,7 +558,10 @@ impl Predicate {
                         &mut out,
                     )?;
                 }
-                Term::In { column, values } => {
+                Term::In { operand, values } => {
+                    let Operand::Column(column) = operand else {
+                        return Err(unsupported());
+                    };
                     for lit in values {
                         validate_literal(&Operand::Literal(lit.clone()))?;
                     }
@@ -561,14 +655,17 @@ impl<'a> Scalar<'a> {
         }
     }
 }
-fn validate_literal(op: &Operand) -> Result<()> {
+pub(super) fn validate_literal(op: &Operand) -> Result<()> {
     if let Operand::Literal(Literal::Int(s)) = op {
         s.parse::<i64>()
             .map_err(|_| EngineError::invalid("Python int too large to convert to C long"))?;
     }
     Ok(())
 }
-fn operand_precision(op: &Operand, columns: &[ColumnData]) -> u8 {
+fn operand_precision<C: std::ops::Index<usize, Output = ColumnData> + ?Sized>(
+    op: &Operand,
+    columns: &C,
+) -> u8 {
     match op {
         Operand::Literal(Literal::Float(_)) => 64,
         Operand::Column(i) => match columns[*i] {
@@ -579,9 +676,9 @@ fn operand_precision(op: &Operand, columns: &[ColumnData]) -> u8 {
         _ => 0,
     }
 }
-fn value<'a>(
+fn value<'a, C: std::ops::Index<usize, Output = ColumnData> + ?Sized>(
     op: &'a Operand,
-    columns: &'a [ColumnData],
+    columns: &'a C,
     row: usize,
     float: u8,
 ) -> Result<Scalar<'a>> {

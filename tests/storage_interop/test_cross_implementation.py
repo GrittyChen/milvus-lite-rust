@@ -17,6 +17,52 @@ PYTHONS = (
 )
 
 
+@pytest.mark.parametrize("writer", ["rust", "reference"])
+@pytest.mark.parametrize("storage", ["wal", "flushed"])
+def test_top_level_dynamic_filters_read_the_other_implementations_directory(tmp_path, interpreters, writer, storage):
+    root=tmp_path/'dynamic.db'
+    write="""
+import os,sys
+from pymilvus import MilvusClient,DataType
+from milvus_lite.server_manager import server_manager_instance
+path,storage=sys.argv[1:]
+client=MilvusClient(path,dedicated=True)
+schema=MilvusClient.create_schema(auto_id=False,enable_dynamic_field=True)
+schema.add_field('id',DataType.INT64,is_primary=True)
+schema.add_field('vector',DataType.FLOAT_VECTOR,dim=2)
+indexes=client.prepare_index_params();indexes.add_index('vector',index_type='FLAT',metric_type='L2')
+client.create_collection('c',schema=schema,index_params=indexes)
+client.insert('c',[{'id':1,'vector':[1.,0.],'category':'tech','x':1},
+                   {'id':2,'vector':[0.,1.],'category':'news','x':1.5},
+                   {'id':3,'vector':[1.,1.],'category':None,'x':'1'},
+                   {'id':4,'vector':[2.,1.]}])
+if storage=='wal':os._exit(0)
+client.flush('c');client.close();server_manager_instance.release_server(path)
+"""
+    read="""
+import sys
+from pymilvus import MilvusClient
+from milvus_lite.server_manager import server_manager_instance
+path=sys.argv[1]
+client=MilvusClient(path,dedicated=True)
+try:
+ client.load_collection('c')
+ assert client.query('c',filter="category in ['tech']",output_fields=['id'])==[{'id':1}]
+ assert client.query('c',filter="$meta['category'] != 'tech'",output_fields=['id'])==[{'id':2}]
+ assert client.query('c',filter='x == 1',output_fields=['id'])==[{'id':1}]
+ assert client.query('c',filter='missing != 1',output_fields=['count(*)'])==[{'count(*)':0}]
+ assert client.search('c',[[1.,0.]],filter="category in ['tech']",limit=1,search_params={'metric_type':'L2'})[0][0]['id']==1
+finally:
+ client.close();server_manager_instance.release_server(path)
+"""
+    python=sys.executable if writer=='rust' else interpreters[PYTHONS[0]]
+    reader=interpreters[PYTHONS[0]] if writer=='rust' else sys.executable
+    run([python,'-c',write,str(root),storage],cwd=tmp_path)
+    wal=root/'collections/c/wal'
+    assert bool(list(wal.glob('wal_data_*.arrow')))==(storage=='wal')
+    run([reader,'-c',read,str(root)],cwd=tmp_path)
+
+
 def run(args, *, cwd=REPO):
     result = subprocess.run(args, cwd=cwd, text=True, capture_output=True, check=False)
     assert result.returncode == 0, (

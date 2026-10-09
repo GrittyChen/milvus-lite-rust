@@ -199,11 +199,12 @@ def test_filter_errors_and_full_syntax_before_unsupported(diff):
     for vectors,metric in [([[1,0]],"bad"),([[1]],"L2")]:
         diff.step("filter_before_search_parameters",lambda c:c.search(name,data=vectors,filter="age = 1",search_params={"metric_type":metric},limit=2),error=True)
     for expr in ["age > 1 or age < 0", "not age > 1", "age in [1]", "age + 1 > 0", "true and missing>1", "active and missing>1",
-                 "title like '三%'", "age is null", "$meta['x'] == 1", "text_match(title, 'x')",
+                 "title like '三%'", "age is null", "text_match(title, 'x')",
                  "array_length(age) > 0", "ISO '2025-01-01T00:00:00Z' == ISO '2025-01-01T00:00:00Z'"]:
         assert run(lambda c: c.query(name, filter=expr), diff.rust)[:2] == ("rpc", "UNIMPLEMENTED"), expr
+    diff.step("disabled_meta_access",lambda c:c.query(name,filter="$meta['x'] == 1"),error=True)
 
-def test_dynamic_collections_keep_reserved_field_errors_and_reject_dynamic_filter_evaluation(diff):
+def test_dynamic_collections_keep_reserved_field_errors_and_resolve_dynamic_fields(diff):
     s=MilvusClient.create_schema(auto_id=False,enable_dynamic_field=True)
     s.add_field("id",DataType.INT64,is_primary=True)
     s.add_field("vector",DataType.FLOAT_VECTOR,dim=2)
@@ -212,7 +213,7 @@ def test_dynamic_collections_keep_reserved_field_errors_and_reject_dynamic_filte
     diff.step("insert",lambda c:c.insert(name,[{"id":1,"vector":[1.0,0.0],"color":"red"}]))
     for expr in ["_seq > 0","_partition == '_default'"]:
         diff.step(expr,lambda c:c.query(name,filter=expr),error=True)
-    assert run(lambda c:c.query(name,filter="color == 'red'"),diff.rust)[:2]==("rpc","UNIMPLEMENTED")
+    assert diff.step("dynamic_field",lambda c:c.query(name,filter="color == 'red'",output_fields=["id"])) == ("ok",[{"id":1}])
     assert diff.step("schema_field",lambda c:c.query(name,filter="id > 0",output_fields=["id"])) == ("ok",[{"id":1}])
 
 def test_reopen_filter_query_limit_order_and_drop_recreate(pair):

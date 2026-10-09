@@ -276,8 +276,51 @@ impl ReadSnapshot {
             return Ok(std::borrow::Cow::Borrowed(&self.chunks));
         };
         let mut chunks = self.chunks.clone();
-        for chunk in &mut chunks {
-            chunk.live = predicate.evaluate(&chunk.columns, &chunk.live)?;
+        if predicate.has_dynamic_fields() {
+            let mut start = 0;
+            while start < chunks.len() {
+                let source = chunks[start].source;
+                let end = start
+                    + chunks[start..]
+                        .iter()
+                        .take_while(|c| c.source == source)
+                        .count();
+                let (locations, matching) = {
+                    let mut locations: Vec<_> = (start..end)
+                        .flat_map(|chunk| {
+                            chunks[chunk].live.live_rows().map(move |row| (chunk, row))
+                        })
+                        .collect();
+                    // 参照按整个 segment/memtable 推断类型；活跃代的报错顺序沿用主键位次。
+                    locations.sort_unstable_by_key(|&(i, row)| {
+                        if chunks[i].generation == 0 {
+                            (chunks[i].row_start + row) as u64
+                        } else {
+                            chunks[i].orders[row]
+                        }
+                    });
+                    let rows: Vec<_> = locations
+                        .iter()
+                        .map(|&(i, row)| crate::filter::DynamicRow {
+                            columns: &chunks[i].columns,
+                            meta: chunks[i].meta.as_ref().map(|m| &m[row]),
+                            row,
+                        })
+                        .collect();
+                    let matching = predicate.evaluate_source_rows(&rows)?;
+                    (locations, matching)
+                };
+                for (index, (chunk, row)) in locations.into_iter().enumerate() {
+                    if !matching.get(index) {
+                        chunks[chunk].live.set(row, false);
+                    }
+                }
+                start = end;
+            }
+        } else {
+            for chunk in &mut chunks {
+                chunk.live = predicate.evaluate(&chunk.columns, &chunk.live)?;
+            }
         }
         Ok(std::borrow::Cow::Owned(chunks))
     }

@@ -41,6 +41,7 @@ impl Literal {
 pub(super) enum Kind {
     Lit(Literal),
     Field(String),
+    Meta(String),
     Cmp(String, usize, usize),
     And(Vec<usize>),
     In {
@@ -531,7 +532,10 @@ impl Parser<'_> {
             }
             if self.has("is") {
                 let tok = self.take();
-                if !matches!(self.nodes[left].kind, Kind::Field(_) | Kind::Path) {
+                if !matches!(
+                    self.nodes[left].kind,
+                    Kind::Field(_) | Kind::Meta(_) | Kind::Path
+                ) {
                     return Err(self.error(
                         "left side of 'is null' must be a field reference or JSON path",
                         tok.pos,
@@ -600,7 +604,10 @@ impl Parser<'_> {
         } else if self.has("exists") {
             let tok = self.take();
             let id = self.primary()?;
-            if !matches!(self.nodes[id].kind, Kind::Field(_) | Kind::Path) {
+            if !matches!(
+                self.nodes[id].kind,
+                Kind::Field(_) | Kind::Meta(_) | Kind::Path
+            ) {
                 return Err(self.error(
                     "'exists' must be followed by a field reference or JSON path",
                     tok.pos,
@@ -665,7 +672,7 @@ impl Parser<'_> {
                     Some("example: $meta[\"category\"]"),
                 ));
             }
-            self.take();
+            let key = self.take();
             if !self.has("]") {
                 return Err(self.error(
                     format!(
@@ -678,8 +685,26 @@ impl Parser<'_> {
                 ));
             }
             self.take();
+            let nested = self.has("[");
             self.path()?;
-            return Ok(self.node(Kind::Path, tok.pos));
+            return Ok(self.node(
+                if nested {
+                    Kind::Path
+                } else {
+                    Kind::Meta(match key.lit {
+                        Some(Literal::String(key)) => key,
+                        _ => {
+                            return Err(self.error(
+                                "$meta key must be a string literal",
+                                key.pos,
+                                1,
+                                None,
+                            ));
+                        }
+                    })
+                },
+                tok.pos,
+            ));
         }
         if tok.kind == "(" {
             self.take();

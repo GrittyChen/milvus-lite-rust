@@ -6,16 +6,16 @@
 
 | 状态 | 含义 | 条数 |
 | --- | --- | --- |
-| 已复制 | 原样复制到本目录 | 119 |
+| 已复制 | 原样复制到本目录 | 120 |
 | 改后复制 | 仅按 0004「验收」第 2 项与 0006 第 25 项授权的条件替换，逐条说明改动 | 46 |
-| 范围外 | 用到当前切片不支持的功能，不复制；未实现能力的代表性入口见「范围外功能的 `UNIMPLEMENTED` 断言」 | 128 |
+| 范围外 | 用到当前切片不支持的功能，不复制；未实现能力的代表性入口见「范围外功能的 `UNIMPLEMENTED` 断言」 | 127 |
 | 待复用 | S1 已解除原过滤阻断，尚须核对 fixture 并迁移；不计入已运行套件 | 0 |
 | 依赖内部模块 | 导入或使用 3.x 的内部模块、内部对象，换成本实现后无法运行 | 33 |
 | 不运行 | 上游被同名定义覆盖，上游自己也不运行 | 1 |
 
 以上是逐条列出的 22 个文件中的 327 条；其余 25 个文件的 310 条整个文件记一行原因，见「整个文件不复用的文件」。
 
-「已复制」与「改后复制」共 165 个用例函数，参数化展开后 179 条。S1 恢复 [test_grpc_crud.py](test_grpc_crud.py) 中的原过滤表达式，并纳入除 LIKE 外的全部 19 条；它们在本实现与真实 3.x 上的两条客户端线均作为本切片验收。本轮迁移全部 40 条待复用用例，恢复此前为绕过过滤限制而替换的原表达式；HNSW→FLAT 的授权替换继续逐条登记。
+「已复制」与「改后复制」共 166 个用例函数，参数化展开后 180 条。S1 恢复 [test_grpc_crud.py](test_grpc_crud.py) 中的原过滤表达式，并纳入除 LIKE 外的全部 19 条；它们在本实现与真实 3.x 上的两条客户端线均作为 S1 验收。随后迁移全部 40 条待复用用例，恢复此前为绕过过滤限制而替换的原表达式；顶层动态字段切片另加入原样的 TestDynamicField 用例。HNSW→FLAT 的授权替换继续逐条登记。
 
 HNSW 换成 FLAT、`== N` 换成 `in [N]` 的条件见 0004「验收」第 2 项及 0006 第 25 项。已接通 S1 的 CRUD 副本不再替换表达式或读回方式。其余副本只删去随范围外用例一起不再使用的 import、helper 与空的分节标题；上游用于跳过的 `importorskip` 改为直接导入（本仓不允许因缺依赖静默跳过），上游因 HNSW 需要 faiss 而加的 `skipif` 随 HNSW 一起去掉。起服务的 fixture 与清理见 [conftest.py](conftest.py)。
 
@@ -299,7 +299,7 @@ HNSW 换成 FLAT、`== N` 换成 `in [N]` 的条件见 0004「验收」第 2 项
 
 ### [test_milvus_compat.py](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py)
 
-40 条：已复制 4，改后复制 25，范围外 11。
+40 条：已复制 5，改后复制 25，范围外 10。
 
 | 用例 | 状态 | 说明 |
 | --- | --- | --- |
@@ -338,7 +338,7 @@ HNSW 换成 FLAT、`== N` 换成 `in [N]` 的条件见 0004「验收」第 2 项
 | [`TestPartition::test_partition_lifecycle`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L459) | 范围外 | 分区 |
 | [`TestPartition::test_partition_insert_and_search_scoped`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L468) | 范围外 | 分区、HNSW |
 | [`TestIndexLifecycle::test_index_create_load_release_drop_cycle`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L507) | 范围外 | DropIndex；断言索引类型为 HNSW |
-| [`TestDynamicField::test_dynamic_field_insert_and_query`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L551) | 范围外 | 过滤表达式（`$meta["category"] == "tech"`） |
+| [`TestDynamicField::test_dynamic_field_insert_and_query`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L551) | 已复制 | 顶层动态字段过滤，函数体保持原文 |
 | [`TestNullableField::test_nullable_varchar_insert_and_query`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L585) | 范围外 | 过滤表达式（`title like "t%"`）、nullable |
 | [`TestCollectionLifecycle::test_create_describe_drop`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L620) | 已复制 |  |
 | [`TestCollectionLifecycle::test_create_duplicate_raises`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L628) | 已复制 |  |

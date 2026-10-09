@@ -1,5 +1,5 @@
 # 复制自 milvus-lite v3.2.1（43d1257）的 tests/adapter/test_milvus_compat.py，Apache-2.0 许可。
-# 仅保留 INVENTORY.md 中已复用的用例；S1 表达式及断言保持上游原文。
+# 仅保留 INVENTORY.md 中已复用的用例；范围内过滤表达式及断言保持上游原文。
 # HNSW 换成 FLAT 并去除 HNSW 参数；小数据集在 3.x 的 MemTable 上按相同度量检索。
 # 直接导入依赖；FLAT 不需要 faiss，移除上游的 faiss 跳过条件。
 """Milvus pymilvus compatibility tests — adapted from milvus-io/milvus
@@ -435,3 +435,33 @@ class TestCollectionLifecycle:
         assert set(names) >= {"c_alpha", "c_beta", "c_gamma"}
         for name in ["c_alpha", "c_beta", "c_gamma"]:
             milvus_client.drop_collection(name)
+
+
+class TestDynamicField:
+    def test_dynamic_field_insert_and_query(self, milvus_client):
+        schema = MilvusClient.create_schema(auto_id=False, enable_dynamic_field=True)
+        schema.add_field("id", DataType.INT64, is_primary=True)
+        schema.add_field("vec", DataType.FLOAT_VECTOR, dim=4)
+        milvus_client.create_collection("dyn", schema=schema)
+        rows = [
+            {"id": i, "vec": [float(i)] * 4, "category": "tech" if i % 2 == 0 else "news"}
+            for i in range(20)
+        ]
+        milvus_client.insert("dyn", rows)
+        idx = milvus_client.prepare_index_params()
+        idx.add_index(field_name="vec", index_type="BRUTE_FORCE",
+                      metric_type="L2", params={})
+        milvus_client.create_index("dyn", idx)
+        milvus_client.load_collection("dyn")
+
+        # Search with $meta filter
+        q = [[5.0, 5.0, 5.0, 5.0]]
+        res = milvus_client.search(
+            "dyn", data=q, limit=10,
+            filter='$meta["category"] == "tech"',
+        )
+        # All results should be even ids (category == tech)
+        for hit in res[0]:
+            assert hit["id"] % 2 == 0
+
+        milvus_client.drop_collection("dyn")
