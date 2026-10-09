@@ -29,6 +29,8 @@ const IMPLEMENTED_METHODS: &[&str] = &[
     "Upsert",
     "Flush",
     "GetFlushState",
+    "ManualCompaction",
+    "GetCompactionState",
     "Query",
     "Search",
 ];

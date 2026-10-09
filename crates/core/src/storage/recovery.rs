@@ -1,6 +1,6 @@
 //! collection 的只读恢复阶段：先验证全部引用文件，再把行与 tombstone 纳入有效位图。
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -103,6 +103,8 @@ pub struct RecoveredCollection {
     pub next_seq: u64,
     pub next_wal_number: u64,
     pub wal_warnings: Vec<String>,
+    pub(crate) retained_old_wal: bool,
+    pub(crate) committed_deletes: HashMap<Pk, u64>,
 }
 
 /// 只在全部引用文件、WAL 与 schema 均验证成功后调用；snapshot 钉住的文件不可删除。
@@ -417,7 +419,10 @@ pub fn load_committed(collection_dir: &Path) -> Result<RecoveredCollection, Reco
             manifest.current_seq
         )));
     }
+    // WAL 会覆盖全局最大删除；先保留真正已提交的删除，不复制数据主键表。
+    let committed_deletes = visibility.delete_snapshot();
     let mut wal_warnings = Vec::new();
+    let mut retained_old_wal = false;
     let wal_paths = scan_wal(&collection_dir.join("wal"))?;
     // 无 WAL 文件就不会回放，不需要复制提交态的全量主键判定表。
     let committed = (!wal_paths.is_empty()).then(|| visibility.clone());
@@ -436,6 +441,7 @@ pub fn load_committed(collection_dir: &Path) -> Result<RecoveredCollection, Reco
                 }
                 for batch in recovered.batches {
                     let decoded = arrow_data::decode_wal_data_batch(&schema, &batch)?;
+                    retained_old_wal |= decoded.seqs.iter().any(|seq| *seq <= manifest.current_seq);
                     if let Some(&first_seq) = decoded.seqs.first() {
                         operations.push((first_seq, WalOperation::Data(decoded)));
                     }
@@ -449,6 +455,7 @@ pub fn load_committed(collection_dir: &Path) -> Result<RecoveredCollection, Reco
                 }
                 for batch in recovered.batches {
                     let decoded = arrow_data::decode_wal_delta_batch(&schema, &batch)?;
+                    retained_old_wal |= decoded.seqs.iter().any(|seq| *seq <= manifest.current_seq);
                     if let Some(&first_seq) = decoded.seqs.first() {
                         operations.push((first_seq, WalOperation::Delete(decoded)));
                     }
@@ -498,6 +505,8 @@ pub fn load_committed(collection_dir: &Path) -> Result<RecoveredCollection, Reco
         next_seq,
         next_wal_number,
         wal_warnings,
+        retained_old_wal,
+        committed_deletes,
     })
 }
 

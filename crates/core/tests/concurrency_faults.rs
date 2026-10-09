@@ -55,11 +55,12 @@ fn batch(id: i64, age: i64) -> InsertBatch {
         ],
     }
 }
-fn open(path: &std::path::Path) -> Db {
+fn open(path: &std::path::Path) -> std::sync::Arc<Db> {
     Db::new(
         DataDir::open(path).unwrap(),
         Compute::new(std::num::NonZeroUsize::new(2).unwrap()).unwrap(),
     )
+    .unwrap()
 }
 fn rows(view: &milvus_lite_core::collection::ReadSnapshot) -> BTreeMap<i64, i64> {
     let result = view

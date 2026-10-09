@@ -6,16 +6,16 @@
 
 | 状态 | 含义 | 条数 |
 | --- | --- | --- |
-| 已复制 | 原样复制到本目录 | 120 |
+| 已复制 | 原样复制到本目录 | 122 |
 | 改后复制 | 仅按 0004「验收」第 2 项与 0006 第 25 项授权的条件替换，逐条说明改动 | 46 |
 | 范围外 | 用到当前切片不支持的功能，不复制；未实现能力的代表性入口见「范围外功能的 `UNIMPLEMENTED` 断言」 | 127 |
 | 待复用 | S1 已解除原过滤阻断，尚须核对 fixture 并迁移；不计入已运行套件 | 0 |
 | 依赖内部模块 | 导入或使用 3.x 的内部模块、内部对象，换成本实现后无法运行 | 33 |
 | 不运行 | 上游被同名定义覆盖，上游自己也不运行 | 1 |
 
-以上是逐条列出的 22 个文件中的 327 条；其余 25 个文件的 310 条整个文件记一行原因，见「整个文件不复用的文件」。
+以上是逐条列出的 23 个文件中的 329 条；其余 24 个文件的 308 条整个文件记一行原因，见「整个文件不复用的文件」。
 
-「已复制」与「改后复制」共 166 个用例函数，参数化展开后 180 条。S1 恢复 [test_grpc_crud.py](test_grpc_crud.py) 中的原过滤表达式，并纳入除 LIKE 外的全部 19 条；它们在本实现与真实 3.x 上的两条客户端线均作为 S1 验收。随后迁移全部 40 条待复用用例，恢复此前为绕过过滤限制而替换的原表达式；顶层动态字段切片另加入原样的 TestDynamicField 用例。HNSW→FLAT 的授权替换继续逐条登记。
+「已复制」与「改后复制」共 168 个用例函数，参数化展开后 182 条。S1 恢复 [test_grpc_crud.py](test_grpc_crud.py) 中的原过滤表达式，并纳入除 LIKE 外的全部 19 条；它们在本实现与真实 3.x 上的两条客户端线均作为 S1 验收。随后迁移全部 40 条待复用用例，恢复此前为绕过过滤限制而替换的原表达式；顶层动态字段切片另加入原样的 TestDynamicField 用例。HNSW→FLAT 的授权替换继续逐条登记。
 
 HNSW 换成 FLAT、`== N` 换成 `in [N]` 的条件见 0004「验收」第 2 项及 0006 第 25 项。已接通 S1 的 CRUD 副本不再替换表达式或读回方式。其余副本只删去随范围外用例一起不再使用的 import、helper 与空的分节标题；上游用于跳过的 `importorskip` 改为直接导入（本仓不允许因缺依赖静默跳过），上游因 HNSW 需要 faiss 而加的 `skipif` 随 HNSW 一起去掉。起服务的 fixture 与清理见 [conftest.py](conftest.py)。
 
@@ -504,6 +504,15 @@ HNSW 换成 FLAT、`== N` 换成 `in [N]` 的条件见 0004「验收」第 2 项
 | [`test_collection_stats_follow_upsert_delete_flush_and_truncate`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_p0_features.py#L195) | 范围外 | delete、upsert、flush、truncate |
 | [`test_partition_stats_follow_upsert_delete_and_flush`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_p0_features.py#L231) | 范围外 | delete、upsert、分区、flush |
 | [`test_statistics_missing_resources_raise`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_p0_features.py#L273) | 范围外 | 分区 |
+## [test_grpc_compaction.py](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_compaction.py)
+
+2 条原样复制。自动维护及两个应答 RPC 的合同见 [0010](../../../docs/decisions/0010-compaction-and-tombstone-gc.md)；Completed 是兼容应答，不表示后台维护已排空。
+
+| 用例 | 状态 | 说明 |
+| --- | --- | --- |
+| `test_compact_empty_collection_reports_completed` | 已复制 | 空集合应答 |
+| `test_compact_preserves_logical_rows_and_search` | 已复制 | 更新、删除与检索结果保持 |
+
 ## 范围外功能的 `UNIMPLEMENTED` 断言
 
 范围外的用例不复制，也不用 skip 占位；当前尚未实现的代表性功能另有用例断言返回 `UNIMPLEMENTED` 且原因正确：
@@ -519,7 +528,8 @@ HNSW 换成 FLAT、`== N` 换成 `in [N]` 的条件见 0004「验收」第 2 项
 | 修改 schema 与 collection properties、rename | `test_pymilvus_entry_points_remaining_unsupported` |
 | HybridSearch、range search、group_by、rerank、请求中的 `timezone` | `test_search_m1_unsupported`、`test_pymilvus_entry_points_remaining_unsupported` |
 | FLAT、BRUTE_FORCE、AUTOINDEX 以外的索引类型 | `test_create_index_m1_unsupported` |
-| DropIndex、compaction | `test_pymilvus_entry_points_remaining_unsupported` |
+| DropIndex | `test_pymilvus_entry_points_remaining_unsupported` |
+| GetCompactionPlans | [test_server_manager.py](../test_server_manager.py) 的 `test_unimplemented_rpc_reason` |
 | snapshot 等其余未列出的 RPC 与 service | `test_unimplemented_rpc_reason`（未实现的 RPC 统一由 [guard.rs](../../../crates/grpc/src/guard.rs) 处理） |
 
 ## 整个文件不复用的文件
@@ -534,7 +544,6 @@ HNSW 换成 FLAT、`== N` 换成 `in [N]` 的条件见 0004「验收」第 2 项
 | [test_boost_ranker.py](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_boost_ranker.py) | 8 | rerank（boost） |
 | [test_group_by.py](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_group_by.py) | 11 | group_by；其中 6 条依赖内部模块 |
 | [test_grpc_collection_properties.py](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_collection_properties.py) | 4 | 修改 collection properties、alias、多数据库 |
-| [test_grpc_compaction.py](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_compaction.py) | 2 | compaction、flush、delete、upsert |
 | [test_grpc_database.py](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_database.py) | 23 | 多数据库 |
 | [test_grpc_fts.py](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_fts.py) | 7 | BM25、稀疏向量、text_match；其中 1 条依赖内部模块 |
 | [test_grpc_geometry.py](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_geometry.py) | 8 | GEOMETRY |

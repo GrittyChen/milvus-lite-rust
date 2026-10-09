@@ -484,7 +484,7 @@ M1 证明了整条链路可行，但数据只在内存中，不发布（[0004](0
 - **物理行序**：按第 23 项。
 - **过滤 S1**：按第 1 项的边界，作用于 Query（含 limit / offset 与 `count(*)`）、Search 与 Delete。
 - **RPC**：
-  - Delete、Upsert、Flush、GetFlushState；ManualCompaction 与 GetCompactionState 按第 3 项返回 UNIMPLEMENTED；
+  - Delete、Upsert、Flush、GetFlushState；ManualCompaction 与 GetCompactionState 在 M2 历史范围按第 3 项返回 UNIMPLEMENTED；后续首发扩展按 0010 接通；
   - 持久化之后 `row_count`、`count(*)`、`DescribeIndex` 行数与 load 状态的语义与 3.x 相同。
 - **0004 交给 M2 的事项**：
   - `metric_type` 与索引度量不一致时，flush 过的数据按请求的度量计算（0004「决策」）；
@@ -585,9 +585,9 @@ M1 证明了整条链路可行，但数据只在内存中，不发布（[0004](0
 | --- | --- | --- | --- | --- |
 | 含不支持内容的 collection | 能使用 | 列出；DescribeCollection 与 drop 照常，其余返回 UNIMPLEMENTED | 第 14 项 | 用 3.x 的其他功能写过的目录 |
 | 已有的别名与其他数据库 | 能使用 | UNIMPLEMENTED | 第 15 项 | 经别名或 `db_name` 的访问 |
-| 带 limit 的过滤结果顺序 | 后台 compaction 之后改变 | 不做 compaction，不变 | 第 3 项 | 带 limit 且文件数不少于 4 的过滤 |
-| ManualCompaction 与 GetCompactionState | 返回成功，恒为 Completed | UNIMPLEMENTED | 第 3 项，不变量 15 | `client.compact()`、`optimize()` |
-| 被覆盖的旧版本与已删除的行 | compaction 回收 | 不回收 | 第 3 项 | 长期运行的写入 |
+| 带 limit 的过滤结果顺序 | 后台 compaction 之后改变 | M2 历史不合并；首发扩展按 [0010](0010-compaction-and-tombstone-gc.md) 的来源序/差异验收 | 第 3 项及后续 0010 | 带 limit 且文件数不少于 4 的过滤 |
+| ManualCompaction 与 GetCompactionState | 返回成功，恒为 Completed | M2 历史 UNIMPLEMENTED；首发扩展成功应答/Completed，不能当成 drain | 第 3 项、0010，不变量 15 | `client.compact()`、`optimize()` |
+| 被覆盖的旧版本与已删除的行 | compaction 回收 | M2 历史不回收；首发按 0010/0011 合并与 GC | 第 3 项、0010/0011 | 长期运行的写入 |
 
 ## 验收
 
@@ -676,3 +676,9 @@ M1 证明了整条链路可行，但数据只在内存中，不发布（[0004](0
 - **AGENTS.md**：
   - 架构地图、技术栈（arrow-rs 与 CoreFoundation 的说明）、常用命令，随引入的 module、依赖与命令更新；
   - 「技术栈」中 serde_json 一条：「它的 Map 按 key 排序，与 3.x 存 `$meta` 时的 `sort_keys=True` 一致」，在开启 `preserve_order` 与 `arbitrary_precision` 时改为第 26 项的做法。
+
+## 首发合并扩展的范围说明
+
+M2 的“不做 compaction”是当时冻结范围，后续首发扩展以 [0010](0010-compaction-and-tombstone-gc.md) 与 [0011](0011-committed-delete-state.md) 为准。正常关闭排空的生命周期同步到 0003；共享格式与原有失败协议保持。
+
+该扩展的差异表在 0010：单 Db 串行维护、文件大小桶的编码器影响、准备期并发 flush、create/drop 取消及异常收尾、原子合并 data/delta 提交、打开时 pins 的边界，以及歧义重复主键/序号的整轮拒绝。原保守最大删除表的 20% 残留已触发负责人确认的 0011；最终回收与内存结论以本轮复跑证据为准。

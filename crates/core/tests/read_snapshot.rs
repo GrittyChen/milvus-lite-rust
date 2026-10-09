@@ -64,7 +64,8 @@ fn varchar_get_pins_remapped_blocks_and_keeps_duplicate_input_order() {
         let db = Db::new(
             DataDir::open(root.path()).unwrap(),
             Compute::for_host().unwrap(),
-        );
+        )
+        .unwrap();
         let mut schema = schema();
         schema.fields[0].data_type = DataType::VarChar;
         schema.fields[0].max_length = Some(32);
@@ -109,10 +110,11 @@ fn varchar_get_pins_remapped_blocks_and_keeps_duplicate_input_order() {
 fn publication_maps_latest_visibility_after_writes_in_the_next_generation() {
     use milvus_lite_core::storage::runtime::pause_flush_before_commit_once;
     let root = tempfile::tempdir().unwrap();
-    let db = Arc::new(Db::new(
+    let db = Db::new(
         DataDir::open(root.path()).unwrap(),
         Compute::for_host().unwrap(),
-    ));
+    )
+    .unwrap();
     db.create_collection("", "c", schema()).unwrap();
     for id in [3, 1, 2] {
         db.insert("", "c", batch(&[id], 1.0)).unwrap();
@@ -155,7 +157,8 @@ fn publication_maps_latest_visibility_after_writes_in_the_next_generation() {
     let reopened = Db::new(
         DataDir::open(root.path()).unwrap(),
         Compute::for_host().unwrap(),
-    );
+    )
+    .unwrap();
     assert_eq!(
         reopened
             .collection("", "c")
@@ -173,10 +176,11 @@ fn locked_snapshot_acquisition_then_unlocked_read_survives_mutation_publication_
     // 分别钉住活跃代与已提交数据；重复请求主键与缺失主键同时验收 Get。
     for committed in [false, true] {
         let root = tempfile::tempdir().unwrap();
-        let db = Arc::new(Db::new(
+        let db = Db::new(
             DataDir::open(root.path()).unwrap(),
             Compute::for_host().unwrap(),
-        ));
+        )
+        .unwrap();
         db.create_collection("", "c", schema()).unwrap();
         db.insert("", "c", batch(&[3, 1, 2], 1.0)).unwrap();
         if committed {
@@ -273,7 +277,8 @@ fn pending_generation_snapshot_survives_pre_and_post_commit_failure_then_retry()
         let db = Db::new(
             DataDir::open(root.path()).unwrap(),
             Compute::for_host().unwrap(),
-        );
+        )
+        .unwrap();
         db.create_collection("", "c", schema()).unwrap();
         db.insert("", "c", batch(&[3, 1, 2], 1.0)).unwrap();
         let handle = db.collection("", "c").unwrap();
@@ -316,7 +321,8 @@ fn disconnected_flush_pause_stays_before_commit_and_can_retry() {
         let db = Db::new(
             DataDir::open(root.path()).unwrap(),
             Compute::for_host().unwrap(),
-        );
+        )
+        .unwrap();
         db.create_collection("", "c", schema()).unwrap();
         db.insert("", "c", batch(&[1], 1.0)).unwrap();
         db.flush_collection("", "c").unwrap();
@@ -339,7 +345,8 @@ fn disconnected_flush_pause_stays_before_commit_and_can_retry() {
         let reopened = Db::new(
             DataDir::open(root.path()).unwrap(),
             Compute::for_host().unwrap(),
-        );
+        )
+        .unwrap();
         assert_eq!(reopened.collection("", "c").unwrap().read().count(), 2);
         reopened.close();
     }

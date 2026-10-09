@@ -8,7 +8,15 @@ M2 崩溃矩阵已覆盖混合 data/delta WAL 写入后的进程退出、flush �
 
 M2 最终验收候选与 Linux LOCK/strace 证据见[验收记录](docs/testing/m2-acceptance.md)，三方性能及修后复测见 [0001](docs/decisions/0001-refactor-baseline.md#m2-三方基准)。性能目标只部分达到，当前候选已通过范围内复审；这不代表首次发布或生产可用。
 
-M2 性能阶段已按负责人确认的顺序收口，各专项结果和未达目标见[阶段总结](docs/testing/m2-performance-summary.md)。接下来补齐[首发最小范围](docs/decisions/0008-first-release-scope.md)：当前切片增加[顶层动态字段过滤](docs/decisions/0009-top-level-dynamic-filter.md)，支持裸字段比较/in 与 `$meta["key"]` 比较；嵌套 JSON 路径等仍显式拒绝。compaction、CLI、Windows 和完整发布验收尚未完成，生产限制保留。
+M2 性能阶段已按负责人确认的顺序收口，各专项结果和未达目标见[阶段总结](docs/testing/m2-performance-summary.md)。接下来补齐[首发最小范围](docs/decisions/0008-first-release-scope.md)：当前切片增加[顶层动态字段过滤](docs/decisions/0009-top-level-dynamic-filter.md)，支持裸字段比较/in 与 `$meta["key"]` 比较；嵌套 JSON 路径等仍显式拒绝。后台 compaction 与整份 tombstone GC 已接入，采用[0010](docs/decisions/0010-compaction-and-tombstone-gc.md) 的单 Db 维护线程和[0011](docs/decisions/0011-committed-delete-state.md) 的独立已提交删除状态，本轮实现与修复已通过评审，证据见[实施验收记录](docs/testing/compaction-correctness.md)；CLI、Windows 和首次发布验收仍未完成，生产限制保留。
+
+## 已知限制
+
+- 正常停服/脚本退出会排空已接受的后台合并，可能额外等待若干轮；RPC 的两秒宽限不是整个停服时限。Ctrl-C 可能直到原生等待返回后才由 Python 处理。退出等待测量口径见[合并条件验收](benchmarks/compaction/README.md)，观测值不能作为阻塞 I/O 的绝对上界。
+- SIGKILL 不执行正常停服；按 WAL/manifest 协议，下次打开恢复已返回成功的写入。这是进程崩溃恢复保证，不等于真实断电证据。
+- 维护线程串行处理同一 Db 的 collection；文件大小桶受 Parquet 编码器影响，已登记的并发/布局差异见 0010。历史旧 WAL 风险和跨选中/未选中来源的同主键同序号歧义会延后或拒绝维护，保留诊断。
+- 合并成功诊断默认静默；需要观察单轮及发布锁耗时时，在服务启动前设置 `MILVUS_LITE_COMPACTION_DIAGNOSTICS=1`，口径见[合并条件验收](benchmarks/compaction/README.md)。
+- 独立已提交删除表增加与 tombstone 数和主键长度有关的内存；额外占用需与回收效果一起看，不能用普通无删除数据的 RSS 代表删除重负载。
 
 ## 文档
 

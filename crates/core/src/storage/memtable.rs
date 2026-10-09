@@ -72,6 +72,18 @@ pub struct FrozenMemTable {
 }
 
 impl FrozenMemTable {
+    pub(crate) fn delete_entries(&self) -> impl Iterator<Item = (&Pk, u64)> {
+        self.memtable
+            .tombstones
+            .iter()
+            .map(|(pk, delete)| (pk, delete.seq))
+    }
+    pub(crate) fn size(&self) -> usize {
+        self.memtable.size()
+    }
+    pub(crate) fn has_legacy_operations(&self, committed: u64) -> bool {
+        self.memtable.has_legacy_operations(committed)
+    }
     pub fn max_seq(&self) -> u64 {
         self.memtable.max_seq
     }
@@ -86,6 +98,15 @@ impl FrozenMemTable {
 }
 
 impl MemTable {
+    pub(crate) fn has_legacy_operations(&self, committed: u64) -> bool {
+        self.batches
+            .iter()
+            .any(|batch| batch.seqs.iter().any(|seq| *seq <= committed))
+            || self
+                .tombstones
+                .values()
+                .any(|delete| delete.seq <= committed)
+    }
     pub fn new(source: SourceId) -> Self {
         Self {
             source,

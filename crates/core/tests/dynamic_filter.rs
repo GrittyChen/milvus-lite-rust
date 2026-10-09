@@ -24,8 +24,8 @@ fn schema() -> CollectionSchema {
         properties: vec![],
     }
 }
-fn db(path: &std::path::Path) -> Db {
-    Db::new(DataDir::open(path).unwrap(), Compute::for_host().unwrap())
+fn db(path: &std::path::Path) -> std::sync::Arc<Db> {
+    Db::new(DataDir::open(path).unwrap(), Compute::for_host().unwrap()).unwrap()
 }
 fn batch(start: i64, values: &[Value]) -> InsertBatch {
     InsertBatch {

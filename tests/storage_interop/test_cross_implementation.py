@@ -18,6 +18,64 @@ PYTHONS = (
 
 
 @pytest.mark.parametrize("writer", ["rust", "reference"])
+@pytest.mark.parametrize("arrow", ["MILVUS_LITE_ARROW15_PYTHON", "MILVUS_LITE_ARROW25_PYTHON"])
+def test_compacted_directory_cross_opens_updates_and_keeps_physical_order(tmp_path, interpreters, writer, arrow):
+    root=tmp_path / 'compacted.db'
+    write="""
+import sys
+from pymilvus import MilvusClient,DataType
+from milvus_lite.server_manager import server_manager_instance as manager
+path=sys.argv[1]
+client=MilvusClient(path,dedicated=True)
+schema=MilvusClient.create_schema(auto_id=False,enable_dynamic_field=True)
+schema.add_field('id',DataType.INT64,is_primary=True)
+schema.add_field('vector',DataType.FLOAT_VECTOR,dim=2)
+indexes=client.prepare_index_params();indexes.add_index('vector',index_type='FLAT',metric_type='L2')
+client.create_collection('c',schema=schema,index_params=indexes)
+for part in range(4):
+ client.insert('c',[{'id':pk,'vector':[1.,0.],'tag':pk} for pk in range(part*10,(part+1)*10)])
+ client.flush('c')
+client.close();manager.release_server(path)
+"""
+    read="""
+import sys
+from pymilvus import MilvusClient
+from milvus_lite.server_manager import server_manager_instance as manager
+path=sys.argv[1]
+client=MilvusClient(path,dedicated=True)
+try:
+ client.load_collection('c')
+ rows=client.query('c',filter='',limit=40,output_fields=['id','tag'])
+ assert [row['id'] for row in rows]==list(range(40)),rows
+ assert client.query('c',filter='tag >= 35',output_fields=['count(*)'])==[{'count(*)':5}]
+ client.upsert('c',[{'id':1,'vector':[2.,0.],'tag':99}]);client.delete('c',ids=[2]);client.flush('c')
+finally:client.close();manager.release_server(path)
+"""
+    verify="""
+import sys
+from pymilvus import MilvusClient
+from milvus_lite.server_manager import server_manager_instance as manager
+path=sys.argv[1];client=MilvusClient(path,dedicated=True)
+try:
+ client.load_collection('c')
+ assert client.query('c',output_fields=['count(*)'])==[{'count(*)':39}]
+ assert list(client.get('c',[1,2],output_fields=['tag','vector']))==[{'id':1,'tag':99,'vector':[2.,0.]}]
+finally:client.close();manager.release_server(path)
+"""
+    writer_python=sys.executable if writer=='rust' else interpreters[PYTHONS[0]]
+    reader_python=interpreters[PYTHONS[0]] if writer=='rust' else sys.executable
+    run([writer_python,'-c',write,str(root)],cwd=tmp_path)
+    collection=root / 'collections/c'
+    manifest=json.loads((collection / 'manifest.json').read_text())
+    assert len(manifest['partitions']['_default']['data_files'])==1
+    parquet=collection / 'partitions/_default' / manifest['partitions']['_default']['data_files'][0]
+    checked=run([interpreters[arrow],'-c',"import pyarrow.parquet as pq,sys; t=pq.read_table(sys.argv[1]);t.validate(full=True);assert t.num_rows==40;print(t.column('_seq').to_pylist())",str(parquet)])
+    assert json.loads(checked)==list(range(1,41))
+    run([reader_python,'-c',read,str(root)],cwd=tmp_path)
+    run([writer_python,'-c',verify,str(root)],cwd=tmp_path)
+
+
+@pytest.mark.parametrize("writer", ["rust", "reference"])
 @pytest.mark.parametrize("storage", ["wal", "flushed"])
 def test_top_level_dynamic_filters_read_the_other_implementations_directory(tmp_path, interpreters, writer, storage):
     root=tmp_path/'dynamic.db'

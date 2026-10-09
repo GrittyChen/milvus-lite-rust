@@ -303,7 +303,7 @@ fn output_name(
     }
 }
 
-fn has_index_sidecar(data_or_delta_dir: &Path, stem: &str) -> Result<bool, FlushError> {
+pub(crate) fn has_index_sidecar(data_or_delta_dir: &Path, stem: &str) -> Result<bool, FlushError> {
     let partition = data_or_delta_dir.parent().ok_or_else(|| {
         FlushError::before(
             data_or_delta_dir,

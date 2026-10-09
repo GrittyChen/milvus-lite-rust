@@ -167,10 +167,11 @@ mod tests {
     #[test]
     fn query_parses_before_acquiring_the_state_lock() {
         let root = tempfile::tempdir().unwrap();
-        let db = Arc::new(Db::new(
+        let db = Db::new(
             DataDir::open(root.path()).unwrap(),
             Compute::for_host().unwrap(),
-        ));
+        )
+        .unwrap();
         let mut id = FieldSchema::new("id", DataType::Int64);
         id.is_primary = true;
         let mut vector = FieldSchema::new("v", DataType::FloatVector);
@@ -250,10 +251,11 @@ mod tests {
     #[test]
     fn query_gathers_and_encodes_after_releasing_state_lock() {
         let root = tempfile::tempdir().unwrap();
-        let db = Arc::new(Db::new(
+        let db = Db::new(
             DataDir::open(root.path()).unwrap(),
             Compute::for_host().unwrap(),
-        ));
+        )
+        .unwrap();
         let mut id = FieldSchema::new("id", DataType::Int64);
         id.is_primary = true;
         let mut v = FieldSchema::new("v", DataType::FloatVector);

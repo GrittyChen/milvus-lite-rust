@@ -47,11 +47,12 @@ fn batch(rows: &[(i64, [f32; 2])]) -> InsertBatch {
     }
 }
 
-fn prepared_mixed_db(path: &str) -> Db {
+fn prepared_mixed_db(path: &str) -> std::sync::Arc<Db> {
     let db = Db::new(
         DataDir::open(std::path::Path::new(path)).unwrap(),
         compute(),
-    );
+    )
+    .unwrap();
     db.create_collection("", "c", schema()).unwrap();
     db.insert("", "c", batch(&[(1, [1.0, 0.0]), (2, [0.0, 1.0])]))
         .unwrap();
@@ -89,7 +90,8 @@ fn create_index_crash_child(stage: &str) {
     let db = Db::new(
         DataDir::open(std::path::Path::new(&path)).unwrap(),
         compute(),
-    );
+    )
+    .unwrap();
     db.create_collection("", "c", schema()).unwrap();
     db.insert("", "c", batch(&[(1, [1.0, 0.0]), (2, [0.0, 1.0])]))
         .unwrap();
@@ -153,7 +155,7 @@ fn mixed_data_and_delta_survive_crash_on_both_sides_of_manifest_replace() {
         assert!(wal.join("wal_data_000002.arrow").exists());
         assert!(wal.join("wal_delta_000002.arrow").exists());
 
-        let db = Db::new(DataDir::open(&path).unwrap(), compute());
+        let db = Db::new(DataDir::open(&path).unwrap(), compute()).unwrap();
         let handle = db.collection("", "c").unwrap();
         let part = path.join("collections/c/partitions/_default");
         for (kind, expected) in [
@@ -184,7 +186,7 @@ fn mixed_data_and_delta_survive_crash_on_both_sides_of_manifest_replace() {
         db.close();
         drop(db);
 
-        let reopened = Db::new(DataDir::open(&path).unwrap(), compute());
+        let reopened = Db::new(DataDir::open(&path).unwrap(), compute()).unwrap();
         assert_eq!(reopened.collection("", "c").unwrap().read().count(), 2);
         reopened.close();
     }
@@ -232,7 +234,7 @@ fn create_index_crash_preserves_pending_data_and_index_commit_boundary() {
         );
         assert_eq!(manifest.index_specs.contains_key("v"), !pending && !before);
 
-        let db = Db::new(DataDir::open(&path).unwrap(), compute());
+        let db = Db::new(DataDir::open(&path).unwrap(), compute()).unwrap();
         let handle = db.collection("", "c").unwrap();
         assert_eq!(
             handle.read().load_state(),
@@ -281,7 +283,7 @@ fn data_wal_unlinked_before_delta_wal_crash_does_not_resurrect_rows() {
     let wal = path.join("collections/c/wal");
     assert!(!wal.join("wal_data_000002.arrow").exists());
     assert!(wal.join("wal_delta_000002.arrow").exists());
-    let db = Db::new(DataDir::open(&path).unwrap(), compute());
+    let db = Db::new(DataDir::open(&path).unwrap(), compute()).unwrap();
     let handle = db.collection("", "c").unwrap();
     assert_eq!(handle.read().count(), 2);
     assert_eq!(
@@ -308,7 +310,8 @@ fn collection_directory_rename_crashes_preserve_commit_boundary() {
         let db = Db::new(
             DataDir::open(std::path::Path::new(&path)).unwrap(),
             compute(),
-        );
+        )
+        .unwrap();
         let creating = stage.starts_with("create");
         if !creating {
             db.create_collection("", "c", schema()).unwrap();
@@ -373,7 +376,7 @@ fn collection_directory_rename_crashes_preserve_commit_boundary() {
         assert_eq!(status.code(), Some(88));
         let exists = stage == "create-after" || stage == "drop-before";
         assert_eq!(path.join("collections/c/schema.json").exists(), exists);
-        let db = Db::new(DataDir::open(&path).unwrap(), compute());
+        let db = Db::new(DataDir::open(&path).unwrap(), compute()).unwrap();
         assert!(
             std::fs::read_dir(path.join(".database-staging"))
                 .unwrap()
@@ -407,7 +410,7 @@ fn collection_directory_rename_crashes_preserve_commit_boundary() {
             assert!(aliases.get("old").is_none());
         }
         db.close();
-        let reopened = Db::new(DataDir::open(&path).unwrap(), compute());
+        let reopened = Db::new(DataDir::open(&path).unwrap(), compute()).unwrap();
         assert_eq!(
             reopened.collection("", "c").is_ok(),
             exists || stage == "drop-after"
@@ -430,7 +433,8 @@ fn failed_wal_append_then_process_exit_never_applies_failed_insert_upsert_or_del
         let db = Db::new(
             DataDir::open(std::path::Path::new(&path)).unwrap(),
             compute(),
-        );
+        )
+        .unwrap();
         db.create_collection("", "c", schema()).unwrap();
         db.insert("", "c", batch(&[(1, [1.0, 0.0]), (2, [1.0, 0.0])]))
             .unwrap();
@@ -500,7 +504,7 @@ fn failed_wal_append_then_process_exit_never_applies_failed_insert_upsert_or_del
                     let status = Command::new(std::env::current_exe().unwrap()).args(["--exact", "failed_wal_append_then_process_exit_never_applies_failed_insert_upsert_or_delete", "--nocapture"])
                         .env("MILVUS_LITE_FAILED_WAL_CASE", &case).env("MILVUS_LITE_CRASH_DIR", &path).status().unwrap();
                     assert_eq!(status.code(), Some(89), "{case}");
-                    let db = Db::new(DataDir::open(&path).unwrap(), compute());
+                    let db = Db::new(DataDir::open(&path).unwrap(), compute()).unwrap();
                     let handle = db.collection("", "c").unwrap();
                     let mut expected = vec![Pk::Int64(1)];
                     if operation != "delete" || writer == "first" {

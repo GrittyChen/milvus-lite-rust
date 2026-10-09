@@ -499,21 +499,21 @@ impl ReadSnapshot {
 
 /// 数据与有效位分离，使覆盖和删除无需复制向量、JSON 与动态字段。
 #[derive(Debug, Clone)]
-struct Chunk {
-    data: Arc<ChunkData>,
+pub(crate) struct Chunk {
+    pub(crate) data: Arc<ChunkData>,
     live: SourceBits,
     generation: u64,
     source: SourceId,
-    row_start: usize,
+    pub(crate) row_start: usize,
     source_rank: usize,
 }
 
 #[derive(Debug, Clone)]
-struct ChunkData {
-    columns: Vec<ColumnData>,
-    meta: Option<Vec<Map<String, Value>>>,
-    norms: Vec<f32>,
-    seqs: Vec<u64>,
+pub(crate) struct ChunkData {
+    pub(crate) columns: Vec<ColumnData>,
+    pub(crate) meta: Option<Vec<Map<String, Value>>>,
+    pub(crate) norms: Vec<f32>,
+    pub(crate) seqs: Vec<u64>,
     orders: Vec<u64>,
 }
 
@@ -612,6 +612,11 @@ impl Collection {
         let mut collection = Self::new(name, recovered.schema.clone())?;
         collection.next_seq = recovered.next_seq;
         let snapshot = recovered.visibility.snapshot();
+        let data_sources = recovered
+            .segments
+            .iter()
+            .map(|s| (s.relative_path.clone(), s.source))
+            .collect();
         // 活行数已由恢复确定；一次预留避免建表时同时保留扩容前后的两张哈希表。
         collection.pk_index.reserve(
             collection.schema.fields[collection.pk_pos].data_type,
@@ -693,7 +698,11 @@ impl Collection {
         if !collection.indexes.is_empty() {
             collection.load_state = LoadState::Released;
         }
-        collection.persistent = Some(PersistentCollection::recovered(dir, recovered));
+        collection.persistent = Some(PersistentCollection::recovered(
+            dir,
+            recovered,
+            data_sources,
+        ));
         Ok(collection)
     }
 
@@ -932,16 +941,20 @@ impl Collection {
             .persistent
             .as_mut()
             .ok_or_else(|| EngineError::Storage("persistent state missing".into()))?;
-        let source = persistent
-            .publish(
-                generation,
-                manifest,
-                mapping,
-                rows,
-                &source_rows,
-                retry_manifest,
-            )
-            .map_err(EngineError::Storage)?;
+        let source = match persistent.publish(
+            generation,
+            manifest,
+            mapping,
+            rows,
+            &source_rows,
+            retry_manifest,
+        ) {
+            Ok(source) => source,
+            Err(reason) => {
+                persistent.poison();
+                return Err(EngineError::Storage(reason));
+            }
+        };
         for &id in &ids {
             self.chunks.remove(&id);
         }
@@ -964,6 +977,256 @@ impl Collection {
             for (pk, at) in refs {
                 self.pk_index.insert(pk, at);
             }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn compaction_view(&self) -> Result<Option<crate::storage::compaction::View>> {
+        use crate::storage::compaction::{Input, View};
+        let p = self
+            .persistent
+            .as_ref()
+            .ok_or_else(|| EngineError::Storage("persistent state missing".into()))?;
+        if self.deleted || !p.can_compact().map_err(EngineError::Storage)? {
+            return Ok(None);
+        }
+        let inputs = p.manifest.partitions["_default"]
+            .data_files
+            .iter()
+            .enumerate()
+            .map(|(rank, relative)| {
+                let source = *p
+                    .data_sources
+                    .get(relative)
+                    .ok_or_else(|| EngineError::Storage("manifest read source missing".into()))?;
+                let chunks = self
+                    .chunks
+                    .values()
+                    .filter(|c| c.source == source)
+                    .cloned()
+                    .collect();
+                Ok(Input {
+                    relative: relative.clone(),
+                    source,
+                    rank,
+                    chunks,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Some(View {
+            dir: p.dir.clone(),
+            schema: self.schema.clone(),
+            manifest: p.manifest.clone(),
+            pins: p.pinned_files.clone(),
+            inputs,
+            sync_inherited: !p.inherited_synced(),
+        }))
+    }
+
+    pub(crate) fn compaction_deletes(
+        &self,
+        inputs: &[crate::storage::compaction::Input],
+    ) -> Result<HashMap<Pk, u64>> {
+        let p = self
+            .persistent
+            .as_ref()
+            .ok_or_else(|| EngineError::Storage("persistent state missing".into()))?;
+        let mut deletes = HashMap::new();
+        for input in inputs {
+            for chunk in &input.chunks {
+                for row in 0..chunk.seqs.len() {
+                    let pk = crate::storage::compaction::primary(chunk, self.pk_pos, row)?;
+                    if let Some(&seq) = p.committed_deletes.get(&pk) {
+                        deletes.insert(pk, seq);
+                    }
+                }
+            }
+        }
+        Ok(deletes)
+    }
+
+    pub(crate) fn validate_compaction(
+        &self,
+        prepared: &crate::storage::compaction::Prepared,
+    ) -> Result<()> {
+        let mut seen: Vec<_> = prepared
+            .outputs
+            .iter()
+            .map(|o| vec![false; o.data.seqs.len()])
+            .collect();
+        for (i, input) in prepared.inputs.iter().enumerate() {
+            let current: Vec<_> = self
+                .chunks
+                .iter()
+                .filter(|(_, c)| c.source == input.source)
+                .collect();
+            let mut physical = 0;
+            for (&id, chunk) in current {
+                if chunk.row_start != physical {
+                    return Err(EngineError::Storage(
+                        "compaction source blocks changed".into(),
+                    ));
+                }
+                for row in 0..chunk.seqs.len() {
+                    let pk = crate::storage::compaction::primary(chunk, self.pk_pos, row)?;
+                    let target = prepared
+                        .mapping
+                        .get(i)
+                        .and_then(|v| v.get(physical + row))
+                        .ok_or_else(|| EngineError::Storage("compaction mapping missing".into()))?;
+                    if let Some(target) = target {
+                        let output = prepared.outputs.get(target.output).ok_or_else(|| {
+                            EngineError::Storage("compaction output missing".into())
+                        })?;
+                        let marked = seen
+                            .get_mut(target.output)
+                            .and_then(|s| s.get_mut(target.row))
+                            .ok_or_else(|| {
+                                EngineError::Storage("compaction target out of range".into())
+                            })?;
+                        let output_pk = match output.data.columns.get(self.pk_pos) {
+                            Some(ColumnData::Int64(v)) => v.get(target.row).copied().map(Pk::Int64),
+                            Some(ColumnData::VarChar(v)) => {
+                                v.get(target.row).cloned().map(Pk::VarChar)
+                            }
+                            _ => None,
+                        };
+                        if *marked
+                            || output.data.seqs.get(target.row) != Some(&chunk.seqs[row])
+                            || output_pk.as_ref() != Some(&pk)
+                        {
+                            return Err(EngineError::Storage(
+                                "compaction data mapping differs from input".into(),
+                            ));
+                        }
+                        *marked = true;
+                        if chunk.live.get(row)
+                            && self
+                                .pk_index
+                                .get(&pk)
+                                .is_none_or(|at| at.chunk != id || at.row != row)
+                        {
+                            return Err(EngineError::Storage(
+                                "compaction live primary reference missing".into(),
+                            ));
+                        }
+                    } else if chunk.live.get(row) {
+                        return Err(EngineError::Storage("compaction drops a live row".into()));
+                    }
+                }
+                physical += chunk.seqs.len();
+            }
+            if physical != prepared.mapping[i].len() {
+                return Err(EngineError::Storage(
+                    "compaction source row count changed".into(),
+                ));
+            }
+        }
+        if seen.iter().flatten().any(|v| !v) {
+            return Err(EngineError::Storage(
+                "compaction output not fully mapped".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn publish_compaction(
+        &mut self,
+        prepared: &mut crate::storage::compaction::Prepared,
+        manifest: crate::storage::manifest::Manifest,
+        threshold: Option<u64>,
+        durability_error: Option<String>,
+    ) -> Result<()> {
+        use crate::storage::visibility::CompactionRow;
+        self.validate_compaction(prepared)?;
+        let p = self
+            .persistent
+            .as_ref()
+            .ok_or_else(|| EngineError::Storage("persistent state missing".into()))?;
+        if p.poisoned() {
+            return Err(EngineError::Storage(
+                "collection was poisoned during compaction".into(),
+            ));
+        }
+        let ids = p
+            .compaction_sources(prepared.outputs.len())
+            .map_err(EngineError::Storage)?;
+        let end = self
+            .next_chunk
+            .checked_add(ids.len())
+            .ok_or_else(|| EngineError::Storage("read block ID exhausted".into()))?;
+        let mut live: Vec<_> = prepared
+            .outputs
+            .iter()
+            .map(|o| vec![false; o.data.seqs.len()])
+            .collect();
+        let mut refs = Vec::new();
+        let mut physical_rows = Vec::new();
+        for (i, input) in prepared.inputs.iter().enumerate() {
+            let mut rows = Vec::with_capacity(prepared.mapping[i].len());
+            for chunk in self.chunks.values().filter(|c| c.source == input.source) {
+                for row in 0..chunk.seqs.len() {
+                    let pk = crate::storage::compaction::primary(chunk, self.pk_pos, row)?;
+                    let target = prepared.mapping[i][chunk.row_start + row];
+                    if let Some(t) = target
+                        && chunk.live.get(row)
+                    {
+                        live[t.output][t.row] = true;
+                        refs.push((
+                            pk.clone(),
+                            RowRef {
+                                chunk: self.next_chunk + t.output,
+                                row: t.row,
+                                order: t.row as u64,
+                            },
+                        ));
+                    }
+                    rows.push(CompactionRow {
+                        pk,
+                        seq: chunk.seqs[row],
+                        target: target.map(|t| (ids[t.output], t.row)),
+                    });
+                }
+            }
+            physical_rows.push((input.source, rows));
+        }
+        self.persistent
+            .as_mut()
+            .ok_or_else(|| EngineError::Storage("persistent state missing".into()))?
+            .publish_compaction(
+                prepared,
+                manifest,
+                &ids,
+                &physical_rows,
+                threshold,
+                durability_error,
+            )
+            .map_err(EngineError::Storage)?;
+        self.chunks
+            .retain(|_, c| !prepared.inputs.iter().any(|i| i.source == c.source));
+        for (i, output) in prepared.outputs.drain(..).enumerate() {
+            let orders = (0..output.data.seqs.len() as u64).collect();
+            self.chunks.insert(
+                self.next_chunk + i,
+                Chunk {
+                    data: Arc::new(ChunkData {
+                        columns: output.data.columns,
+                        meta: output.data.meta,
+                        seqs: output.data.seqs,
+                        norms: output.norms,
+                        orders,
+                    }),
+                    live: SourceBits::from_live(&live[i]),
+                    generation: 0,
+                    source: ids[i],
+                    row_start: 0,
+                    source_rank: 0,
+                },
+            );
+        }
+        self.next_chunk = end;
+        for (pk, at) in refs {
+            self.pk_index.insert(pk, at);
         }
         Ok(())
     }
@@ -1497,8 +1760,33 @@ impl Collection {
         }
     }
 
+    #[allow(clippy::expect_used)] // 持久化块与 visibility 来源在同一次状态写锁内登记/移除。
     pub fn read_snapshot(&self) -> ReadSnapshot {
         let mut snapshot = self.read_metadata();
+        if let Some(persistent) = &self.persistent {
+            let ranks: HashMap<_, _> = persistent
+                .visibility
+                .source_order()
+                .iter()
+                .enumerate()
+                .map(|(rank, id)| (*id, rank))
+                .collect();
+            snapshot.chunks = self
+                .chunks
+                .values()
+                .cloned()
+                .map(|mut chunk| {
+                    chunk.source_rank = *ranks
+                        .get(&chunk.source)
+                        .expect("persistent read source is registered");
+                    chunk
+                })
+                .collect();
+            snapshot
+                .chunks
+                .sort_by_key(|chunk| (chunk.source_rank, chunk.row_start));
+            return snapshot;
+        }
         let mut previous = None;
         let mut rank = 0;
         snapshot.chunks = self
@@ -2154,7 +2442,8 @@ mod tests {
         let db = Db::new(
             DataDir::open(root.path()).unwrap(),
             Compute::for_host().unwrap(),
-        );
+        )
+        .unwrap();
         db.create_collection("", "c", schema).unwrap();
         for ids in [vec![1, 2], vec![3, 4]] {
             db.insert(
@@ -2282,7 +2571,8 @@ mod tests {
             let db = Db::new(
                 DataDir::open(root.path()).unwrap(),
                 Compute::for_host().unwrap(),
-            );
+            )
+            .unwrap();
             db.create_collection("", "c", collection(&mut rng, 2).schema.clone())
                 .unwrap();
             db.close();
@@ -2336,7 +2626,8 @@ mod tests {
         let db = Db::new(
             DataDir::open(root.path()).unwrap(),
             Compute::for_host().unwrap(),
-        );
+        )
+        .unwrap();
         db.create_collection("", "c", collection(&mut rng, 2).schema.clone())
             .unwrap();
         db.insert(
@@ -2396,7 +2687,8 @@ mod tests {
         let reopened = Db::new(
             DataDir::open(root.path()).unwrap(),
             Compute::for_host().unwrap(),
-        );
+        )
+        .unwrap();
         let recovered = reopened.collection("", "c").unwrap();
         assert_storage_mapping(&recovered.read());
         assert_eq!(recovered.read().count(), 2);
@@ -2420,7 +2712,8 @@ mod tests {
         let db = Db::new(
             DataDir::open(root.path()).unwrap(),
             Compute::for_host().unwrap(),
-        );
+        )
+        .unwrap();
         db.create_collection("", "c", collection(&mut rng, 2).schema.clone())
             .unwrap();
         let rows = |ids: &[i64]| InsertBatch {
@@ -2518,7 +2811,8 @@ mod tests {
         let db = Db::new(
             DataDir::open(root.path()).unwrap(),
             Compute::for_host().unwrap(),
-        );
+        )
+        .unwrap();
         db.create_collection("", "c", template.schema.clone())
             .unwrap();
         let handle = db.collection("", "c").unwrap();
@@ -2592,7 +2886,8 @@ mod tests {
         let reopened = Db::new(
             DataDir::open(root.path()).unwrap(),
             Compute::for_host().unwrap(),
-        );
+        )
+        .unwrap();
         assert_storage_mapping(&reopened.collection("", "c").unwrap().read());
         reopened.close();
     }
@@ -2665,7 +2960,8 @@ mod tests {
             let db = Db::new(
                 DataDir::open(root.path()).unwrap(),
                 Compute::for_host().unwrap(),
-            );
+            )
+            .unwrap();
             db.create_collection("", "c", collection(&mut rng, 2).schema.clone())
                 .unwrap();
             db.insert(

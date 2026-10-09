@@ -14,5 +14,8 @@ crate-type = ["cdylib"]
 milvus-lite-grpc.workspace = true
 pyo3 = { workspace = true, features = ["abi3-py310", "extension-module"] }
 
+[features]
+fault-injection = ["milvus-lite-grpc/fault-injection"]
+
 [lints]
 workspace = true

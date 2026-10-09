@@ -45,7 +45,7 @@ fn drop_displaced_open_collection_retires_wal_and_old_handle_before_recreate() {
     for remove in [false, true] {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("displaced.db");
-        let db = Db::new(DataDir::open(&path).unwrap(), compute());
+        let db = Db::new(DataDir::open(&path).unwrap(), compute()).unwrap();
         db.create_collection("", "c", schema()).unwrap();
         db.insert("", "c", batch(&[1, 2])).unwrap();
         db.delete("", "c", &[Pk::Int64(1)]).unwrap();
@@ -89,7 +89,7 @@ fn drop_displaced_open_collection_retires_wal_and_old_handle_before_recreate() {
         db.insert("", "c", batch(&[9])).unwrap();
         db.flush_collection("", "c").unwrap();
         db.close();
-        let reopened = Db::new(DataDir::open(&path).unwrap(), compute());
+        let reopened = Db::new(DataDir::open(&path).unwrap(), compute()).unwrap();
         assert_eq!(
             reopened
                 .collection("", "c")
@@ -114,7 +114,7 @@ fn displaced_drop_sync_failure_retains_handle_and_retries_without_creating_files
     for fault in [RetainedWalSyncFault::Data, RetainedWalSyncFault::Delta] {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("displaced-failure.db");
-        let db = Db::new(DataDir::open(&path).unwrap(), compute());
+        let db = Db::new(DataDir::open(&path).unwrap(), compute()).unwrap();
         db.create_collection("", "c", schema()).unwrap();
         db.insert("", "c", batch(&[1, 2])).unwrap();
         db.delete("", "c", &[Pk::Int64(1)]).unwrap();
@@ -146,7 +146,7 @@ fn displaced_drop_sync_failure_retains_handle_and_retries_without_creating_files
 fn drop_missing_schema_retires_the_open_handle_without_removing_the_residual_directory() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("missing-schema.db");
-    let db = Db::new(DataDir::open(&path).unwrap(), compute());
+    let db = Db::new(DataDir::open(&path).unwrap(), compute()).unwrap();
     db.create_collection("", "c", schema()).unwrap();
     db.insert("", "c", batch(&[1])).unwrap();
     let old = db.collection("", "c").unwrap();
@@ -172,7 +172,7 @@ fn drop_missing_schema_retires_the_open_handle_without_removing_the_residual_dir
 fn empty_delete_does_not_create_wal_or_consume_sequence() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("empty-delete.db");
-    let db = Db::new(DataDir::open(&path).unwrap(), compute());
+    let db = Db::new(DataDir::open(&path).unwrap(), compute()).unwrap();
     let mut auto_schema = schema();
     auto_schema.fields[0].auto_id = true;
     db.create_collection("", "c", auto_schema).unwrap();
@@ -204,7 +204,7 @@ fn empty_delete_does_not_create_wal_or_consume_sequence() {
 fn delete_and_partial_upsert_survive_flush_and_reopen() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("mutations.db");
-    let db = Db::new(DataDir::open(&path).unwrap(), compute());
+    let db = Db::new(DataDir::open(&path).unwrap(), compute()).unwrap();
     db.create_collection("", "c", schema()).unwrap();
     db.insert("", "c", batch(&[1, 2])).unwrap();
     db.flush_collection("", "c").unwrap();
@@ -239,7 +239,7 @@ fn delete_and_partial_upsert_survive_flush_and_reopen() {
     db.close();
     drop(db);
 
-    let reopened = Db::new(DataDir::open(&path).unwrap(), compute());
+    let reopened = Db::new(DataDir::open(&path).unwrap(), compute()).unwrap();
     let handle = reopened.collection("", "c").unwrap();
     let c = handle.read();
     assert_eq!(c.count(), 1);
@@ -262,7 +262,7 @@ fn delete_and_partial_upsert_survive_flush_and_reopen() {
 fn upsert_repeated_pk_merges_with_earlier_row_in_same_batch() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("merge.db");
-    let db = Db::new(DataDir::open(&path).unwrap(), compute());
+    let db = Db::new(DataDir::open(&path).unwrap(), compute()).unwrap();
     db.create_collection("", "c", schema()).unwrap();
     let merged = InsertBatch {
         num_rows: 2,
@@ -284,7 +284,7 @@ fn upsert_repeated_pk_merges_with_earlier_row_in_same_batch() {
     assert_eq!(db.collection("", "c").unwrap().read().count(), 1);
     db.close();
     drop(db);
-    let reopened = Db::new(DataDir::open(&path).unwrap(), compute());
+    let reopened = Db::new(DataDir::open(&path).unwrap(), compute()).unwrap();
     assert_eq!(reopened.collection("", "c").unwrap().read().count(), 1);
     reopened.close();
 }
@@ -293,7 +293,7 @@ fn upsert_repeated_pk_merges_with_earlier_row_in_same_batch() {
 fn concurrent_partial_upserts_preserve_both_fields() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("concurrent-upsert.db");
-    let db = std::sync::Arc::new(Db::new(DataDir::open(&path).unwrap(), compute()));
+    let db = Db::new(DataDir::open(&path).unwrap(), compute()).unwrap();
     let mut dynamic_schema = schema();
     dynamic_schema.enable_dynamic_field = true;
     db.create_collection("", "c", dynamic_schema).unwrap();
@@ -341,7 +341,7 @@ fn concurrent_partial_upserts_preserve_both_fields() {
 fn create_insert_flush_close_and_reopen() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("demo.db");
-    let db = Db::new(DataDir::open(&path).unwrap(), compute());
+    let db = Db::new(DataDir::open(&path).unwrap(), compute()).unwrap();
     db.create_collection("", "c", schema()).unwrap();
     assert!(matches!(
         db.collection("", "c").unwrap().write().insert(batch(&[99])),
@@ -357,7 +357,7 @@ fn create_insert_flush_close_and_reopen() {
     db.close();
     drop(db);
 
-    let reopened = Db::new(DataDir::open(&path).unwrap(), compute());
+    let reopened = Db::new(DataDir::open(&path).unwrap(), compute()).unwrap();
     assert_eq!(reopened.list_collections("").unwrap().len(), 1);
     let handle = reopened.collection("", "c").unwrap();
     let collection = handle.read();
@@ -372,13 +372,13 @@ fn create_insert_flush_close_and_reopen() {
 fn close_nowait_keeps_unflushed_wal_for_recovery() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("wal.db");
-    let db = std::sync::Arc::new(Db::new(DataDir::open(&path).unwrap(), compute()));
+    let db = Db::new(DataDir::open(&path).unwrap(), compute()).unwrap();
     db.create_collection("", "c", schema()).unwrap();
     db.insert("", "c", batch(&[10, 20])).unwrap();
     db.close_nowait();
     db.close();
     drop(db);
-    let reopened = Db::new(DataDir::open(&path).unwrap(), compute());
+    let reopened = Db::new(DataDir::open(&path).unwrap(), compute()).unwrap();
     assert_eq!(reopened.collection("", "c").unwrap().read().count(), 2);
     reopened.close();
 }
@@ -387,7 +387,7 @@ fn close_nowait_keeps_unflushed_wal_for_recovery() {
 fn close_nowait_keeps_unflushed_delta_wal_for_recovery() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("delta-wal.db");
-    let db = std::sync::Arc::new(Db::new(DataDir::open(&path).unwrap(), compute()));
+    let db = Db::new(DataDir::open(&path).unwrap(), compute()).unwrap();
     db.create_collection("", "c", schema()).unwrap();
     db.insert("", "c", batch(&[1, 2])).unwrap();
     db.flush_collection("", "c").unwrap();
@@ -395,7 +395,7 @@ fn close_nowait_keeps_unflushed_delta_wal_for_recovery() {
     db.close_nowait();
     db.close();
     drop(db);
-    let reopened = Db::new(DataDir::open(&path).unwrap(), compute());
+    let reopened = Db::new(DataDir::open(&path).unwrap(), compute()).unwrap();
     assert_eq!(reopened.collection("", "c").unwrap().read().count(), 1);
     reopened.close();
 }
@@ -404,7 +404,7 @@ fn close_nowait_keeps_unflushed_delta_wal_for_recovery() {
 fn drop_then_recreate_rejects_the_old_handle() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("drop.db");
-    let db = Db::new(DataDir::open(&path).unwrap(), compute());
+    let db = Db::new(DataDir::open(&path).unwrap(), compute()).unwrap();
     db.create_collection("", "c", schema()).unwrap();
     let old = db.collection("", "c").unwrap();
     db.insert("", "c", batch(&[1])).unwrap();
@@ -413,7 +413,7 @@ fn drop_then_recreate_rejects_the_old_handle() {
     db.create_collection("", "c", schema()).unwrap();
     assert_eq!(db.collection("", "c").unwrap().read().count(), 0);
     db.close();
-    let reopened = Db::new(DataDir::open(&path).unwrap(), compute());
+    let reopened = Db::new(DataDir::open(&path).unwrap(), compute()).unwrap();
     assert_eq!(reopened.collection("", "c").unwrap().read().count(), 0);
     reopened.close();
 }
@@ -422,7 +422,7 @@ fn drop_then_recreate_rejects_the_old_handle() {
 fn one_corrupt_collection_fails_closed_without_hiding_others() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("broken.db");
-    let db = Db::new(DataDir::open(&path).unwrap(), compute());
+    let db = Db::new(DataDir::open(&path).unwrap(), compute()).unwrap();
     for name in ["broken", "healthy"] {
         db.create_collection("", name, schema()).unwrap();
         db.insert("", name, batch(&[1])).unwrap();
@@ -436,7 +436,7 @@ fn one_corrupt_collection_fails_closed_without_hiding_others() {
         .unwrap()
         .count();
 
-    let reopened = Db::new(DataDir::open(&path).unwrap(), compute());
+    let reopened = Db::new(DataDir::open(&path).unwrap(), compute()).unwrap();
     assert_eq!(
         reopened.list_collections("").unwrap(),
         vec![
@@ -467,7 +467,7 @@ fn one_corrupt_collection_fails_closed_without_hiding_others() {
 fn invalid_snapshot_metadata_preserves_unreferenced_files() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("snapshot-error.db");
-    let db = Db::new(DataDir::open(&path).unwrap(), compute());
+    let db = Db::new(DataDir::open(&path).unwrap(), compute()).unwrap();
     db.create_collection("", "c", schema()).unwrap();
     db.insert("", "c", batch(&[1])).unwrap();
     db.close();
@@ -478,7 +478,7 @@ fn invalid_snapshot_metadata_preserves_unreferenced_files() {
     std::fs::create_dir_all(&metadata).unwrap();
     std::fs::write(metadata.join("broken.json"), b"{").unwrap();
 
-    let reopened = Db::new(DataDir::open(&path).unwrap(), compute());
+    let reopened = Db::new(DataDir::open(&path).unwrap(), compute()).unwrap();
     assert!(matches!(
         reopened.collection("", "c"),
         Err(EngineError::Storage(_))
@@ -491,7 +491,7 @@ fn invalid_snapshot_metadata_preserves_unreferenced_files() {
 fn future_schema_key_fails_as_unsupported_without_modifying_files() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("future.db");
-    let db = Db::new(DataDir::open(&path).unwrap(), compute());
+    let db = Db::new(DataDir::open(&path).unwrap(), compute()).unwrap();
     db.create_collection("", "c", schema()).unwrap();
     db.close();
     let schema_path = path.join("collections/c/schema.json");
@@ -500,7 +500,7 @@ fn future_schema_key_fails_as_unsupported_without_modifying_files() {
     value["future_key"] = serde_json::json!(1);
     let bytes = serde_json::to_vec(&value).unwrap();
     std::fs::write(&schema_path, &bytes).unwrap();
-    let reopened = Db::new(DataDir::open(&path).unwrap(), compute());
+    let reopened = Db::new(DataDir::open(&path).unwrap(), compute()).unwrap();
     assert_eq!(
         reopened.list_collections("").unwrap(),
         [("c".to_owned(), LoadState::Released)]
@@ -517,7 +517,7 @@ fn future_schema_key_fails_as_unsupported_without_modifying_files() {
 fn index_spec_is_committed_and_recovered_with_load_state() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("index.db");
-    let db = Db::new(DataDir::open(&path).unwrap(), compute());
+    let db = Db::new(DataDir::open(&path).unwrap(), compute()).unwrap();
     db.create_collection("", "c", schema()).unwrap();
     db.insert("", "c", batch(&[1])).unwrap();
     db.create_index(
@@ -537,7 +537,7 @@ fn index_spec_is_committed_and_recovered_with_load_state() {
     assert_eq!(manifest["index_specs"]["v"]["metric_type"], "L2");
     db.close();
 
-    let reopened = Db::new(DataDir::open(&path).unwrap(), compute());
+    let reopened = Db::new(DataDir::open(&path).unwrap(), compute()).unwrap();
     let handle = reopened.collection("", "c").unwrap();
     let collection = handle.read();
     assert_eq!(collection.load_state(), LoadState::Released);
@@ -552,7 +552,7 @@ fn index_spec_is_committed_and_recovered_with_load_state() {
 fn insert_response_pk_type_comes_from_the_handle_that_received_the_write() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("recreate.db");
-    let db = Db::new(DataDir::open(&path).unwrap(), compute());
+    let db = Db::new(DataDir::open(&path).unwrap(), compute()).unwrap();
     db.create_collection("", "c", schema()).unwrap();
     let old_handle = db.collection("", "c").unwrap();
     db.drop_collection("", "c").unwrap();
@@ -603,7 +603,7 @@ fn insert_response_pk_type_comes_from_the_handle_that_received_the_write() {
 fn create_cleans_dangling_aliases_before_the_new_name_can_reuse_them() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("aliases.db");
-    let db = Db::new(DataDir::open(&path).unwrap(), compute());
+    let db = Db::new(DataDir::open(&path).unwrap(), compute()).unwrap();
     db.create_collection("", "existing", schema()).unwrap();
     std::fs::write(
         path.join("aliases.json"),
@@ -621,7 +621,7 @@ fn create_cleans_dangling_aliases_before_the_new_name_can_reuse_them() {
 fn create_checks_directory_shape_before_cleaning_aliases() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("occupied.db");
-    let db = Db::new(DataDir::open(&path).unwrap(), compute());
+    let db = Db::new(DataDir::open(&path).unwrap(), compute()).unwrap();
     let aliases = br#"{"stale":"missing"}"#;
     std::fs::write(path.join("aliases.json"), aliases).unwrap();
     std::fs::write(path.join("collections"), b"occupied").unwrap();
@@ -649,7 +649,7 @@ fn orphan_cleanup_io_failures_do_not_block_healthy_collection_reads() {
     ] {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("cleanup-error.db");
-        let db = Db::new(DataDir::open(&path).unwrap(), compute());
+        let db = Db::new(DataDir::open(&path).unwrap(), compute()).unwrap();
         db.create_collection("", "c", schema()).unwrap();
         db.insert("", "c", batch(&[1, 2])).unwrap();
         db.close();
@@ -659,7 +659,7 @@ fn orphan_cleanup_io_failures_do_not_block_healthy_collection_reads() {
         let orphan = dir.join(name);
         std::fs::write(&orphan, b"unreferenced").unwrap();
 
-        let reopened = Db::new(DataDir::open(&path).unwrap(), compute());
+        let reopened = Db::new(DataDir::open(&path).unwrap(), compute()).unwrap();
         inject_orphan_cleanup_failure_once(fault);
         let handle = reopened.collection("", "c").unwrap();
         assert_eq!(handle.read().count(), 2);
@@ -683,7 +683,7 @@ fn orphan_cleanup_io_failures_do_not_block_healthy_collection_reads() {
         drop(handle);
         reopened.close();
         drop(reopened);
-        let final_open = Db::new(DataDir::open(&path).unwrap(), compute());
+        let final_open = Db::new(DataDir::open(&path).unwrap(), compute()).unwrap();
         assert_eq!(final_open.collection("", "c").unwrap().read().count(), 3);
         assert!(!orphan.exists());
         final_open.close();
@@ -697,7 +697,7 @@ fn post_replace_failure_recommits_before_accepting_another_write() {
 
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("fault.db");
-    let db = Db::new(DataDir::open(&path).unwrap(), compute());
+    let db = Db::new(DataDir::open(&path).unwrap(), compute()).unwrap();
     db.create_collection("", "c", schema()).unwrap();
     db.insert("", "c", batch(&[1])).unwrap();
     inject_manifest_dir_sync_failure_once();
@@ -722,7 +722,7 @@ fn post_replace_failure_recommits_before_accepting_another_write() {
     std::thread::sleep(std::time::Duration::from_millis(1050));
     db.insert("", "c", batch(&[3])).unwrap();
     db.close();
-    let reopened = Db::new(DataDir::open(&path).unwrap(), compute());
+    let reopened = Db::new(DataDir::open(&path).unwrap(), compute()).unwrap();
     assert_eq!(reopened.collection("", "c").unwrap().read().count(), 3);
     reopened.close();
 }
@@ -734,14 +734,14 @@ fn partial_wal_append_does_not_resurrect_the_failed_batch() {
 
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("partial.db");
-    let db = Db::new(DataDir::open(&path).unwrap(), compute());
+    let db = Db::new(DataDir::open(&path).unwrap(), compute()).unwrap();
     db.create_collection("", "c", schema()).unwrap();
     db.insert("", "c", batch(&[1])).unwrap();
     inject_append_failure_after_bytes(20);
     assert!(db.insert("", "c", batch(&[2])).is_err());
     db.insert("", "c", batch(&[3])).unwrap();
     db.close();
-    let reopened = Db::new(DataDir::open(&path).unwrap(), compute());
+    let reopened = Db::new(DataDir::open(&path).unwrap(), compute()).unwrap();
     let handle = reopened.collection("", "c").unwrap();
     assert_eq!(handle.read().count(), 2);
     assert_eq!(
@@ -764,7 +764,7 @@ fn partial_delta_wal_append_keeps_the_deleted_row_live() {
 
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("partial-delta.db");
-    let db = Db::new(DataDir::open(&path).unwrap(), compute());
+    let db = Db::new(DataDir::open(&path).unwrap(), compute()).unwrap();
     db.create_collection("", "c", schema()).unwrap();
     db.insert("", "c", batch(&[1, 2])).unwrap();
     inject_append_failure_after_bytes(20);
@@ -773,7 +773,7 @@ fn partial_delta_wal_append_keeps_the_deleted_row_live() {
     db.delete("", "c", &[Pk::Int64(2)]).unwrap();
     db.close();
     drop(db);
-    let reopened = Db::new(DataDir::open(&path).unwrap(), compute());
+    let reopened = Db::new(DataDir::open(&path).unwrap(), compute()).unwrap();
     assert_eq!(reopened.collection("", "c").unwrap().read().count(), 1);
     assert_eq!(
         reopened
@@ -796,7 +796,7 @@ fn wal_cleanup_failures_do_not_block_later_inserts() {
 
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("cleanup.db");
-    let db = Db::new(DataDir::open(&path).unwrap(), compute());
+    let db = Db::new(DataDir::open(&path).unwrap(), compute()).unwrap();
     db.create_collection("", "c", schema()).unwrap();
     for id in [1, 2] {
         db.insert("", "c", batch(&[id])).unwrap();
@@ -805,7 +805,7 @@ fn wal_cleanup_failures_do_not_block_later_inserts() {
     }
     db.insert("", "c", batch(&[3])).unwrap();
     db.close();
-    let reopened = Db::new(DataDir::open(&path).unwrap(), compute());
+    let reopened = Db::new(DataDir::open(&path).unwrap(), compute()).unwrap();
     assert_eq!(reopened.collection("", "c").unwrap().read().count(), 3);
     reopened.close();
 }
@@ -817,14 +817,14 @@ fn close_worker_spawn_failure_still_syncs_accepted_wal() {
 
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("worker.db");
-    let db = std::sync::Arc::new(Db::new(DataDir::open(&path).unwrap(), compute()));
+    let db = Db::new(DataDir::open(&path).unwrap(), compute()).unwrap();
     db.create_collection("", "c", schema()).unwrap();
     db.insert("", "c", batch(&[1])).unwrap();
     db.delete("", "c", &[Pk::Int64(1)]).unwrap();
     inject_close_worker_spawn_failure_once();
     db.close_nowait();
     drop(db);
-    let reopened = Db::new(DataDir::open(&path).unwrap(), compute());
+    let reopened = Db::new(DataDir::open(&path).unwrap(), compute()).unwrap();
     assert_eq!(reopened.collection("", "c").unwrap().read().count(), 0);
     reopened.close();
 }
@@ -836,7 +836,7 @@ fn inherited_files_are_synced_before_the_first_commit_only() {
 
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("sync-once.db");
-    let db = Db::new(DataDir::open(&path).unwrap(), compute());
+    let db = Db::new(DataDir::open(&path).unwrap(), compute()).unwrap();
     db.create_collection("", "c", schema()).unwrap();
     let before = inherited_sync_count();
     for id in [1, 2] {
@@ -855,7 +855,7 @@ fn index_recommit_does_not_delete_inherited_wal_before_first_generation_publish(
 
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("inherited-wal.db");
-    let db = std::sync::Arc::new(Db::new(DataDir::open(&path).unwrap(), compute()));
+    let db = Db::new(DataDir::open(&path).unwrap(), compute()).unwrap();
     db.create_collection("", "c", schema()).unwrap();
     db.insert("", "c", batch(&[1])).unwrap();
     inject_wal_unlink_failure_once();
@@ -866,7 +866,7 @@ fn index_recommit_does_not_delete_inherited_wal_before_first_generation_publish(
     let wal = path.join("collections/c/wal/wal_data_000001.arrow");
     assert!(wal.exists());
 
-    let reopened = Db::new(DataDir::open(&path).unwrap(), compute());
+    let reopened = Db::new(DataDir::open(&path).unwrap(), compute()).unwrap();
     assert_eq!(reopened.collection("", "c").unwrap().read().count(), 1);
     inject_manifest_dir_sync_failure_once();
     reopened
@@ -888,7 +888,7 @@ fn index_recommit_does_not_delete_inherited_wal_before_first_generation_publish(
     reopened.flush_collection("", "c").unwrap();
     assert!(!wal.exists());
     reopened.close();
-    let final_open = Db::new(DataDir::open(&path).unwrap(), compute());
+    let final_open = Db::new(DataDir::open(&path).unwrap(), compute()).unwrap();
     assert_eq!(final_open.collection("", "c").unwrap().read().count(), 2);
     final_open.close();
 }
@@ -900,7 +900,7 @@ fn normalized_create_name_rolls_back_before_exposing_collection() {
 
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("normalized.db");
-    let db = Db::new(DataDir::open(&path).unwrap(), compute());
+    let db = Db::new(DataDir::open(&path).unwrap(), compute()).unwrap();
     inject_create_name_verification_failure_once();
     assert!(db.create_collection("", "c", schema()).is_err());
     assert!(!path.join("collections/c").exists());
@@ -921,13 +921,13 @@ fn directory_sync_failure_and_panic_seal_all_mutations_but_preserve_open_reads()
             for fault in [DirectoryFault::Error, DirectoryFault::Panic] {
                 let root = tempfile::tempdir().unwrap();
                 let path = root.path().join("sealed.db");
-                let db = Db::new(DataDir::open(&path).unwrap(), compute());
+                let db = Db::new(DataDir::open(&path).unwrap(), compute()).unwrap();
                 for name in ["existing", "lazy", "victim"] {
                     db.create_collection("", name, schema()).unwrap();
                     db.insert("", name, batch(&[1])).unwrap();
                 }
                 db.close();
-                let db = Db::new(DataDir::open(&path).unwrap(), compute());
+                let db = Db::new(DataDir::open(&path).unwrap(), compute()).unwrap();
                 let existing = db.collection("", "existing").unwrap();
                 let victim = db.collection("", "victim").unwrap();
                 let orphan = path.join("collections/lazy/partitions/_default/data/orphan");
@@ -1014,7 +1014,7 @@ fn directory_sync_failure_and_panic_seal_all_mutations_but_preserve_open_reads()
                 for (path, bytes) in retained {
                     assert_eq!(std::fs::read(path).unwrap(), bytes);
                 }
-                let reopened = Db::new(DataDir::open(&path).unwrap(), compute());
+                let reopened = Db::new(DataDir::open(&path).unwrap(), compute()).unwrap();
                 assert_eq!(
                     reopened.collection("", "existing").unwrap().read().count(),
                     2
@@ -1035,7 +1035,7 @@ fn rename_failure_keeps_collection_usable_and_retryable() {
         DirectoryFault, DirectoryOperation, DirectoryPoint, inject_directory_fault_once,
     };
     let root = tempfile::tempdir().unwrap();
-    let db = Db::new(DataDir::open(root.path()).unwrap(), compute());
+    let db = Db::new(DataDir::open(root.path()).unwrap(), compute()).unwrap();
     inject_directory_fault_once(
         DirectoryOperation::Create,
         DirectoryPoint::BeforeRename,
@@ -1066,7 +1066,7 @@ fn committed_drop_alias_error_is_explicit_and_retry_does_not_rebind_old_alias() 
     };
     for retry in ["same-drop", "recreate", "other-drop"] {
         let root = tempfile::tempdir().unwrap();
-        let db = Db::new(DataDir::open(root.path()).unwrap(), compute());
+        let db = Db::new(DataDir::open(root.path()).unwrap(), compute()).unwrap();
         db.create_collection("", "c", schema()).unwrap();
         db.create_collection("", "other", schema()).unwrap();
         std::fs::write(
@@ -1112,7 +1112,7 @@ fn startup_staging_cleanup_failures_allow_healthy_collection_reads_and_retry() {
     use milvus_lite_core::data_dir::{StagingFault, inject_staging_failure_once};
     for fault in [StagingFault::Remove, StagingFault::Sync] {
         let root = tempfile::tempdir().unwrap();
-        let db = Db::new(DataDir::open(root.path()).unwrap(), compute());
+        let db = Db::new(DataDir::open(root.path()).unwrap(), compute()).unwrap();
         db.create_collection("", "c", schema()).unwrap();
         db.insert("", "c", batch(&[1])).unwrap();
         db.close();
@@ -1120,11 +1120,11 @@ fn startup_staging_cleanup_failures_allow_healthy_collection_reads_and_retry() {
         std::fs::create_dir_all(&residue).unwrap();
         std::fs::write(residue.join("keep"), b"residue").unwrap();
         inject_staging_failure_once(fault);
-        let db = Db::new(DataDir::open(root.path()).unwrap(), compute());
+        let db = Db::new(DataDir::open(root.path()).unwrap(), compute()).unwrap();
         assert_eq!(db.collection("", "c").unwrap().read().count(), 1);
         assert_eq!(residue.exists(), fault == StagingFault::Remove);
         db.close();
-        let db = Db::new(DataDir::open(root.path()).unwrap(), compute());
+        let db = Db::new(DataDir::open(root.path()).unwrap(), compute()).unwrap();
         assert!(!residue.exists());
         assert_eq!(db.collection("", "c").unwrap().read().count(), 1);
         db.close();
@@ -1139,7 +1139,7 @@ fn create_and_drop_wait_for_first_lazy_open_cleanup() {
     use std::time::Duration;
     for creating in [false, true] {
         let root = tempfile::tempdir().unwrap();
-        let db = Db::new(DataDir::open(root.path()).unwrap(), compute());
+        let db = Db::new(DataDir::open(root.path()).unwrap(), compute()).unwrap();
         for name in ["lazy", "victim"] {
             db.create_collection("", name, schema()).unwrap();
         }
@@ -1149,7 +1149,7 @@ fn create_and_drop_wait_for_first_lazy_open_cleanup() {
             .path()
             .join("collections/lazy/partitions/_default/data/orphan");
         std::fs::write(&orphan, b"orphan").unwrap();
-        let db = Arc::new(Db::new(DataDir::open(root.path()).unwrap(), compute()));
+        let db = Db::new(DataDir::open(root.path()).unwrap(), compute()).unwrap();
         let (entered_tx, entered_rx) = mpsc::channel();
         let (resume_tx, resume_rx) = mpsc::channel();
         let opener = Arc::clone(&db);
@@ -1201,7 +1201,7 @@ fn drop_wal_sync_failure_preserves_data_and_delta_and_accepts_later_writes() {
         RetainedWalSyncFault::Directory,
     ] {
         let root = tempfile::tempdir().unwrap();
-        let db = Db::new(DataDir::open(root.path()).unwrap(), compute());
+        let db = Db::new(DataDir::open(root.path()).unwrap(), compute()).unwrap();
         db.create_collection("", "c", schema()).unwrap();
         db.insert("", "c", batch(&[1, 2])).unwrap();
         db.delete("", "c", &[Pk::Int64(1)]).unwrap();
@@ -1221,7 +1221,7 @@ fn drop_wal_sync_failure_preserves_data_and_delta_and_accepts_later_writes() {
             [Pk::Int64(3)]
         );
         db.close();
-        let reopened = Db::new(DataDir::open(root.path()).unwrap(), compute());
+        let reopened = Db::new(DataDir::open(root.path()).unwrap(), compute()).unwrap();
         assert_eq!(
             reopened
                 .collection("", "c")
@@ -1247,7 +1247,7 @@ fn reopen_uses_actual_directory_state_after_unconfirmed_rename() {
     for op in [DirectoryOperation::Create, DirectoryOperation::Drop] {
         for rolled_back in [false, true] {
             let root = tempfile::tempdir().unwrap();
-            let db = Db::new(DataDir::open(root.path()).unwrap(), compute());
+            let db = Db::new(DataDir::open(root.path()).unwrap(), compute()).unwrap();
             if op == DirectoryOperation::Drop {
                 db.create_collection("", "c", schema()).unwrap();
                 db.insert("", "c", batch(&[1, 2])).unwrap();
@@ -1286,7 +1286,7 @@ fn reopen_uses_actual_directory_state_after_unconfirmed_rename() {
                     std::fs::rename(residue, root.path().join("collections/c")).unwrap();
                 }
             }
-            let reopened = Db::new(DataDir::open(root.path()).unwrap(), compute());
+            let reopened = Db::new(DataDir::open(root.path()).unwrap(), compute()).unwrap();
             let exists = (op == DirectoryOperation::Create) != rolled_back;
             assert_eq!(reopened.collection("", "c").is_ok(), exists);
             if exists {
@@ -1329,7 +1329,7 @@ fn create_alias_cleanup_fault_fires_before_directory_commit_and_can_retry() {
         DirectoryFault, DirectoryOperation, DirectoryPoint, inject_directory_fault_once,
     };
     let root = tempfile::tempdir().unwrap();
-    let db = Db::new(DataDir::open(root.path()).unwrap(), compute());
+    let db = Db::new(DataDir::open(root.path()).unwrap(), compute()).unwrap();
     db.create_collection("", "existing", schema()).unwrap();
     let aliases_path = root.path().join("aliases.json");
     let aliases = br#"{"old":"gone","live":"existing"}"#;
@@ -1373,7 +1373,7 @@ fn staging_entry_type_failure_rejects_open_without_deleting_any_residue() {
     for name in ["first", "second"] {
         assert_eq!(std::fs::read(staging.join(name)).unwrap(), name.as_bytes());
     }
-    let db = Db::new(DataDir::open(root.path()).unwrap(), compute());
+    let db = Db::new(DataDir::open(root.path()).unwrap(), compute()).unwrap();
     assert!(std::fs::read_dir(staging).unwrap().next().is_none());
     db.close();
 }
@@ -1387,7 +1387,7 @@ fn enospc_insert_upsert_delete_preserve_memory_and_recover_after_close() {
             for cut in [0, 20, usize::MAX] {
                 for continue_writing in [false, true] {
                     let root = tempfile::tempdir().unwrap();
-                    let db = Db::new(DataDir::open(root.path()).unwrap(), compute());
+                    let db = Db::new(DataDir::open(root.path()).unwrap(), compute()).unwrap();
                     db.create_collection("", "c", schema()).unwrap();
                     db.insert("", "c", batch(&[1, 2])).unwrap();
                     db.flush_collection("", "c").unwrap();
@@ -1428,7 +1428,7 @@ fn enospc_insert_upsert_delete_preserve_memory_and_recover_after_close() {
                     }
                     let expected = handle.read().get(&ids, &["v".into()]).unwrap().rows;
                     db.close();
-                    let reopened = Db::new(DataDir::open(root.path()).unwrap(), compute());
+                    let reopened = Db::new(DataDir::open(root.path()).unwrap(), compute()).unwrap();
                     let recovered = reopened.collection("", "c").unwrap();
                     assert_eq!(recovered.read().count(), expected.pks.len());
                     let actual = recovered.read().get(&ids, &["v".into()]).unwrap().rows;
@@ -1451,7 +1451,7 @@ fn wal_read_io_failure_preserves_files_and_lazy_open_can_retry() {
         wal::{WalKind, WalReadFault, WalWriter, inject_read_fault_once},
     };
     let root = tempfile::tempdir().unwrap();
-    let db = Db::new(DataDir::open(root.path()).unwrap(), compute());
+    let db = Db::new(DataDir::open(root.path()).unwrap(), compute()).unwrap();
     db.create_collection("", "c", schema()).unwrap();
     db.insert("", "c", batch(&[1, 2])).unwrap();
     db.close();
@@ -1479,7 +1479,7 @@ fn wal_read_io_failure_preserves_files_and_lazy_open_can_retry() {
     let before = std::fs::read(&path).unwrap();
     let orphan = dir.join("partitions/_default/data/orphan");
     std::fs::write(&orphan, b"orphan").unwrap();
-    let db = Db::new(DataDir::open(root.path()).unwrap(), compute());
+    let db = Db::new(DataDir::open(root.path()).unwrap(), compute()).unwrap();
     inject_read_fault_once(WalReadFault::Io);
     assert!(
         db.collection("", "c")
@@ -1500,7 +1500,7 @@ fn failed_wal_append_consumes_auto_ids_in_process_but_reopen_uses_recoverable_se
     use milvus_lite_core::storage::wal::inject_storage_full_after_bytes;
     for continued in [false, true] {
         let root = tempfile::tempdir().unwrap();
-        let db = Db::new(DataDir::open(root.path()).unwrap(), compute());
+        let db = Db::new(DataDir::open(root.path()).unwrap(), compute()).unwrap();
         let mut auto_schema = schema();
         auto_schema.fields[0].auto_id = true;
         db.create_collection("", "c", auto_schema).unwrap();
@@ -1524,7 +1524,7 @@ fn failed_wal_append_consumes_auto_ids_in_process_but_reopen_uses_recoverable_se
             assert_eq!(db.insert("", "c", input(1)).unwrap(), [Pk::Int64(5)]);
         }
         db.close();
-        let reopened = Db::new(DataDir::open(root.path()).unwrap(), compute());
+        let reopened = Db::new(DataDir::open(root.path()).unwrap(), compute()).unwrap();
         assert_eq!(
             reopened.insert("", "c", input(1)).unwrap(),
             [Pk::Int64(if continued { 6 } else { 3 })]
@@ -1545,7 +1545,7 @@ fn frozen_wal_pre_sync_failure_stays_before_replace_and_explicit_flush_recovers(
         RetainedWalSyncFault::Directory,
     ] {
         let root = tempfile::tempdir().unwrap();
-        let db = Db::new(DataDir::open(root.path()).unwrap(), compute());
+        let db = Db::new(DataDir::open(root.path()).unwrap(), compute()).unwrap();
         db.create_collection("", "c", schema()).unwrap();
         db.create_collection("", "other", schema()).unwrap();
         db.insert("", "c", batch(&[1, 2, 3])).unwrap();
@@ -1598,7 +1598,7 @@ fn frozen_wal_pre_sync_failure_stays_before_replace_and_explicit_flush_recovers(
         db.flush_collection("", "c").unwrap();
         db.insert("", "c", batch(&[5])).unwrap();
         db.close();
-        let reopened = Db::new(DataDir::open(root.path()).unwrap(), compute());
+        let reopened = Db::new(DataDir::open(root.path()).unwrap(), compute()).unwrap();
         let rows = reopened
             .collection("", "c")
             .unwrap()

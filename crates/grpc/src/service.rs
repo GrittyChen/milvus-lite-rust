@@ -93,6 +93,32 @@ fn success() -> common::Status {
 
 #[tonic::async_trait]
 impl Service for MilvusService {
+    async fn manual_compaction(
+        &self,
+        _request: Request<svc::ManualCompactionRequest>,
+    ) -> Result<Response<svc::ManualCompactionResponse>, Status> {
+        self.run(Branch::Engine, |_| {
+            Ok(svc::ManualCompactionResponse {
+                status: Some(st::success()),
+                ..Default::default()
+            })
+        })
+        .await
+    }
+
+    async fn get_compaction_state(
+        &self,
+        _request: Request<svc::GetCompactionStateRequest>,
+    ) -> Result<Response<svc::GetCompactionStateResponse>, Status> {
+        self.run(Branch::Engine, |_| {
+            Ok(svc::GetCompactionStateResponse {
+                status: Some(st::success()),
+                state: common::CompactionState::Completed as i32,
+                ..Default::default()
+            })
+        })
+        .await
+    }
     async fn connect(
         &self,
         _request: Request<svc::ConnectRequest>,
@@ -493,10 +519,11 @@ mod tests {
         use std::sync::mpsc;
         use std::time::Duration;
         let root = tempfile::tempdir().unwrap();
-        let db = Arc::new(Db::new(
+        let db = Db::new(
             DataDir::open(root.path()).unwrap(),
             Compute::for_host().unwrap(),
-        ));
+        )
+        .unwrap();
         let mut id = FieldSchema::new("id", DataType::Int64);
         id.is_primary = true;
         let mut v = FieldSchema::new("v", DataType::FloatVector);
@@ -604,7 +631,7 @@ mod tests {
     fn a_panic_in_the_body_maps_to_code_1_and_the_service_keeps_working() {
         let root = tempfile::tempdir().unwrap();
         let compute = Compute::new(std::num::NonZeroUsize::MIN).unwrap();
-        let db = Arc::new(Db::new(DataDir::open(root.path()).unwrap(), compute));
+        let db = Db::new(DataDir::open(root.path()).unwrap(), compute).unwrap();
         let service = MilvusService::new("test".to_owned(), db);
         let rt = tokio::runtime::Runtime::new().unwrap();
         let reply = rt

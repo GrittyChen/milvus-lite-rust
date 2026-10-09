@@ -1,6 +1,6 @@
 //! collection 写路径的持久化状态；读视图由 collection 的列式块维护。
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -159,6 +159,12 @@ pub struct PersistentCollection {
     pub visibility: Visibility,
     pub active: MemTable,
     pub generation: u64,
+    pub(crate) data_sources: BTreeMap<String, SourceId>,
+    pub(crate) pinned_files: crate::storage::snapshot::PinnedFiles,
+    retained_old_wal: bool,
+    pub(crate) maintenance_status: Arc<crate::maintenance::Status>,
+    pub(crate) compaction_cleanup: Vec<PathBuf>,
+    pub(crate) committed_deletes: HashMap<Pk, u64>,
     next_source: u64,
     data_wal: Option<WalWriter>,
     delta_wal: Option<WalWriter>,
@@ -195,6 +201,12 @@ impl PersistentCollection {
             visibility,
             active: MemTable::new(SourceId(1)),
             generation: 1,
+            data_sources: BTreeMap::new(),
+            pinned_files: Default::default(),
+            retained_old_wal: false,
+            maintenance_status: Arc::new(Default::default()),
+            compaction_cleanup: Vec::new(),
+            committed_deletes: HashMap::new(),
             next_source: 2,
             data_wal: None,
             delta_wal: None,
@@ -209,7 +221,11 @@ impl PersistentCollection {
         })
     }
 
-    pub fn recovered(dir: PathBuf, recovered: RecoveredCollection) -> Self {
+    pub(crate) fn recovered(
+        dir: PathBuf,
+        recovered: RecoveredCollection,
+        data_sources: BTreeMap<String, SourceId>,
+    ) -> Self {
         let next_source = recovered.active_memtable.source.0 + 1;
         Self {
             dir,
@@ -217,6 +233,12 @@ impl PersistentCollection {
             visibility: recovered.visibility,
             active: recovered.active_memtable,
             generation: recovered.next_wal_number,
+            data_sources,
+            pinned_files: recovered.pinned_files,
+            retained_old_wal: recovered.retained_old_wal,
+            maintenance_status: Arc::new(Default::default()),
+            compaction_cleanup: Vec::new(),
+            committed_deletes: recovered.committed_deletes,
             next_source,
             data_wal: None,
             delta_wal: None,
@@ -233,6 +255,96 @@ impl PersistentCollection {
 
     pub fn flush_lock(&self) -> Arc<crate::lock_order::Mutex<(), 4>> {
         Arc::clone(&self.flush_lock)
+    }
+
+    pub(crate) fn can_compact(&self) -> Result<bool, String> {
+        Ok(!self.poisoned
+            && !self.needs_retry()
+            && !self.retained_old_wal
+            && !self.active.has_legacy_operations(self.manifest.current_seq)
+            && !self
+                .pending
+                .iter()
+                .any(|g| g.table.has_legacy_operations(self.manifest.current_seq)))
+    }
+
+    pub(crate) fn committed_wal_limit(&self) -> Option<u64> {
+        self.last_published_generation
+    }
+
+    pub(crate) fn compaction_sources(&self, count: usize) -> Result<Vec<SourceId>, String> {
+        let end = self
+            .next_source
+            .checked_add(u64::try_from(count).map_err(err)?)
+            .ok_or("source ID space exhausted")?;
+        Ok((self.next_source..end).map(SourceId).collect())
+    }
+
+    pub(crate) fn publish_compaction(
+        &mut self,
+        prepared: &crate::storage::compaction::Prepared,
+        manifest: Manifest,
+        ids: &[SourceId],
+        rows: &[(SourceId, Vec<crate::storage::visibility::CompactionRow>)],
+        threshold: Option<u64>,
+        durability_error: Option<String>,
+    ) -> Result<(), String> {
+        let mut sources = self.data_sources.clone();
+        for input in &prepared.inputs {
+            sources.remove(&input.relative);
+        }
+        for (output, source) in prepared.outputs.iter().zip(ids) {
+            sources.insert(
+                output
+                    .relative
+                    .clone()
+                    .ok_or("compaction output name missing")?,
+                *source,
+            );
+        }
+        let mut order = manifest.partitions["_default"]
+            .data_files
+            .iter()
+            .map(|name| {
+                sources
+                    .get(name)
+                    .copied()
+                    .ok_or("compacted manifest source missing")
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        for &source in self.visibility.source_order() {
+            if !prepared.inputs.iter().any(|i| i.source == source) && !order.contains(&source) {
+                order.push(source);
+            }
+        }
+        let outputs: Vec<_> = prepared
+            .outputs
+            .iter()
+            .zip(ids)
+            .map(|(o, id)| (*id, o.data.seqs.len()))
+            .collect();
+        self.visibility.compacted(rows, &outputs, order)?;
+        self.next_source = self
+            .next_source
+            .checked_add(u64::try_from(ids.len()).map_err(err)?)
+            .ok_or("source ID space exhausted")?;
+        self.data_sources = sources;
+        self.manifest = manifest;
+        self.inherited_synced = true;
+        self.retry_manifest = durability_error.is_some();
+        if let Some(reason) = durability_error {
+            self.record_failure(reason);
+        } else {
+            self.visibility
+                .gc_deletes(threshold, self.manifest.current_seq);
+            self.committed_deletes
+                .retain(|_, seq| threshold.is_some_and(|t| *seq >= t));
+            // 删除重负载后不能让已过期表长期保留峰值桶容量。
+            if self.committed_deletes.len() < self.committed_deletes.capacity() / 4 {
+                self.committed_deletes.shrink_to_fit();
+            }
+        }
+        Ok(())
     }
 
     pub fn needs_retry(&self) -> bool {
@@ -500,6 +612,21 @@ impl PersistentCollection {
             return Err("flush generation changed before publication".to_owned());
         }
         let segment_source = SourceId(self.next_source);
+        let new_file = if data_rows > 0 {
+            let old = &self.manifest.partitions["_default"].data_files;
+            let files: Vec<_> = manifest.partitions["_default"]
+                .data_files
+                .iter()
+                .filter(|f| !old.contains(f))
+                .cloned()
+                .collect();
+            if files.len() != 1 {
+                return Err("published data filename is incomplete".into());
+            }
+            files.into_iter().next()
+        } else {
+            None
+        };
         self.next_source = self
             .next_source
             .checked_add(1)
@@ -514,9 +641,20 @@ impl PersistentCollection {
             self.poisoned = true;
             return Err(error.to_string());
         }
+        if let Some(file) = new_file {
+            self.data_sources.insert(file, segment_source);
+        }
         self.manifest = manifest;
         self.pending.pop_front();
         self.last_published_generation = Some(generation.number);
+        for (pk, seq) in generation.table.delete_entries() {
+            self.committed_deletes
+                .entry(pk.clone())
+                .and_modify(|old| *old = (*old).max(seq))
+                .or_insert(seq);
+        }
+        // 此代编号大于打开时扫描到的所有 WAL；维护入场还须确认这些 WAL 清理成功。
+        self.retained_old_wal = false;
         self.inherited_synced = true;
         self.failed_flush = false;
         self.retry_manifest |= after_replace_error;

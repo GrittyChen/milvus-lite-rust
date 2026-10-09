@@ -17,6 +17,9 @@ tokio = { workspace = true, features = ["rt-multi-thread", "net", "sync", "time"
 tonic.workspace = true
 tonic-prost.workspace = true
 
+[features]
+fault-injection = ["milvus-lite-core/fault-injection"]
+
 [build-dependencies]
 protox.workspace = true
 tonic-prost-build.workspace = true

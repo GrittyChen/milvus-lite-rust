@@ -15,6 +15,12 @@ pub struct RowLocation {
     pub seq: u64,
 }
 
+pub(crate) struct CompactionRow {
+    pub pk: Pk,
+    pub seq: u64,
+    pub target: Option<(SourceId, usize)>,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct SourceBits {
     pub(crate) len: usize,
@@ -155,6 +161,110 @@ pub struct Visibility {
 }
 
 impl Visibility {
+    pub(crate) fn source_order(&self) -> &[SourceId] {
+        &self.source_order
+    }
+
+    pub(crate) fn delete_snapshot(&self) -> HashMap<Pk, u64> {
+        self.latest_delete.clone()
+    }
+
+    pub(crate) fn compacted(
+        &mut self,
+        inputs: &[(SourceId, Vec<CompactionRow>)],
+        outputs: &[(SourceId, usize)],
+        order: Vec<SourceId>,
+    ) -> Result<(), String> {
+        let removed: HashSet<_> = inputs.iter().map(|(id, _)| *id).collect();
+        if removed.len() != inputs.len() {
+            return Err("duplicate compaction source".into());
+        }
+        let mut bits = BTreeMap::new();
+        for &(id, rows) in outputs {
+            if self.sources.contains_key(&id) || bits.insert(id, SourceBits::new(rows)).is_some() {
+                return Err("compaction target source already exists".into());
+            }
+        }
+        let expected: HashSet<_> = self
+            .sources
+            .keys()
+            .filter(|id| !removed.contains(id))
+            .copied()
+            .chain(bits.keys().copied())
+            .collect();
+        if order.len() != expected.len()
+            || order.iter().copied().collect::<HashSet<_>>() != expected
+        {
+            return Err("compaction source order is incomplete".into());
+        }
+        let mut targets = HashSet::new();
+        for (id, rows) in inputs {
+            let old = self.sources.get(id).ok_or("compaction source missing")?;
+            if old.len != rows.len() {
+                return Err("compaction source row count changed".into());
+            }
+            for (row, data) in rows.iter().enumerate() {
+                if let Some((source, target)) = data.target {
+                    let dst = bits
+                        .get_mut(&source)
+                        .ok_or("compaction target source missing")?;
+                    if target >= dst.len || !targets.insert((source, target)) {
+                        return Err("invalid compaction target row".into());
+                    }
+                    if old.get(row) {
+                        dst.set(target, true);
+                    }
+                } else if old.get(row) {
+                    return Err("compaction omits a live row".into());
+                }
+                if data.target.is_none()
+                    && self
+                        .latest_data(&data.pk)
+                        .is_some_and(|at| at.source == *id && at.row == row)
+                    && self
+                        .latest_delete(&data.pk)
+                        .is_none_or(|seq| seq <= data.seq)
+                {
+                    return Err("removed primary winner has no protecting delete".into());
+                }
+            }
+        }
+        if targets.len() != outputs.iter().map(|(_, n)| *n).sum::<usize>() {
+            return Err("compaction targets are incomplete".into());
+        }
+        // 全部边界已校验；只更新选中来源的主键，未选中/活跃引用保持原样。
+        for (id, rows) in inputs {
+            for (row, data) in rows.iter().enumerate() {
+                if self
+                    .latest_data(&data.pk)
+                    .is_some_and(|at| at.source == *id && at.row == row)
+                {
+                    if let Some((source, row)) = data.target {
+                        self.latest_data.insert(
+                            data.pk.clone(),
+                            RowLocation {
+                                source,
+                                row,
+                                seq: data.seq,
+                            },
+                        );
+                    } else {
+                        self.latest_data.remove(&data.pk);
+                    }
+                }
+            }
+            self.sources.remove(id);
+        }
+        self.sources.extend(bits);
+        self.source_order = order;
+        Ok(())
+    }
+
+    pub(crate) fn gc_deletes(&mut self, threshold: Option<u64>, committed: u64) {
+        self.latest_delete
+            .retain(|_, seq| *seq > committed || threshold.is_some_and(|t| *seq >= t));
+    }
+
     pub fn add_source(&mut self, id: SourceId, rows: usize) -> Result<(), VisibilityError> {
         if self.sources.contains_key(&id) {
             return Err(VisibilityError::DuplicateSource(id));

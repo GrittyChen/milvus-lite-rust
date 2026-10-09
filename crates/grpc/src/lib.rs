@@ -14,6 +14,8 @@ mod server;
 mod service;
 mod status;
 
+#[cfg(feature = "fault-injection")]
+pub use milvus_lite_core::{CompactionFault, CompactionPausePoint};
 pub use server::{Server, ServerConfig, ServerError};
 
 /// 与 3.x（及 Milvus Standalone）一致的消息大小上限，收发两个方向相同；tonic 默认解码上限只有 4 MB。

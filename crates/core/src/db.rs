@@ -5,7 +5,7 @@ use std::fs;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 
 use crate::lock_order::{Mutex as OrderedMutex, RwLock};
@@ -307,6 +307,8 @@ pub struct Db {
     open_failures: RwLock<BTreeMap<String, OpenFailure>, 6>,
     /// create/drop 与 collection 的写入/flush 互斥；目录提交点后失败时封锁后续写入。
     write_gate: RwLock<bool, 1>,
+    maintenance: Arc<crate::maintenance::Maintenance>,
+    namespace_waiters: AtomicUsize,
 }
 
 /// 关闭闸门（0003「进程退出」第 2、3 步）：关闭后不再接受新任务，在途任务全部结束后才释放 LOCK，
@@ -336,10 +338,31 @@ impl Drop for InFlight<'_> {
     }
 }
 
+struct NamespaceIntent<'a>(&'a AtomicUsize);
+impl<'a> NamespaceIntent<'a> {
+    fn new(counter: &'a AtomicUsize) -> Self {
+        counter.fetch_add(1, Ordering::AcqRel);
+        Self(counter)
+    }
+}
+impl Drop for NamespaceIntent<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+impl Drop for Db {
+    fn drop(&mut self) {
+        self.maintenance.stop(false);
+        if self.gate.get_mut().data_dir.is_some() {
+            self.finish_storage(false);
+        }
+    }
+}
+
 impl Db {
-    pub fn new(data_dir: DataDir, compute: Compute) -> Self {
+    pub fn new(data_dir: DataDir, compute: Compute) -> Result<Arc<Self>> {
         let path = data_dir.path().to_path_buf();
-        Self {
+        let db = Arc::new(Self {
             collections: RwLock::new(BTreeMap::new()),
             gate: Mutex::new(Gate {
                 closed: false,
@@ -355,7 +378,11 @@ impl Db {
             name_locks: OrderedMutex::new(BTreeMap::new()),
             open_failures: RwLock::new(BTreeMap::new()),
             write_gate: RwLock::new(false),
-        }
+            maintenance: crate::maintenance::Maintenance::new(),
+            namespace_waiters: AtomicUsize::new(0),
+        });
+        db.maintenance.start(Arc::downgrade(&db))?;
+        Ok(db)
     }
 
     pub fn compute(&self) -> &Compute {
@@ -388,6 +415,8 @@ impl Db {
         }
         drop(gate);
         self.finish_storage(true);
+        self.maintenance.stop(true);
+        self.finish_storage(false);
         let mut gate = self.gate.lock();
         gate.data_dir = None;
         self.idle.notify_all();
@@ -395,6 +424,7 @@ impl Db {
 
     /// 不阻塞的关闭：拒绝新任务；没有在途任务时立即释放 LOCK，否则由最后一个任务结束时释放。
     pub fn close_nowait(self: &Arc<Self>) {
+        self.maintenance.abort.store(true, Ordering::Release);
         let mut gate = self.gate.lock();
         gate.closed = true;
         if gate.cleanup_started {
@@ -418,6 +448,7 @@ impl Db {
                         db.idle.wait(&mut gate);
                     }
                     drop(gate);
+                    db.maintenance.stop(false);
                     db.finish_storage(false);
                     let mut gate = db.gate.lock();
                     gate.data_dir = None;
@@ -431,6 +462,7 @@ impl Db {
                 self.idle.wait(&mut gate);
             }
             drop(gate);
+            self.maintenance.stop(false);
             self.finish_storage(false);
             let mut gate = self.gate.lock();
             gate.data_dir = None;
@@ -474,7 +506,7 @@ impl Db {
         let handles: Vec<_> = self.collections.read().values().cloned().collect();
         for handle in handles {
             if flush {
-                match Self::flush_handle(&handle, true) {
+                match self.flush_handle(&handle, true) {
                     Ok(()) => {
                         let extra_wal = handle
                             .read()
@@ -489,7 +521,7 @@ impl Db {
                                     .ok_or_else(|| storage("persistent state missing"))
                                     .and_then(|p| p.freeze_active(true).map_err(storage));
                                 if let Err(error) =
-                                    frozen.and_then(|()| Self::flush_handle(&handle, false))
+                                    frozen.and_then(|()| self.flush_handle(&handle, false))
                                 {
                                     eprintln!("collection close WAL cleanup failed: {error}");
                                 }
@@ -518,9 +550,24 @@ impl Db {
         name: &str,
         schema: CollectionSchema,
     ) -> Result<()> {
+        self.create_collection_inner(database, name, schema)?;
+        let handle = self.collections.read().get(name).cloned();
+        if let Some(handle) = handle {
+            self.schedule_maintenance(&handle);
+        }
+        Ok(())
+    }
+
+    fn create_collection_inner(
+        &self,
+        database: &str,
+        name: &str,
+        schema: CollectionSchema,
+    ) -> Result<()> {
         require_database(database)?;
         validate_filesystem_name(name, "collection")?;
         let mut collection = Collection::new(name, schema)?;
+        let _intent = NamespaceIntent::new(&self.namespace_waiters);
         let mut blocked = self.write_gate.write();
         if *blocked {
             return Err(EngineError::Storage(
@@ -644,6 +691,7 @@ impl Db {
             return Ok(());
         }
         validate_filesystem_name(name, "collection")?;
+        let _intent = NamespaceIntent::new(&self.namespace_waiters);
         let mut blocked = self.write_gate.write();
         if *blocked {
             return Err(storage(
@@ -969,7 +1017,7 @@ impl Db {
             }
             if collection.persistent().is_some_and(|p| p.needs_retry()) {
                 drop(collection);
-                Self::flush_handle(&handle, false)?;
+                self.flush_handle(&handle, false)?;
                 continue;
             }
             break collection.read_snapshot();
@@ -1046,7 +1094,7 @@ impl Db {
             }
             if collection.persistent().is_some_and(|p| p.needs_retry()) {
                 drop(collection);
-                Self::flush_handle(handle, false)?;
+                self.flush_handle(handle, false)?;
                 continue;
             }
             break collection;
@@ -1063,7 +1111,7 @@ impl Db {
                     .persistent()
                     .is_some_and(|p| p.has_pending_generation());
                 drop(collection);
-                if pending && let Err(flush_error) = Self::flush_handle(handle, false) {
+                if pending && let Err(flush_error) = self.flush_handle(handle, false) {
                     eprintln!("WAL failure recovery flush of {name:?} failed: {flush_error}");
                 }
                 return Err(error);
@@ -1092,7 +1140,7 @@ impl Db {
         drop(collection);
         if auto_flush {
             // 写入已经落 WAL 并在内存中可见；之后的提交故障由下一次写入先重试。
-            if let Err(error) = Self::flush_handle(handle, false) {
+            if let Err(error) = self.flush_handle(handle, false) {
                 eprintln!("automatic flush of {name:?} failed after accepted mutation: {error}");
             }
         }
@@ -1108,7 +1156,7 @@ impl Db {
             ));
         }
         let handle = self.collection_inner(name)?;
-        Self::flush_handle(&handle, true)
+        self.flush_handle(&handle, true)
     }
 
     pub fn create_index(
@@ -1126,7 +1174,7 @@ impl Db {
             ));
         }
         let handle = self.collection_inner(name)?;
-        Self::flush_handle(&handle, true)?;
+        self.flush_handle(&handle, true)?;
         let lock = handle
             .read()
             .persistent()
@@ -1141,7 +1189,7 @@ impl Db {
         })
     }
 
-    fn flush_handle(handle: &CollectionHandle, include_active: bool) -> Result<()> {
+    fn flush_handle(&self, handle: &CollectionHandle, include_active: bool) -> Result<()> {
         let lock = handle
             .read()
             .persistent()
@@ -1245,6 +1293,10 @@ impl Db {
                     {
                         persistent.record_failure(reason.clone());
                     }
+                    drop(collection);
+                    if work.table.size() > 0 {
+                        self.schedule_maintenance(handle);
+                    }
                     if let Some(error) = outcome.post_commit_error {
                         return Err(storage(match error {
                             runtime::PostCommitError::Durability(reason) => format!(
@@ -1266,6 +1318,410 @@ impl Db {
                 }
             }
         }
+    }
+
+    fn schedule_maintenance(&self, handle: &CollectionHandle) {
+        if let Err(error) = self.maintenance.enqueue(handle)
+            && !matches!(error, EngineError::Closed)
+        {
+            eprintln!("cannot schedule maintenance: {error}");
+        }
+    }
+
+    fn maintenance_cancelled(&self) -> bool {
+        self.maintenance.abort.load(Ordering::Acquire)
+            || self.namespace_waiters.load(Ordering::Acquire) != 0
+    }
+
+    pub(crate) fn compact_handle(&self, handle: &CollectionHandle) -> Result<usize> {
+        let phase = std::cell::Cell::new(fs_commit::CommitPhase::BeforeReplace);
+        let cleanup = std::cell::Cell::new(false);
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.compact_transaction(handle, &phase, &cleanup)
+        }))
+        .unwrap_or_else(|payload| {
+            Err(storage(format!(
+                "compaction panicked ({:?}, cleanup={}): {}",
+                phase.get(),
+                cleanup.get(),
+                crate::error::panic_description(payload.as_ref())
+            )))
+        })
+    }
+
+    fn compact_transaction(
+        &self,
+        handle: &CollectionHandle,
+        phase: &std::cell::Cell<fs_commit::CommitPhase>,
+        cleanup: &std::cell::Cell<bool>,
+    ) -> Result<usize> {
+        use crate::storage::{compaction, flush};
+        if self.maintenance_cancelled() {
+            return Err(EngineError::Closed);
+        }
+        let _task = {
+            let mut gate = self.gate.lock();
+            if gate.data_dir.is_none() || self.maintenance.abort.load(Ordering::Acquire) {
+                return Err(EngineError::Closed);
+            }
+            gate.in_flight += 1;
+            InFlight { db: self }
+        };
+        let blocked = self.write_gate.read();
+        if *blocked {
+            return Err(storage("database directory durability is unconfirmed"));
+        }
+        if self.maintenance_cancelled() {
+            return Err(EngineError::Closed);
+        }
+        let lock = handle
+            .read()
+            .persistent()
+            .ok_or_else(|| storage("persistent state missing"))?
+            .flush_lock();
+        let view = {
+            let _flush = lock.lock();
+            if !self.prepare_maintenance_boundary(handle, false)? {
+                return Ok(0);
+            }
+            handle.read().compaction_view()?
+        };
+        let Some(view) = view else {
+            return Ok(0);
+        };
+        let inputs = compaction::select(&view.dir, view.inputs.clone())?;
+        if inputs.is_empty() {
+            return Ok(0);
+        }
+        compaction::reject_external_sequence_ties(
+            &view.inputs,
+            &inputs,
+            view.schema
+                .primary_position()
+                .ok_or_else(|| storage("compaction schema has no primary key"))?,
+        )?;
+        {
+            let _flush = lock.lock();
+            if !self.prepare_maintenance_boundary(handle, true)? {
+                return Ok(0);
+            }
+        }
+        #[cfg(feature = "fault-injection")]
+        self.compaction_pause(crate::CompactionPausePoint::BeforePrepare)?;
+        #[cfg(feature = "fault-injection")]
+        let fault = self.maintenance.fault.lock().take();
+        #[cfg(feature = "fault-injection")]
+        match fault {
+            Some(crate::CompactionFault::PreparePanic) => {
+                panic!("injected compaction preparation panic")
+            }
+            Some(crate::CompactionFault::BeforeReplacePanic) => {
+                fs_commit::inject_manifest_panic_once(fs_commit::CommitPhase::BeforeReplace)
+            }
+            Some(crate::CompactionFault::AfterReplacePanic) => {
+                fs_commit::inject_manifest_panic_once(fs_commit::CommitPhase::AfterReplace)
+            }
+            Some(crate::CompactionFault::DirectorySyncIo) => {
+                fs_commit::inject_manifest_dir_sync_failure_once()
+            }
+            Some(crate::CompactionFault::ExitBeforeReplace) => {
+                fs_commit::inject_manifest_process_exit_once(fs_commit::CommitPhase::BeforeReplace)
+            }
+            Some(crate::CompactionFault::ExitAfterReplace) => {
+                fs_commit::inject_manifest_process_exit_once(fs_commit::CommitPhase::AfterReplace)
+            }
+            _ => {}
+        }
+        let deletes = handle.read().compaction_deletes(&inputs)?;
+        if view.sync_inherited {
+            flush::sync_inherited(&view.dir, &view.manifest).map_err(storage)?;
+        }
+        let mut prepared = compaction::prepare(&view.dir, &view.schema, inputs, &deletes, || {
+            self.maintenance_cancelled()
+        })?;
+        #[cfg(feature = "fault-injection")]
+        self.compaction_pause(crate::CompactionPausePoint::BeforeCommit)?;
+        if self.maintenance_cancelled() {
+            return Err(EngineError::Closed);
+        }
+        let _flush = lock.lock();
+        if !self.prepare_maintenance_boundary(handle, true)? {
+            return Err(storage("compaction deferred until foreground flush retry"));
+        }
+        let manifest = {
+            let collection = handle.read();
+            if collection.is_deleted() {
+                return Err(EngineError::Closed);
+            }
+            let p = collection
+                .persistent()
+                .ok_or_else(|| storage("persistent state missing"))?;
+            if !p.can_compact().map_err(storage)? {
+                return Err(storage("compaction state changed before commit"));
+            }
+            collection.validate_compaction(&prepared)?;
+            p.compaction_sources(prepared.outputs.len())
+                .map_err(storage)?;
+            p.manifest.clone()
+        };
+        if self.maintenance_cancelled() {
+            return Err(EngineError::Closed);
+        }
+        let submission = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            compaction::promote(&view.dir, &mut prepared, &view.pins)?;
+            let (candidate, threshold, obsolete) =
+                compaction::candidate(&manifest, &prepared, &view.pins)?;
+            let durability_error = match fs_commit::commit_manifest(&view.dir, &candidate) {
+                Ok(_) => {
+                    phase.set(fs_commit::CommitPhase::AfterReplace);
+                    None
+                }
+                Err(error) if error.phase == fs_commit::CommitPhase::AfterReplace => {
+                    phase.set(fs_commit::CommitPhase::AfterReplace);
+                    Some(error.to_string())
+                }
+                Err(error) => return Err(storage(error)),
+            };
+            Ok((candidate, threshold, obsolete, durability_error))
+        }))
+        .unwrap_or_else(|payload| {
+            Err(storage(format!(
+                "compaction submission panicked ({:?}): {}",
+                phase.get(),
+                crate::error::panic_description(payload.as_ref())
+            )))
+        });
+        if submission.is_err() && phase.get() == fs_commit::CommitPhase::BeforeReplace {
+            // 保留到下一次持 flush 锁的清理；最终名可能被前台 flush 复用，不能在 Drop 中删除。
+            handle
+                .write()
+                .persistent_mut()
+                .ok_or_else(|| storage("persistent state missing"))?
+                .compaction_cleanup
+                .extend(
+                    prepared
+                        .outputs
+                        .iter()
+                        .filter_map(|output| output.relative.as_ref().map(PathBuf::from)),
+                );
+        }
+        let (candidate, threshold, obsolete, durability_error) = submission?;
+        #[cfg(feature = "fault-injection")]
+        if let Err(error) = self.compaction_pause(crate::CompactionPausePoint::AfterReplace) {
+            if let Some(p) = handle.write().persistent_mut() {
+                p.poison();
+            }
+            return Err(storage(format!(
+                "compaction pause failed after replace: {error}"
+            )));
+        }
+        let requested = self.maintenance.diagnostics.then(std::time::Instant::now);
+        let mut collection = handle.write();
+        let acquired = requested.map(|_| std::time::Instant::now());
+        let publication = state_change(&mut collection, |c| {
+            #[cfg(feature = "fault-injection")]
+            if matches!(fault, Some(crate::CompactionFault::PublishPanic)) {
+                panic!("injected compaction publication panic");
+            }
+            c.publish_compaction(
+                &mut prepared,
+                candidate,
+                threshold,
+                durability_error.clone(),
+            )
+        });
+        if let Err(error) = publication {
+            if let Some(p) = collection.persistent_mut() {
+                p.poison();
+            }
+            return Err(error);
+        }
+        collection
+            .persistent_mut()
+            .ok_or_else(|| storage("persistent state missing"))?
+            .compaction_cleanup
+            .extend(obsolete);
+        let held = acquired.map(|start| start.elapsed());
+        drop(collection);
+        if let (Some(requested), Some(acquired), Some(held)) = (requested, acquired, held) {
+            eprintln!(
+                "compaction publication: input_rows={} wait_seconds={:.6} lock_seconds={:.6}",
+                prepared.input_rows,
+                acquired.duration_since(requested).as_secs_f64(),
+                held.as_secs_f64(),
+            );
+        }
+        if let Some(reason) = durability_error {
+            return Err(storage(format!(
+                "compaction manifest replaced but durability unconfirmed: {reason}"
+            )));
+        }
+        cleanup.set(true);
+        #[cfg(feature = "fault-injection")]
+        if matches!(fault, Some(crate::CompactionFault::CleanupPanic)) {
+            panic!("injected compaction cleanup panic");
+        }
+        self.cleanup_compaction_files(handle)?;
+        Ok(prepared.input_rows)
+    }
+
+    fn prepare_maintenance_boundary(
+        &self,
+        handle: &CollectionHandle,
+        cleanup_wal: bool,
+    ) -> Result<bool> {
+        let (dir, limit) = {
+            let collection = handle.read();
+            if collection.is_deleted() {
+                return Err(EngineError::Closed);
+            }
+            let p = collection
+                .persistent()
+                .ok_or_else(|| storage("persistent state missing"))?;
+            if p.poisoned() {
+                return Err(storage(
+                    "collection state is unusable after a storage failure",
+                ));
+            }
+            // 后台维护不能绕过前台重试节流，也不能抢先消耗前台故障注入/重新提交边界。
+            if p.needs_retry() {
+                return Ok(false);
+            }
+            let p = collection
+                .persistent()
+                .ok_or_else(|| storage("persistent state missing"))?;
+            (p.dir.clone(), p.committed_wal_limit())
+        };
+        if cleanup_wal && let Some(limit) = limit {
+            crate::storage::flush::cleanup_wal(&dir.join("wal"), limit).map_err(storage)?;
+        }
+        self.cleanup_compaction_files(handle)?;
+        Ok(true)
+    }
+
+    fn cleanup_compaction_files(&self, handle: &CollectionHandle) -> Result<()> {
+        let (dir, pins, obsolete) = {
+            let c = handle.read();
+            let p = c
+                .persistent()
+                .ok_or_else(|| storage("persistent state missing"))?;
+            if p.retry_manifest() || p.poisoned() {
+                return Ok(());
+            }
+            let current = &p.manifest.partitions["_default"];
+            let obsolete: Vec<_> = p
+                .compaction_cleanup
+                .iter()
+                .filter(|path| {
+                    path.to_str().is_some_and(|name| {
+                        !current
+                            .data_files
+                            .iter()
+                            .chain(&current.delta_files)
+                            .any(|f| f == name)
+                    })
+                })
+                .cloned()
+                .collect();
+            (p.dir.clone(), p.pinned_files.clone(), obsolete)
+        };
+        if obsolete.is_empty() {
+            handle
+                .write()
+                .persistent_mut()
+                .ok_or_else(|| storage("persistent state missing"))?
+                .compaction_cleanup
+                .clear();
+            return Ok(());
+        }
+        let finished = crate::storage::compaction::cleanup(&dir, &obsolete, &pins, || {
+            self.maintenance_cancelled() || handle.read().persistent().is_some_and(|p| p.poisoned())
+        })?;
+        if finished {
+            handle
+                .write()
+                .persistent_mut()
+                .ok_or_else(|| storage("persistent state missing"))?
+                .compaction_cleanup
+                .clear();
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "fault-injection")]
+    pub fn wait_for_maintenance(
+        &self,
+        database: &str,
+        name: &str,
+        timeout: std::time::Duration,
+    ) -> Result<crate::MaintenanceReport> {
+        require_database(database)?;
+        validate_filesystem_name(name, "collection")?;
+        let cached = self.collections.read().get(name).cloned();
+        let handle = match cached {
+            Some(handle) => handle,
+            None => self.collection(database, name)?,
+        };
+        let status = handle
+            .read()
+            .persistent()
+            .ok_or_else(|| storage("persistent state missing"))?
+            .maintenance_status
+            .clone();
+        status.wait(timeout)
+    }
+
+    #[cfg(feature = "fault-injection")]
+    pub fn pause_compaction_before_commit_once(
+        &self,
+        entered: std::sync::mpsc::Sender<()>,
+        resume: std::sync::mpsc::Receiver<()>,
+    ) {
+        self.pause_compaction_once(crate::CompactionPausePoint::BeforeCommit, entered, resume);
+    }
+
+    #[cfg(feature = "fault-injection")]
+    pub fn pause_compaction_once(
+        &self,
+        point: crate::CompactionPausePoint,
+        entered: std::sync::mpsc::Sender<()>,
+        resume: std::sync::mpsc::Receiver<()>,
+    ) {
+        *self.maintenance.pause.lock() = Some((point, entered, resume));
+    }
+
+    #[cfg(feature = "fault-injection")]
+    fn compaction_pause(&self, point: crate::CompactionPausePoint) -> Result<()> {
+        let pause = {
+            let mut slot = self.maintenance.pause.lock();
+            if slot.as_ref().is_some_and(|(wanted, _, _)| *wanted == point) {
+                slot.take()
+            } else {
+                None
+            }
+        };
+        if let Some((_, entered, resume)) = pause {
+            entered.send(()).map_err(storage)?;
+            resume
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .map_err(storage)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "fault-injection")]
+    pub fn inject_compaction_fault_once(&self, fault: crate::CompactionFault) {
+        *self.maintenance.fault.lock() = Some(fault);
+    }
+
+    #[cfg(feature = "fault-injection")]
+    pub fn pending_namespace_changes(&self) -> usize {
+        self.namespace_waiters.load(Ordering::Acquire)
+    }
+
+    #[cfg(feature = "fault-injection")]
+    pub fn trace_next_maintenance(&self, trace: std::sync::mpsc::Sender<Vec<fs_commit::FsEvent>>) {
+        *self.maintenance.trace.lock() = Some(trace);
     }
 
     fn collection_path(&self, name: &str) -> PathBuf {
@@ -1360,6 +1816,9 @@ impl Db {
         self.collections
             .write()
             .insert(name.to_owned(), Arc::clone(&handle));
+        drop(_name);
+        drop(lease);
+        self.schedule_maintenance(&handle);
         Ok(handle)
     }
 
@@ -1592,6 +2051,56 @@ mod tests {
     use crate::schema::{DataType, FieldSchema};
 
     #[test]
+    fn compaction_cleanup_does_not_delete_a_path_now_referenced_by_flush() {
+        let root = tempfile::tempdir().unwrap();
+        let db = test_db(root.path());
+        db.create_collection("", "c", basic_schema()).unwrap();
+        db.insert(
+            "",
+            "c",
+            InsertBatch {
+                num_rows: 1,
+                columns: vec![
+                    ("id".into(), InputValues::Int(vec![1])),
+                    (
+                        "v".into(),
+                        InputValues::FloatVector {
+                            dim: 2,
+                            values: vec![1.0, 0.0],
+                        },
+                    ),
+                ],
+            },
+        )
+        .unwrap();
+        db.flush_collection("", "c").unwrap();
+        let handle = db.collection("", "c").unwrap();
+        let lock = handle.read().persistent().unwrap().flush_lock();
+        let held = lock.lock();
+        let path = {
+            let mut collection = handle.write();
+            let persistent = collection.persistent_mut().unwrap();
+            let relative = persistent.manifest.partitions["_default"].data_files[0].clone();
+            persistent.compaction_cleanup.push(PathBuf::from(&relative));
+            persistent.dir.join("partitions/_default").join(relative)
+        };
+        let before = fs::read(&path).unwrap();
+        db.cleanup_compaction_files(&handle).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert_eq!(handle.read().count(), 1);
+        assert!(
+            handle
+                .read()
+                .persistent()
+                .unwrap()
+                .compaction_cleanup
+                .is_empty()
+        );
+        drop(held);
+        db.close();
+    }
+
+    #[test]
     fn aliases_leaf_lock_covers_real_read_modify_replace_transactions() {
         use std::sync::mpsc;
         use std::time::Duration;
@@ -1646,11 +2155,12 @@ mod tests {
         }
     }
 
-    fn test_db(path: &std::path::Path) -> Db {
+    fn test_db(path: &std::path::Path) -> Arc<Db> {
         Db::new(
             DataDir::open(path).unwrap(),
             Compute::new(std::num::NonZeroUsize::MIN).unwrap(),
         )
+        .unwrap()
     }
 
     #[test]
@@ -2255,7 +2765,7 @@ mod tests {
         assert!(!Arc::ptr_eq(&old, &new));
         assert_eq!(new.read().count(), 0);
         assert!(matches!(
-            Db::flush_handle(&old, true),
+            db.flush_handle(&old, true),
             Err(EngineError::CollectionNotFound(_))
         ));
         assert_eq!(db.collection("", "other").unwrap().read().count(), 1);
@@ -2350,7 +2860,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("blocked.db");
         let compute = || Compute::new(std::num::NonZeroUsize::MIN).unwrap();
-        let db = Db::new(DataDir::open(&path).unwrap(), compute());
+        let db = Db::new(DataDir::open(&path).unwrap(), compute()).unwrap();
         db.create_collection("", "c", basic_schema()).unwrap();
         db.insert(
             "",
@@ -2377,7 +2887,7 @@ mod tests {
             path.join("collections/c/wal/wal_data_000001.arrow")
                 .exists()
         );
-        let reopened = Db::new(DataDir::open(&path).unwrap(), compute());
+        let reopened = Db::new(DataDir::open(&path).unwrap(), compute()).unwrap();
         assert_eq!(reopened.collection("", "c").unwrap().read().count(), 1);
         reopened.close();
     }
@@ -2387,12 +2897,12 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("stale.db");
         let compute = Compute::new(std::num::NonZeroUsize::MIN).unwrap();
-        let db = Db::new(DataDir::open(&path).unwrap(), compute);
+        let db = Db::new(DataDir::open(&path).unwrap(), compute).unwrap();
         db.create_collection("", "c", basic_schema()).unwrap();
         let stale = db.collection("", "c").unwrap();
         db.drop_collection("", "c").unwrap();
         assert!(matches!(
-            Db::flush_handle(&stale, true),
+            db.flush_handle(&stale, true),
             Err(EngineError::CollectionNotFound(_))
         ));
         assert!(!path.join("collections/c").exists());
@@ -2407,13 +2917,15 @@ mod tests {
         let db = Db::new(
             DataDir::open(root.path()).unwrap(),
             Compute::new(std::num::NonZeroUsize::MIN).unwrap(),
-        );
+        )
+        .unwrap();
         db.create_collection("", "c", basic_schema()).unwrap();
         db.close();
-        let db = Arc::new(Db::new(
+        let db = Db::new(
             DataDir::open(root.path()).unwrap(),
             Compute::new(std::num::NonZeroUsize::MIN).unwrap(),
-        ));
+        )
+        .unwrap();
         let (entered_tx, entered_rx) = mpsc::channel();
         let (resume_tx, resume_rx) = mpsc::channel();
         let opener = Arc::clone(&db);
@@ -2437,10 +2949,11 @@ mod tests {
         use std::time::{Duration, Instant};
         for creating in [true, false] {
             let root = tempfile::tempdir().unwrap();
-            let db = Arc::new(Db::new(
+            let db = Db::new(
                 DataDir::open(root.path()).unwrap(),
                 Compute::new(std::num::NonZeroUsize::MIN).unwrap(),
-            ));
+            )
+            .unwrap();
             db.create_collection("", "writer", basic_schema()).unwrap();
             db.create_collection("", "victim", basic_schema()).unwrap();
             let handle = db.collection("", "writer").unwrap();

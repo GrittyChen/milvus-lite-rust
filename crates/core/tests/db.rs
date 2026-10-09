@@ -32,10 +32,10 @@ fn schema() -> CollectionSchema {
     }
 }
 
-fn db() -> (tempfile::TempDir, Db) {
+fn db() -> (tempfile::TempDir, std::sync::Arc<Db>) {
     let root = tempfile::tempdir().unwrap();
     let dir = DataDir::open(root.path()).unwrap();
-    (root, Db::new(dir, compute()))
+    (root, Db::new(dir, compute()).unwrap())
 }
 
 #[test]
@@ -130,7 +130,7 @@ fn data_only_reference_directory_accepts_first_index_and_first_empty_flush() {
             manifest.to_bytes().unwrap(),
         )
         .unwrap();
-        let db = Db::new(DataDir::open(root.path()).unwrap(), compute());
+        let db = Db::new(DataDir::open(root.path()).unwrap(), compute()).unwrap();
         assert!(!partition.join("delta").exists());
         if index_first {
             db.create_index(
@@ -173,7 +173,7 @@ fn data_only_reference_directory_accepts_first_index_and_first_empty_flush() {
             include_bytes!("fixtures/data_3x.parquet")
         );
         db.close();
-        let reopened = Db::new(DataDir::open(root.path()).unwrap(), compute());
+        let reopened = Db::new(DataDir::open(root.path()).unwrap(), compute()).unwrap();
         assert_eq!(reopened.collection("", "c").unwrap().read().count(), 2);
         reopened.close();
     }
@@ -273,7 +273,7 @@ fn lock_is_free(path: &std::path::Path) -> bool {
 #[test]
 fn close_waits_for_in_flight_tasks_before_releasing_the_lock() {
     let root = tempfile::tempdir().unwrap();
-    let db = Arc::new(Db::new(DataDir::open(root.path()).unwrap(), compute()));
+    let db = Db::new(DataDir::open(root.path()).unwrap(), compute()).unwrap();
     let (started_tx, started_rx) = std::sync::mpsc::channel();
     let (finish_tx, finish_rx) = std::sync::mpsc::channel::<()>();
     let task = {
@@ -306,7 +306,7 @@ fn close_waits_for_in_flight_tasks_before_releasing_the_lock() {
 #[test]
 fn close_nowait_syncs_in_the_background_before_releasing_the_lock() {
     let root = tempfile::tempdir().unwrap();
-    let db = Arc::new(Db::new(DataDir::open(root.path()).unwrap(), compute()));
+    let db = Db::new(DataDir::open(root.path()).unwrap(), compute()).unwrap();
     let task = db.enter().unwrap();
     db.close_nowait();
     assert!(!lock_is_free(root.path()));
@@ -319,7 +319,7 @@ fn close_nowait_syncs_in_the_background_before_releasing_the_lock() {
     assert!(lock_is_free(root.path()));
 
     let root = tempfile::tempdir().unwrap();
-    let db = Arc::new(Db::new(DataDir::open(root.path()).unwrap(), compute()));
+    let db = Db::new(DataDir::open(root.path()).unwrap(), compute()).unwrap();
     db.close_nowait();
     db.close();
     assert!(lock_is_free(root.path()));

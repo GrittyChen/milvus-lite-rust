@@ -98,6 +98,8 @@ reply_with_status_field!(
     crate::pb::service::MutationResult,
     crate::pb::service::FlushResponse,
     crate::pb::service::GetFlushStateResponse,
+    crate::pb::service::ManualCompactionResponse,
+    crate::pb::service::GetCompactionStateResponse,
     crate::pb::service::QueryResults,
     crate::pb::service::SearchResults,
 );

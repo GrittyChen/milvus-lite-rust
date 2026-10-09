@@ -10,6 +10,12 @@ pub mod filter;
 mod flat;
 pub mod index;
 pub mod lock_order;
+mod maintenance;
+#[cfg(feature = "fault-injection")]
+pub use maintenance::{
+    CompactionFault, CompactionPausePoint, MaintenanceReport,
+    inject_start_failure_once as inject_maintenance_start_failure_once,
+};
 pub mod projection;
 pub mod pyjson;
 pub mod schema;

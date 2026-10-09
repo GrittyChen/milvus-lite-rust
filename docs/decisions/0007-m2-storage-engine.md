@@ -493,3 +493,15 @@ WAL 追加（每次写入调用一个 batch，dim 128）：
 S1 不实施过滤索引或表达式缓存；初始化切片本身不声明性能改善，后续列求值优化的测量范围单独记录在 [S1 性能专项](../testing/s1-performance.md)。S1 用例复用、并发故障与 Parquet 读取的证据见[正确性记录](../testing/m2-correctness.md)；平台实测与 M2 性能基准见[验收记录](../testing/m2-acceptance.md)。
 
 首发阶段的后续顶层动态字段过滤以 [0009](0009-top-level-dynamic-filter.md) 为准；上节记录 S1 的原始范围。新增路径按完整数据源绑定类型，复用不可变快照和有效位，不更改本决策的锁、落盘或提交协议。
+
+## 首发 compaction 与独立已提交删除状态
+
+后续首发能力按已确认的 [0010](0010-compaction-and-tombstone-gc.md) 与 [0011](0011-committed-delete-state.md) 接入。M2 历史“无 compaction”的测量与范围陈述保留为当时的快照。
+
+- 每 Db 一个维护线程、按实例计数，一次触发一轮；成功 create/懒打开及每个有效发布代调度。正常关闭完成最后一次 flush 并排空，生命周期口径同步到 0003。
+- 合并准备使用内存中不可变输入；data 目录内临时输出在准备阶段 fsync。提交只持 flush_lock 做改名、目录同步和 manifest 提交，状态锁用于短预检与按最新状态的完整发布。
+- 读取顺序以 visibility 的来源序为准，compaction 输出追加到 committed 尾部，不再由稳定 ChunkId 的数值大小推导。旧快照仍钉住旧列/位图。
+- committed_deletes 只从已提交 delta 恢复并在冻结代发布后更新；visibility.latest_delete 仍包含活跃/冻结删除。合并不以活跃最大删除倒推已提交状态；两表按安全阈值 GC，历史旧 WAL 与持久化未确认保护保持。
+- 后台维护不抢先消耗前台 recommit 或绕过失败节流；无合并候选时不顺手清理已提交 WAL。维护的提交点前后、panic、清理、取消与等待按 0010 分类。
+
+共享格式与既有 WAL 同步/发布保证不变。完整验收结果应按正式 wheel / 隔离测试 wheel 分开记录，不以默认测试绿灯替代新增矩阵。

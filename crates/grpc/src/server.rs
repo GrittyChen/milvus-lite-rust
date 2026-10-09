@@ -29,6 +29,8 @@ pub struct ServerConfig {
 #[derive(Debug, thiserror::Error)]
 pub enum ServerError {
     #[error(transparent)]
+    Engine(#[from] milvus_lite_core::EngineError),
+    #[error(transparent)]
     DataDir(#[from] DataDirError),
     #[error(transparent)]
     Compute(#[from] ComputeError),
@@ -66,10 +68,7 @@ struct Running {
 
 impl Server {
     pub fn start(config: ServerConfig) -> Result<Self, ServerError> {
-        let db = Arc::new(Db::new(
-            DataDir::open(&config.data_dir)?,
-            Compute::for_host()?,
-        ));
+        let db = Db::new(DataDir::open(&config.data_dir)?, Compute::for_host()?)?;
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .thread_name("milvus-lite-rt")
@@ -123,8 +122,56 @@ impl Server {
         self.port
     }
 
+    #[cfg(feature = "fault-injection")]
+    pub fn pause_compaction(
+        &self,
+        point: milvus_lite_core::CompactionPausePoint,
+        entered: std::sync::mpsc::Sender<()>,
+        resume: std::sync::mpsc::Receiver<()>,
+    ) -> Result<(), ServerError> {
+        self.running
+            .as_ref()
+            .ok_or(milvus_lite_core::EngineError::Closed)?
+            .db
+            .pause_compaction_once(point, entered, resume);
+        Ok(())
+    }
+
+    #[cfg(feature = "fault-injection")]
+    pub fn inject_compaction_fault(
+        &self,
+        fault: milvus_lite_core::CompactionFault,
+    ) -> Result<(), ServerError> {
+        self.running
+            .as_ref()
+            .ok_or(milvus_lite_core::EngineError::Closed)?
+            .db
+            .inject_compaction_fault_once(fault);
+        Ok(())
+    }
+
+    #[cfg(feature = "fault-injection")]
+    pub fn wait_for_maintenance(
+        &self,
+        name: &str,
+        timeout: Duration,
+    ) -> Result<milvus_lite_core::MaintenanceReport, ServerError> {
+        if std::process::id() != self.owner_pid {
+            return Err(ServerError::NotOwner {
+                owner: self.owner_pid,
+                current: std::process::id(),
+            });
+        }
+        self.running
+            .as_ref()
+            .ok_or(milvus_lite_core::EngineError::Closed)?
+            .db
+            .wait_for_maintenance("", name, timeout)
+            .map_err(ServerError::Engine)
+    }
+
     /// 按 0003「进程退出」的顺序停止：停止接受新请求，最多等 `grace` 让在途请求结束，超时后取消；
-    /// 再关闭引擎，等仍在执行的引擎任务结束（任务不可取消，但有界）；最后释放 LOCK。
+    /// 再关闭引擎，完成最后一次 flush 并排空已接受的维护；grace 不限制整个停服时长；最后释放 LOCK。
     /// 重复调用是空操作。只能由创建者进程调用（见 0003「fork」）。
     pub fn stop(&mut self, grace: Duration) -> Result<(), ServerError> {
         let current = std::process::id();

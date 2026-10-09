@@ -38,8 +38,8 @@ fn batch(rows: &[(i64, i64)]) -> InsertBatch {
         ],
     }
 }
-fn db(path: &std::path::Path) -> Db {
-    Db::new(DataDir::open(path).unwrap(), Compute::for_host().unwrap())
+fn db(path: &std::path::Path) -> std::sync::Arc<Db> {
+    Db::new(DataDir::open(path).unwrap(), Compute::for_host().unwrap()).unwrap()
 }
 
 #[test]

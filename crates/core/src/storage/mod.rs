@@ -1,6 +1,7 @@
 //! 与 3.x 数据目录互通的持久化格式。
 
 pub mod arrow_data;
+pub(crate) mod compaction;
 pub mod flush;
 pub mod fs_commit;
 pub mod manifest;
