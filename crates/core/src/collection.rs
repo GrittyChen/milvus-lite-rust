@@ -1712,13 +1712,13 @@ fn scan(
             for (row, candidate, norm) in live_rows() {
                 let scores = flat::score_batch(batch, candidate, norm);
                 for (top, score) in tops.iter_mut().zip(scores) {
-                    top.push(score, at(row));
+                    top.push(score, || at(row));
                 }
             }
         } else {
             for (query, top) in queries.iter().zip(tops.iter_mut()) {
                 for (row, candidate, norm) in live_rows() {
-                    top.push(query.score(candidate, norm), at(row));
+                    top.push(query.score(candidate, norm), || at(row));
                 }
             }
         }
@@ -1756,16 +1756,20 @@ impl TopK {
     }
 
     #[inline(always)]
-    fn push(&mut self, score: f32, pos: RankedRow) {
-        let candidate = (score, pos);
-        if self.take == 0
-            || self
-                .bound
-                .is_some_and(|b| order(self.metric, &candidate, &b).is_ge())
-        {
+    fn push(&mut self, score: f32, pos: impl FnOnce() -> RankedRow) {
+        if self.take == 0 {
             return;
         }
-        self.candidates.push(candidate);
+        // 严格更差的分数无需读取源内位次；并列（含 NaN 与 ±0）仍必须按完整位置判定。
+        let rank = self.bound.map(|b| flat::rank(self.metric, score, b.0));
+        if rank.is_some_and(|rank| rank.is_gt()) {
+            return;
+        }
+        let pos = pos();
+        if rank.is_some_and(|rank| rank.is_eq()) && self.bound.is_some_and(|b| pos >= b.1) {
+            return;
+        }
+        self.candidates.push((score, pos));
         // 攒够一批再筛，均摊每个候选的筛选代价。
         if self.candidates.len() >= self.take.saturating_mul(2).max(64) {
             self.shrink();
@@ -1789,7 +1793,7 @@ impl TopK {
     /// 并入另一部分行的前 `take` 名。结果与推入的先后无关：被跳过的候选前面总有至少 `take` 个更好的。
     fn absorb(&mut self, other: TopK) {
         for (score, pos) in other.candidates {
-            self.push(score, pos);
+            self.push(score, || pos);
         }
     }
 
@@ -1803,7 +1807,7 @@ impl TopK {
 }
 
 fn order(metric: Metric, a: &(f32, RankedRow), b: &(f32, RankedRow)) -> std::cmp::Ordering {
-    flat::rank(metric, a.0, b.0).then(a.1.cmp(&b.1))
+    flat::rank(metric, a.0, b.0).then_with(|| a.1.cmp(&b.1))
 }
 
 fn vector_values(column: &ColumnData) -> (usize, &[f32]) {
@@ -2942,13 +2946,116 @@ mod tests {
             expected.truncate(take);
             let mut top = TopK::new(metric, take);
             for (s, pos) in &scored {
-                top.push(*s, *pos);
+                top.push(*s, || *pos);
             }
             let got = top.finish();
             let bits = |v: &[(f32, RankedRow)]| {
                 v.iter().map(|(s, p)| (s.to_bits(), *p)).collect::<Vec<_>>()
             };
             assert_eq!(bits(&got), bits(&expected), "case {case}");
+        }
+    }
+
+    #[test]
+    fn top_k_reads_position_only_when_score_can_reach_the_bound() {
+        let position = |source_rank, order| RankedRow {
+            source_rank,
+            at: RowRef {
+                order,
+                chunk: 1,
+                row: 2,
+            },
+        };
+        let bound_pos = position(3, 9);
+        let earlier = position(2, 99);
+        let later = position(4, 0);
+        for metric in [Metric::L2, Metric::Ip, Metric::Cosine] {
+            let (better, worse) = if metric.higher_is_better() {
+                (2.0, 0.0)
+            } else {
+                (0.0, 2.0)
+            };
+            for (bound, score, pos, reads, accepted) in [
+                (1.0, worse, earlier, false, false),
+                (1.0, better, later, true, true),
+                (1.0, 1.0, earlier, true, true),
+                (1.0, 1.0, bound_pos, true, false),
+                (1.0, 1.0, later, true, false),
+                (0.0, -0.0, earlier, true, true),
+                (-0.0, 0.0, later, true, false),
+                (1.0, f32::NAN, earlier, false, false),
+                (f32::NAN, 1.0, later, true, true),
+                (f32::NAN, -f32::NAN, earlier, true, true),
+                (f32::NAN, f32::NAN, later, true, false),
+                (f32::INFINITY, f32::INFINITY, earlier, true, true),
+            ] {
+                let mut top = TopK::new(metric, 1);
+                top.candidates.push((bound, bound_pos));
+                top.bound = Some((bound, bound_pos));
+                let called = std::cell::Cell::new(false);
+                top.push(score, || {
+                    called.set(true);
+                    pos
+                });
+                assert_eq!(called.get(), reads, "{metric:?}: {score} / {bound}");
+                assert_eq!(top.candidates.len(), 1 + usize::from(accepted));
+            }
+            TopK::new(metric, 0).push(1.0, || panic!("zero take must not read a position"));
+            let mut unbounded = TopK::new(metric, 1);
+            unbounded.push(f32::NAN, || earlier);
+            assert_eq!(unbounded.candidates[0].1, earlier);
+        }
+    }
+
+    #[test]
+    fn top_k_keeps_full_source_and_position_order_with_lazy_candidates() {
+        let mut rng = Rng(0x8765_4321);
+        for metric in [Metric::L2, Metric::Ip, Metric::Cosine] {
+            for take in [0, 1, 10, 65, 500] {
+                let palette = [
+                    0.0,
+                    -0.0,
+                    1.0,
+                    -1.0,
+                    f32::INFINITY,
+                    f32::NEG_INFINITY,
+                    f32::NAN,
+                    -f32::NAN,
+                ];
+                let scored: Vec<_> = (0..300)
+                    .map(|row| {
+                        (
+                            palette[rng.below(palette.len())],
+                            RankedRow {
+                                source_rank: rng.below(5),
+                                at: RowRef {
+                                    order: rng.below(20) as u64,
+                                    chunk: rng.below(4),
+                                    row,
+                                },
+                            },
+                        )
+                    })
+                    .collect();
+                let mut expected = scored.clone();
+                // 保留原先的完整比较，避免模型复用被优化的推入或懒比较。
+                expected.sort_by(|a, b| flat::rank(metric, a.0, b.0).then(a.1.cmp(&b.1)));
+                expected.truncate(take);
+                let mut top = TopK::new(metric, take);
+                for (score, pos) in scored {
+                    top.push(score, || pos);
+                }
+                let bits = |rows: &[(f32, RankedRow)]| {
+                    rows.iter()
+                        .map(|(s, p)| (s.to_bits(), *p))
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(
+                    bits(&top.finish()),
+                    bits(&expected),
+                    "{metric:?}, take={take}"
+                );
+            }
         }
     }
 }

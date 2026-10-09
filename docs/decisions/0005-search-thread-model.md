@@ -82,7 +82,7 @@ M1 的实现：每个 RPC 的处理体在 tokio 的阻塞线程池（`spawn_bloc
 
 ## 验证
 
-后续批量距离核展开与 TopK 内联保持本节任务、分波、内存和锁约束不变，数值及测量证据见[批量检索专项](../testing/batch-search-performance.md)。
+后续批量距离核展开、TopK 内联与候选位次懒读取保持本节任务、分波、内存和锁约束不变，数值及测量证据见[批量检索专项](../testing/batch-search-performance.md)。
 
 | 用例 | 断言 |
 | --- | --- |
