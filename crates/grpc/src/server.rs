@@ -598,6 +598,71 @@ mod tests {
     }
 
     #[test]
+    fn stop_retains_lock_until_admitted_rpc_finishes_after_runtime_shutdown() {
+        use std::sync::{Mutex, mpsc};
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("inflight.db");
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release = Mutex::new(release_rx);
+        let hooks = crate::service::RpcTestHooks {
+            after_attempt: Some(Arc::new(move |admitted| {
+                assert!(admitted);
+                entered_tx.send(()).unwrap();
+                release
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(10))
+                    .unwrap();
+            })),
+            after_enqueue: None,
+        };
+        let mut server = Server::start_inner(config(path.clone(), 0), hooks).unwrap();
+        let clients = io_client();
+        let channel = clients
+            .block_on(
+                tonic::transport::Endpoint::from_shared(format!(
+                    "http://{}",
+                    server.bound_address()
+                ))
+                .unwrap()
+                .connect(),
+            )
+            .unwrap();
+        let rpc = clients.spawn(load_state(channel));
+        entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let (gap_tx, gap_rx) = mpsc::channel();
+        let (finish_tx, finish_rx) = mpsc::channel();
+        server.after_runtime_shutdown = Some(ShutdownPause {
+            entered: gap_tx,
+            resume: finish_rx,
+        });
+        let (closed_tx, closed_rx) = mpsc::channel();
+        let closer = std::thread::spawn(move || {
+            let result = server.stop(Duration::from_millis(30));
+            closed_tx.send(()).unwrap();
+            result
+        });
+        gap_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        finish_tx.send(()).unwrap();
+        let waiting = matches!(
+            closed_rx.recv_timeout(Duration::from_millis(100)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        );
+        let locked = matches!(
+            DataDir::open(&path),
+            Err(milvus_lite_core::DataDirError::Locked { .. })
+        );
+        // 先放行并回收线程，再断言失败，避免错误实现使测试自己留下后台任务。
+        release_tx.send(()).unwrap();
+        closer.join().unwrap().unwrap();
+        assert!(clients.block_on(rpc).unwrap().is_err());
+        assert!(waiting);
+        assert!(locked);
+        DataDir::open(&path).unwrap();
+    }
+
+    #[test]
     fn shutdown_closes_admission_before_runtime_and_rejects_queued_writes() {
         use std::sync::{Mutex, mpsc};
         let root = tempfile::tempdir().unwrap();

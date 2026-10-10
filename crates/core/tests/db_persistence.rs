@@ -4,8 +4,11 @@
 
 use milvus_lite_core::{
     CollectionSchema, Compute, DataDir, DataType, Db, EngineError, FieldSchema, IndexRequest,
-    InputValues, InsertBatch, LoadState, Pk, QueryVectors, SearchRequest,
+    InputValues, InsertBatch, LoadState, Pk,
 };
+
+#[cfg(unix)]
+use milvus_lite_core::{QueryVectors, SearchRequest};
 
 fn compute() -> Compute {
     Compute::new(std::num::NonZeroUsize::new(2).unwrap()).unwrap()

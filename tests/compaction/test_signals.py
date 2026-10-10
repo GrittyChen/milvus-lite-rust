@@ -1,7 +1,8 @@
 """隔离测试产物验证正常停服等待期间的 Python 信号处理。"""
 
 import json
-import selectors
+import queue
+import threading
 import signal
 import subprocess
 import sys
@@ -45,20 +46,32 @@ worker.join()
 print(json.dumps({"interrupted":interrupted,"elapsed":elapsed}),flush=True)
 """
     process = subprocess.Popen([sys.executable,"-u","-c",code,str(tmp_path / "signal.db")],stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
-    selector = selectors.DefaultSelector()
-    selector.register(process.stdout,selectors.EVENT_READ)
+    output = queue.Queue()
+    def read_output():
+        for value in process.stdout:
+            output.put(value)
+        output.put(None)
+    reader = threading.Thread(target=read_output, daemon=True)
+    reader.start()
     try:
-        assert selector.select(20)
-        assert process.stdout.readline().strip()=="READY"
+        value = output.get(timeout=20)
+        assert value is not None and value.strip()=="READY"
         time.sleep(0.15)
         process.send_signal(signal.SIGINT)
-        stdout,stderr=process.communicate(timeout=20)
+        process.wait(timeout=20)
+        reader.join(timeout=5)
+        assert not reader.is_alive()
+        stderr=process.stderr.read()
         assert process.returncode==0,stderr
-        result=json.loads(stdout)
+        value=output.get(timeout=5)
+        assert value is not None
+        result=json.loads(value)
         assert result["interrupted"]
         assert result["elapsed"]>=1.5,result
     finally:
-        selector.close()
         if process.poll() is None:
             process.kill()
             process.wait()
+        reader.join(timeout=5)
+        assert not reader.is_alive()
+        process.stdout.close(); process.stderr.close()

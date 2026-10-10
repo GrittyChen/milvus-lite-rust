@@ -1,0 +1,82 @@
+"""从当前源码构建、检查并在洁净环境安装候选；仅末尾输出通过记录。"""
+
+import argparse
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+
+from check_artifacts import check, check_binary
+
+
+def run(command, *, cwd, log, env=None):
+    with Path(log).open("w") as output:
+        subprocess.run([str(v) for v in command], cwd=cwd, env=env, stdout=output, stderr=subprocess.STDOUT, check=True)
+
+
+def execute(repo, work, python=sys.executable, sdk="3.0.2", suite=False, wheel=None, sdist=None):
+    repo, work = Path(repo).resolve(), Path(work).resolve()
+    if (wheel is None) != (sdist is None):
+        raise ValueError("wheel and sdist must be provided together")
+    if wheel is not None:
+        wheel, sdist = Path(wheel).resolve(), Path(sdist).resolve()
+        if not wheel.is_file() or not sdist.is_file():
+            raise ValueError("existing wheel and sdist files required")
+    if work == repo or repo in work.parents:
+        raise ValueError("work directory must be outside repository")
+    work.mkdir(parents=True, exist_ok=False)
+    env = os.environ.copy()
+    env["MACOSX_DEPLOYMENT_TARGET"] = "11.0"
+    for key in ["RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS"]:
+        if env.get(key):
+            raise ValueError("release probe requires default CPU/build flags: " + key)
+    if wheel is None:
+        run([python, "-m", "maturin", "build", "--release", "--locked", "-o", work / "wheels"], cwd=repo, log=work / "build.log", env=env)
+        run([python, "-m", "maturin", "sdist", "-o", work / "sdist"], cwd=repo, log=work / "sdist.log", env=env)
+        wheels, sources = list((work / "wheels").glob("*.whl")), list((work / "sdist").glob("*.tar.gz"))
+        if len(wheels) != 1 or len(sources) != 1:
+            raise ValueError("exactly one wheel/sdist required")
+        wheel, sdist = wheels[0], sources[0]
+    else:
+        # 检查与安装使用同一份本次副本，外部源文件之后的改写不改变已核对的字节。
+        for source, directory in [(wheel, work / "wheels"), (sdist, work / "sdist")]:
+            directory.mkdir()
+            shutil.copyfile(source, directory / source.name)
+        wheel, sdist = work / "wheels" / wheel.name, work / "sdist" / sdist.name
+    identity = check(wheel, sdist, repo)
+    identity["binary"] = check_binary(wheel, identity["tags"])
+    interpreters = {}
+    for mode in ["minimal", "sdk"]:
+        venv = work / mode
+        run(["uv", "venv", "--python", python, venv], cwd=work, log=work / (mode + "-venv.log"))
+        interpreter = venv / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+        interpreters[mode] = interpreter
+        packages = [wheel] + (["pymilvus==" + sdk, "pytest"] if mode == "sdk" else [])
+        run(["uv", "pip", "install", "--python", interpreter, *packages], cwd=work, log=work / (mode + "-install.log"))
+    for mode, interpreter in interpreters.items():
+        extra = ["--peer-python", interpreters["sdk"]] if mode == "minimal" else []
+        run([interpreter, repo / "tests/packaging/install_smoke.py", "--work-dir", work / (mode + "-data"), "--mode", mode, *extra], cwd=work, log=work / (mode + "-smoke.log"))
+        if mode == "sdk" and suite:
+            run([interpreter, "-m", "pytest", repo / "tests/python", "-q", "--basetemp=" + str(work / "pytest")], cwd=work, log=work / "python.log")
+    return {"artifacts": identity, "sdk": sdk, "suite": suite, "passed": True}
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--work-dir", required=True, type=Path)
+    parser.add_argument("--repo", type=Path, default=Path(__file__).resolve().parents[2])
+    parser.add_argument("--sdk", choices=["2.6.17", "3.0.2"], default="3.0.2")
+    parser.add_argument("--python", default=sys.executable)
+    parser.add_argument("--suite", action="store_true")
+    parser.add_argument("--wheel", type=Path)
+    parser.add_argument("--sdist", type=Path)
+    args = parser.parse_args()
+    if (args.wheel is None) != (args.sdist is None):
+        parser.error("--wheel and --sdist must be provided together")
+    print(json.dumps(execute(args.repo, args.work_dir, args.python, args.sdk, args.suite, args.wheel, args.sdist)))
+
+
+if __name__ == "__main__":
+    main()

@@ -840,6 +840,7 @@ version = "0.1.0-dev.0"
 dependencies = [
  "milvus-lite-grpc",
  "pyo3",
+ "pyo3-build-config",
 ]
 
 [[package]]

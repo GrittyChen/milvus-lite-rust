@@ -17,8 +17,8 @@ uv pip install -q -p "$WORK/rs/bin/python" "pymilvus==$PYMILVUS" numpy "$WORK"/w
 # 工作区有未提交改动时附上改动内容的指纹：同一 commit 上的不同版本才不会被汇总成一组
 commit=$(git -C "$REPO" rev-parse HEAD)
 # 构建身份只取引擎与打包输入，基准或本地工作日志不会改变 native 产物。
-if [ -n "$(git -C "$REPO" status --porcelain -- Cargo.toml Cargo.lock crates)" ]; then
-  fp=$( (git -C "$REPO" diff HEAD -- Cargo.toml Cargo.lock crates; git -C "$REPO" ls-files -o --exclude-standard -z -- crates | (cd "$REPO" && xargs -0 cat)) | shasum -a 256 | cut -c1-8)
+if [ -n "$(git -C "$REPO" status --porcelain -- Cargo.toml Cargo.lock pyproject.toml rust-toolchain.toml crates)" ]; then
+  fp=$( (git -C "$REPO" diff HEAD -- Cargo.toml Cargo.lock pyproject.toml rust-toolchain.toml crates; git -C "$REPO" ls-files -o --exclude-standard -z -- Cargo.toml Cargo.lock pyproject.toml rust-toolchain.toml crates | (cd "$REPO" && xargs -0 cat)) | shasum -a 256 | cut -c1-8)
   commit="$commit+$fp"
 fi
 echo "$commit" > "$WORK/rs/BUILD_COMMIT"

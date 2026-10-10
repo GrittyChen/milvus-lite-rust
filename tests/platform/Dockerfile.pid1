@@ -1,0 +1,11 @@
+ARG BASE_IMAGE=python:3.10-slim-bookworm
+FROM ${BASE_IMAGE}
+RUN python -m pip install --timeout 120 pymilvus==3.0.2 \
+    && useradd --create-home --uid 1000 tester \
+    && mkdir /data /control \
+    && chown tester:tester /data /control
+COPY *.whl /tmp/artifacts/
+RUN python -m pip install --no-deps /tmp/artifacts/*.whl
+COPY pid1_entry.py /opt/pid1_entry.py
+USER tester
+ENTRYPOINT ["milvus-lite", "server", "--data-dir", "/data/service.db", "--host", "0.0.0.0", "--port", "19530", "--max-workers", "1"]

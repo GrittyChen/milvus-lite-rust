@@ -4,7 +4,7 @@ import errno
 import json
 import os
 from pathlib import Path
-import selectors
+import queue
 import signal
 import socket
 import subprocess
@@ -135,8 +135,17 @@ class Process:
         self.log = (path.parent / (path.name + ".log")).open("w+")
         command = [str(Path(sys.executable).with_name("milvus-lite.exe" if os.name == "nt" else "milvus-lite"))] if console else [sys.executable, "-m", "milvus_lite"]
         self.process = subprocess.Popen([*command, "server", "--data-dir", str(path), "--host", "127.0.0.1", "--port", "0", *extra], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self.log, text=True, creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0)
-        self.selector = selectors.DefaultSelector()
-        self.selector.register(self.process.stdout, selectors.EVENT_READ)
+        self.output = queue.Queue()
+        def read_output():
+            try:
+                for value in self.process.stdout:
+                    self.output.put(value)
+            except Exception as error:
+                self.output.put(error)
+            finally:
+                self.output.put(None)
+        self.reader = threading.Thread(target=read_output, daemon=True)
+        self.reader.start()
         try:
             line = self.line()
             assert "listening on " in line, line
@@ -146,19 +155,35 @@ class Process:
             self.close()
             raise
     def line(self):
-        assert self.selector.select(20), "CLI did not print a flushed line"
-        return self.process.stdout.readline()
+        value = self.output.get(timeout=20)
+        if isinstance(value, Exception):
+            raise value
+        assert value is not None, "CLI exited before printing a flushed line"
+        return value
     def stop(self, sig=None):
         if sig is None:
             sig = signal.CTRL_BREAK_EVENT if os.name == "nt" else signal.SIGINT
         self.process.send_signal(sig)
-        stdout, _ = self.process.communicate(timeout=30)
+        self.process.wait(timeout=30)
+        self.reader.join(timeout=5)
+        assert not self.reader.is_alive(), "CLI output reader did not finish"
+        lines = []
+        while not self.output.empty():
+            value = self.output.get_nowait()
+            if isinstance(value, Exception):
+                raise value
+            if value is not None:
+                lines.append(value)
         self.log.seek(0)
-        return self.process.returncode, stdout, self.log.read()
+        return self.process.returncode, "".join(lines), self.log.read()
     def close(self):
         if self.process.poll() is None:
             self.process.kill(); self.process.wait()
-        self.selector.close()
+        self.reader.join(timeout=5)
+        assert not self.reader.is_alive(), "CLI output reader did not finish"
+        self.process.stdout.close()
+        if self.process.stdin is not None:
+            self.process.stdin.close()
         self.log.close()
 
 

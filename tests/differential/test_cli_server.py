@@ -2,7 +2,8 @@
 
 import os
 from pathlib import Path
-import selectors
+import queue
+import threading
 import signal
 import socket
 import subprocess
@@ -24,23 +25,41 @@ class Cli:
         env = os.environ.copy()
         env["PYTHONUNBUFFERED"] = "1"
         self.process = subprocess.Popen([python, "-m", "milvus_lite", "server", "--data-dir", str(path), "--host", "127.0.0.1", "--port", str(port), "--max-workers", "1"], env=env, stdout=subprocess.PIPE, stderr=self.log, text=True, creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0)
-        selector = selectors.DefaultSelector()
+        self.output = queue.Queue()
+        def read_output():
+            try:
+                for value in self.process.stdout:
+                    self.output.put(value)
+            except Exception as error:
+                self.output.put(error)
+            finally:
+                self.output.put(None)
+        self.reader = threading.Thread(target=read_output, daemon=True)
+        self.reader.start()
         try:
-            selector.register(self.process.stdout, selectors.EVENT_READ)
-            assert selector.select(20)
-            line = self.process.stdout.readline()
-            assert f"listening on 127.0.0.1:{port}" in line, line
+            line = self.output.get(timeout=20)
+            if isinstance(line, Exception):
+                raise line
+            assert line is not None and f"listening on 127.0.0.1:{port}" in line, line
         except BaseException:
             self.close()
             raise
-        finally:
-            selector.close()
         self.reference = python != sys.executable
         self.client = MilvusClient(uri=f"http://127.0.0.1:{port}", dedicated=True)
     def stop(self):
         self.client.close()
         self.process.send_signal(signal.CTRL_BREAK_EVENT if os.name == "nt" else signal.SIGINT)
-        output, _ = self.process.communicate(timeout=30)
+        self.process.wait(timeout=30)
+        self.reader.join(timeout=5)
+        assert not self.reader.is_alive()
+        lines = []
+        while not self.output.empty():
+            value = self.output.get_nowait()
+            if isinstance(value, Exception):
+                raise value
+            if value is not None:
+                lines.append(value)
+        output = "".join(lines)
         self.log.seek(0)
         if os.name == "nt" and self.reference:
             # 0012 的已登记差异：参照不接管 SIGBREAK，本实现按正常停服处理。
@@ -53,6 +72,9 @@ class Cli:
             self.client.close()
         if self.process.poll() is None:
             self.process.kill(); self.process.wait()
+        self.reader.join(timeout=5)
+        assert not self.reader.is_alive()
+        self.process.stdout.close()
         self.log.close()
 
 
