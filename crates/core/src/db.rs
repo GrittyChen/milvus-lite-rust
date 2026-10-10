@@ -5,7 +5,7 @@ use std::fs;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 
 use crate::lock_order::{Mutex as OrderedMutex, RwLock};
@@ -309,6 +309,7 @@ pub struct Db {
     write_gate: RwLock<bool, 1>,
     maintenance: Arc<crate::maintenance::Maintenance>,
     namespace_waiters: AtomicUsize,
+    shutdown_failed: AtomicBool,
 }
 
 /// 关闭闸门（0003「进程退出」第 2、3 步）：关闭后不再接受新任务，在途任务全部结束后才释放 LOCK，
@@ -322,7 +323,7 @@ struct Gate {
     data_dir: Option<DataDir>,
 }
 
-/// 一个在途任务。引擎的每次使用都要持有它；析构时若引擎已关闭且这是最后一个任务，就释放 LOCK。
+/// 一个在途任务。析构递减计数并唤醒收尾等待者；LOCK 仍由最终 close 完成后释放。
 #[must_use]
 pub struct InFlight<'a> {
     db: &'a Db,
@@ -380,6 +381,7 @@ impl Db {
             write_gate: RwLock::new(false),
             maintenance: crate::maintenance::Maintenance::new(),
             namespace_waiters: AtomicUsize::new(0),
+            shutdown_failed: AtomicBool::new(false),
         });
         db.maintenance.start(Arc::downgrade(&db))?;
         Ok(db)
@@ -399,6 +401,26 @@ impl Db {
         Ok(InFlight { db: self })
     }
 
+    /// 宽限结束后只封住公开入场；在途任务、维护和 LOCK 仍由最终 close 收尾。
+    pub fn begin_shutdown(&self) {
+        self.gate.lock().closed = true;
+    }
+
+    pub fn shutdown_failed(&self) -> bool {
+        self.shutdown_failed.load(Ordering::Acquire)
+    }
+
+    fn report_shutdown_failure(&self, reason: impl std::fmt::Display) {
+        self.shutdown_failed.store(true, Ordering::Release);
+        eprintln!("{reason}");
+    }
+
+    pub(crate) fn record_maintenance_shutdown_failure(&self) {
+        if self.gate.lock().cleanup_started {
+            self.shutdown_failed.store(true, Ordering::Release);
+        }
+    }
+
     /// 关闭引擎：拒绝新任务，等在途任务全部结束（任务有界，不设超时），然后释放 LOCK。可重复调用。
     pub fn close(&self) {
         let mut gate = self.gate.lock();
@@ -415,14 +437,16 @@ impl Db {
         }
         drop(gate);
         self.finish_storage(true);
-        self.maintenance.stop(true);
+        if !self.maintenance.stop(true) {
+            self.report_shutdown_failure("maintenance shutdown failed");
+        }
         self.finish_storage(false);
         let mut gate = self.gate.lock();
         gate.data_dir = None;
         self.idle.notify_all();
     }
 
-    /// 不阻塞的关闭：拒绝新任务；没有在途任务时立即释放 LOCK，否则由最后一个任务结束时释放。
+    /// 拒绝新任务并由收尾线程等待在途/维护结束、同步保留 WAL 后释放 LOCK。
     pub fn close_nowait(self: &Arc<Self>) {
         self.maintenance.abort.store(true, Ordering::Release);
         let mut gate = self.gate.lock();
@@ -479,10 +503,10 @@ impl Db {
             self.finish_storage_inner(flush);
         }));
         if let Err(payload) = result {
-            eprintln!(
+            self.report_shutdown_failure(format!(
                 "storage close panicked: {}",
                 crate::error::panic_description(payload.as_ref())
-            );
+            ));
             // 关闭已经不可逆；停止 manifest 提交，只同步原 WAL，再让关闭闸门完成并释放 LOCK。
             let handles: Vec<_> = self.collections.read().values().cloned().collect();
             for handle in handles {
@@ -494,7 +518,9 @@ impl Db {
                     Ok(())
                 });
                 if let Err(error) = result {
-                    eprintln!("cannot sync WAL after close panic: {error}");
+                    self.report_shutdown_failure(format!(
+                        "cannot sync WAL after close panic: {error}"
+                    ));
                 }
             }
         }
@@ -502,7 +528,14 @@ impl Db {
 
     fn finish_storage_inner(&self, flush: bool) {
         // 目录改名的持久化未确认时，任何 manifest 提交都可能固定错误的目录状态。
-        let flush = flush && !*self.write_gate.read();
+        let flush = if flush && *self.write_gate.read() {
+            self.report_shutdown_failure(
+                "storage close flush skipped: database directory durability is unconfirmed",
+            );
+            false
+        } else {
+            flush
+        };
         let handles: Vec<_> = self.collections.read().values().cloned().collect();
         for handle in handles {
             if flush {
@@ -523,14 +556,19 @@ impl Db {
                                 if let Err(error) =
                                     frozen.and_then(|()| self.flush_handle(&handle, false))
                                 {
-                                    eprintln!("collection close WAL cleanup failed: {error}");
+                                    self.report_shutdown_failure(format!(
+                                        "collection close WAL cleanup failed: {error}"
+                                    ));
                                 }
                             }
                             Ok(false) => {}
-                            Err(error) => eprintln!("collection close WAL scan failed: {error}"),
+                            Err(error) => self.report_shutdown_failure(format!(
+                                "collection close WAL scan failed: {error}"
+                            )),
                         }
                     }
-                    Err(error) => eprintln!("collection close flush failed: {error}"),
+                    Err(error) => self
+                        .report_shutdown_failure(format!("collection close flush failed: {error}")),
                 }
             }
             let result = handle
@@ -538,7 +576,7 @@ impl Db {
                 .persistent_mut()
                 .map(|p| p.sync_retained_wal());
             if let Some(Err(error)) = result {
-                eprintln!("collection close WAL sync failed: {error}");
+                self.report_shutdown_failure(format!("collection close WAL sync failed: {error}"));
             }
         }
     }
@@ -2882,6 +2920,7 @@ mod tests {
         .unwrap();
         *db.write_gate.write() = true;
         db.close();
+        assert!(db.shutdown_failed());
         assert!(!path.join("collections/c/manifest.json").exists());
         assert!(
             path.join("collections/c/wal/wal_data_000001.arrow")
@@ -2890,6 +2929,77 @@ mod tests {
         let reopened = Db::new(DataDir::open(&path).unwrap(), compute()).unwrap();
         assert_eq!(reopened.collection("", "c").unwrap().read().count(), 1);
         reopened.close();
+    }
+
+    #[cfg(feature = "fault-injection")]
+    #[test]
+    fn blocked_close_reports_failure_with_or_without_pending_maintenance() {
+        use std::time::{Duration, Instant};
+
+        for pending in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let db = test_db(root.path());
+            db.create_collection("", "c", basic_schema()).unwrap();
+            let before = db
+                .wait_for_maintenance("", "c", Duration::from_secs(10))
+                .unwrap();
+            assert_eq!(before.accepted, before.completed);
+            assert_eq!(before.failed, 0);
+            db.insert(
+                "",
+                "c",
+                InsertBatch {
+                    num_rows: 1,
+                    columns: vec![
+                        ("id".into(), InputValues::Int(vec![1])),
+                        (
+                            "v".into(),
+                            InputValues::FloatVector {
+                                dim: 2,
+                                values: vec![1.0, 0.0],
+                            },
+                        ),
+                    ],
+                },
+            )
+            .unwrap();
+            let wal = root.path().join("collections/c/wal/wal_data_000001.arrow");
+            let wal_before = fs::read(&wal).unwrap();
+            let handle = db.collection("", "c").unwrap();
+            // 维护不能越过闸门；关闭开始后才放行，固定积压任务的失败时机。
+            let mut blocked = db.write_gate.write();
+            *blocked = true;
+            if pending {
+                db.maintenance.enqueue(&handle).unwrap();
+            }
+            let closing = Arc::clone(&db);
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                closing.close();
+                done_tx.send(()).unwrap();
+            });
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !db.gate.lock().cleanup_started {
+                assert!(Instant::now() < deadline, "close did not start");
+                std::thread::yield_now();
+            }
+            drop(blocked);
+            done_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            worker.join().unwrap();
+            assert!(db.shutdown_failed(), "pending={pending}");
+            let after = db
+                .wait_for_maintenance("", "c", Duration::from_secs(10))
+                .unwrap();
+            assert_eq!(after.accepted, before.accepted + u64::from(pending));
+            assert_eq!(after.completed, after.accepted);
+            assert_eq!(after.failed, u64::from(pending));
+            assert!(!root.path().join("collections/c/manifest.json").exists());
+            assert_eq!(fs::read(&wal).unwrap(), wal_before);
+            let reopened = test_db(root.path());
+            assert_eq!(reopened.collection("", "c").unwrap().read().count(), 1);
+            reopened.close();
+            assert!(!reopened.shutdown_failed());
+        }
     }
 
     #[test]

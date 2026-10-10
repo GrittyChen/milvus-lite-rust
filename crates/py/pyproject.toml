@@ -13,6 +13,9 @@ classifiers = [
     "Programming Language :: Python :: Implementation :: CPython",
 ]
 
+[project.scripts]
+milvus-lite = "milvus_lite.cmdline:main"
+
 [tool.maturin]
 python-source = "python"
 module-name = "milvus_lite._native"

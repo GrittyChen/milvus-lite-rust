@@ -11,11 +11,20 @@ use crate::pb::service::{self as svc, milvus_service_server::MilvusService as Se
 use crate::status::{self as st, Branch, Reply};
 use crate::{MAX_MESSAGE_SIZE, index, insert, query, schema, search};
 
+#[cfg(test)]
+#[derive(Clone, Default)]
+pub(crate) struct RpcTestHooks {
+    pub after_attempt: Option<Arc<dyn Fn(bool) + Send + Sync>>,
+    pub after_enqueue: Option<Arc<dyn Fn() + Send + Sync>>,
+}
+
 pub(crate) struct MilvusService {
     version: String,
     db: Arc<Db>,
     #[cfg(test)]
     after_search_snapshot: Option<Arc<dyn Fn() + Send + Sync>>,
+    #[cfg(test)]
+    pub(crate) test_hooks: RpcTestHooks,
 }
 
 impl MilvusService {
@@ -25,6 +34,8 @@ impl MilvusService {
             db,
             #[cfg(test)]
             after_search_snapshot: None,
+            #[cfg(test)]
+            test_hooks: RpcTestHooks::default(),
         }
     }
 
@@ -36,11 +47,22 @@ impl MilvusService {
         F: FnOnce(&Db) -> Result<R, EngineError> + Send + 'static,
     {
         let db = Arc::clone(&self.db);
-        let joined = tokio::task::spawn_blocking(move || {
-            let _task = db.enter()?;
+        #[cfg(test)]
+        let after_attempt = self.test_hooks.after_attempt.clone();
+        let task = tokio::task::spawn_blocking(move || {
+            let admitted = db.enter();
+            #[cfg(test)]
+            if let Some(hook) = after_attempt {
+                hook(admitted.is_ok());
+            }
+            let _task = admitted?;
             f(&db)
-        })
-        .await;
+        });
+        #[cfg(test)]
+        if let Some(hook) = &self.test_hooks.after_enqueue {
+            hook();
+        }
+        let joined = task.await;
         let reply = match joined {
             Ok(Ok(reply)) => reply,
             Ok(Err(e)) => R::with_status(st::from_engine(&e, branch)?),

@@ -22,7 +22,7 @@
 | --- | --- |
 | **参照实现** | [references/milvus-lite/](references/milvus-lite/)，被 `.gitignore` 忽略、不随本仓提交的本地 checkout。当前对照版本为 v3.2.1（`43d1257`），升级时同步改这里与差分测试的版本守卫（[tests/differential/conftest.py](tests/differential/conftest.py) 的 `REF_VERSION`）；记录对照结论时写明所依据的 commit（`git -C references/milvus-lite log -1`） |
 | **pymilvus 接入点** | `pymilvus` 遇到以 `.db` 结尾的 URI 时，先检查父目录存在，再执行 `from milvus_lite.server_manager import server_manager_instance` 并调用 `start_and_get_uri(uri)`（3.x 的签名为 `start_and_get_uri(path, args=None)`）；返回 `None` 即报 “Open local milvus failed”，否则按返回的 `http://127.0.0.1:<port>` 走普通 Milvus gRPC（参照实现 [server_manager.py](references/milvus-lite/milvus_lite/server_manager.py)）。以上在 pymilvus 2.6.15 / 2.6.17 / 3.0.2 中逐行一致；pymilvus 升级时重新核对。**模块路径、实例名、方法签名、返回约定都是对外契约**。pymilvus 的 `milvus-lite` extra 依赖 PyPI 上的 `milvus-lite`（`>=2.4.0`，非 Windows），这个名字归官方所有，因此本项目以 `milvus-lite-rust` 发布：用户安装 `pymilvus` 与 `milvus-lite-rust`，不用 `pymilvus[milvus-lite]`。它与官方 `milvus-lite` 争用同一个 `milvus_lite` 模块与 `milvus-lite` 命令，**不得同时安装**：pip 不会阻止，后装者覆盖同名文件，卸载任一方都会弄坏另一方；pymilvus 导入失败时的提示还会把用户引向官方包。因此绑定层导入时须检测已安装的官方发行包 `milvus-lite` 并明确报错，README 的安装说明须先 `pip uninstall milvus-lite`。官方包后装覆盖本包的情形检测不到，只能靠文档说明 |
-| **CLI** | 参照实现提供 `milvus-lite server --data-dir <dir> [--host] [--port] [--max-workers]` 与 `milvus-lite dump`（[cmdline.py](references/milvus-lite/milvus_lite/cmdline.py)）。本实现先提供 `server`，参数与之一致，按对外契约对待（`--max-workers` 原本控制 grpcio 线程池，在本实现中的对应含义待定义）；`dump` 后续再做（见[技术栈](#技术栈)） |
+| **CLI** | 参照实现提供 `milvus-lite server --data-dir <dir> [--host] [--port] [--max-workers]` 与 `milvus-lite dump`（[cmdline.py](references/milvus-lite/milvus_lite/cmdline.py)）。本实现先提供 `server`，参数与之一致，按对外契约对待（`--max-workers` 控制 RPC 阻塞池，计算池与维护线程独立；见 [0012](docs/decisions/0012-cli-server.md)）；`dump` 后续再做（见[技术栈](#技术栈)） |
 | **gRPC adapter** | Milvus 协议 → 引擎 API 的翻译层。**只翻译、不加能力**：引擎不支持的 RPC 返回 `UNIMPLEMENTED` + 明确信息，绝不静默成功（参照实现架构不变量 15） |
 | **`_seq`** | 正常写入的操作全序号；覆盖 / 丢弃 / 去重按 `_seq` 判定。3.x 故障目录中的重复 `_seq` 属例外，按 [0007「数据结构」](docs/decisions/0007-m2-storage-engine.md#数据结构) 记录的来源与平局规则处理 |
 | **WAL / MemTable / segment / delta / manifest** | LSM 式存储：写入先落 WAL 与 MemTable，flush 生成不可变 segment，删除写 delta（tombstone），compaction 合并并回收 tombstone；manifest 是唯一真值、原子更新；`data_dir/LOCK` 保证单进程独占。机制见参照实现 [wal-design.md](references/milvus-lite/docs/wal-design.md) 与 [modules.md](references/milvus-lite/docs/modules.md) |
@@ -58,6 +58,7 @@
 | 第二个里程碑（M2）做什么、不做什么 / 3.x 存储层的实测事实与缺陷 / 与 3.x 的差异 / 持久化保证 / 验收 | [docs/decisions/0006-m2-scope.md](docs/decisions/0006-m2-scope.md) |
 | M2 存储引擎的结构 / 取锁顺序 / 快照与有效位图 / WAL、flush、drop 与关闭的提交和失败协议 | [docs/decisions/0007-m2-storage-engine.md](docs/decisions/0007-m2-storage-engine.md) |
 | 首发 compaction、正常关闭排空、GC 与独立已提交删除状态 | [0010](docs/decisions/0010-compaction-and-tombstone-gc.md)、[0011](docs/decisions/0011-committed-delete-state.md) |
+| CLI server 参数、工作者、信号与停服错误（已实现，冻结范围复审通过） | [0012](docs/decisions/0012-cli-server.md) |
 | 性能基线怎么测 / 口径 / 注意事项 | [benchmarks/baseline/README.md](benchmarks/baseline/README.md) |
 | 代码审查 / 修复复审（冻结合同、完整调用链、同类全域清扫、分级与证据门槛、二三阶影响矩阵） | [code-review-rules](.agents/skills/code-review-rules/SKILL.md)（Claude Code 经 `.claude/skills` 软链读取同一份） |
 
@@ -81,7 +82,7 @@ pymilvus ──server_manager──▶ adapter/grpc ──▶ db（多 collectio
 | --- | --- | --- |
 | `crates/core` | [db.py](references/milvus-lite/milvus_lite/db.py) 及其下各层 | 引擎：多 collection 生命周期、LOCK、存储、检索、索引、schema。不依赖 protobuf 与 Python。module：`lock_order`（五层锁与查表叶子锁的 debug 顺序检查）、`maintenance`（每 Db 单线程、按句柄计数的后台维护与正常关闭排空；见 0010）、`db`（数据库与 collection 生命周期、写入许可、按名字懒打开与失败判定缓存、关闭闸门）、`collection`（不可变列式读快照、稳定块引用与源映射、小块合并、主键读取准备、写入校验、get / count / 检索、load 状态）、`compute`（服务的计算池，rayon-core 只在这里调用）、`schema`、`data`（列式数据与私有的按类型主键表 `PkMap`）、`index`（索引定义与度量）、`projection`（output_fields 展开）、`filter`（`parser` / `temporal` / `unicode` 负责完整语法与诊断，`eval` 负责 S1 字段绑定与列式求值，`dynamic` 负责顶层动态键的数据源级绑定与求值，主键 in 识别保留快路径；范围见 0006 / 0009）、`flat`（暴力检索的距离）、`data_dir`（LOCK 与数据库 staging 残留清理）、`storage::wal`（3.x Arrow IPC stream WAL 的读写与已校验前缀恢复）、`storage::manifest` / `schema_file`（3.x JSON 格式的解析与编码）、`storage::parquet_file` / `arrow_data`（3.x Parquet 与列式值的转换）、`storage::memtable` / `visibility`（M2 的位次、tombstone、跨数据源 `_seq` 判定、有效位图与读快照）、`storage::fs_commit` / `flush`（schema、manifest 与冻结代的提交和 WAL 清理）、`storage::snapshot`（读取 3.x snapshot 元数据与钉住集合）、`storage::recovery`（加载已提交 segment、delta 与 WAL 并建位图）、`storage::compaction`（已提交文件的有界选择、物理行映射、临时输出与整份 delta GC）、`storage::runtime`（WAL 代、冻结、提交、同步、独立已提交删除表与故障状态）、`error`（与 3.x 异常一一对应的错误及 Python repr 格式化）、`pyjson`（按 Python `json.dumps` 的格式输出 JSON） |
 | `crates/grpc` | [adapter/grpc/](references/milvus-lite/milvus_lite/adapter/grpc/) | proto 代码生成（protox）、协议翻译与错误映射；作为服务宿主，负责服务实例（runtime、计算池、引擎、端口）的启动与停止，计算池交给引擎。module：`service`（各 RPC 的实现）、`schema` / `insert` / `search` / `query` / `index` / `output`（请求解码与响应编码）、`status`（错误映射）、`pyint`（按 Python `int()` / `float()` 解析参数）、`guard`（未实现的 RPC 与超限请求）、`server`（服务宿主）。RPC 的处理体在 tokio 的阻塞线程池中执行，检索在其中经计算池并行（[0005](docs/decisions/0005-search-thread-model.md)） |
-| `crates/py` | [server_manager.py](references/milvus-lite/milvus_lite/server_manager.py) | PyO3 扩展，加上 Python 包 `milvus_lite`：`server_manager.py` 维护路径表，导入时检测官方发行包。CLI 放在哪里待定 |
+| `crates/py` | [server_manager.py](references/milvus-lite/milvus_lite/server_manager.py) | PyO3 扩展，加上 Python 包 `milvus_lite`：`server_manager.py` 维护路径表，导入时检测官方发行包。`cmdline.py` / `__main__.py` 解析独立 CLI、信号与关闭；合同见 0012 |
 
 服务实例的所有权、同路径复用、进程退出与 fork 的处理见 [0003](docs/decisions/0003-in-process-server-lifecycle.md)。跨文件的隐含约定：
 
@@ -140,6 +141,7 @@ pymilvus ──server_manager──▶ adapter/grpc ──▶ db（多 collectio
 | 端到端测试（真实 pymilvus；含 [tests/python/adapter/](tests/python/adapter/) 中复制自参照实现的用例，逐条状态见其 INVENTORY.md） | `.venv/bin/python -m pytest tests/python` |
 | 与 3.x 的差分测试（3.x 的 venv 可用 `benchmarks/baseline/setup.sh <work_dir>` 建出的 `<work_dir>/v3`；不设环境变量时报错，不跳过；上一行的命令不包含它） | `MILVUS_LITE_3X_PYTHON=<3.x 的 venv>/bin/python .venv/bin/python -m pytest tests/differential` |
 | M2 存储文件双向互通矩阵（环境准备见 [tests/storage_interop/README.md](tests/storage_interop/README.md)） | `MILVUS_LITE_3X_PYTHON=<v3>/bin/python MILVUS_LITE_ARROW15_PYTHON=<arrow15>/bin/python MILVUS_LITE_ARROW25_PYTHON=<v3>/bin/python .venv/bin/python -m pytest tests/storage_interop` |
+| 独立 CLI server | `.venv/bin/milvus-lite server --data-dir <data_dir> --host 127.0.0.1 --port 19530 --max-workers 10`；也可 `python -m milvus_lite server ...`，合同见 0012 |
 | 构建 wheel / sdist | `.venv/bin/maturin build --release -m crates/py/Cargo.toml` / `.venv/bin/maturin sdist -m crates/py/Cargo.toml` |
 | 核对依赖图中没有 C++ 构建与 protoc | `cargo tree --workspace -e all` |
 

@@ -566,3 +566,7 @@ HNSW 换成 FLAT、`== N` 换成 `in [N]` 的条件见 0004「验收」第 2 项
 ## tests/compatibility
 
 [tests/compatibility/](https://github.com/milvus-io/milvus-lite/tree/v3.2.1/tests/compatibility) 的 9 个文件共 239 条用例，M1 不复用：它们以范围外的功能为主（过滤、分区与 partition key、多数据库、function、delete / upsert），而且每个文件各自用 `start_server_in_thread` 定义起服务的 fixture。某个文件涉及的功能全部进入范围后，替换 fixture 整文件运行（0004「验收」第 2 项）。
+
+## CLI 入口用例（独立来源）
+
+[test_cli_entrypoints.py](../test_cli_entrypoints.py) 另原样复制参照 tests/test_dump_tool.py 的 test_main_dispatches_server 和 test_package_module_main_delegates_to_cmdline，共 2 条。它们不属于 tests/adapter 的 637 条统计，起服务/信号与参数的真实验证见 test_cli.py 和差分的 test_cli_server.py；dump 尚未复用。

@@ -8,7 +8,7 @@ M2 崩溃矩阵已覆盖混合 data/delta WAL 写入后的进程退出、flush �
 
 M2 最终验收候选与 Linux LOCK/strace 证据见[验收记录](docs/testing/m2-acceptance.md)，三方性能及修后复测见 [0001](docs/decisions/0001-refactor-baseline.md#m2-三方基准)。性能目标只部分达到，当前候选已通过范围内复审；这不代表首次发布或生产可用。
 
-M2 性能阶段已按负责人确认的顺序收口，各专项结果和未达目标见[阶段总结](docs/testing/m2-performance-summary.md)。接下来补齐[首发最小范围](docs/decisions/0008-first-release-scope.md)：当前切片增加[顶层动态字段过滤](docs/decisions/0009-top-level-dynamic-filter.md)，支持裸字段比较/in 与 `$meta["key"]` 比较；嵌套 JSON 路径等仍显式拒绝。后台 compaction 与整份 tombstone GC 已接入，采用[0010](docs/decisions/0010-compaction-and-tombstone-gc.md) 的单 Db 维护线程和[0011](docs/decisions/0011-committed-delete-state.md) 的独立已提交删除状态，本轮实现与修复已通过评审，证据见[实施验收记录](docs/testing/compaction-correctness.md)；CLI、Windows 和首次发布验收仍未完成，生产限制保留。
+M2 性能阶段已按负责人确认的顺序收口，各专项结果和未达目标见[阶段总结](docs/testing/m2-performance-summary.md)。接下来补齐[首发最小范围](docs/decisions/0008-first-release-scope.md)：当前切片增加[顶层动态字段过滤](docs/decisions/0009-top-level-dynamic-filter.md)，支持裸字段比较/in 与 `$meta["key"]` 比较；嵌套 JSON 路径等仍显式拒绝。后台 compaction 与整份 tombstone GC 已接入，采用[0010](docs/decisions/0010-compaction-and-tombstone-gc.md) 的单 Db 维护线程和[0011](docs/decisions/0011-committed-delete-state.md) 的独立已提交删除状态，本轮实现与修复已通过评审，证据见[实施验收记录](docs/testing/compaction-correctness.md)；CLI `server` 已接入，Windows 和首次发布验收仍未完成，生产限制保留。
 
 ## 已知限制
 
@@ -25,6 +25,28 @@ M2 性能阶段已按负责人确认的顺序收口，各专项结果和未达�
 | 项目上下文、术语与全局规则（人与 coding agent 共用） | [AGENTS.md](AGENTS.md) |
 | 设计决策 | [docs/decisions/](docs/decisions/)：[0001 重构基线选择](docs/decisions/0001-refactor-baseline.md)、[0002 数据目录格式](docs/decisions/0002-data-dir-compat.md)、[0003 进程内服务的生命周期](docs/decisions/0003-in-process-server-lifecycle.md)、[0004 M1 范围与验收](docs/decisions/0004-m1-scope.md)、[0005 检索线程模型](docs/decisions/0005-search-thread-model.md)、[0006 M2 范围与验收](docs/decisions/0006-m2-scope.md)、[0007 M2 存储引擎](docs/decisions/0007-m2-storage-engine.md) |
 | 与官方 2.5.1 / 3.x 对照的基线基准 | [benchmarks/baseline/](benchmarks/baseline/README.md) |
+
+## 独立 CLI server
+
+安装本包后可启动独立服务，使用 0012 的已确认生命周期与线程配置：
+
+```bash
+milvus-lite server --data-dir ./demo.db --host 127.0.0.1 --port 19530 --max-workers 10
+# 等价模块入口
+python -m milvus_lite server --data-dir ./demo.db --host 127.0.0.1 --port 19530 --max-workers 10
+```
+
+客户端使用 `MilvusClient(uri="http://127.0.0.1:19530")`。data-dir 不要求 .db 后缀。`--port 0` 自动分配，ready 行显示实际地址；hostname 只绑定解析结果中首个成功 bind 的地址，IPv6 使用括号显示，应按实际地址连接。`--max-workers` 控制引擎 RPC 的阻塞处理并发，计算池与维护线程独立；嵌入服务省略该参数时保持 512 上限。
+
+IPv6 监听已通过 Milvus 协议直连验证；本次验证的 pymilvus 2.6.17/3.0.2 存在 IPv6 URI 重组问题，用这两条 SDK 时请显式绑定 `127.0.0.1`。
+
+默认 host 为 `0.0.0.0`，监听所有网卡；当前没有认证/TLS。仅本机使用应显式指定 `--host 127.0.0.1`。目前仅提供 server，dump 后续补齐。
+
+首次 SIGINT/SIGTERM 请求正常关闭，Windows 的新进程组 CTRL_BREAK_EVENT/SIGBREAK 按单独的平台验收处理。RPC 宽限为 5 秒，之后仍等待已入场引擎任务、flush 和后台维护排空；这是总等待的一部分，不是退出期限。宽限结束后未入场的排队写入不执行，已入场但客户端未收到结果的请求仍可能生效。
+
+进入原生 stop 前，CLI 将停止信号设为 SIG_DFL；普通进程后续信号可使其异常终止。若启动 CLI 的包装进程会转发 SIGINT，一次 Ctrl-C 可能变成两次，导致非零退出并打断维护排空，数据依赖进程崩溃恢复；这不是断电保证。Linux PID 1 和 Windows 的默认终止行为有特殊限制，监督器可能在外部期限后强杀，详见 [0012](docs/decisions/0012-cli-server.md)。
+
+argparse 的语法与数值参数错误退出 2；host 格式校验失败（例如 `[bad]`）、启动和停止错误退出 1。数值与括号地址格式校验在创建资源前完成；DNS 解析和 bind 失败发生在打开数据目录之后，可能已创建目录。正常关闭因目录持久化未确认而跳过最终 flush，以及存储收尾的 flush、WAL 同步/清理或 panic，都会记录失败标志，显式 stop 返回错误、CLI 退出 1。正常停止退出 0 仍不宣称所有平台/故障情况下全部文件已确认持久化；Drop 无接收者仍记录日志。CLI 的代码验收与平台未验证范围见[CLI 实施记录](docs/testing/cli-correctness.md)。
 
 ## 许可
 

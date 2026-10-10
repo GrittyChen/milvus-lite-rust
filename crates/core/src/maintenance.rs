@@ -248,6 +248,9 @@ impl Maintenance {
                         && !matches!(error, EngineError::Closed)
                     {
                         eprintln!("background maintenance failed: {error}");
+                        if let Some(db) = owner.upgrade() {
+                            db.record_maintenance_shutdown_failure();
+                        }
                     }
                     let elapsed = start.elapsed();
                     #[cfg(feature = "fault-injection")]
@@ -320,7 +323,7 @@ impl Maintenance {
         Ok(())
     }
 
-    pub fn stop(&self, drain: bool) {
+    pub fn stop(&self, drain: bool) -> bool {
         if !drain {
             self.abort.store(true, Ordering::Release);
         }
@@ -337,6 +340,21 @@ impl Maintenance {
                 "maintenance thread terminated: {}",
                 crate::error::panic_description(payload.as_ref())
             );
+            return false;
         }
+        true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn joining_a_failed_worker_reports_failure_to_storage_close() {
+        let maintenance = Maintenance::new();
+        *maintenance.join.lock() = Some(std::thread::spawn(|| panic!("failed worker")));
+        assert!(!maintenance.stop(true));
+        assert!(maintenance.stop(true));
     }
 }

@@ -1,6 +1,7 @@
 //! Python 扩展 `milvus_lite._native`：只做胶水，启动与停止 Rust gRPC 服务。
 //! 路径表、atexit 与 fork 钩子在 `milvus_lite/server_manager.py`（见 0003）。
 
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -16,6 +17,7 @@ type PauseChannels = (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>
 struct NativeServer {
     server: Mutex<Server>,
     port: u16,
+    bound_address: String,
     #[cfg(feature = "fault-injection")]
     compaction_pause: Mutex<Option<PauseChannels>>,
 }
@@ -127,26 +129,37 @@ impl NativeServer {
     }
     /// 打开数据目录并在 `host:port` 上启动服务（`port=0` 由系统分配）。失败抛 `RuntimeError`。
     #[staticmethod]
+    #[pyo3(signature = (data_dir, host, port, version, max_workers=None))]
     fn start(
         py: Python<'_>,
         data_dir: PathBuf,
         host: String,
         port: u16,
         version: String,
+        max_workers: Option<usize>,
     ) -> PyResult<Self> {
+        let max_blocking_threads = max_workers
+            .map(|value| {
+                NonZeroUsize::new(value)
+                    .ok_or_else(|| PyValueError::new_err("max_workers must be greater than 0"))
+            })
+            .transpose()?;
         let config = ServerConfig {
             data_dir,
             host,
             port,
             version,
+            max_blocking_threads,
         };
         let server = py
             .detach(|| Server::start(config))
             .map_err(|e| PyRuntimeError::new_err(error_chain(&e)))?;
         let port = server.port();
+        let bound_address = server.bound_address().to_string();
         Ok(Self {
             server: Mutex::new(server),
             port,
+            bound_address,
             #[cfg(feature = "fault-injection")]
             compaction_pause: Mutex::new(None),
         })
@@ -155,6 +168,11 @@ impl NativeServer {
     #[getter]
     fn port(&self) -> u16 {
         self.port
+    }
+
+    #[getter]
+    fn bound_address(&self) -> &str {
+        &self.bound_address
     }
 
     /// grace 只限制 RPC 宽限；正常停服还会等待引擎与后台维护排空后释放 LOCK。
