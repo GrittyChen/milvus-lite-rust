@@ -125,6 +125,7 @@ E4、E5 违反了架构不变量 8（单进程独占 data_dir）和不变量 5�
 | `Server::drop` 非阻塞析构 | 正常情况下析构线程立即返回；后台收尾同步保留的 WAL 之前，另一进程仍拿不到 LOCK；线程创建失败的故障注入下析构线程同步完成 WAL 收尾后才返回，重开仍能恢复 |
 | `release_server` 后再次打开同一路径 | 旧服务已停、LOCK 已释放，新服务可用 |
 | 正常退出 | 最后一次有效 flush 的维护计数不丢，已接受维护全部完成后才释放 LOCK；不以 RPC 宽限作为总退出时限；重开数据完整，单轮大数据耗时与信号处理另按 0010 验收 |
+| 退出时有在途请求 | 宽限期内完成的已入场请求照常返回，应答与未停服时相同；宽限期满仍未完成的被取消，客户端在停服完成前收到错误（经 pymilvus 为 `UNAVAILABLE`，与 3.x 相同）；已开始的引擎任务结束后才释放 LOCK。grpc 的 `rpc_admitted_before_stop_completes_normally_within_grace` 以钩子判定第一项（能识别信号后立即取消的实现）；`stop_retains_lock_until_admitted_rpc_finishes_after_runtime_shutdown` 以事件顺序判定取消早于停服完成、LOCK 等待引擎任务，并以单向下限识别截短的宽限。经正式 wheel 的两条 Python 用例只做冒烟，不推断跨请求耗时 |
 | 正常退出时 collection 正在 flush | Parquet 与 manifest 提交、保留 WAL 的 fsync 尚未结束时，另一进程拿不到 LOCK；收尾完成后才能打开并恢复。此并发故障用例随完整 M2 验收执行 |
 | 进程被 SIGKILL（引入 WAL 后） | 重开后从 WAL 恢复出全部已返回成功的写入 |
 | 同时开两个服务，其中一个停止失败（故障注入） | 另一个照常停止；失败的那个保留了 WAL，重开后能恢复；错误写入日志 |

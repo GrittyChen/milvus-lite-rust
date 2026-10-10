@@ -239,8 +239,12 @@ def test_normal_exit_releases_lock_without_hanging(tmp_path):
     assert can_open_in_other_process(path)
 
 
-def _slow_search_env(tmp_path, seconds):
-    """起一个服务，建好使一次检索耗时约 ``seconds`` 秒的 collection，返回 (manager, path, 发起检索的函数)。"""
+def _slow_search_env(tmp_path, seconds, pick=None):
+    """起一个服务，建好使一次检索耗时约 ``seconds`` 秒的 collection，返回 (manager, path, 发起检索的函数)。
+
+    ``pick`` 为 ``min`` 时按多次测量中最快的一次、``max`` 时按最慢的一次，把耗时按条数线性近似换算，
+    使检索大致偏长或偏短于 ``seconds``；这是近似估计，调用方须在前提上自留余量，不能当作保证。
+    """
     from pymilvus.grpc_gen import common_pb2, milvus_pb2, milvus_pb2_grpc, schema_pb2
     from rawproto import raw_insert
 
@@ -278,6 +282,11 @@ def _slow_search_env(tmp_path, seconds):
         if took >= 0.3:
             break
         nq *= 4
+    if pick is not None:
+        for _ in range(2):
+            start = time.monotonic()
+            search(nq)
+            took = pick(took, time.monotonic() - start)
     nq = max(1, int(seconds * nq / took))
     return manager, path, lambda: search(nq)
 
@@ -298,8 +307,11 @@ def _run_in_thread(fn):
 
 
 def test_stop_lets_short_in_flight_request_finish(tmp_path):
-    # 0003「验证」正常退出：宽限期内能完成的在途请求照常返回结果。
-    manager, path, search = _slow_search_env(tmp_path, seconds=0.5)
+    # 0003「验证」正常退出的冒烟：短请求在停服时照常返回、之后 LOCK 已释放。宽限期内已入场的
+    # 请求不被取消，由 grpc 的 rpc_admitted_before_stop_completes_normally_within_grace 以钩子判定。
+    # 这里按多次测量中最慢的一次近似换算到约 0.5 秒，与宽限期之间按线性估计留约 4 倍余量；请求也可能
+    # 在停服前就已完成，此时本用例不覆盖在途情形。
+    manager, path, search = _slow_search_env(tmp_path, seconds=0.5, pick=max)
     t, result = _run_in_thread(search)
     time.sleep(0.3)
     manager.release_server(str(path))
@@ -308,29 +320,36 @@ def test_stop_lets_short_in_flight_request_finish(tmp_path):
     assert lock_is_free(path)
 
 
-def test_stop_waits_for_engine_task_before_releasing_lock(tmp_path):
-    # 0003「进程退出」：宽限期（2 秒）过后请求被取消，客户端随即收到错误；但已经开始的引擎任务
-    # 不可取消，停止要等它结束才释放 LOCK。检索约 5 秒，明显长于宽限期。
-    manager, path, search = _slow_search_env(tmp_path, seconds=5.0)
-    # 先完整跑一次同样的检索，得到它的实际耗时，下限不依赖粗略的估算。检索须明显长于
-    # 「宽限期 + 下限余量」，否则不等引擎任务就返回的实现（约 2 秒）也能满足下限。
-    started = time.monotonic()
-    search()
-    seconds = time.monotonic() - started
-    assert seconds > 3.5, seconds
+def test_stop_cancels_long_request_then_releases_lock_and_reopens(tmp_path):
+    # 0003「进程退出」的冒烟：宽限期（2 秒）满后仍在进行的请求被取消，客户端收到 UNAVAILABLE；停服后
+    # LOCK 已释放，重开后数据完整。取消早于停服完成、停服等已开始的引擎任务结束，由 grpc 的
+    # stop_retains_lock_until_admitted_rpc_finishes_after_runtime_shutdown 以钩子和事件顺序判定；这里不比较
+    # 两次请求的耗时，也不比较线程记录时间的先后（记录时刻受线程调度影响）。
+    # 唯一的前提是检索长于宽限期：按多次测量中最快的一次近似换算到约 10 秒，按线性估计留约 4 倍余量。
+    manager, path, search = _slow_search_env(tmp_path, seconds=10.0, pick=min)
     t, result = _run_in_thread(search)
     time.sleep(0.3)
-    start = time.monotonic()
+    stop_started = time.monotonic()
     manager.release_server(str(path))
-    elapsed = time.monotonic() - start
+    t.join(timeout=60)
+    assert not t.is_alive()
+    if "value" in result:
+        # 仅为诊断：区分“检索短于宽限期、前提不成立”与“宽限期满仍未取消”。
+        pytest.fail(
+            f"request finished {result['done_at'] - stop_started:.2f}s after stop began "
+            "without being cancelled; under 2s means the search was shorter than the grace period"
+        )
+    assert result.get("error") == grpc.StatusCode.UNAVAILABLE, result
     assert lock_is_free(path)
-    t.join()
-    assert "error" in result, result
-    # 请求在宽限期满时被取消，不等引擎任务结束。
-    assert result["done_at"] - start <= 2 + 1, result["done_at"] - start
-    # 检索还剩约 seconds - 0.3 秒；停止不得早于它结束（留 1 秒余量吸收耗时波动），也不应远超它。
-    assert elapsed >= seconds - 0.3 - 1, (elapsed, seconds)
-    assert elapsed <= 2 * seconds + 2, elapsed
+    reopened = ServerManager()
+    client = MilvusClient(reopened.start_and_get_uri(str(path)))
+    try:
+        client.load_collection("s")
+        assert client.query("s", output_fields=["count(*)"])[0]["count(*)"] == 50_000
+    finally:
+        client.close()
+        reopened.release_server(str(path))
+    assert lock_is_free(path)
 
 
 def test_unimplemented_rpc_reason(manager, tmp_path):

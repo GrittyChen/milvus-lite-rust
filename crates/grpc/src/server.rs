@@ -67,6 +67,8 @@ pub struct Server {
     running: Option<Running>,
     #[cfg(test)]
     after_runtime_shutdown: Option<ShutdownPause>,
+    #[cfg(test)]
+    after_shutdown_signal: Option<ShutdownStarted>,
 }
 
 #[derive(Debug)]
@@ -101,6 +103,19 @@ fn parse_io_threads(
 struct ShutdownPause {
     entered: std::sync::mpsc::Sender<()>,
     resume: std::sync::mpsc::Receiver<()>,
+}
+
+/// 停服信号已发出、宽限期开始；受控测试据此确认在途请求是在停服之后才完成的。
+#[cfg(test)]
+#[derive(Debug)]
+struct ShutdownStarted(std::sync::mpsc::Sender<()>);
+
+#[cfg(test)]
+impl ShutdownStarted {
+    #[allow(clippy::expect_used)] // 观察者断开时测试的交错没有发生，不能当作通过。
+    fn notify(self) {
+        self.0.send(()).expect("shutdown observer is alive");
+    }
 }
 
 #[cfg(test)]
@@ -192,6 +207,8 @@ impl Server {
             bound_address,
             #[cfg(test)]
             after_runtime_shutdown: None,
+            #[cfg(test)]
+            after_shutdown_signal: None,
             running: Some(Running {
                 runtime,
                 shutdown,
@@ -280,6 +297,10 @@ impl Server {
         // 接收端已不在说明服务任务已经结束，它的结果在下面取回。
         match shutdown.send(()) {
             Ok(()) | Err(()) => {}
+        }
+        #[cfg(test)]
+        if let Some(started) = self.after_shutdown_signal.take() {
+            started.notify();
         }
         let result = runtime.block_on(async {
             match tokio::time::timeout(grace, &mut serve).await {
@@ -598,6 +619,84 @@ mod tests {
     }
 
     #[test]
+    fn rpc_admitted_before_stop_completes_normally_within_grace() {
+        use std::sync::{Mutex, mpsc};
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("grace.db");
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release = Mutex::new(release_rx);
+        let hooks = crate::service::RpcTestHooks {
+            after_attempt: Some(Arc::new(move |admitted| {
+                assert!(admitted);
+                entered_tx.send(()).unwrap();
+                release
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(10))
+                    .unwrap();
+            })),
+            after_enqueue: None,
+        };
+        let mut server = Server::start_inner(config(path.clone(), 0), hooks).unwrap();
+        let clients = io_client();
+        let channel = clients
+            .block_on(
+                tonic::transport::Endpoint::from_shared(format!(
+                    "http://{}",
+                    server.bound_address()
+                ))
+                .unwrap()
+                .connect(),
+            )
+            .unwrap();
+        let rpc = clients.spawn(load_state(channel));
+        entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (gap_tx, gap_rx) = mpsc::channel();
+        let (finish_tx, finish_rx) = mpsc::channel();
+        server.after_shutdown_signal = Some(ShutdownStarted(started_tx));
+        server.after_runtime_shutdown = Some(ShutdownPause {
+            entered: gap_tx,
+            resume: finish_rx,
+        });
+        // 宽限远长于测试本身。tonic 收到停服信号后会等全部连接结束，请求放行前 runtime 不会关闭，
+        // 所以在测试的有限超时内，这一观察不会让正确实现失败；不等宽限、立即取消的实现会在观察窗口内
+        // 关闭 runtime。
+        let closer = std::thread::spawn(move || server.stop(Duration::from_secs(60)));
+        let started = started_rx.recv_timeout(Duration::from_secs(10));
+        let cancelled_early = gap_rx.recv_timeout(Duration::from_millis(200)).is_ok();
+        // 先放行并回收线程，再断言失败，避免错误实现使测试自己留下后台任务。
+        release_tx.send(()).unwrap();
+        let reached_shutdown =
+            cancelled_early || gap_rx.recv_timeout(Duration::from_secs(10)).is_ok();
+        finish_tx.send(()).unwrap();
+        let stopped = closer.join().unwrap();
+        let response = clients.block_on(rpc).unwrap();
+        started.unwrap();
+        assert!(
+            !cancelled_early,
+            "runtime shut down before the admitted RPC finished"
+        );
+        assert!(reached_shutdown);
+        stopped.unwrap();
+        // 传输成功还不够：业务应答也须与未停服时相同（3.x：不存在的 collection 返回成功与 NotExist）。
+        let response = response.unwrap();
+        let Some(status) = response.status else {
+            panic!("GetLoadState response carries no status");
+        };
+        // 3.x 客户端仍读取已弃用的 error_code，两者都须表示成功。
+        #[allow(deprecated)]
+        let error_code = status.error_code;
+        assert_eq!((status.code, error_code), (0, 0), "{status:?}");
+        assert_eq!(
+            response.state,
+            crate::pb::common::LoadState::NotExist as i32
+        );
+        DataDir::open(&path).unwrap();
+    }
+
+    #[test]
     fn stop_retains_lock_until_admitted_rpc_finishes_after_runtime_shutdown() {
         use std::sync::{Mutex, mpsc};
         let root = tempfile::tempdir().unwrap();
@@ -629,7 +728,7 @@ mod tests {
                 .connect(),
             )
             .unwrap();
-        let rpc = clients.spawn(load_state(channel));
+        let mut rpc = clients.spawn(load_state(channel));
         entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
         let (gap_tx, gap_rx) = mpsc::channel();
         let (finish_tx, finish_rx) = mpsc::channel();
@@ -638,12 +737,21 @@ mod tests {
             resume: finish_rx,
         });
         let (closed_tx, closed_rx) = mpsc::channel();
+        let grace = Duration::from_millis(300);
+        let stop_called = std::time::Instant::now();
         let closer = std::thread::spawn(move || {
-            let result = server.stop(Duration::from_millis(30));
+            let result = server.stop(grace);
             closed_tx.send(()).unwrap();
             result
         });
-        gap_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let shut_down = gap_rx.recv_timeout(Duration::from_secs(10));
+        // 宽限计时不会提前到期，所以这是单向下限：只会拦下截短宽限的实现，不会误报。
+        let waited = stop_called.elapsed();
+        // runtime 已关闭、stop 仍停在暂停点：客户端此时就应收到取消，证明取消早于停服完成，
+        // 以事件顺序而非耗时判定。有限超时只防止错误实现挂起测试，且短于钩子的 10 秒放行期限，
+        // 使错误实现在这里而不是在清理时失败。
+        let cancelled = clients
+            .block_on(async { tokio::time::timeout(Duration::from_secs(5), &mut rpc).await });
         finish_tx.send(()).unwrap();
         let waiting = matches!(
             closed_rx.recv_timeout(Duration::from_millis(100)),
@@ -656,7 +764,12 @@ mod tests {
         // 先放行并回收线程，再断言失败，避免错误实现使测试自己留下后台任务。
         release_tx.send(()).unwrap();
         closer.join().unwrap().unwrap();
-        assert!(clients.block_on(rpc).unwrap().is_err());
+        shut_down.unwrap();
+        assert!(
+            waited >= grace,
+            "stop shut down after {waited:?}, before grace {grace:?}"
+        );
+        assert!(matches!(cancelled, Ok(Ok(Err(_)))), "{cancelled:?}");
         assert!(waiting);
         assert!(locked);
         DataDir::open(&path).unwrap();
