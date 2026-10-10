@@ -18,7 +18,7 @@ py crate 的构建脚本按目标 OS 和 PyO3 目标解释器配置拒绝 Window
 | --- | --- | --- |
 | macOS arm64 正式 | `e1d3c9d72ab36bacd384ddd6e7b85d8969f73742ffe7d0ee90088cafcc322975` | 单架构 arm64，Mach-O 最低 macOS 11.0 |
 | macOS x86_64 正式 | `0d2d2f45a2e7afbd8ec8a9460f3203e83b8bf52b6b4f0a17a224e4f950fb8b80` | 单架构 x86_64，Mach-O 最低 macOS 11.0；Rosetta 冒烟 |
-| Linux x86_64 正式 | `68a17c9c9a5c684aa44115e4bf06530af88530a3c49d34a40c0066dbd70eca52` | manylinux_2_28_x86_64，最高 GLIBC 2.28；ARM 宿主模拟冒烟 |
+| Linux x86_64 正式 | `68a17c9c9a5c684aa44115e4bf06530af88530a3c49d34a40c0066dbd70eca52` | manylinux_2_28_x86_64，最高 GLIBC 2.28；ARM 宿主模拟构建与冒烟，构建于提交前；原生构建身份以下文「Linux x86_64 原生标准层」为准（构建路径不同，原生库字节不同） |
 | Linux arm64 正式 | `0c3ec2f433b7404f2c745f57d3110656ab20ace4f070f3bedc353b27458a279c` | manylinux_2_28_aarch64，最高 GLIBC 2.28 |
 
 sdist SHA256：`2cfce71a091339d5b7bd5a7e26ce3eceddf543a600a97d08d0268249aeb7d1bf`。wheel/sdist 的版本、标签、console script、两份许可内容及 License-File、markdown 长描述、禁入路径和正式/FI 标记均由 [归档检查器](../../tests/packaging/check_artifacts.py) 核对。原始文件与日志保留在仓库外，本记录不保存个人绝对路径。
@@ -68,7 +68,7 @@ Python 端点 SDK 固定 2.6.17 / 3.0.2；实际依赖版本与原生库哈希�
 
 PID 1 探针按 [平台流程](../../tests/platform/README.md) 使用正式 console ENTRYPOINT 和 FI 包装入口，数据/控制命名卷、同 Docker VM 的 peer flock、日志检查点及监督器 kill 事件分别验证。Docker Engine 29.8.2、VM 内核 7.0.14-linuxkit，基础镜像 ID `sha256:8bfa0d9787b8209665706873c70643c1e897c0b70bab81eb69f8f97dfac207c4`。三项均通过：正式关闭退出 0、重开 3 行/current_seq=6；FI 放行排空退出 0、重开 4 行/current_seq=4；FI 后续 SIGTERM 不结束服务，监督器超时留下 signal=9 事件，退出 137 且非 OOM、重开 4 行/current_seq=4。放行前 LOCK 始终被占用，停止后释放；关闭原文各一次。两个 FI 场景的检查点与正式 console 场景分别保存。测试通过不等于真实断电或任意文件系统的持久化证明。
 
-Linux x86_64 仅有 ARM 宿主上的模拟执行，不能将其写成原生标准层通过。2026-10-17 是资源/层级决策检查点，仍需负责人决定原生资源或修订层级。Windows 没有运行环境；PowerShell 静态准备流程已写但未在 Windows 执行；对应 cargo 参数已在 macOS 交叉验证，不宣称 Windows 支持。macOS 11 的 Mach-O 下限检查不替代 macOS 11 真机运行。
+准备阶段的 Linux x86_64 仅有 ARM 宿主上的模拟执行，不写成原生通过；原生标准层结果见下文「Linux x86_64 原生标准层」。Windows 没有运行环境；PowerShell 静态准备流程已写但未在 Windows 执行；对应 cargo 参数已在 macOS 交叉验证，不宣称 Windows 支持。macOS 11 的 Mach-O 下限检查不替代 macOS 11 真机运行。
 
 准备切片和最终候选/上传是三个阶段。公开地址、正式版本、tag 和上传均待另行授权。保留已有存储、停服与信号合同：进程崩溃不等于断电；退出总耗时无硬上限；PID 1 切到 SIG_DFL 后后续 SIGTERM 被忽略，监督器最终 SIGKILL 走崩溃恢复。
 
@@ -120,3 +120,32 @@ Linux x86_64 仅有 ARM 宿主上的模拟执行，不能将其写成原生标�
 ## 准备切片收口
 
 2026-10-10：实施评审及修复复审均通过，负责人授权将 0013 准备切片作为一个提交推送；不包含候选发行、公开源码地址或上传授权。最后补入无协议 www. 地址的精确主机检查，反例与 Apache 正常例均通过，提交前脚本自检为 135 passed，冻结产物检查仍通过；原有字段/许可/标签规则不变。平台缺口、SHUTDOWN-TIMING-01 和 2026-10-17 的资源检查点继续按上述边界保留。
+
+## Linux x86_64 原生标准层
+
+2026-10-10 在一台原生 x86_64 物理机（AMD EPYC 7702，无虚拟化）上执行，源码为 `b5393de` 的 `git archive`，下文测试修复以补丁形式叠加。宿主为 CentOS 7、内核 3.10.0-1160、glibc 2.17，不能直接加载 manylinux_2_28 wheel，因此构建、测试与安装均在 `quay.io/pypa/manylinux_2_28_x86_64@sha256:4131ddd7…`（镜像 ID `sha256:2dd9abc5…`，AlmaLinux 8.10、glibc 2.28）容器内执行：使用宿主原生 CPU 与内核，无模拟，并同时覆盖 glibc 下限。Docker 20.10.5，overlay2 / xfs；工作目录为宿主 ext4 绑定挂载；测试容器绑定 16 核并以非 root 用户运行。Rust 1.98.1 官方完整发行包与 crane 0.20.3 均经官方 SHA256 核对后使用；该主机 Docker 守护进程配置的代理无法访问镜像仓库，基础镜像经客户端按摘要获取后载入并核对镜像 ID。主机名与个人路径不入库。
+
+| 检查 | 结果 | 边界 |
+| --- | --- | --- |
+| fmt；workspace 默认 / all-features Clippy | 通过 | `--all-targets --locked -D warnings` |
+| 默认 workspace / core FI / grpc all-features | 252 / 323 / 21 passed | 含下文全部修复，`--no-fail-fast`；core lib release 145 passed，FI lib 整体并行 30 轮 0 失败 |
+| 正式与 FI wheel、sdist 构建及归档/二进制检查 | 通过 | `cp310-abi3-manylinux_2_28_x86_64`，GLIBC 依赖最高 2.28；正式/FI 标记正确 |
+| 构建拒绝：free-threaded 3.14t / 3.15t、PyPy 3.11 | 均为本项目拒绝原因，非零退出 | 镜像内真实解释器 |
+| 同一正式 wheel：CPython 3.10.22 / 3.15.0 × SDK 2.6.17 / 3.0.2 | 四组各 272 passed | `run_acceptance.py --wheel --sdist --suite`，含无 SDK CLI 与 SDK 生命周期冒烟 |
+| CPython 3.11.17 / 3.12.15 / 3.13.16 / 3.14.8，SDK 3.0.2 | 安装冒烟通过 | 同一正式 wheel |
+| 隔离 FI wheel 的 compaction 套件 | 5 passed | CPython 3.12、SDK 3.0.2 |
+| Rust 与 3.2.1 的 LOCK 双向互斥 | 通过 | flock 互斥、lockf 独立、释放后可打开 |
+| strace 同步/提交/删除顺序 | 通过，83 次成功调用 | strace 5.18，FI 测试二进制 |
+| PID 1 正常 / 排空 / 监督器强杀 | 退出 0 / 0 / 137（非 OOM，signal=9 事件）；重开 3 / 4 / 4 行 | 宿主内核 3.10；基础镜像为官方 `python:3.10-slim-bookworm` amd64（`sha256:fbff8a8e…`）；探针容器未绑核 |
+
+产物身份（`b5393de`，修复前构建）：正式原生库 `69231b3bb81fd6a82cab04c5a146ecb767779fc6a70260023a07938e200669a6`，FI 原生库 `0c47ae7228a322254e117cad3a667281191d802440ba0a2c751b7eab43e3cff3`，sdist `4d60bcc47063c3efcffb794edaf504a1d0a770e99ac871418528617f2b304f6e`。同一提交在 macOS 上构建的 sdist 字节相同。前文“产物身份”节的 sdist `2cfce71…` 构建于提交之前，与 `b5393de` 的 sdist 只差 server.rs 中的 RPC/LOCK 测试，提交对应的 sdist 以 `4d60bcc…` 为准。修复后重建的正式原生库与修复前大小相同、`.text` 一致，差异只在符号字符串表、build-id 与 9 个 panic 位置行号（flat.rs 前移 2 行）；候选发行物仍须从最终提交重新构建。
+
+### 原生运行发现并修复的测试缺陷
+
+**批量距离核的 NaN 位模式**：`flat::tests::expanded_batch_kernel_matches_original_loops_including_special_values_and_tails` 在 x86_64 上失败（macOS 与 Linux arm64 通过，模拟环境未跑 Rust 测试）。两条路径都得到 NaN，但符号/payload 不同（传播输入 `0x7fc00123` 或产生 x86 默认 `0xffc00000`），且 debug 与 release 的选择不同。Rust 不保证 NaN 位模式；排序把所有 NaN 视为相同（`collection.rs` 与 `flat.rs` 已有 ±NaN 排序用例），对外顺序不受影响。隔离诊断显示，所有非 NaN 结果在 debug 与 release 下仍逐位相同。修复只改测试：NaN 结果要求两边都是 NaN，非 NaN 保持逐位比较；flat.rs 模块与 `score_batch` 注释及 [0004](../decisions/0004-m1-scope.md) 的跨平台逐位相同表述补 NaN 例外。变异反证：批量核一路乘 1.000001 后，修复后的测试在 dim=16 的非 NaN 用例失败。
+
+**目录变更等待无关写入者的前置条件**：FI 用例 `db::tests::directory_changes_wait_for_an_unrelated_writer_before_taking_namespace` 在整个 lib 并行时偶发失败（单跑 0/300、db 模块并行 0/20、整个 lib 并行 2/10）。建表会排入后台维护，`compact_transaction` 也短暂持有写入许可的读锁；用例把“许可不可得”当作插入线程已入场，维护恰好持锁时前置条件不成立。诊断现场：插入在主线程仍持 collection 写锁时已返回 “database writes are blocked after an unconfirmed directory change”，目录变更先行、其后的写入被正确拒绝，产品行为符合合同。修复只改测试：建表后先等两个 collection 的已接受维护轮次完成，使观察到的占用只能来自插入线程；观察后以零超时核对没有维护轮次在途，不满足时以明确信息失败。同负载交替 30 轮：修复版 0/30；去掉前置等待的变异版 10/30，全部由新核对拦下；原版 1/30。修复版另跑整个 lib 并行 60 轮 0 失败。该用例来自 `2ed4a34`，与本切片的其它改动无关。
+
+**并行等价用例的参照口径**（复审发现，属同一 NaN 口径）：`collection::tests::parallel_search_matches_serial_reference` 把每个并行变体与逐条打分的独立参照逐位比较，而产品在查询组满 4 条时走批量核，NaN 位模式可能不同；复审探针中同一查询单独检索与 4 条一组检索的 NaN 分数在 x86_64（Rosetta）release 上有 73/713 个位模式不同。用例改为两层：各行块划分与线程数对串行结果逐位比较（含 NaN 位模式，同一扫描代码），串行结果对独立参照只按“同为 NaN”比较；数据与查询加入 NaN、±inf、±0（每个分量仍只取一次随机数，共用该数据辅助函数的其它用例布局不变），维度加入 33。0005 验证表曾称覆盖 ±0、±inf，原数据实际只有 NaN 与有限值，现已补齐。变异反证（各变异使用独立的 Cargo 输出目录）：参照改回原始位比较后 aarch64 release 在 case 10 失败，说明 NaN 归一确被数据触发；参照对有限非零分数偏 1 ulp 时在 case 0 失败。修复后 aarch64 与 x86_64（Rosetta）的 debug/release 均通过。对外 NaN 分数的符号与 payload 因而不作保证，已写入 flat.rs 与 [0004](../decisions/0004-m1-scope.md)，排序与结果集合不受影响。
+
+macOS 修复后默认 252、core FI 323 passed；Windows core/grpc 默认与 FI 交叉 Clippy 通过。差分/存储互通未在 x86_64 运行（与 arm64 层级一致）。负责人可据此在 2026-10-17 检查点确认 Linux x86_64 的标准层证据；首发候选的整体结论仍按 0013「收口条件」另行决定。

@@ -30,6 +30,6 @@ ANN、BM25/function chain、query iterator、field_ops、别名/多数据库与 
 
 顶层动态过滤见 0009，合并/删除回收见 0010/0011；CLI 的六项取舍及第 6 项收尾失败报告已按 [0012](0012-cli-server.md) 实施，并于 2026-10-10 在冻结合同范围内复审通过。代码与验证边界见 [CLI 实施记录](../testing/cli-correctness.md)。跨平台与完整首次发布验收、发布授权仍未完成。
 
-下一切片的候选平台矩阵、Linux PID 1、Windows 准备流程与发行物门槛见 [0013 草案](0013-first-release-platform-and-packaging.md)。负责人已决定 Windows 延后、保留 sdist 的限定源码回退与 Intel Mac 分层；Linux x86_64 先做构建与模拟验证，原生证据缺口单列。
+下一切片的候选平台矩阵、Linux PID 1、Windows 准备流程与发行物门槛见 [0013 草案](0013-first-release-platform-and-packaging.md)。负责人已决定 Windows 延后、保留 sdist 的限定源码回退与 Intel Mac 分层；Linux x86_64 先做构建与模拟验证，原生标准层已于 2026-10-10 补跑，见 0013。
 
 平台差异登记：参照 3.x 的 CI 覆盖 Windows，本项目首发不提供 Windows wheel 或支持承诺；由于当前存在未修复的目录/只读句柄同步问题，首发 Python 包在构建期明确拒绝 Windows 目标，避免 pip 自动从 sdist 安装出已知不可用的包。差异影响 Windows 上的安装、create/flush/drop/关闭，后续以独立 Windows 切片修复并实跑。其它矩阵外源码构建仅为自行尝试；Windows/free-threaded/非 CPython 明确拒绝，详见 0013。

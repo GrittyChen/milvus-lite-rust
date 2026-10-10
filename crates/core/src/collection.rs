@@ -3111,12 +3111,9 @@ mod tests {
         };
         let mut c = Collection::new("c", schema).unwrap();
         let insert = |c: &mut Collection, rng: &mut Rng, pks: Vec<i64>| {
-            // 取值很少的分量制造大量并列，偶尔插入 NaN 行。
+            // 取值很少的分量制造大量并列，偶尔插入 NaN、±inf 与 ±0 分量。
             let values = (0..pks.len() * dim)
-                .map(|_| match rng.below(40) {
-                    0 => f32::NAN,
-                    r => (r % 4) as f32 - 1.5,
-                })
+                .map(|_| special_or(rng, 40, |r| (r % 4) as f32 - 1.5))
                 .collect();
             c.insert(InsertBatch {
                 num_rows: pks.len(),
@@ -3138,6 +3135,29 @@ mod tests {
             insert(&mut c, rng, pks);
         }
         c
+    }
+
+    /// 每个分量只取一次随机数：前 5 个取值依次给 NaN（带 payload）、±inf、±0，其余由 `finite`
+    /// 给出有限值。随机数的消耗与只生成有限值时相同，共用本辅助函数的用例的数据布局不变。
+    fn special_or(rng: &mut Rng, range: usize, finite: impl Fn(usize) -> f32) -> f32 {
+        match rng.below(range) {
+            0 => f32::from_bits(0x7fc0_0123),
+            1 => f32::INFINITY,
+            2 => f32::NEG_INFINITY,
+            3 => -0.0,
+            4 => 0.0,
+            r => finite(r),
+        }
+    }
+
+    /// 与独立参照比较时的分数键：NaN 的符号与 payload 不受保证（见 flat 模块说明），
+    /// 只要求仍是 NaN；其余分数逐位比较。
+    fn nan_equivalent(score: f32) -> u32 {
+        if score.is_nan() {
+            f32::NAN.to_bits()
+        } else {
+            score.to_bits()
+        }
     }
 
     /// 独立的参照：每个存活行逐个打分，按名次稳定排序（扫描顺序即位置顺序）。
@@ -3165,27 +3185,34 @@ mod tests {
                     .into_iter()
                     .take(req.limit.saturating_add(req.offset))
                     .skip(req.offset)
-                    .map(|(s, _, pk)| (s.to_bits(), pk))
+                    .map(|(s, _, pk)| (nan_equivalent(s), pk))
                     .collect()
             })
             .collect()
     }
 
     /// 0005「验证」：行块边界落在 chunk 内部、行块中没有存活行、各种查询条数与 limit / offset、
-    /// 并列与 NaN 下，并行结果与串行参照逐位相同。
+    /// 并列、±0、±inf 与 NaN 下，各行块划分与线程数的结果与串行逐位相同（含 NaN 位模式，
+    /// 它们走同一扫描代码）。独立参照逐条打分，不按产品的查询分组走批量核，因此只按
+    /// [`nan_equivalent`] 比较。
     #[test]
     fn parallel_search_matches_serial_reference() {
         let mut rng = Rng(0x1234_5678);
         let pools = [1, 3].map(|n| Compute::new(NonZeroUsize::new(n).unwrap()).unwrap());
         for case in 0..400 {
-            let dim = [1, 3, 17][case % 3];
+            // 33 维有两段完整的 16 路累加，单条核与批量核的 NaN 位模式可在此分叉。
+            let dim = [1, 3, 17, 33][case % 4];
             let c = collection(&mut rng, dim);
             let metric = [Metric::L2, Metric::Ip, Metric::Cosine][rng.below(3)];
             let nq = [1, 3, 4, 5, 9][rng.below(5)];
             let (limit, offset) =
                 [(0, 0), (1, 0), (5, 2), (10, 0), (3, 40), (500, 0), (7, 500)][rng.below(7)];
             let vectors = (0..nq)
-                .map(|_| (0..dim).map(|_| (rng.below(4) as f32) - 1.5).collect())
+                .map(|_| {
+                    (0..dim)
+                        .map(|_| special_or(&mut rng, 20, |r| (r % 4) as f32 - 1.5))
+                        .collect()
+                })
                 .collect();
             let req = SearchRequest {
                 anns_field: None,
@@ -3196,23 +3223,36 @@ mod tests {
                 output_fields: Vec::new(),
             };
             let expected = reference(&c, &req, metric);
+            let run = |pool, rows_per_block| -> Vec<Vec<(u32, Pk)>> {
+                c.search_in_blocks(req.clone(), pool, rows_per_block)
+                    .unwrap()
+                    .hits
+                    .iter()
+                    .map(|h| {
+                        h.scores
+                            .iter()
+                            .map(|s| s.to_bits())
+                            .zip(h.rows.pks.iter().cloned())
+                            .collect()
+                    })
+                    .collect()
+            };
+            // 单线程、单个行块即串行计算。
+            let serial = run(&pools[0], usize::MAX);
+            let comparable = |hits: &[Vec<(u32, Pk)>]| -> Vec<Vec<(u32, Pk)>> {
+                hits.iter()
+                    .map(|h| {
+                        h.iter()
+                            .map(|(bits, pk)| (nan_equivalent(f32::from_bits(*bits)), pk.clone()))
+                            .collect()
+                    })
+                    .collect()
+            };
+            assert_eq!(comparable(&serial), expected, "case {case}, serial");
             for rows_per_block in [1, 2, 7, 64, 10_000] {
                 for pool in &pools {
-                    let got = c
-                        .search_in_blocks(req.clone(), pool, rows_per_block)
-                        .unwrap();
-                    let got: Vec<Vec<(u32, Pk)>> = got
-                        .hits
-                        .iter()
-                        .map(|h| {
-                            h.scores
-                                .iter()
-                                .map(|s| s.to_bits())
-                                .zip(h.rows.pks.iter().cloned())
-                                .collect()
-                        })
-                        .collect();
-                    assert_eq!(got, expected, "case {case}, block {rows_per_block}");
+                    let got = run(pool, rows_per_block);
+                    assert_eq!(got, serial, "case {case}, block {rows_per_block}");
                 }
             }
         }

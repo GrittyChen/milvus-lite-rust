@@ -34,7 +34,7 @@ python -m pip install .
 
 | 首发候选 | 系统下限 | 证据层级 |
 | --- | --- | --- |
-| Linux x86_64 | glibc 2.28 | 完整验收目标；当前先准备构建与模拟验证，原生环境未取得 |
+| Linux x86_64 | glibc 2.28 | 完整验收目标；已在原生 x86_64 的 glibc 2.28 环境实跑 |
 | Linux arm64 | glibc 2.28 | 完整验收目标；较新 Linux 容器的结果不等于最低 glibc 已验证 |
 | macOS arm64 | macOS 11 | 完整验收目标 |
 | macOS x86_64 | macOS 11 | 构建与安装/读写恢复冒烟；实际原生或 Rosetta 方式单独记录，证据弱于完整验收 |

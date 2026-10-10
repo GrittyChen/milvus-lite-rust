@@ -3,6 +3,10 @@
 //!
 //! 求和分 16 路累加，再两两归约，最后按顺序加上不足 16 个的尾部元素。求和顺序只由源码决定：
 //! Rust 不会把乘加合并成 FMA，也不会重排浮点运算，所以同一输入在各平台、各指令集上结果逐位相同。
+//! NaN 结果除外：Rust 不保证 NaN 的符号与 payload，传播哪个输入 NaN、还是产生平台默认 NaN，
+//! 随平台与代码生成而变（x86_64 与 aarch64 的 release 构建上均可观察到）。因此同一查询单独打分
+//! 与按 [`BATCH`] 条一组打分，可能得到位模式不同的 NaN，对外返回的 NaN 分数的符号与 payload
+//! 不作保证。排序（[`rank`]）把所有 NaN 视为相同，结果顺序不受影响。
 //! 顺序累加的误差在 dim 32768 时超出 0004「决策」的允许误差，分路累加后回到界内。
 //! L2 必须逐元素相减再平方（0004「决策」），不能展开成 ‖q‖² + ‖v‖² − 2q·v。
 //!
@@ -93,8 +97,8 @@ pub(crate) fn rank(metric: Metric, a: f32, b: f32) -> Ordering {
     }
 }
 
-/// [`BATCH`] 条同一度量的查询对同一个候选打分，结果与逐条调用 [`Query::score`] 逐位相同：
-/// 每条查询的每一路做同样顺序的运算，只是共用读入的候选向量。
+/// [`BATCH`] 条同一度量的查询对同一个候选打分，结果与逐条调用 [`Query::score`] 逐位相同（NaN
+/// 只保证仍是 NaN，见模块说明）：每条查询的每一路做同样顺序的运算，只是共用读入的候选向量。
 pub(crate) fn score_batch(
     queries: &[Query; BATCH],
     candidate: &[f32],
@@ -380,11 +384,14 @@ mod tests {
                     });
                     let got = score_batch(&queries, &candidate, norm(&candidate));
                     for i in 0..BATCH {
-                        assert_eq!(
-                            got[i].to_bits(),
-                            expected[i].to_bits(),
-                            "dim={dim}, metric={metric:?}, special={special}, query={i}"
-                        );
+                        let case =
+                            format!("dim={dim}, metric={metric:?}, special={special}, query={i}");
+                        // NaN 的符号与 payload 随平台与代码生成而变（见模块说明），只要求两边都是 NaN。
+                        if expected[i].is_nan() {
+                            assert!(got[i].is_nan(), "{case}: got {}", got[i]);
+                        } else {
+                            assert_eq!(got[i].to_bits(), expected[i].to_bits(), "{case}");
+                        }
                     }
                 }
             }

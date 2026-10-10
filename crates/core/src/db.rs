@@ -3066,6 +3066,14 @@ mod tests {
             .unwrap();
             db.create_collection("", "writer", basic_schema()).unwrap();
             db.create_collection("", "victim", basic_schema()).unwrap();
+            // 建表会排入后台维护，维护轮次也短暂持有写入许可；先等它们结束，下面观察到的
+            // 许可占用才能归因于插入线程。
+            let statuses = ["writer", "victim"].map(|name| {
+                db.wait_for_maintenance("", name, Duration::from_secs(5))
+                    .unwrap();
+                let handle = db.collection("", name).unwrap();
+                Arc::clone(&handle.read().persistent().unwrap().maintenance_status)
+            });
             let handle = db.collection("", "writer").unwrap();
             let state = handle.write();
             let writer = Arc::clone(&db);
@@ -3092,6 +3100,13 @@ mod tests {
             while db.write_gate.available() {
                 assert!(Instant::now() < deadline);
                 std::thread::sleep(Duration::from_millis(1));
+            }
+            // 主线程持有 writer 的状态写锁，不能再经 Db 取读锁；用事先取得的维护状态核对。
+            for status in &statuses {
+                assert!(
+                    status.wait(Duration::ZERO).is_ok(),
+                    "a maintenance round may hold the write permission"
+                );
             }
             let changer = Arc::clone(&db);
             let (started_tx, started_rx) = mpsc::channel();
