@@ -59,7 +59,7 @@
 | M2 存储引擎的结构 / 取锁顺序 / 快照与有效位图 / WAL、flush、drop 与关闭的提交和失败协议 | [docs/decisions/0007-m2-storage-engine.md](docs/decisions/0007-m2-storage-engine.md) |
 | 首发 compaction、正常关闭排空、GC 与独立已提交删除状态 | [0010](docs/decisions/0010-compaction-and-tombstone-gc.md)、[0011](docs/decisions/0011-committed-delete-state.md) |
 | CLI server 参数、工作者、信号与停服错误（已实现，冻结范围复审通过） | [0012](docs/decisions/0012-cli-server.md) |
-| 首发平台、PID 1 与发行物验收（已确认；准备切片实施评审已通过） | [0013](docs/decisions/0013-first-release-platform-and-packaging.md) |
+| 首发平台、PID 1、发行物验收与候选阶段决策（rc1 版本、补跑范围、发布方式；准备切片已通过） | [0013](docs/decisions/0013-first-release-platform-and-packaging.md) |
 | 性能基线怎么测 / 口径 / 注意事项 | [benchmarks/baseline/README.md](benchmarks/baseline/README.md) |
 | 代码审查 / 修复复审（冻结合同、完整调用链、同类全域清扫、分级与证据门槛、二三阶影响矩阵） | [code-review-rules](.agents/skills/code-review-rules/SKILL.md)（Claude Code 经 `.claude/skills` 软链读取同一份） |
 
