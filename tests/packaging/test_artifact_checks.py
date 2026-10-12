@@ -17,8 +17,8 @@ def artifacts(tmp_path):
         path = root / name
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes((repo / name).read_bytes())
-    metadata = ("Metadata-Version: 2.4\nName: milvus-lite-rust\nVersion: 0.1.0.dev0\nRequires-Python: >=3.10\nLicense-Expression: Apache-2.0\nLicense-File: LICENSE\nLicense-File: crates/grpc/proto/LICENSE\nDescription-Content-Type: text/markdown; charset=UTF-8\n\n" + (root / "README.md").read_text()).encode()
-    info = "milvus_lite_rust-0.1.0.dev0.dist-info"
+    metadata = ("Metadata-Version: 2.4\nName: milvus-lite-rust\nVersion: 0.1.0rc1\nRequires-Python: >=3.10\nLicense-Expression: Apache-2.0\nLicense-File: LICENSE\nLicense-File: crates/grpc/proto/LICENSE\nProject-URL: Repository, https://github.com/GrittyChen/milvus-lite-rust\nProject-URL: Issues, https://github.com/GrittyChen/milvus-lite-rust/issues\nDescription-Content-Type: text/markdown; charset=UTF-8\n\n" + (root / "README.md").read_text()).encode()
+    info = "milvus_lite_rust-0.1.0rc1.dist-info"
     wheel_files = {
         info + "/METADATA": metadata,
         info + "/WHEEL": b"Wheel-Version: 1.0\nTag: cp310-abi3-macosx_11_0_arm64\n",
@@ -63,7 +63,7 @@ def test_invalid_artifact_never_passes(case, artifacts):
     elif case == "source_license":
         del s["LICENSE"]
     elif case == "version":
-        w[info + "/METADATA"] = w[info + "/METADATA"].replace(b"Version: 0.1.0.dev0", b"Version: 9.0")
+        w[info + "/METADATA"] = w[info + "/METADATA"].replace(b"Version: 0.1.0rc1", b"Version: 9.0")
     elif case == "python_cap":
         w[info + "/METADATA"] = w[info + "/METADATA"].replace(b">=3.10", b">=3.10,<3.16")
     elif case == "tag":
@@ -154,6 +154,25 @@ def test_unconfirmed_project_metadata_is_rejected(header, destination, artifacts
         check(wheel, sdist, root)
 
 
+@pytest.mark.parametrize("change", ["missing", "duplicate", "wrong_issues", "home_page"])
+@pytest.mark.parametrize("destination", ["wheel", "sdist"])
+def test_project_metadata_must_be_exactly_the_confirmed_addresses(change, destination, artifacts):
+    root, wheel, sdist, w, s, info, write = artifacts
+    files, key = (w, info + "/METADATA") if destination == "wheel" else (s, "PKG-INFO")
+    issues = b"Project-URL: Issues, https://github.com/GrittyChen/milvus-lite-rust/issues\n"
+    if change == "missing":
+        files[key] = files[key].replace(issues, b"")
+    elif change == "duplicate":
+        files[key] = issues + files[key]
+    elif change == "wrong_issues":
+        files[key] = files[key].replace(issues, issues.replace(b"/issues", b"-issues"))
+    else:
+        files[key] = b"Home-page: https://github.com/GrittyChen/milvus-lite-rust\n" + files[key]
+    write()
+    with pytest.raises(ValueError, match="unconfirmed project address"):
+        check(wheel, sdist, root)
+
+
 def test_source_distribution_cannot_pin_user_toolchain(artifacts):
     root, wheel, sdist, _, s, _, write = artifacts
     s["rust-toolchain.toml"] = b'[toolchain]\nchannel = "1.98.1"\n'
@@ -173,6 +192,149 @@ def test_other_relative_links_are_rejected(addition, reason):
     readme = (Path(__file__).resolve().parents[2] / "README.md").read_text()
     body = readme + "\n" + addition
     with pytest.raises(ValueError, match=reason):
+        check_description(body, body)
+
+
+@pytest.mark.parametrize("addition", [
+    "https://github.com/GrittyChen/milvus-lite-rust-evil",
+    "https://github.com/GrittyChen/other",
+    "https://github.com/grittychen/milvus-lite-rust",
+    "http://github.com/GrittyChen/milvus-lite-rust",
+    "https://www.github.com/GrittyChen/milvus-lite-rust",
+    "https://github.com:443/GrittyChen/milvus-lite-rust",
+    "https://x@github.com/GrittyChen/milvus-lite-rust",
+    "https://github.com.evil.example/GrittyChen/milvus-lite-rust",
+    "[source](https://github.com/GrittyChen/milvus-lite-rust/../../other-owner/other)",
+    "[source][r]\n[r]: https://github.com/GrittyChen/milvus-lite-rust/../../other-owner/other",
+    "<https://github.com/GrittyChen/milvus-lite-rust/../../other-owner/other>",
+    "https://github.com/GrittyChen/milvus-lite-rust/%2e%2e/%2E%2E/other-owner/other",
+    "https://github.com/GrittyChen/milvus-lite-rust%2F..%2F..%2Fother-owner%2Fother",
+    "https://github.com/GrittyChen/milvus-lite-rust/./issues",
+    "https://github.com/GrittyChen/milvus-lite-rust/%252e%252e/other",
+    "https://github.com/GrittyChen/milvus-lite-rust/..\\..\\other-owner/other",
+    "https://x@apache.org/licenses/",
+])
+def test_lookalike_project_addresses_are_rejected(addition):
+    from check_artifacts import check_description
+    readme = (Path(__file__).resolve().parents[2] / "README.md").read_text()
+    body = readme + "\n" + addition
+    with pytest.raises(ValueError, match="unconfirmed external"):
+        check_description(body, body)
+
+
+def described(addition):
+    readme = (Path(__file__).resolve().parents[2] / "README.md").read_text()
+    return readme + "\n" + addition + "\n"
+
+
+@pytest.mark.parametrize("addition", [
+    "```bash\npython -m pip install pymilvus milvus-lite-rust\n```",
+    "```bash\npip install milvus-lite-rust==0.1.0rc1 --find-links https://github.com/GrittyChen/milvus-lite-rust/releases/expanded_assets/v0.1.0rc1\n```",
+    '`uv pip install "milvus_lite_rust==0.1.0rc1"`',
+    "```bash\npython -m pip install \\\n  Milvus.Lite.Rust\n```",
+    "```bash\npython -m pip install milvus-lite-\\\nrust==0.1.0rc1\n```",
+    "`pip3 install milvus-lite-rust[extra]>=0.1`",
+    "```bash\npip install milvus-lite-rust==0.1.0rc1 # --no-index\n```",
+    "```bash\npip install milvus-lite-rust==0.1.0rc1 && echo --no-index\n```",
+    "```bash\npip install --no-index ./x.whl; pip install milvus-lite-rust\n```",
+    "```bash\npython -m pip --quiet install milvus-lite-rust==0.1.0rc1\n```",
+    "```bash\npip install \"milvus--lite__rust==0.1.0rc1\"\n```",
+    "```bash\npip install milvus-lite-rust --prefix --no-index\n```",
+    "```bash\npip install milvus\\-lite\\-rust\n```",
+    "```bash\npip install \"milvus-\"\"lite-rust\"\n```",
+    '`pip install "" milvus-lite-rust`',
+    "`uv add milvus-lite-rust`",
+    "`pip download milvus-lite-rust`",
+    "`uvx --from milvus-lite-rust milvus-lite server --data-dir x`",
+    "pip install milvus&#45;lite&#x2D;rust",
+    "pip install &#109;ilvus-lite-rust",
+    "## pip install milvus-lite-rust",
+    "#  milvus-lite-rust",
+    "pip install milvus-lite-&shy;rust",
+    "pip install milvus-lite-​rust",
+    "pip install milvus-lite-**rust**",
+    "pip install milvus-lite-<b>rust</b>",
+    "pip install milvus-lite-<!-- x -->rust",
+    "安装：pip install `milvus-lite-rust`",
+    "pip install `milvus-lite-rust`==0.1.0rc1",
+    "pip install ``milvus-lite-rust``",
+    "pip install [milvus-lite-](https://www.apache.org/ \"a)b\")rust",
+    "pip install [milvus-lite-](<https://www.apache.org/a)b>)rust",
+    "pip install [milvus-lite-](https://www.apache.org/(a)b)rust",
+    "pip install [milvus-lite-][a\\]b]rust",
+    "`printf '%s' milvus-lite- rust | tr -d ' ' | xargs pip install`",
+    "`python -c \"import subprocess; subprocess.run(['pip', 'install', 'milvus-lite-' 'rust'])\"`",
+    "不要用 `pip install milvus-lite-rust --no-index` 以外的写法安装",
+    "`pip install --no-index --find-links https://github.com/GrittyChen/milvus-lite-rust/releases/expanded_assets/v0.1.0rc1 milvus-lite-rust==0.1.0rc1`",
+    "`pip install ./milvus_lite_rust-0.1.0rc1-cp310-abi3-macosx_11_0_arm64.whl`",
+    "python -m pip install --no-index --only-binary :all: --find-links https://github.com/GrittyChen/milvus-lite-rust/releases/expanded_assets/v0.1.0rc2 milvus-lite-rust==0.1.0rc2",
+    "python -m pip install --no-index --only-binary :all: --find-links https://github.com/GrittyChen/milvus-lite-rust/releases/expanded_assets/v0.1.0rc1 milvus-lite-rust==0.1.0rc1; pip install milvus-lite-rust",
+])
+def test_naming_this_package_outside_release_commands_is_rejected(addition):
+    from check_artifacts import check_description
+    body = described(addition)
+    with pytest.raises(ValueError, match="names this package outside the release commands"):
+        check_description(body, body)
+
+
+@pytest.mark.parametrize("addition", [
+    "```bash\nN=milvus-lite; pip install $N-rust\n```",
+    "```bash\npip install milvus-lite-{rust,x}\n```",
+    "```bash\npip install {milvus-lite-r,x}ust\n```",
+    "`pip install milvus-lite-ru{s,}t`",
+    "    ```python\npip install {milvus-lite-r,x}ust\n    ```",
+    "```python\n# pip install {milvus-lite-r,x}ust\n```",
+    "pip install milvus-lite-ru&#123;s,&#125;t",
+    "价格 &#36;5",
+])
+def test_shell_expansion_is_rejected(addition):
+    from check_artifacts import check_description
+    body = described(addition)
+    with pytest.raises(ValueError, match="shell expansion"):
+        check_description(body, body)
+
+
+def test_only_the_confirmed_address_itself_is_removed_before_name_detection():
+    from check_artifacts import names_this_package
+    assert not names_this_package("<https://github.com/GrittyChen/milvus-lite-rust/issues>")
+    assert names_this_package("see https://github.com/GrittyChen/milvus-lite-rust-evil")
+
+
+@pytest.mark.parametrize("version,change,reason", [
+    ("0.1.0rc1", "missing", "missing release install command"),
+    ("0.1.0rc2", None, "names this package outside the release commands"),
+])
+def test_release_commands_must_match_this_version(version, change, reason):
+    from check_artifacts import check_description, release_install_commands
+    body = (Path(__file__).resolve().parents[2] / "README.md").read_text()
+    if change == "missing":
+        body = body.replace(sorted(release_install_commands(version))[1], "python -m pip install .")
+    with pytest.raises(ValueError, match=reason):
+        check_description(body, body, version)
+
+
+@pytest.mark.parametrize("addition", [
+    "`pip install https://github.com/GrittyChen/milvus-lite-rust/releases/download/v0.1.0rc1/milvus_lite_rust-0.1.0rc1-cp310-abi3-macosx_11_0_arm64.whl`",
+    "`pip install .`",
+    "`pip install pymilvus`",
+    "`pip uninstall milvus-lite`",
+    "[issues](https://github.com/GrittyChen/milvus-lite-rust/issues)",
+    "<https://github.com/GrittyChen/milvus-lite-rust>",
+    "以 Rust 重写的 milvus-lite，与官方 milvus-lite 互通。",
+    "The project's wheels don't need a Rust toolchain.",
+    "```python\nclient.insert(\"docs\", [dict(id=2)])\n```",
+])
+def test_release_installs_and_project_mentions_are_accepted(addition):
+    from check_artifacts import check_description
+    body = described(addition)
+    check_description(body, body)
+
+
+def test_same_line_mention_of_official_package_and_rust_is_rejected_by_design():
+    # 判定按片段顺序而非渲染结果，宁可多拒：这种句子需要调整语序或分行。
+    from check_artifacts import check_description
+    body = described("本项目是 milvus-lite 的 Rust 实现。")
+    with pytest.raises(ValueError, match="names this package"):
         check_description(body, body)
 
 

@@ -4,6 +4,7 @@ import argparse
 import configparser
 from email.parser import Parser
 import hashlib
+import html
 import json
 from pathlib import Path, PurePosixPath
 import re
@@ -12,6 +13,13 @@ import tarfile
 import tempfile
 import zipfile
 from urllib.parse import urlsplit
+
+VERSION = "0.1.0rc1"
+# 已确认的公开仓库（0013 候选阶段决策 4）；按路径段匹配，同前缀的其它仓库不放行。
+PROJECT = "https://github.com/GrittyChen/milvus-lite-rust"
+PROJECT_URLS = {"Repository, " + PROJECT, "Issues, " + PROJECT + "/issues"}
+PROJECT_ADDRESS = re.compile(re.escape(PROJECT) + r"(?=[/?#\s<>()\[\]`\"']|$)[^\s<>()\[\]`\"']*")
+LOCAL_HOSTS = {"apache.org", "www.apache.org", "127.0.0.1", "localhost"}
 
 
 def require(condition, reason):
@@ -31,20 +39,70 @@ def safe_names(names):
         require(not any(p in {".workbuddy", "references", ".git", "__pycache__"} or p.endswith(".db") for p in parts), "private or runtime content in artifact")
 
 
-def check_description(body, expected):
+def confirmed_address(address):
+    parts = urlsplit(address)
+    if parts.username is not None or parts.password is not None:
+        return False
+    if parts.hostname in LOCAL_HOSTS:
+        return True
+    project = urlsplit(PROJECT)
+    # `..` 段及其编码形式会被客户端整理到仓库边界之外；本项目地址不需要编码，一律拒绝。
+    path = parts.path
+    if "%" in path or "\\" in path or {".", ".."} & set(path.split("/")):
+        return False
+    return (parts.scheme, parts.netloc) == (project.scheme, project.netloc) and (path == project.path or path.startswith(project.path + "/"))
+
+
+def release_install_commands(version):
+    return {
+        f"python -m pip install --no-index --only-binary :all: --find-links {PROJECT}/releases/expanded_assets/v{version} milvus-lite-rust=={version}",
+        f"shasum -a 256 -c --ignore-missing SHA256SUMS && python -m pip install --no-index ./milvus_lite_rust-{version}-*.whl",
+    }
+
+
+def names_this_package(text):
+    # 同一行内 milvus、lite、rust 依次出现（不区分大小写）即视为引用本包名，三段之间插入的
+    # 引号、转义、Markdown 与 HTML 标记或链接拆不开这一判定。已确认仓库地址本身不是安装
+    # 命令，先移除。词内拆字与运行时变换属于刻意混淆，不在范围。
+    return re.search("milvus.*lite.*rust", PROJECT_ADDRESS.sub("", text), flags=re.I) is not None
+
+
+def check_install_commands(body, version):
+    # 名称可能被他人在 PyPI 注册（0013 候选阶段决策 6）。检查器防的是按常规写法误写的按名
+    # 安装，不解析 shell 或 Markdown：除标题外，引用本包名的行只能是固定的 Release 安装
+    # 命令。`$` 与花括号是最常见的拼接手段且 README 用不到，一律拒绝；其余运行时计算
+    # 不在范围，由 README 评审把关。
+    commands = release_install_commands(version)
+    seen = set()
+    for line in re.sub(r"\\\n", "", body).splitlines():
+        line = line.strip()
+        for text in (line, html.unescape(line)):
+            require(not re.search(r"[${}]", text), "install command check: shell expansion")
+        if line in commands:
+            seen.add(line)
+        elif line != "# milvus-lite-rust":
+            for text in (line, html.unescape(line)):
+                require(not names_this_package(text), "install command check: names this package outside the release commands")
+    require(seen == commands, "install command check: missing release install command")
+
+
+def check_description(body, expected, version=VERSION):
     require(body.rstrip() == expected.rstrip(), "long description differs from canonical README")
     for token in ["非官方", "无隶属关系", "pip uninstall milvus-lite", "pymilvus[milvus-lite]", "Windows", "free-threaded", "sdist", "Intel", "3.10–3.15"]:
         require(token in body, "missing user documentation: " + token)
     # 安装代码也能引入远端项目地址，不能跳过代码片段；本地 RPC 示例由精确主机名单放行。
-    require(not re.search(r"\b(?:href|src)\s*=", body, flags=re.I), "raw HTML link attributes in long description")
-    targets = re.findall(r"\]\(([^)]+)\)", body)
-    targets += re.findall(r"^\s*\[[^\]]+\]:\s*(\S+)", body, flags=re.M)
-    for target in targets:
-        target = target.removeprefix("<").split(">", 1)[0]
-        require(target.lower().startswith(("https://", "http://", "#")), "relative file link in long description")
-    for target in re.findall(r"(?:[a-z][a-z0-9+.-]*://|\bwww\.)[^\s<>\[\]()`]+", body, flags=re.I):
-        address = target if "://" in target else "https://" + target
-        require(urlsplit(address.rstrip("\"'")).hostname in {"apache.org", "www.apache.org", "127.0.0.1", "localhost"}, "unconfirmed external address in long description")
+    # 渲染器会解码链接中的字符引用，原文与解码后的文本都要核对。
+    for text in (body, html.unescape(body)):
+        require(not re.search(r"\b(?:href|src)\s*=", text, flags=re.I), "raw HTML link attributes in long description")
+        targets = re.findall(r"\]\(([^)]+)\)", text)
+        targets += re.findall(r"^\s*\[[^\]]+\]:\s*(\S+)", text, flags=re.M)
+        for target in targets:
+            target = target.removeprefix("<").split(">", 1)[0]
+            require(target.lower().startswith(("https://", "http://", "#")), "relative file link in long description")
+        for target in re.findall(r"(?:[a-z][a-z0-9+.-]*://|\bwww\.)[^\s<>\[\]()`]+", text, flags=re.I):
+            address = target if "://" in target else "https://" + target
+            require(confirmed_address(address.rstrip("\"'")), "unconfirmed external address in long description")
+    check_install_commands(body, version)
 
 
 def check_metadata(raw, readme, version):
@@ -55,8 +113,8 @@ def check_metadata(raw, readme, version):
     require(metadata["License-Expression"] == "Apache-2.0", "wrong license expression")
     require((metadata["Description-Content-Type"] or "").split(";", 1)[0].strip() == "text/markdown", "missing markdown description")
     require(set(metadata.get_all("License-File", [])) == {"LICENSE", "crates/grpc/proto/LICENSE"}, "missing license declaration")
-    require(not metadata.get_all("Project-URL") and not metadata.get_all("Home-page"), "unconfirmed project address in metadata")
-    check_description(metadata.get_payload(), readme)
+    require(set(metadata.get_all("Project-URL", [])) == PROJECT_URLS and len(metadata.get_all("Project-URL", [])) == len(PROJECT_URLS) and not metadata.get_all("Home-page"), "unconfirmed project address in metadata")
+    check_description(metadata.get_payload(), readme, version)
 
 
 def check_binary(wheel, tags):
@@ -83,7 +141,7 @@ def check_binary(wheel, tags):
         return {"glibc_versions": versions}
 
 
-def check(wheel, sdist, repo, version="0.1.0.dev0", kind="formal"):
+def check(wheel, sdist, repo, version=VERSION, kind="formal"):
     repo = Path(repo)
     readme = (repo / "README.md").read_text()
     licenses = {p: (repo / p).read_bytes() for p in ["LICENSE", "crates/grpc/proto/LICENSE"]}
@@ -137,7 +195,7 @@ def main():
     parser.add_argument("--wheel", required=True, type=Path)
     parser.add_argument("--sdist", required=True, type=Path)
     parser.add_argument("--repo", required=True, type=Path)
-    parser.add_argument("--version", default="0.1.0.dev0")
+    parser.add_argument("--version", default=VERSION)
     parser.add_argument("--kind", choices=["formal", "fi"], default="formal")
     parser.add_argument("--binary", action="store_true")
     args = parser.parse_args()

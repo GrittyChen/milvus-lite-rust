@@ -1,6 +1,6 @@
 # 首发平台与发行物准备验收
 
-日期：2026-10-10。功能基线 `2151dcc`，本记录对应其后的 0013 准备切片；参照 milvus-lite v3.2.1 / `43d1257`。合同与负责人取舍见 [0013](../decisions/0013-first-release-platform-and-packaging.md)。当前仍是 `0.1.0-dev.0`（Python 元数据 `0.1.0.dev0`），未发布。
+日期：2026-10-10。功能基线 `2151dcc`，本记录对应其后的 0013 准备切片；参照 milvus-lite v3.2.1 / `43d1257`。合同与负责人取舍见 [0013](../decisions/0013-first-release-platform-and-packaging.md)。记录时为 `0.1.0-dev.0`（Python 元数据 `0.1.0.dev0`），未发布；其后的版本切换、公开地址与发布渠道见 0013 候选阶段决策。
 
 ## 变更范围
 

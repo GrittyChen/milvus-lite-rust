@@ -1,6 +1,6 @@
 # 首发发行物验收
 
-合同见 [0013](../../docs/decisions/0013-first-release-platform-and-packaging.md)。当前版本为开发候选，脚本不上传发行物。根 `pyproject.toml` 是唯一配置；从仓库根和 sdist 解包根执行 `maturin build`，也可以保留 `-m crates/py/Cargo.toml`。
+合同见 [0013](../../docs/decisions/0013-first-release-platform-and-packaging.md)。检查器默认版本为 `0.1.0rc1`；脚本不上传或发布发行物。根 `pyproject.toml` 是唯一配置；从仓库根和 sdist 解包根执行 `maturin build`，也可以保留 `-m crates/py/Cargo.toml`。
 
 ## 构建与安装
 
@@ -38,4 +38,4 @@ PYO3_NO_PYTHON=1 cargo check -p milvus-lite-py --target x86_64-pc-windows-msvc -
 
 CPython 3.10、3.15 各跑两条 SDK 全套；3.11–3.14 用同一个正式 wheel 冒烟。Intel Mac 仅构建与两个端点冒烟，Rosetta 结果单独标注。资源缺口与实跑计数集中在 [首发验收记录](../../docs/testing/first-release-acceptance.md)，不将准备切片完成写成已发布。
 
-公开项目地址尚未确认，完整 README（含代码示例、无协议 www. 地址）的 URL 主机仅接受 `apache.org` / `www.apache.org` 与本地 RPC 示例的 `127.0.0.1` / `localhost`。内联与引用式的文件相对链接均拒绝；出现 HTML `href` / `src` 属性即拒绝，元数据不接受 `Project-URL` / `Home-page`。以后确认公开地址时同步修订 0013、允许项和反证测试。
+完整 README（含代码示例、无协议 www. 地址）中的地址只接受已确认仓库 `https://github.com/GrittyChen/milvus-lite-rust` 及其下路径（按路径段匹配；相似仓库名、其它大小写、http、www、端口、`.`/`..` 段与百分号编码均拒绝，任何地址带用户信息也拒绝），以及 `apache.org` / `www.apache.org` 与本地 RPC 示例的 `127.0.0.1` / `localhost`。内联与引用式的文件相对链接均拒绝；出现 HTML `href` / `src` 属性即拒绝。元数据的 `Project-URL` 必须恰为 Repository 与 Issues 两项，不接受 `Home-page`。为避免从 PyPI 取到同名的他人包（0013 候选阶段决策 6），安装命令用白名单而不解析 shell 或 Markdown：反斜杠续行合并后，逐行检查原文与 HTML 解码后的文本；移除已确认仓库地址后，同一行内 milvus、lite、rust 依次出现（不区分大小写）即视为引用本包名。除标题 `# milvus-lite-rust` 外，这样的行去除首尾空白后必须逐字等于 `release_install_commands(version)` 的两条命令之一，两条都须出现，版本随 `--version` 变化；`$` 与花括号在任何位置都拒绝（README 的 Python 示例因此用 `dict(...)`）。检查器防的是按常规写法误写的按名安装：任意大小写与 `-_.` 分隔，或在三段之间插入引号、转义、字符引用、Markdown 与 HTML 标记、链接，都会被识别。这一判定宁可多拒：同一行依次提到官方 milvus-lite 与 Rust 的句子需要调整语序或分行，正文也不再以行内代码写出发行名。不在检查范围、由 README 评审把关：在单词字母中间插入内容的刻意混淆；运行时计算或变换（命令替换、变量、管道中的文本变换、printf 或解释器的转义序列等），无论单行或跨行；长描述之外的内容（如 requirements 文件）；依赖当前目录已有文件的通配符。

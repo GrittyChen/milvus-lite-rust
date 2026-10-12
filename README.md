@@ -2,11 +2,13 @@
 
 以 Rust 实现的非官方 milvus-lite，与 Milvus / Zilliz 无隶属关系。目标是让 `pymilvus` 用户继续使用 `MilvusClient("./demo.db")`，并读取官方 3.x 的数据目录。
 
-**当前是开发候选，尚未发布到 PyPI，也尚不可用于生产。** 以下平台表是首发候选及验收边界，不表示所有行已经通过。公开源码和文档地址尚未确定，开发与验收材料在源码树中维护。
+**`0.1.0rc1` 是预发布试用版本，不建议用于生产。** 它只通过本项目 GitHub 仓库的 Release 分发，目前未发布到 PyPI；PyPI 上若出现同名包，并非本项目发布。以下平台表是首发候选及验收边界，各行实际达到的证据层级以 Release 说明为准。
+
+源码：<https://github.com/GrittyChen/milvus-lite-rust>；问题反馈：<https://github.com/GrittyChen/milvus-lite-rust/issues>。设计决策与验收记录在源码树的 docs 目录中维护。
 
 ## 安装与包冲突
 
-本包的发行名为 `milvus-lite-rust`，提供 `milvus_lite` 模块及 `milvus-lite` 命令。它与官方发行包 `milvus-lite` **不能同时安装**，pip 不会阻止同名模块被覆盖；后装者覆盖文件，卸载任一方也可能损坏另一方。
+本包的发行名即下方安装命令中的包名，提供 `milvus_lite` 模块及 `milvus-lite` 命令。它与官方发行包 `milvus-lite` **不能同时安装**，pip 不会阻止同名模块被覆盖；后装者覆盖文件，卸载任一方也可能损坏另一方。
 
 先移除官方包：
 
@@ -14,11 +16,20 @@
 python -m pip uninstall milvus-lite
 ```
 
-发布后使用以下安装方式；当前尚未发布，不能将这些命令当作现有 PyPI 包已可用：
+pymilvus 从 PyPI 安装；本包只从 GitHub Release 的附件安装，`--no-index` 保证 pip 不向 PyPI 查询本包，`--only-binary :all:` 让不受支持的平台直接失败而不是尝试源码构建：
 
 ```bash
-python -m pip install pymilvus milvus-lite-rust
+python -m pip install pymilvus
+python -m pip install --no-index --only-binary :all: --find-links https://github.com/GrittyChen/milvus-lite-rust/releases/expanded_assets/v0.1.0rc1 milvus-lite-rust==0.1.0rc1
 ```
+
+需要先核对文件时，从 [v0.1.0rc1 Release](https://github.com/GrittyChen/milvus-lite-rust/releases/tag/v0.1.0rc1) 下载本平台的 wheel 与 `SHA256SUMS`，在同一目录核对后安装本地文件：
+
+```bash
+shasum -a 256 -c --ignore-missing SHA256SUMS && python -m pip install --no-index ./milvus_lite_rust-0.1.0rc1-*.whl
+```
+
+核对失败时不会执行安装。Linux 上也可以用 `sha256sum -c --ignore-missing SHA256SUMS` 代替 `shasum -a 256 -c --ignore-missing SHA256SUMS`。
 
 **不要使用 `pymilvus[milvus-lite]`**：该 extra 会引入官方发行包。若两个发行包已经同时存在，应卸载二者后只重新安装本包。绑定层会拒绝检测到的共存，但官方包后装覆盖本模块的情况无法由本包检测；pymilvus 的导入错误提示也可能把用户引向官方包。
 
@@ -55,7 +66,7 @@ from pymilvus import MilvusClient
 client = MilvusClient("./demo.db")
 try:
     client.create_collection("docs", dimension=2, metric_type="L2")
-    client.insert("docs", [{"id": 1, "vector": [1.0, 0.0], "category": "tech"}])
+    client.insert("docs", [dict(id=1, vector=[1.0, 0.0], category="tech")])
     print(client.query("docs", filter="category == 'tech'", output_fields=["id"]))
     print(client.search("docs", [[1.0, 0.0]], limit=1))
     client.flush("docs")
