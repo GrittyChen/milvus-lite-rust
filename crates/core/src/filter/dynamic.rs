@@ -763,10 +763,8 @@ mod tests {
 
     #[test]
     fn dynamic_batches_match_reference_masks_and_errors() {
-        let fixture: Value = serde_json::from_str(include_str!(
-            "../../../../tests/differential/fixtures/filter_dynamic.json"
-        ))
-        .unwrap();
+        let fixture: Value =
+            serde_json::from_str(include_str!("../../tests/fixtures/filter_dynamic.json")).unwrap();
         let mut failures = Vec::new();
         for (index, case) in fixture["cases"].as_array().unwrap().iter().enumerate() {
             let collision = case["collision"].as_bool().unwrap();

@@ -35,7 +35,7 @@ Linux arm64 基础镜像：`quay.io/pypa/manylinux_2_28_aarch64@sha256:abd1230aa
 | Windows py target 拒绝 | 本项目预期消息，非零退出 | 首发不提供 Windows 包 |
 | 实际 free-threaded CPython 3.14.8 构建拒绝 | 本项目预期消息，非零退出 | 无数据目录副作用 |
 | 实际 PyPy 3.11 构建拒绝 | 本项目预期消息，非零退出 | Linux 容器内执行 |
-| 仓库与 sdist 解包的 MSRV | 默认与 all-features workspace/all-targets 均通过 | Rust 1.89.0，不代替其它目标运行 |
+| 仓库与 sdist 解包的 MSRV | 默认与 all-features workspace/all-targets 均通过（sdist 解包部分不成立，见下方更正） | Rust 1.89.0，不代替其它目标运行 |
 | sdist 解包入口 | 根 wheel 构建及 `-m crates/py/Cargo.toml` sdist 构建通过 | 原打包命令仍有效 |
 | sdist PEP 517 安装 | `uv pip install <sdist>` 后真实 SDK 生命周期通过 | 构建隔离，独立安装环境，原生库身份独立记录 |
 | macOS 洁净无 SDK / SDK 安装 | 真实 CLI RPC 与 `.db` 关闭/重开通过 | 两环境隔离；无 SDK 环境不装 numpy/grpcio/pymilvus |
@@ -52,6 +52,8 @@ Linux arm64 基础镜像：`quay.io/pypa/manylinux_2_28_aarch64@sha256:abd1230aa
 | Linux arm64 Python 3.11–3.14 | CLI 与 `.db` 生命周期冒烟通过 | 同一正式 wheel；SDK 3.0.2 |
 | Linux arm64 洁净无 SDK | CLI 接受独立 SDK 的真实 RPC 并正常停止 | 不装 numpy/grpcio/pymilvus |
 | 脚本自检（benchmark + packaging + platform） | 99 passed | 包含拒绝、失败传播、路径与二进制下限反证 |
+
+**更正（2026-10-12）**：rc1 候选验收在 sdist 解包目录实跑上表 MSRV 两套检查，均因 core 的两个单元测试以 `include_str!` 引用仓库根 `tests/differential/fixtures/` 而编译失败；该目录不在 sdist 中。用同一方式重跑本记录的 `4d60bcc…` sdist 结果相同，因此上表 sdist 解包部分的通过结论不成立，仓库内的检查结论不受影响。sdist 的两个构建入口与 PEP 517 安装只编译库本身，不受影响。两个语料已移入 [core 的测试数据目录](../../crates/core/tests/fixtures/README.md)，候选验收在 sdist 解包目录重新实跑该门槛。
 
 Python 端点 SDK 固定 2.6.17 / 3.0.2；实际依赖版本与原生库哈希随各安装日志记录。Linux arm64 的 CPython 3.15 安装中，SDK 依赖 orjson 3.13.0 从源码回退并用已安装的 Rust 编译；本包自身使用同一个 abi3 wheel，不将 SDK 依赖的这次安装写成全套无编译器安装证据。测试环境都在仓库外，未安装官方发行包到 Rust 环境。
 

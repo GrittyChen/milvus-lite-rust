@@ -100,7 +100,7 @@ for source in sorted(sources):
     else:
         result = None
     cases.append({"source": source, "error": result})
-target = Path(__file__).with_name("fixtures") / "filter_parse_v321.json"
+target = root / "crates/core/tests/fixtures/filter_parse_v321.json"
 payload = json.dumps({"reference": "v3.2.1 / 43d1257", "cases": cases}, ensure_ascii=False, indent=2) + "\n"
 if "--verify" in sys.argv:
     assert target.read_text() == payload

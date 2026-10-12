@@ -15,7 +15,7 @@ from milvus_lite.search.filter.parser import parse_expr
 from milvus_lite.search.filter.semantic import compile_expr
 
 REPO = Path(__file__).resolve().parents[2]
-OUTPUT = REPO / "tests/differential/fixtures/filter_dynamic.json"
+OUTPUT = REPO / "crates/core/tests/fixtures/filter_dynamic.json"
 
 
 def cases():

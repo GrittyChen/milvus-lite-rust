@@ -986,10 +986,9 @@ mod tests {
     use super::*;
     #[test]
     fn reference_parser_acceptance_and_diagnostics_match_the_generated_corpus() {
-        let cases: serde_json::Value = serde_json::from_str(include_str!(
-            "../../../../tests/differential/fixtures/filter_parse_v321.json"
-        ))
-        .unwrap();
+        let cases: serde_json::Value =
+            serde_json::from_str(include_str!("../../tests/fixtures/filter_parse_v321.json"))
+                .unwrap();
         let mut mismatches = Vec::new();
         for case in cases["cases"].as_array().unwrap() {
             let source = case["source"].as_str().unwrap();
