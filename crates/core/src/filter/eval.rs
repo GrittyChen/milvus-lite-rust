@@ -576,6 +576,9 @@ impl Predicate {
                     };
                     // Arrow 先尝试把整个 double value_set 无损转成列的 int64 类型。
                     // 只有该转换失败才把列转为 double；后一路的 set lookup 按位区分 ±0。
+                    // 2^63 不在 int64 范围内：参照的 Arrow 在 arm64 上把它饱和成 i64::MAX 并通过
+                    // 往返校验，x86_64 则判为截断。这里按截断处理，越界浮点数（包括 float(i64::MAX - 1)）
+                    // 不能命中、更不能删除另一个整数；差异见 0006「与 3.x 的差异」。
                     let integer_set = float != 0
                         && matches!(columns[*column], ColumnData::Int64(_))
                         && values.iter().all(|literal| match literal {
@@ -583,7 +586,7 @@ impl Predicate {
                             Literal::Float(v) => {
                                 v.is_finite()
                                     && v.fract() == 0.0
-                                    && (-9_223_372_036_854_775_808.0..=9_223_372_036_854_775_808.0)
+                                    && (-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0)
                                         .contains(v)
                             }
                             _ => false,
@@ -608,7 +611,7 @@ impl Predicate {
                         }
                         let scalar =
                             if integer_set && let Operand::Literal(Literal::Float(v)) = operand {
-                                // Arrow 对恰为 2^63 的 double 也通过安全转换，并得到 i64::MAX。
+                                // 上面的范围检查保证这个整数值的 double 能精确转换。
                                 Scalar::Int(*v as i64)
                             } else {
                                 value(operand, columns, 0, lookup_precision)?

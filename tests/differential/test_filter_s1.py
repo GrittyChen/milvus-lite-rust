@@ -1,6 +1,8 @@
 """S1 的真实入口、失败优先级与重开顺序，以 v3.2.1 / 43d1257 作证。"""
 import json
+import os
 import struct
+import subprocess
 from pathlib import Path
 
 import grpc
@@ -8,7 +10,7 @@ import pytest
 from pymilvus import DataType, MilvusClient
 from pymilvus.grpc_gen import common_pb2, milvus_pb2, milvus_pb2_grpc
 
-from compare import hits, run
+from compare import exact, hits, run
 from test_reopen import pair  # 每次关闭服务，确保重开确实恢复同一个目录。
 from test_scenarios import index
 
@@ -38,6 +40,142 @@ def test_iso_diagnostics_cover_clock_shapes_offsets_and_tail_bytes(diff):
         assert reference[:3]==("err",6,6)
         assert reference[3].startswith("top-level filter expression must evaluate to bool, got timestamptz")
 
+MAX = 9223372036854775807
+BELOW_2_63 = 9223372036854774784  # 小于 2^63 的最大 double
+WIDE_ERROR = ("err", 1, 0, "Integer value 9007199254740993 not in range: -9007199254740992 to 9007199254740992")
+
+
+@pytest.fixture(scope="module")
+def reference_arch():
+    """参照进程（MILVUS_LITE_3X_PYTHON）的架构与 pyarrow 版本：2^63 的转换结果取决于二者。"""
+    machine, arrow = subprocess.check_output(
+        [os.environ["MILVUS_LITE_3X_PYTHON"], "-c", "import platform, pyarrow; print(platform.machine(), pyarrow.__version__)"],
+        text=True).split()
+    if machine in ("x86_64", "AMD64"):
+        # x86_64 的参照与本实现逐字比较，结果不依赖饱和行为。
+        return "x86_64"
+    # 饱和结果已在 macOS arm64 与 Linux aarch64 上以 pyarrow 25.0.1 核实；其它环境须先核实再登记。
+    assert machine in ("arm64", "aarch64") and arrow == "25.0.1", f"unverified reference: {machine} pyarrow {arrow}"
+    return "arm64"
+
+
+def test_float_membership_beyond_int64_follows_strict_cast_on_every_architecture(pair, reference_arch):
+    """2^63 不在 int64 范围内：本实现在所有架构上按截断处理，与 x86_64 的参照一致；arm64 的参照
+    （pyarrow 25.0.1）把它饱和成 INT64_MAX。两侧各自对照完整的预期结果，架构差异只放开命中哪些行；
+    差异见 0006「与 3.x 的差异」。"""
+    diff = pair.open()
+    dyn = MilvusClient.create_schema(auto_id=False, enable_dynamic_field=True)
+    dyn.add_field("id", DataType.INT64, is_primary=True)
+    dyn.add_field("vector", DataType.FLOAT_VECTOR, dim=2)
+    wide = [0, 9007199254740993, -MAX - 1, MAX, BELOW_2_63]
+    dyn_wide = [(1, 0), (2, MAX), (3, 9007199254740993), (4, BELOW_2_63)]
+    # 只有 ±2^53 内的整数时，动态字段与小整数列同走 Arrow 的 double 路径，不转入 Python。
+    dyn_small = [(1, 0), (2, 1), (3, 2)]
+    # 每行的向量不同，L2 距离为位次的平方，Search 没有并列，命中哪些行可以严格判定。
+    vec = lambda i: [1.0, float(i)]
+    pk_rows = lambda pks: ([{**row(pk, 1), "vector": vec(i)} for i, pk in enumerate(pks)], schema(), pks)
+    dyn_rows = lambda xs: ([{"id": pk, "vector": vec(i), "x": x} for i, (pk, x) in enumerate(xs)], dyn, [pk for pk, _ in xs])
+    data = {"wide": pk_rows(wide), "small": pk_rows([-1, 0, 1, 2]), "dyn": dyn_rows(dyn_wide), "dyn_small": dyn_rows(dyn_small)}
+    stages = ["active", "committed", "reopened"]
+    # 删除会让两侧数据分叉：每个存储状态、每种删除各用一个 collection。
+    for stage in stages:
+        data["del_wide_" + stage], data["del_dyn_" + stage] = pk_rows(wide), dyn_rows(dyn_wide)
+    for name, (rows, s, _) in data.items():
+        diff.step(name + "_create", lambda c: c.create_collection(name, schema=s, index_params=index("L2")))
+        diff.step(name + "_insert", lambda c: c.insert(name, rows))
+
+    def expected(name, kind, pks):
+        """完整的预期结果：pks 为命中的主键（按插入顺序）或 WIDE_ERROR。"""
+        if pks == WIDE_ERROR:
+            return pks
+        if kind == "count":
+            return ("ok", [{"count(*)": len(pks)}])
+        if kind == "search":
+            order = data[name][2]
+            hits_ = sorted(({"id": pk, "distance": float(order.index(pk) ** 2), "entity": {"id": pk}} for pk in pks),
+                           key=lambda h: h["distance"])
+            return ("ok", [hits_])
+        return ("ok", [{"id": pk} for pk in pks])
+
+    def checker(name, kind, rust, arm64=None):
+        """rust 为本实现在所有架构上命中的主键或 WIDE_ERROR；arm64 为 arm64 参照的结果，缺省同 rust。"""
+        reference = rust if reference_arch == "x86_64" or arm64 is None else arm64
+        vectors = {pk: vec(i) for i, pk in enumerate(data[name][2])}
+        def agree(x, y, k):
+            if kind == "search" and x[0] == y[0] == "ok":
+                # hits() 把只在一侧出现、距离相同的主键当作截断位置的并列；这里距离互不相同，
+                # 没有合法的并列，主键序列须逐项相同。
+                why = hits("L2", [[1.0, 0.0]], vectors, k=k)(x, y)
+                order = lambda r: [[repr(h["id"]) for h in q] for q in r[1]]
+                return why or (None if order(x) == order(y) else "hit ids differ")
+            return exact(x, y)
+        def check(a, b):
+            ka = 0 if rust == WIDE_ERROR else len(rust)
+            kb = 0 if reference == WIDE_ERROR else len(reference)
+            for side, got, want, k in [("rust", a, rust, ka), (f"reference ({reference_arch})", b, reference, kb)]:
+                why = agree(got, expected(name, kind, want), k)
+                if why:
+                    return f"{side}: {why}"
+            return agree(a, b, ka) if rust == reference else None
+        return check, reference == WIDE_ERROR
+
+    cases = [("wide", "id in [9223372036854775808.0]", WIDE_ERROR, [MAX]),
+             ("wide", "id in [9.223372036854776e18]", WIDE_ERROR, [MAX]),
+             ("wide", "id in [-0.0, 9223372036854775808.0]", WIDE_ERROR, [0, MAX]),
+             ("wide", "id in [9223372036854774784.0]", [BELOW_2_63], None),
+             ("wide", "id in [-9223372036854775808.0]", [-MAX - 1], None),
+             ("wide", "id in [9223372036854775807]", [MAX], None),
+             ("small", "id in [9223372036854775808.0]", [], None),
+             ("small", "id in [-0.0, 9223372036854775808.0]", [], [0]),
+             ("dyn", "x in [9223372036854775808.0]", [], [2]),
+             ("dyn", "x in [-0.0, 9223372036854775808.0]", [1], [1, 2]),
+             ("dyn", "x in [9223372036854774784.0]", [4], None),
+             ("dyn_small", "x in [9223372036854775808.0]", [], None),
+             ("dyn_small", "x in [-0.0, 9223372036854775808.0]", [], [1]),
+             ("dyn_small", "x in [-0.0]", [1], None)]
+    deletes = [("del_wide_", "id in [9223372036854775808.0]", WIDE_ERROR, [MAX], wide, MAX),
+               ("del_dyn_", "x in [9223372036854775808.0]", [], [2], [pk for pk, _ in dyn_wide], 2)]
+
+    def deleted(result):
+        """pymilvus 的 delete 返回被删除的主键列表，零删除时返回计数；转成与 query 相同的形状。"""
+        if result[0] != "ok":
+            return result
+        pks = [] if result[1] == {"delete_count": 0, "cost": 0} else result[1]
+        assert isinstance(pks, list), result
+        return ("ok", [{"id": pk} for pk in pks])
+
+    def check_stage(stage):
+        for name, expr, rust, arm64 in cases:
+            for kind, call in [("query", lambda c: c.query(name, filter=expr, output_fields=["id"])),
+                               ("count", lambda c: c.query(name, filter=expr, output_fields=["count(*)"])),
+                               ("search", lambda c: c.search(name, data=[[1.0, 0.0]], filter=expr, limit=10,
+                                                             output_fields=["id"], search_params={"metric_type": "L2"}))]:
+                check, error = checker(name, kind, rust, arm64)
+                diff.step(f"{stage}_{name}_{kind}_{expr}", call, check=check, error=error)
+        # 每个状态各执行一次边界删除；失败或零匹配的删除不改变本实现的行，arm64 参照会删除 INT64_MAX 那一行。
+        for prefix, expr, rust, arm64, _, _ in deletes:
+            name = prefix + stage
+            check, error = checker(name, "delete", rust, arm64)
+            diff.step(f"{stage}_delete_{name}", lambda c: c.delete(name, filter=expr),
+                      check=lambda a, b, check=check: check(deleted(a), deleted(b)), error=error)
+        for done in stages[:stages.index(stage) + 1]:
+            for prefix, _, _, _, pks, removed in deletes:
+                name = prefix + done
+                check, _ = checker(name, "query", pks, [pk for pk in pks if pk != removed])
+                diff.step(f"{stage}_{name}_remaining", lambda c: c.query(name, filter="", output_fields=["id"], limit=100),
+                          check=check)
+
+    check_stage("active")
+    for name in data:
+        diff.step(name + "_flush", lambda c: c.flush(name))
+    check_stage("committed")
+    pair.close()
+    diff = pair.open()
+    for name in data:
+        diff.step(name + "_load", lambda c: c.load_collection(name))
+    check_stage("reopened")
+
+
 def test_primary_key_membership_casts_and_signed_zero_match_reference_before_and_after_reopen(pair):
     diff=pair.open()
     healthy=[-1,0,1,2]
@@ -48,8 +186,8 @@ def test_primary_key_membership_casts_and_signed_zero_match_reference_before_and
     small_cases=[("[-0.0]",[0]),("[-0.0, 1]",[0,1]),("[-0.0, 1.5]",[]),
                  ("[0.0, 1.5]",[0]),("[-0.0, -1.0]",[-1,0]),("[-0.0, 1e999]",[]),
                  ("[-0.0, 0.0, 1.5]",[0]),("[]",[])]
+    # 2^63 的 value_set 随参照的架构变化，见上方 test_float_membership_beyond_int64_*。
     wide_cases=[("[-0.0]",[0]),("[-0.0, 1]",[0]),("[-0.0, 9007199254740992.0]",[0]),
-                ("[-0.0, 9223372036854775808.0]",[0,9223372036854775807]),
                 ("[-0.0, -9223372036854775808.0]",[0,-9223372036854775808]),("[]",[])]
     def check(stage):
         for name,ids,cases in [("in_small",healthy,small_cases),("in_wide",wide,wide_cases)]:

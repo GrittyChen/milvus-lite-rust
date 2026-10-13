@@ -211,3 +211,141 @@ fn unknown_ordering_cannot_commit_a_partial_delete_or_consume_sequence() {
     );
     reopened.close();
 }
+
+#[test]
+fn out_of_range_float_membership_never_matches_int64_max_or_deletes_it() {
+    let root = tempfile::tempdir().unwrap();
+    let mut engine = db(root.path());
+    engine.create_collection("", "c", schema()).unwrap();
+    // 宽整数让 value_set 的 double 路径转换失败，进入 Python 语义：int 与 float 精确比较。
+    let below = 9_223_372_036_854_774_784_i64;
+    engine
+        .insert(
+            "",
+            "c",
+            batch(
+                1,
+                &[
+                    json!(0),
+                    json!(i64::MAX),
+                    json!(9_007_199_254_740_993_i64),
+                    json!(below),
+                ],
+            ),
+        )
+        .unwrap();
+    let dir = root.path().join("collections/c");
+    let check = |engine: &Db| {
+        let snapshot = engine.collection("", "c").unwrap().read().read_snapshot();
+        for (expr, expected) in [
+            ("x in [9223372036854775808.0]", 0),
+            ("x in [9.223372036854776e18]", 0),
+            ("x in [-0.0, 9223372036854775808.0]", 1),
+            ("x in [9223372036854774784.0]", 1),
+            ("x in [9223372036854775807]", 1),
+        ] {
+            assert_eq!(snapshot.count_filtered(expr).unwrap(), expected, "{expr}");
+        }
+        assert_eq!(
+            snapshot
+                .query("x in [-0.0, 9223372036854775808.0]", &[], None, 0)
+                .unwrap()
+                .rows
+                .pks,
+            vec![Pk::Int64(1)]
+        );
+    };
+    let wal_files = || {
+        let mut names: Vec<_> = std::fs::read_dir(dir.join("wal"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        names.sort();
+        names
+    };
+    for stage in ["active", "committed", "reopened"] {
+        match stage {
+            "committed" => engine.flush_collection("", "c").unwrap(),
+            "reopened" => {
+                engine.close();
+                engine = db(root.path());
+                engine.collection("", "c").unwrap().write().load();
+            }
+            _ => {}
+        }
+        check(&engine);
+        let rows = engine
+            .collection("", "c")
+            .unwrap()
+            .read()
+            .read_snapshot()
+            .query("", &[], None, 0)
+            .unwrap();
+        let before_wal = wal_files();
+        let before_data = (stage == "active")
+            .then(|| std::fs::read(dir.join("wal/wal_data_000001.arrow")).unwrap());
+        let before_manifest =
+            (stage != "active").then(|| std::fs::read(dir.join("manifest.json")).unwrap());
+        assert!(
+            engine
+                .delete_expr("", "c", "x in [9223372036854775808.0]", "")
+                .unwrap()
+                .0
+                .is_empty(),
+            "{stage}"
+        );
+        assert_eq!(
+            engine
+                .collection("", "c")
+                .unwrap()
+                .read()
+                .read_snapshot()
+                .query("", &[], None, 0)
+                .unwrap(),
+            rows,
+            "{stage}"
+        );
+        assert_eq!(wal_files(), before_wal, "{stage}");
+        if let Some(data) = &before_data {
+            assert_eq!(
+                &std::fs::read(dir.join("wal/wal_data_000001.arrow")).unwrap(),
+                data
+            );
+        }
+        if let Some(manifest) = &before_manifest {
+            assert_eq!(&std::fs::read(dir.join("manifest.json")).unwrap(), manifest);
+        }
+        // 重开会按磁盘状态重建 next_seq，所以在重开前确认活跃与已提交阶段没有在内存中占用序号：
+        // 4 行之后的探针写入取得 5 号；重开后的零匹配删除同样不占用，下一次写入取得 6 号。
+        if stage != "active" {
+            let (id, seq) = if stage == "committed" { (5, 5) } else { (6, 6) };
+            engine.insert("", "c", batch(id, &[json!(1)])).unwrap();
+            engine.flush_collection("", "c").unwrap();
+            let manifest: Value =
+                serde_json::from_slice(&std::fs::read(dir.join("manifest.json")).unwrap()).unwrap();
+            assert_eq!(manifest["current_seq"], json!(seq), "{stage}");
+        }
+    }
+    // 只有 ±2^53 内的整数时不转入 Python：与小整数主键列一样按 double 位模式查集合，-0.0 不命中 0。
+    engine.create_collection("", "small", schema()).unwrap();
+    engine
+        .insert("", "small", batch(1, &[json!(0), json!(1), json!(2)]))
+        .unwrap();
+    let small = engine
+        .collection("", "small")
+        .unwrap()
+        .read()
+        .read_snapshot();
+    for (expr, expected) in [
+        ("x in [9223372036854775808.0]", 0),
+        ("x in [-0.0, 9223372036854775808.0]", 0),
+        ("x in [-0.0]", 1),
+    ] {
+        assert_eq!(small.count_filtered(expr).unwrap(), expected, "{expr}");
+    }
+    engine.close();
+    let reopened = db(root.path());
+    reopened.collection("", "c").unwrap().write().load();
+    check(&reopened);
+    reopened.close();
+}

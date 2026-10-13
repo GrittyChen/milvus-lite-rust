@@ -57,6 +57,7 @@ fn membership_preserves_arrow_cast_selection_and_signed_zero_without_changing_co
                 (9_007_199_254_740_993, 2),
                 (i64::MIN, 3),
                 (i64::MAX, 4),
+                (BELOW_2_63, 5),
             ]),
         )
         .unwrap();
@@ -65,22 +66,35 @@ fn membership_preserves_arrow_cast_selection_and_signed_zero_without_changing_co
             engine.flush_collection("", "c").unwrap();
         }
         let snapshot = engine.collection("", "c").unwrap().read().read_snapshot();
+        // None 表示报错：比较走 double 的安全转换，宽整数报错；membership 整数化则不转列。
+        // 2^63 不能无损转成 int64，value_set 改走 double，宽整数列同样报错。
         for (expr, expected) in [
-            ("id in [-0.0]", vec![Pk::Int64(0)]),
-            ("id in [-0.0, 1]", vec![Pk::Int64(0), Pk::Int64(1)]),
-            ("id in [-0.0, 9007199254740992.0]", vec![Pk::Int64(0)]),
+            ("id in [-0.0]", Some(vec![Pk::Int64(0)])),
+            ("id in [-0.0, 1]", Some(vec![Pk::Int64(0), Pk::Int64(1)])),
+            ("id in [-0.0, 9007199254740992.0]", Some(vec![Pk::Int64(0)])),
+            ("id in [-0.0, 9223372036854775808.0]", None),
+            ("id in [9223372036854775808.0]", None),
             (
-                "id in [-0.0, 9223372036854775808.0]",
-                vec![Pk::Int64(0), Pk::Int64(i64::MAX)],
+                "id in [9223372036854774784.0]",
+                Some(vec![Pk::Int64(BELOW_2_63)]),
             ),
-            ("id == -0.0", vec![Pk::Int64(0)]),
+            (
+                "id in [-9223372036854775808.0]",
+                Some(vec![Pk::Int64(i64::MIN)]),
+            ),
+            (
+                "id in [9223372036854775807]",
+                Some(vec![Pk::Int64(i64::MAX)]),
+            ),
+            ("id == -0.0", None),
         ] {
-            // 比较走 double 的安全转换，宽整数仍报错；membership 整数化则不转列。
             let result = snapshot.query(expr, &[], None, 0);
-            if expr.contains("==") {
-                assert!(matches!(result, Err(EngineError::InvalidArgument(_))));
-            } else {
-                assert_eq!(result.unwrap().rows.pks, expected, "{expr}");
+            match expected {
+                Some(pks) => assert_eq!(result.unwrap().rows.pks, pks, "{expr}"),
+                None => assert!(
+                    matches!(&result, Err(EngineError::InvalidArgument(m)) if m == "Integer value 9007199254740993 not in range: -9007199254740992 to 9007199254740992"),
+                    "{expr}: {result:?}"
+                ),
             }
         }
         assert!(matches!(
@@ -116,7 +130,133 @@ fn membership_preserves_arrow_cast_selection_and_signed_zero_without_changing_co
         snapshot.query("id == -0.0", &[], None, 0).unwrap().rows.pks,
         [Pk::Int64(0)]
     );
+    // 小整数列可安全转为 double：2^63 不命中任何行，-0.0 按位查集合也不命中 0。
+    for expr in [
+        "id in [9223372036854775808.0]",
+        "id in [-0.0, 9223372036854775808.0]",
+    ] {
+        assert!(
+            snapshot.query(expr, &[], None, 0).unwrap().rows.is_empty(),
+            "{expr}"
+        );
+    }
     engine.close();
+}
+
+/// 小于 2^63 的最大 double，可以无损转成 int64。
+const BELOW_2_63: i64 = 9_223_372_036_854_774_784;
+
+#[test]
+fn out_of_range_float_membership_delete_leaves_rows_sequence_and_wal_unchanged() {
+    const WIDE: &str =
+        "Integer value 9007199254740993 not in range: -9007199254740992 to 9007199254740992";
+    let root = tempfile::tempdir().unwrap();
+    let mut engine = db(root.path());
+    engine.create_collection("", "c", schema()).unwrap();
+    engine
+        .insert(
+            "",
+            "c",
+            batch(&[(9_007_199_254_740_993, 1), (i64::MAX - 1, 2), (i64::MAX, 3)]),
+        )
+        .unwrap();
+    let dir = root.path().join("collections/c");
+    let rows = |engine: &Db| {
+        engine
+            .collection("", "c")
+            .unwrap()
+            .read()
+            .read_snapshot()
+            .query("", &[], None, 0)
+            .unwrap()
+    };
+    let wal_files = || {
+        let mut names: Vec<_> = std::fs::read_dir(dir.join("wal"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        names.sort();
+        names
+    };
+    // float(i64::MAX - 1) 也是 2^63；活跃、已提交与重开后都不能命中或删除 i64::MAX。
+    for stage in ["active", "committed", "reopened"] {
+        match stage {
+            "committed" => engine.flush_collection("", "c").unwrap(),
+            "reopened" => {
+                engine.close();
+                engine = db(root.path());
+                engine.collection("", "c").unwrap().write().load();
+            }
+            _ => {}
+        }
+        assert!(
+            matches!(
+                engine.collection("", "c").unwrap().read().read_snapshot().query("id in [9223372036854775808.0]", &[], None, 0),
+                Err(EngineError::InvalidArgument(m)) if m == WIDE
+            ),
+            "{stage}"
+        );
+        let before_rows = rows(&engine);
+        let before_wal = wal_files();
+        let before_data = (stage == "active")
+            .then(|| std::fs::read(dir.join("wal/wal_data_000001.arrow")).unwrap());
+        let before_manifest =
+            (stage != "active").then(|| std::fs::read(dir.join("manifest.json")).unwrap());
+        for expr in [
+            "id in [9223372036854775808.0]",
+            "id in [9.223372036854776e18]",
+        ] {
+            assert!(
+                matches!(
+                    engine.delete_expr("", "c", expr, ""),
+                    Err(EngineError::InvalidArgument(m)) if m == WIDE
+                ),
+                "{stage} {expr}"
+            );
+            assert_eq!(rows(&engine), before_rows, "{stage} {expr}");
+            assert_eq!(wal_files(), before_wal, "{stage} {expr}");
+            if let Some(data) = &before_data {
+                assert_eq!(
+                    &std::fs::read(dir.join("wal/wal_data_000001.arrow")).unwrap(),
+                    data
+                );
+            }
+            if let Some(manifest) = &before_manifest {
+                assert_eq!(&std::fs::read(dir.join("manifest.json")).unwrap(), manifest);
+            }
+        }
+        // 重开会按磁盘状态重建 next_seq，所以在重开前确认活跃与已提交阶段没有在内存中占用序号：
+        // 3 行之后的探针写入取得 4 号；重开后的失败删除同样不占用，下一次写入取得 5 号。
+        if stage != "active" {
+            let (pk, seq) = if stage == "committed" { (6, 4) } else { (7, 5) };
+            engine.insert("", "c", batch(&[(pk, 4)])).unwrap();
+            engine.flush_collection("", "c").unwrap();
+            let manifest: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(dir.join("manifest.json")).unwrap()).unwrap();
+            assert_eq!(manifest["current_seq"], serde_json::json!(seq), "{stage}");
+        }
+    }
+    engine.close();
+    let reopened = db(root.path());
+    let handle = reopened.collection("", "c").unwrap();
+    handle.write().load();
+    assert_eq!(
+        handle
+            .read()
+            .read_snapshot()
+            .query("", &[], None, 0)
+            .unwrap()
+            .rows
+            .pks,
+        vec![
+            Pk::Int64(9_007_199_254_740_993),
+            Pk::Int64(i64::MAX - 1),
+            Pk::Int64(i64::MAX),
+            Pk::Int64(6),
+            Pk::Int64(7)
+        ]
+    );
+    reopened.close();
 }
 
 #[test]
