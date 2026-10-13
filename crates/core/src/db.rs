@@ -2252,7 +2252,7 @@ mod tests {
         assert_eq!(worker.join().unwrap().0, [Pk::Int64(1)]);
         let handle = db.collection("", "c").unwrap();
         assert_eq!(handle.read().load_state(), LoadState::Released);
-        handle.write().load();
+        handle.write().load().unwrap();
         assert_eq!(
             handle
                 .read()

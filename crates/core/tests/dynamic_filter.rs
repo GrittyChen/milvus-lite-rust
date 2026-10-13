@@ -98,7 +98,7 @@ fn committed_source_type_binding_survives_parquet_batch_splits_and_reopen() {
     engine.close();
     let reopened = db(root.path());
     let handle = reopened.collection("", "c").unwrap();
-    handle.write().load();
+    handle.write().load().unwrap();
     let snapshot = handle.read().read_snapshot();
     assert_eq!(snapshot.count_filtered("x in [-0.0]").unwrap(), 20_000);
     reopened.close();
@@ -144,7 +144,7 @@ fn failed_dynamic_delete_preserves_sequence_wal_and_rows() {
     engine.close();
     let reopened = db(root.path());
     let handle = reopened.collection("", "c").unwrap();
-    handle.write().load();
+    handle.write().load().unwrap();
     assert_eq!(
         handle
             .read()
@@ -198,7 +198,7 @@ fn unknown_ordering_cannot_commit_a_partial_delete_or_consume_sequence() {
     engine.close();
     let reopened = db(root.path());
     let handle = reopened.collection("", "c").unwrap();
-    handle.write().load();
+    handle.write().load().unwrap();
     assert_eq!(
         handle
             .read()
@@ -269,7 +269,7 @@ fn out_of_range_float_membership_never_matches_int64_max_or_deletes_it() {
             "reopened" => {
                 engine.close();
                 engine = db(root.path());
-                engine.collection("", "c").unwrap().write().load();
+                engine.collection("", "c").unwrap().write().load().unwrap();
             }
             _ => {}
         }
@@ -345,7 +345,12 @@ fn out_of_range_float_membership_never_matches_int64_max_or_deletes_it() {
     }
     engine.close();
     let reopened = db(root.path());
-    reopened.collection("", "c").unwrap().write().load();
+    reopened
+        .collection("", "c")
+        .unwrap()
+        .write()
+        .load()
+        .unwrap();
     check(&reopened);
     reopened.close();
 }

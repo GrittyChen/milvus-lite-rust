@@ -255,7 +255,12 @@ fn state_panics_seal_only_the_affected_collection_and_recover_from_disk() {
         let reopened = open(root.path());
         let view = reopened.collection("", "c").unwrap().read().read_snapshot();
         if matches!(point, StatePanicPoint::Index) {
-            reopened.collection("", "c").unwrap().write().load();
+            reopened
+                .collection("", "c")
+                .unwrap()
+                .write()
+                .load()
+                .unwrap();
         }
         let view = if matches!(point, StatePanicPoint::Index) {
             reopened.collection("", "c").unwrap().read().read_snapshot()

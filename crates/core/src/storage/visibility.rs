@@ -288,6 +288,11 @@ impl Visibility {
         Ok(())
     }
 
+    /// 数据源的物理行数，包括已被删除隐藏的行。
+    pub(crate) fn source_len(&self, id: SourceId) -> Option<usize> {
+        self.sources.get(&id).map(|bits| bits.len)
+    }
+
     pub fn snapshot(&self) -> VisibilitySnapshot {
         VisibilitySnapshot {
             sources: self.sources.clone(),

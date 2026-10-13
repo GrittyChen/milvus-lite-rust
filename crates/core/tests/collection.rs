@@ -758,7 +758,7 @@ fn load_state_semantics_match_3x() {
     // count 与 insert 不受 load 状态影响。
     c.insert(rows(&[2], &[[0.0, 1.0]], &["b"])).unwrap();
     assert_eq!(c.count(), 2);
-    c.load();
+    c.load().unwrap();
     assert_eq!(c.get(&[Pk::Int64(2)], &[]).unwrap().rows.len(), 1);
 }
 

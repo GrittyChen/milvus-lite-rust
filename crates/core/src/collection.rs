@@ -1248,8 +1248,44 @@ impl Collection {
         self.load_state
     }
 
-    pub fn load(&mut self) {
+    /// 3.x：已 loaded 时直接返回；否则为有行的已提交 segment 建索引，建不成就保持 released。
+    /// 只有 WAL 的数据不触发，load 之后新提交的 segment 要等 release 后再次 load 才判定。
+    pub fn load(&mut self) -> Result<()> {
+        if self.load_state == LoadState::Loaded {
+            return Ok(());
+        }
+        let failure = self.indexes.iter().find_map(|spec| {
+            let field = self
+                .schema
+                .fields
+                .iter()
+                .find(|f| f.name == spec.field_name)?;
+            crate::index::unbuildable(spec, field)
+        });
+        if let Some(error) = failure
+            && self.has_committed_rows()?
+        {
+            return Err(error);
+        }
         self.load_state = LoadState::Loaded;
+        Ok(())
+    }
+
+    /// 按物理行数：被删除隐藏的行仍在 segment 中，3.x 照样为它建索引。
+    fn has_committed_rows(&self) -> Result<bool> {
+        let Some(p) = &self.persistent else {
+            return Ok(false);
+        };
+        for source in p.data_sources.values() {
+            let rows = p
+                .visibility
+                .source_len(*source)
+                .ok_or_else(|| EngineError::Storage("manifest read source missing".into()))?;
+            if rows > 0 {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// 3.x：没有任何索引定义时 release 不生效，collection 仍可检索。

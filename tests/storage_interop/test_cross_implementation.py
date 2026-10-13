@@ -2,6 +2,7 @@
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -119,6 +120,84 @@ finally:
     wal=root/'collections/c/wal'
     assert bool(list(wal.glob('wal_data_*.arrow')))==(storage=='wal')
     run([reader,'-c',read,str(root)],cwd=tmp_path)
+
+
+UNBUILDABLE = {
+    'IVF_PQ': "index_type='IVF_PQ' is reserved for a future phase; supported: HNSW, HNSW_SQ, IVF_FLAT, IVF_SQ8, BRUTE_FORCE",
+    'INVERTED': 'scalar index INVERTED does not support field type FLOAT_VECTOR',
+    'DISKANN': "unknown index_type: 'DISKANN'",
+    'FOO': "unknown index_type: 'FOO'",
+}
+
+
+@pytest.mark.parametrize("storage", ["flushed", "deleted", "wal"])
+@pytest.mark.parametrize("index_type", [*UNBUILDABLE, "HNSW", "SPARSE_INVERTED_INDEX"])
+def test_index_definitions_3x_cannot_build_fail_load_like_3x(tmp_path, interpreters, index_type, storage):
+    # 3.x 的 create_index 不校验向量字段的 index_type；空 collection 上建定义不触发 build，
+    # 之后的 load 才为有行的已提交 segment 建索引。只有 WAL 时不建，被删除的行仍算物理行。
+    write="""
+import os,sys
+from pymilvus import MilvusClient,DataType
+from milvus_lite.server_manager import server_manager_instance as manager
+path,index_type,storage=sys.argv[1:]
+client=MilvusClient(path,dedicated=True)
+schema=MilvusClient.create_schema(auto_id=False)
+schema.add_field('id',DataType.INT64,is_primary=True)
+schema.add_field('vector',DataType.FLOAT_VECTOR,dim=2)
+client.create_collection('c',schema=schema)
+indexes=client.prepare_index_params();indexes.add_index('vector',index_type=index_type,metric_type='L2')
+client.create_index('c',indexes)
+client.release_collection('c')
+client.insert('c',[{'id':1,'vector':[1.,0.]},{'id':2,'vector':[0.,1.]}])
+if storage=='wal':os._exit(0)
+client.flush('c')
+if storage=='deleted':client.delete('c',ids=[1,2]);client.flush('c')
+client.close();manager.release_server(path)
+"""
+    read="""
+import json,sys
+from pymilvus import MilvusClient
+from milvus_lite.server_manager import server_manager_instance as manager
+path,storage=sys.argv[1:]
+client=MilvusClient(path,dedicated=True)
+def step(call):
+ try:return call()
+ except Exception as error:return [getattr(error,'code',None),getattr(error,'message',str(error))]
+def load():client.load_collection('c');return 'ok'
+def search():return [hit['id'] for hit in client.search('c',[[1.,0.]],limit=2,search_params={'metric_type':'L2'})[0]]
+def state():return str(client.get_load_state('c')['state'])
+out=[]
+try:
+ out+=[step(load),state(),step(search)]
+ if storage=='wal':
+  client.flush('c');out+=[step(load),step(search)]
+  client.release_collection('c');out+=[step(load),state()]
+finally:client.close();manager.release_server(path)
+print(json.dumps(out))
+"""
+    root=tmp_path/'written.db'
+    run([interpreters[PYTHONS[0]],'-c',write,str(root),index_type,storage],cwd=tmp_path)
+    collection=root/'collections/c'
+    manifest=json.loads((collection/'manifest.json').read_text())
+    assert manifest['index_specs']['vector']['index_type']==index_type
+    assert manifest['index_specs']['vector']['build_params']=={}
+    assert len(manifest['partitions']['_default']['data_files'])==(storage!='wal')
+    assert bool(list((collection/'wal').glob('wal_data_*.arrow')))==(storage=='wal')
+    results={}
+    for side,python in [('reference',interpreters[PYTHONS[0]]),('rust',sys.executable)]:
+        copy=tmp_path/f'{side}.db'
+        shutil.copytree(root,copy)
+        results[side]=json.loads(run([python,'-c',read,str(copy),storage],cwd=tmp_path))
+    error=[1,UNBUILDABLE[index_type]] if index_type in UNBUILDABLE else None
+    not_loaded=[101,"Collection 'c' is in state 'released'; call load() before search/get/query"]
+    if storage=='wal':
+        expected=['ok','Loaded',[1,2],'ok',[1,2]]+([error,'NotLoad'] if error else ['ok','Loaded'])
+    elif error:
+        expected=[error,'NotLoad',not_loaded]
+    else:
+        expected=['ok','Loaded',[] if storage=='deleted' else [1,2]]
+    assert results['reference']==expected
+    assert results['rust']==expected
 
 
 def run(args, *, cwd=REPO):

@@ -244,7 +244,7 @@ fn create_index_crash_preserves_pending_data_and_index_commit_boundary() {
                 LoadState::Loaded
             }
         );
-        handle.write().load();
+        handle.write().load().unwrap();
         let collection = handle.read();
         assert_eq!(collection.count(), 2);
         assert_eq!(

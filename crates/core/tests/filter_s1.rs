@@ -185,7 +185,7 @@ fn out_of_range_float_membership_delete_leaves_rows_sequence_and_wal_unchanged()
             "reopened" => {
                 engine.close();
                 engine = db(root.path());
-                engine.collection("", "c").unwrap().write().load();
+                engine.collection("", "c").unwrap().write().load().unwrap();
             }
             _ => {}
         }
@@ -239,7 +239,7 @@ fn out_of_range_float_membership_delete_leaves_rows_sequence_and_wal_unchanged()
     engine.close();
     let reopened = db(root.path());
     let handle = reopened.collection("", "c").unwrap();
-    handle.write().load();
+    handle.write().load().unwrap();
     assert_eq!(
         handle
             .read()

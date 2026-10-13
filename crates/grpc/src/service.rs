@@ -314,7 +314,7 @@ impl Service for MilvusService {
         self.run(Branch::Engine, move |db| {
             db.collection(&database, &req.collection_name)?
                 .write()
-                .load();
+                .load()?;
             Ok(success())
         })
         .await

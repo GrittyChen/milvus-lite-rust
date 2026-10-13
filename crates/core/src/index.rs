@@ -154,6 +154,37 @@ pub(crate) fn build_spec(field: &FieldSchema, req: IndexRequest) -> Result<Index
     })
 }
 
+/// 3.x `load()` 为每个有行的已提交 segment 建索引：INVERTED 不论字段类型都走标量倒排，其余类型走
+/// `index/factory.py` 的 `build_index_from_spec`（SPARSE_INVERTED_INDEX 不逐 segment 建）。本实现不建
+/// 索引，但 3.x 自身建不成的存量定义要在同一时机以同样的错误拒绝（0002「结论」）。只判定向量字段：
+/// 3.x 的 `create_index` 在标量字段上只接受 INVERTED，写不出别的定义。
+pub(crate) fn unbuildable(spec: &IndexSpec, field: &FieldSchema) -> Option<EngineError> {
+    if !field.data_type.is_vector() {
+        return None;
+    }
+    let message = match spec.index_type.as_str() {
+        "FLAT"
+        | "BRUTE_FORCE"
+        | "AUTOINDEX"
+        | "HNSW"
+        | "HNSW_SQ"
+        | "IVF_FLAT"
+        | "IVF_SQ8"
+        | "SPARSE_INVERTED_INDEX" => return None,
+        "INVERTED" => format!(
+            "scalar index INVERTED does not support field type {}",
+            field.data_type.name()
+        ),
+        "IVF_PQ" => format!(
+            "index_type={} is reserved for a future phase; \
+             supported: HNSW, HNSW_SQ, IVF_FLAT, IVF_SQ8, BRUTE_FORCE",
+            py_repr(&spec.index_type)
+        ),
+        other => format!("unknown index_type: {}", py_repr(other)),
+    };
+    Some(EngineError::invalid(message))
+}
+
 fn validate_scalar_request(data_type: DataType, index_type: &str) -> Result<()> {
     if !KNOWN_SCALAR_INDEX_TYPES.contains(&index_type) {
         return Err(EngineError::schema(format!(
