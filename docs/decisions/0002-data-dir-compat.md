@@ -25,7 +25,7 @@
   - **稠密向量字段上的显式 ANN 类型**（HNSW、HNSW_SQ、IVF_FLAT、IVF_SQ8）与**标量字段上的 INVERTED**：新建时明确报错。打开 3.x 写的、带这类定义的目录时，**原样保留**定义，让 3.x 回来后还能照常使用。向量检索按 FLAT 精确执行，召回只高不低，但更慢；标量过滤按扫描执行，更慢，结果也不一定相同：3.x 自身在已建索引的 segment 与 memtable 上结果就不一致，索引又是 load 之后在后台构建的，本实现按扫描求值并登记差异（[0006](0006-m2-scope.md) 第 14 项）。
   - **稀疏向量字段**：第一阶段在稀疏字段上新建任何索引都明确报错。存量的 SPARSE_INVERTED_INDEX 定义原样保留，稀疏向量检索在全文检索阶段之前明确报错。
   - 以上执行方式与 3.x 不同的地方，都登记为已知的对外差异（[AGENTS.md](../../AGENTS.md) 规则 2）。
-  - **3.x 自身也无法 load 的索引定义**：包括 3.x 会原样持久化的 DISKANN、IVF_PQ，以及放错字段类型的定义，例如稀疏字段上的 AUTOINDEX / FLAT / HNSW（见约束 1）。处理与 3.x 一致：目录照常打开，只有该 collection 在 build 索引时报错，即 load 时报错；如果 collection 已处于 load 状态，`create_index` 持久化定义后会立刻 build 并报错。
+  - **3.x 自身也无法 load 的索引定义**：包括 3.x 会原样持久化的 DISKANN、IVF_PQ，以及放错字段类型的定义，例如稀疏字段上的 AUTOINDEX / FLAT / HNSW（见约束 1）。处理与 3.x 一致：目录照常打开，只有该 collection 在 build 索引时报错，即 load 时报错；如果 collection 已处于 load 状态，`create_index` 持久化定义后会立刻 build 并报错。rc1 尚未实现这一报错边界，见[发布验收记录](../testing/first-release-acceptance.md#留待-rc2)。
 
 互通的前提是**共享文件的语义也完全一致**，不只是格式能读。下面「共享状态的语义约束」中标注「实测」的条目，都已在 3.2.1 上复现：违反它们会造成数据丢失、已删除的行复活、主键重复覆盖，或检索结果静默出错。
 

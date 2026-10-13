@@ -14,7 +14,7 @@
 
 重构基线已定：**以 3.x 为基础，不以 2.5.1（C++）为基础**。3.x 的性能损失主要来自 Python 实现，架构内只有一处需要修正的设计；2.5.1 反而有冷启动全量重放、索引不落盘等架构级瓶颈；决策、数据与由此得出的实现约束见 [0001-重构基线选择](docs/decisions/0001-refactor-baseline.md)。
 
-当前状态：仓库有 README / LICENSE（Apache-2.0）、设计决策（[docs/decisions/](docs/decisions/)）与基线基准脚本（[benchmarks/baseline/](benchmarks/baseline/)），以及 M1（[0004](docs/decisions/0004-m1-scope.md)）完成的工程骨架：三个 crate、进程内服务的生命周期、内存引擎、gRPC 翻译、差分测试与基准。M2 的实现与验收见 [0006](docs/decisions/0006-m2-scope.md)、[0007](docs/decisions/0007-m2-storage-engine.md) 和 [验收记录](docs/testing/m2-acceptance.md)；当前推进首发平台与发行物准备 [0013](docs/decisions/0013-first-release-platform-and-packaging.md)，尚未发布或声明生产可用。新增 module、依赖或命令时同步更新本文的[架构地图](#架构地图跨文件心智)、[技术栈](#技术栈)与[常用命令](#常用命令)；这几节中标注「待定」的内容不得当作事实引用。
+当前状态：仓库有 README / LICENSE（Apache-2.0）、设计决策（[docs/decisions/](docs/decisions/)）与基线基准脚本（[benchmarks/baseline/](benchmarks/baseline/)），以及 M1（[0004](docs/decisions/0004-m1-scope.md)）完成的工程骨架：三个 crate、进程内服务的生命周期、内存引擎、gRPC 翻译、差分测试与基准。M2 的实现与验收见 [0006](docs/decisions/0006-m2-scope.md)、[0007](docs/decisions/0007-m2-storage-engine.md) 和 [验收记录](docs/testing/m2-acceptance.md)；首发平台与发行物见 [0013](docs/decisions/0013-first-release-platform-and-packaging.md)：`0.1.0rc1` 已作为预发布通过 GitHub Release 发布（[发布记录](docs/testing/first-release-acceptance.md#010rc1-发布)），未发布到 PyPI，未声明生产可用。新增 module、依赖或命令时同步更新本文的[架构地图](#架构地图跨文件心智)、[技术栈](#技术栈)与[常用命令](#常用命令)；这几节中标注「待定」的内容不得当作事实引用。
 
 ## 核心业务术语
 
@@ -59,7 +59,7 @@
 | M2 存储引擎的结构 / 取锁顺序 / 快照与有效位图 / WAL、flush、drop 与关闭的提交和失败协议 | [docs/decisions/0007-m2-storage-engine.md](docs/decisions/0007-m2-storage-engine.md) |
 | 首发 compaction、正常关闭排空、GC 与独立已提交删除状态 | [0010](docs/decisions/0010-compaction-and-tombstone-gc.md)、[0011](docs/decisions/0011-committed-delete-state.md) |
 | CLI server 参数、工作者、信号与停服错误（已实现，冻结范围复审通过） | [0012](docs/decisions/0012-cli-server.md) |
-| 首发平台、PID 1、发行物验收与候选阶段决策（rc1 版本、补跑范围、RC 只发 GitHub Release、公开地址；准备切片已通过） | [0013](docs/decisions/0013-first-release-platform-and-packaging.md) |
+| 首发平台、PID 1、发行物验收与候选阶段决策（rc1 版本、补跑范围、RC 只发 GitHub Release、公开地址；rc1 已发布） | [0013](docs/decisions/0013-first-release-platform-and-packaging.md) |
 | 性能基线怎么测 / 口径 / 注意事项 | [benchmarks/baseline/README.md](benchmarks/baseline/README.md) |
 | 代码审查 / 修复复审（冻结合同、完整调用链、同类全域清扫、分级与证据门槛、二三阶影响矩阵） | [code-review-rules](.agents/skills/code-review-rules/SKILL.md)（Claude Code 经 `.claude/skills` 软链读取同一份） |
 
