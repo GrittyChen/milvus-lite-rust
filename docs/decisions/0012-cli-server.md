@@ -142,6 +142,7 @@ Server.stop 在所有收尾结束、LOCK 释放后检查标志；失败返回 St
 | 场景 | 参照/已有行为 | 推荐方案 | 理由与影响用例 |
 | --- | --- | --- | --- |
 | POSIX SIGTERM | 直接终止，不打印关闭行 | 首次请求正常关闭，通常返回 0，并打印固定关闭行 | 监督进程停止；WAL/维护/LOCK 与外部超时用例 |
+| 进程继承 SIGINT=SIG_IGN（如非交互 shell 中以 `&` 启动的后台作业） | Python 只在 SIGINT 为默认处置时安装 KeyboardInterrupt 处理器；SIGINT 不起作用，服务持续运行，直到 SIGTERM 等默认终止（2026-10-13 对 3.2.1 / `43d1257` 实测：10 秒后仍在运行，SIGTERM 后退出 -15） | 显式接管 SIGINT，与正常处置相同：正常停服、退出 0，并打印固定关闭行 | 与 SIGTERM 取向一致，明确的停止请求按正常停服处理，不取决于继承的处置；rc1 候选验收中发现，实测记录见[首发验收](../testing/first-release-acceptance.md#候选过程中的修复)；差分 CLI 用例以测试进程的默认 SIGINT 处置为前提 |
 | 停止时新的排队任务 | 现有 Rust runtime shutdown 与 Db.close 之间仍可能取得 enter | 宽限结束后先拒绝入场，再关 runtime | 已入场未应答仍可能生效，后入场不得写入；共享 stop 修改另行确认 |
 | 停止期间信号 | 参照 Python 等待可能被后续信号打断 | stop 前 SIG_DFL，之后的信号按默认动作处理 | 普通 POSIX 进程可强制终止；PID 1 与 Windows 特殊规则分列 |
 | 无效 worker/port | 0/-1 worker 先建目录、退出 1；越界 port 探针能启动 | 提前参数错误，退出 2 | 无资源副作用，不能用截断/空转接受无效数值 |

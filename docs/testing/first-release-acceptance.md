@@ -157,3 +157,72 @@ PID 1 探针按 [平台流程](../../tests/platform/README.md) 使用正式 cons
 **并行等价用例的参照口径**（复审发现，属同一 NaN 口径）：`collection::tests::parallel_search_matches_serial_reference` 把每个并行变体与逐条打分的独立参照逐位比较，而产品在查询组满 4 条时走批量核，NaN 位模式可能不同；复审探针中同一查询单独检索与 4 条一组检索的 NaN 分数在 x86_64（Rosetta）release 上有 73/713 个位模式不同。用例改为两层：各行块划分与线程数对串行结果逐位比较（含 NaN 位模式，同一扫描代码），串行结果对独立参照只按“同为 NaN”比较；数据与查询加入 NaN、±inf、±0（每个分量仍只取一次随机数，共用该数据辅助函数的其它用例布局不变），维度加入 33。0005 验证表曾称覆盖 ±0、±inf，原数据实际只有 NaN 与有限值，现已补齐。变异反证（各变异使用独立的 Cargo 输出目录）：参照改回原始位比较后 aarch64 release 在 case 10 失败，说明 NaN 归一确被数据触发；参照对有限非零分数偏 1 ulp 时在 case 0 失败。修复后 aarch64 与 x86_64（Rosetta）的 debug/release 均通过。对外 NaN 分数的符号与 payload 因而不作保证，已写入 flat.rs 与 [0004](../decisions/0004-m1-scope.md)，排序与结果集合不受影响。
 
 macOS 修复后默认 252、core FI 323 passed；Windows core/grpc 默认与 FI 交叉 Clippy 通过。差分/存储互通未在 x86_64 运行（与 arm64 层级一致）。负责人可据此在 2026-10-17 检查点确认 Linux x86_64 的标准层证据；首发候选的整体结论仍按 0013「收口条件」另行决定。
+
+## 0.1.0rc1 候选验收
+
+2026-10-13。冻结提交 `8f86851`（`git archive` 的 SHA256 为 `fa3025b2699e71c5b4801f679fcc02d7dc3ba4ec224ec83d3fc70374b125d99e`），参照 milvus-lite v3.2.1 / `43d1257`。三个平台各自从该提交的源码构建并验收；本节与 [0012](../decisions/0012-cli-server.md#与参照的差异已确认) 的差异登记在其后的文档提交中加入，它们不进入 wheel/sdist。构建均为 Rust 1.98.1、maturin 1.15.0，目标默认 CPU、锁定依赖；macOS 显式设置 `MACOSX_DEPLOYMENT_TARGET=11.0`，Linux 在上文所记的 manylinux_2_28 固定镜像中以 `--compatibility manylinux_2_28` 构建。
+
+### 候选过程中的修复
+
+此前以 `5a5e3a7`、`8779e2a` 构建的候选均被替代，其结果不作为本节证据：
+
+1. **sdist 的 MSRV 门槛**（`8779e2a`）：解包目录中两套 all-targets 检查因 core 单元测试引用仓库根的过滤语料而失败，见上文「更正」；语料移入 core 的测试数据目录后，本轮在解包目录实跑通过。
+2. **2^63 的成员匹配**（`8f86851`）：原生 x86_64 上的差分发现参照实现在这一边界随 CPU 架构变化；本实现改为在所有平台按截断处理，避免越界浮点数命中或删除 `INT64_MAX`。差异与依据见 [0006](../decisions/0006-m2-scope.md#与-3x-的差异)。
+3. **启动方式造成的假失败**：macOS 第一次运行安装与差分阶段时，流水线经非交互 shell 的后台作业启动，所有子进程继承 SIGINT=SIG_IGN，FI 信号用例与差分 CLI 停服用例因此失败。以同一用例在前台与后台作业两种启动方式确定性复现，与产品无关，该次输出作废（原文件保留在仓库外），改以默认信号处置重跑；构建产物不受影响，未重建。由此发现的参照差异——继承 SIG_IGN 时 3.x 不响应 SIGINT、本实现照常停服——已登记在 0012，不改变产品行为。
+
+### 发行物身份
+
+wheel/sdist 哈希就是 Release 附件的哈希；原生库哈希为 wheel 内扩展模块的 SHA256。各项版本、标签、许可、长描述、链接与禁入内容由 [归档检查器](../../tests/packaging/check_artifacts.py) 以 `--binary` 核对。
+
+| 产物 | 文件 SHA256 | 原生库 SHA256 | 二进制检查 |
+| --- | --- | --- | --- |
+| `milvus_lite_rust-0.1.0rc1-cp310-abi3-macosx_11_0_arm64.whl` | `46a5e1acc95b4a638dafa80d292d29420434c7c529e3794b8e1deddb943a695d` | `ec6c960578de77914df50548332d9077f2d3512e223a51480e7a9563af2d37ce` | 单架构 arm64，Mach-O 最低 11.0 |
+| `milvus_lite_rust-0.1.0rc1-cp310-abi3-macosx_11_0_x86_64.whl` | `306ee5048047d544c67ef8b16eac6a0cdcd1c866b3eb04d002a0a1cbd704c790` | `432b6858fa435ad6b82a8969a9ffe17ec6f48e948b0268b69ad3152dd7c6e81a` | 单架构 x86_64，Mach-O 最低 11.0 |
+| `milvus_lite_rust-0.1.0rc1-cp310-abi3-manylinux_2_28_x86_64.whl` | `c37d952e13874ee2e07faaf9b5908473fdb897ec419f3bd0e0a12e86811fb281` | `05e6fa446ec727b5162c661096a7da2f00a4d2927632dbd07c8b37b4129a45de` | GLIBC 依赖最高 2.28 |
+| `milvus_lite_rust-0.1.0rc1-cp310-abi3-manylinux_2_28_aarch64.whl` | `589d54fb76f69f3d84aee01a9e0b2ee597b29359e38192b001ea8f25a503091e` | `5396c98861bbabf0e6ce7456c2471dff6e5fbbeec849328b31e434bcd1fa2ca2` | GLIBC 依赖最高 2.28 |
+| `milvus_lite_rust-0.1.0rc1.tar.gz` | `aeceb6d8eaad644f12b3c7dbcdd196ae4fd2d04fbb572688b8897372f4df5757` | — | 三个平台分别构建，逐字节相同 |
+
+隔离 FI wheel 只用于测试，不随 Release 发布：macOS arm64 `cc2f0a7b…`（原生库 `6421f36b…`）、Linux x86_64 `ed80c8f9…`（`8927577f…`）、Linux arm64 `d6ca9af3…`（`846be396…`），均由检查器确认含隔离入口；正式 wheel 均确认不含测试入口。
+
+Release 附件的 `SHA256SUMS` 为下列内容，覆盖四个正式 wheel 与 sdist：
+
+```text
+46a5e1acc95b4a638dafa80d292d29420434c7c529e3794b8e1deddb943a695d  milvus_lite_rust-0.1.0rc1-cp310-abi3-macosx_11_0_arm64.whl
+306ee5048047d544c67ef8b16eac6a0cdcd1c866b3eb04d002a0a1cbd704c790  milvus_lite_rust-0.1.0rc1-cp310-abi3-macosx_11_0_x86_64.whl
+589d54fb76f69f3d84aee01a9e0b2ee597b29359e38192b001ea8f25a503091e  milvus_lite_rust-0.1.0rc1-cp310-abi3-manylinux_2_28_aarch64.whl
+c37d952e13874ee2e07faaf9b5908473fdb897ec419f3bd0e0a12e86811fb281  milvus_lite_rust-0.1.0rc1-cp310-abi3-manylinux_2_28_x86_64.whl
+aeceb6d8eaad644f12b3c7dbcdd196ae4fd2d04fbb572688b8897372f4df5757  milvus_lite_rust-0.1.0rc1.tar.gz
+```
+
+### 实跑结果
+
+| 检查 | macOS arm64 | Linux x86_64（原生） | Linux arm64 |
+| --- | --- | --- | --- |
+| fmt；workspace 默认 / all-features Clippy | 通过 | 通过 | 通过 |
+| 默认 workspace / core FI / grpc all-features | 255 / 325 / 22 passed | 255 / 325 / 22 passed | 255 / 325 / 22 passed |
+| 构建拒绝 | Windows 目标、free-threaded 3.14 | free-threaded 3.14 / 3.15、PyPy 3.11 | free-threaded 3.14 / 3.15、PyPy 3.11 |
+| Windows core/grpc 默认与 FI 的 check/Clippy | 四项通过（交叉静态检查） | — | — |
+| CPython 3.10 / 3.15 × SDK 2.6.17 / 3.0.2 全套 | 四组各 272 passed | 四组各 272 passed | 四组各 272 passed |
+| CPython 3.11–3.14 安装冒烟（SDK 3.0.2） | 通过 | 通过 | 通过 |
+| 隔离 FI 的 compaction 套件 | 两条 SDK 各 5 passed | 5 passed | 5 passed |
+| 与 3.x 的差分（两条 SDK） | 各 123 passed | 各 123 passed | 各 123 passed |
+| 存储互通（两条 SDK；Arrow 15/25） | 各 68 passed | 各 68 passed | 各 68 passed |
+| Rust 与 3.2.1 的 LOCK 双向互斥 | — | 通过 | 通过 |
+| strace 同步/提交/删除顺序 | — | 通过，83 次成功调用 | 通过，83 次成功调用 |
+| PID 1 正常 / 排空 / 监督器强杀 | — | 退出 0 / 0 / 137，重开 3 / 4 / 4 行 | 退出 0 / 0 / 137，重开 3 / 4 / 4 行 |
+| sdist 解包：Rust 1.89.0 默认与 all-features all-targets check | 通过 | — | — |
+| sdist 解包：cargo test 默认 / core FI | 255 / 325 passed | — | — |
+| sdist 解包：根入口与 `-m crates/py/Cargo.toml` 构建、PEP 517 安装冒烟 | 通过 | — | — |
+| 脚本自检（benchmark + packaging + platform，仓库内 `8f86851`） | 222 passed | — | — |
+
+Intel Mac：同一 x86_64 wheel 在 CPython 3.10 / 3.15、SDK 3.0.2 下通过无 SDK CLI 与 SDK `.db` 生命周期冒烟，在 Apple Silicon 上经 Rosetta 运行，不是原生 Intel 证据。
+
+环境：macOS 27.0.1（Apple M2 Pro）；Linux x86_64 为上文「Linux x86_64 原生标准层」所记的原生主机与镜像（宿主内核 3.10.0-1160、Docker 20.10.5，测试容器绑定 16 核、非 root）；Linux arm64 为本机 Docker 29.8.2 的 VM（内核 7.0.14-linuxkit），工作目录在 Docker 命名卷内、非 root。Rust aarch64 工具链安装包经官方 SHA256 核对。CPython 版本：macOS 3.10.21 / 3.11.16 / 3.12.14 / 3.13.15 / 3.14.7 / 3.15.0，Linux 3.10.22 / 3.11.17 / 3.12.15 / 3.13.16 / 3.14.8 / 3.15.0；SDK 依赖 grpcio 1.84.0，numpy 随解释器为 2.2.6 / 2.4.6 / 2.5.4。差分与互通的参照环境为可编辑安装的 `43d1257` 加 pymilvus 3.0.2、pyarrow 25.0.1，另有 pyarrow 15.0.0 / numpy 1.26.4 环境；测试环境为 CPython 3.12。Linux 两种架构的 CPython 3.15 安装中，SDK 依赖 orjson 3.13.0 由源码编译，本包仍使用同一个 abi3 wheel。
+
+### 边界与剩余缺口
+
+- Windows 不提供包，构建期拒绝；Windows 只有交叉静态检查，没有运行证据。
+- Intel Mac 只有 Rosetta 冒烟；Mach-O 最低系统字段不替代 macOS 11 真机运行。
+- Linux x86_64 只在内核 3.10 的原生主机上运行（0013 候选阶段决策 1）；Linux arm64 为 Docker Desktop VM。
+- 进程崩溃与强杀恢复不等于真实断电或任意文件系统的持久化证明。
+- 候选验收不包括发布：tag、仓库转公开、Release 草稿核对与发布、发布后从公开地址下载冒烟仍按 0013 候选阶段决策 6 逐项授权与执行。
