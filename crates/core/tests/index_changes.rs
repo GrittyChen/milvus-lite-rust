@@ -12,6 +12,19 @@ use std::{
     sync::Arc,
 };
 
+// exec 前继承的 flock 引用会干扰其他用例的关闭重开；只隔离用例，不串行化用例内线程。
+static CASE_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+#[test]
+fn failed_case_does_not_poison_the_serialization_lock() {
+    let failed = std::panic::catch_unwind(|| {
+        let _case = CASE_LOCK.lock();
+        panic!("deliberate isolated case failure");
+    });
+    assert!(failed.is_err());
+    let _next = CASE_LOCK.lock();
+}
+
 fn open(path: &Path) -> Arc<Db> {
     Db::new(
         DataDir::open(path).unwrap(),
@@ -110,6 +123,7 @@ fn snapshot(path: &Path, files: &[PathBuf]) {
 
 #[test]
 fn accepted_definitions_preserve_parameters_state_and_reopen() {
+    let _case = CASE_LOCK.lock();
     for kind in [
         "FLAT",
         "BRUTE_FORCE",
@@ -159,6 +173,7 @@ fn accepted_definitions_preserve_parameters_state_and_reopen() {
 
 #[test]
 fn drop_names_error_priority_and_auto_loaded_match_reference() {
+    let _case = CASE_LOCK.lock();
     for name in ["v", "not-a-name", ""] {
         let (_root, path, db) = fixture();
         db.create_index(
@@ -219,6 +234,7 @@ fn drop_names_error_priority_and_auto_loaded_match_reference() {
 
 #[test]
 fn drop_removes_unpinned_files_and_create_removes_stale_files() {
+    let _case = CASE_LOCK.lock();
     let (_root, path, db) = fixture();
     let files = sidecars(&path, "HNSW");
     assert_eq!(files.len(), 2);
@@ -243,6 +259,7 @@ fn drop_removes_unpinned_files_and_create_removes_stale_files() {
 
 #[test]
 fn pinned_files_require_all_saved_definitions_to_match() {
+    let _case = CASE_LOCK.lock();
     for conflict in [false, true] {
         let (_root, path, db) = fixture();
         let files = sidecars(&path, "HNSW");
@@ -287,6 +304,7 @@ fn pinned_files_require_all_saved_definitions_to_match() {
 #[cfg(unix)]
 #[test]
 fn cached_directory_chain_and_candidate_symlinks_fail_before_deletion() {
+    let _case = CASE_LOCK.lock();
     for relative in [
         "partitions",
         "partitions/_default",
@@ -350,6 +368,7 @@ fn marker(path: &Path) -> serde_json::Value {
 }
 #[test]
 fn malformed_and_unknown_markers_only_block_index_changes() {
+    let _case = CASE_LOCK.lock();
     for variant in 0..9 {
         let (_root, path, db) = fixture();
         let before = manifest(&path);
@@ -453,6 +472,7 @@ mod faults {
 
     #[test]
     fn every_preparation_failure_preserves_sidecars_and_cleans_owned_tmp() {
+        let _case = CASE_LOCK.lock();
         for create in [false, true] {
             for point in [
                 P::InheritedSync,
@@ -507,6 +527,7 @@ mod faults {
 
     #[test]
     fn interrupted_deletion_blocks_both_endpoints_and_same_boot_reopen() {
+        let _case = CASE_LOCK.lock();
         let _reset = Reset;
         known(BOOT);
         for create in [false, true] {
@@ -582,6 +603,7 @@ mod faults {
 
     #[test]
     fn trusted_reboot_clears_but_unknown_sources_never_do() {
+        let _case = CASE_LOCK.lock();
         let _reset = Reset;
         for old_known in [false, true] {
             for reboot in [false, true] {
@@ -616,6 +638,7 @@ mod faults {
 
     #[test]
     fn manifest_phase_cleanup_failure_and_retry_are_independent() {
+        let _case = CASE_LOCK.lock();
         let _reset = Reset;
         known(BOOT);
         for phase in [
@@ -659,6 +682,7 @@ mod faults {
 
     #[test]
     fn lost_cleanup_knowledge_on_reopen_and_marker_tampering_fail_closed() {
+        let _case = CASE_LOCK.lock();
         let _reset = Reset;
         known(BOOT);
         for reopen in [false, true] {
@@ -689,6 +713,7 @@ mod faults {
 
     #[test]
     fn concurrent_load_rejects_drop_after_confirmed_delete_and_cleans_marker() {
+        let _case = CASE_LOCK.lock();
         let (_root, path, db) = fixture();
         let files = sidecars(&path, "HNSW");
         let before = manifest(&path);
@@ -709,6 +734,7 @@ mod faults {
 
     #[test]
     fn trace_proves_intent_sync_precedes_unlink_and_commit_follows_delete_sync() {
+        let _case = CASE_LOCK.lock();
         let (_root, path, db) = fixture();
         let files = sidecars(&path, "HNSW");
         fs_commit::begin_fs_trace();
@@ -739,6 +765,7 @@ mod faults {
 
     #[test]
     fn crash_child() {
+        let _case = CASE_LOCK.lock();
         let Some(path) = std::env::var_os("MLR_INDEX_CRASH_PATH") else {
             return;
         };
@@ -751,6 +778,7 @@ mod faults {
     }
     #[test]
     fn process_exit_before_delete_sync_survives_reopen() {
+        let _case = CASE_LOCK.lock();
         let _reset = Reset;
         known(BOOT);
         let (_root, path, db) = fixture();
@@ -786,6 +814,7 @@ mod permissions {
     #[cfg(target_os = "linux")]
     #[test]
     fn differing_credentials_child() {
+        let _case = CASE_LOCK.lock();
         if std::env::var_os("MLR_INDEX_DIFFERING_CREDENTIALS").is_none() {
             return;
         }
@@ -833,6 +862,7 @@ mod permissions {
     #[cfg(target_os = "linux")]
     #[test]
     fn no_deletion_does_not_require_deletion_credentials() {
+        let _case = CASE_LOCK.lock();
         // SAFETY: 仅查询；降权的场景在独立子进程内执行。
         if unsafe { libc::geteuid() } != 0 {
             return;
@@ -857,6 +887,7 @@ mod permissions {
 
     #[test]
     fn permission_child() {
+        let _case = CASE_LOCK.lock();
         let Some(root) = std::env::var_os("MLR_INDEX_PERMISSION_ROOT") else {
             return;
         };
@@ -970,6 +1001,7 @@ mod permissions {
     }
     #[test]
     fn permissions_are_checked_before_any_sidecar_is_removed() {
+        let _case = CASE_LOCK.lock();
         let root = tempfile::tempdir().unwrap();
         fs::set_permissions(root.path(), fs::Permissions::from_mode(0o777)).unwrap();
         let mut command = std::process::Command::new(std::env::current_exe().unwrap());
@@ -1008,6 +1040,7 @@ mod permissions {
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_delete_acl_and_manifest_protection_fail_in_preflight() {
+        let _case = CASE_LOCK.lock();
         for create in [false, true] {
             for case in [
                 "index_acl",
@@ -1122,6 +1155,7 @@ mod permissions {
 
 #[test]
 fn manifest_version_exhaustion_rejects_before_any_deletion() {
+    let _case = CASE_LOCK.lock();
     let (_root, path, db) = fixture();
     let files = sidecars(&path, "HNSW");
     db.close();
@@ -1147,6 +1181,7 @@ fn manifest_version_exhaustion_rejects_before_any_deletion() {
 #[cfg(feature = "fault-injection")]
 #[test]
 fn cleanup_failure_during_retry_is_not_immediately_retried_again() {
+    let _case = CASE_LOCK.lock();
     use milvus_lite_core::storage::index_intent::{FaultKind as K, IndexPoint as P, inject_fault};
     let (_root, path, db) = fixture();
     sidecars(&path, "HNSW");
@@ -1171,6 +1206,7 @@ fn cleanup_failure_during_retry_is_not_immediately_retried_again() {
 #[cfg(feature = "fault-injection")]
 #[test]
 fn marker_preparation_failure_and_cleanup_failure_preserve_safe_retry_state() {
+    let _case = CASE_LOCK.lock();
     use milvus_lite_core::storage::index_intent::{FaultKind as K, IndexPoint as P, inject_fault};
     for create in [false, true] {
         let (_root, path, db) = fixture();
@@ -1205,6 +1241,7 @@ fn marker_preparation_failure_and_cleanup_failure_preserve_safe_retry_state() {
 
 #[test]
 fn every_pinning_snapshot_is_checked_before_any_stale_file_deletion() {
+    let _case = CASE_LOCK.lock();
     let (_root, path, db) = fixture();
     let files = sidecars(&path, "HNSW");
     snapshot(&path, &files);
@@ -1246,6 +1283,7 @@ fn every_pinning_snapshot_is_checked_before_any_stale_file_deletion() {
 
 #[test]
 fn windows_snapshot_pins_survive_drop_and_same_definition_recreation() {
+    let _case = CASE_LOCK.lock();
     let (_root, path, db) = fixture();
     let files = sidecars(&path, "HNSW");
     snapshot(&path, &files);
@@ -1279,6 +1317,7 @@ fn windows_snapshot_pins_survive_drop_and_same_definition_recreation() {
 #[cfg(feature = "fault-injection")]
 #[test]
 fn concurrent_load_error_keeps_its_category_when_marker_cleanup_also_fails() {
+    let _case = CASE_LOCK.lock();
     use milvus_lite_core::storage::index_intent::{
         FaultKind as K, IndexPoint as P, before_commit_once, inject_fault,
     };

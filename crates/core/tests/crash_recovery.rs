@@ -12,6 +12,19 @@ use milvus_lite_core::{
     InsertBatch, LoadState, Pk,
 };
 
+// exec 前继承的 flock 引用会干扰其他用例的关闭重开；只隔离用例，不串行化用例内线程。
+static CASE_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+#[test]
+fn failed_case_does_not_poison_the_serialization_lock() {
+    let failed = std::panic::catch_unwind(|| {
+        let _case = CASE_LOCK.lock();
+        panic!("deliberate isolated case failure");
+    });
+    assert!(failed.is_err());
+    let _next = CASE_LOCK.lock();
+}
+
 fn compute() -> Compute {
     Compute::new(std::num::NonZeroUsize::new(2).unwrap()).unwrap()
 }
@@ -120,6 +133,7 @@ fn create_index_crash_child(stage: &str) {
 
 #[test]
 fn mixed_data_and_delta_survive_crash_on_both_sides_of_manifest_replace() {
+    let _case = CASE_LOCK.lock();
     if let Ok(stage) = std::env::var("MILVUS_LITE_CRASH_STAGE") {
         manifest_replace_crash_child(&stage);
     }
@@ -194,6 +208,7 @@ fn mixed_data_and_delta_survive_crash_on_both_sides_of_manifest_replace() {
 
 #[test]
 fn create_index_crash_preserves_pending_data_and_index_commit_boundary() {
+    let _case = CASE_LOCK.lock();
     if let Ok(stage) = std::env::var("MILVUS_LITE_INDEX_CRASH_STAGE") {
         create_index_crash_child(&stage);
     }
@@ -263,6 +278,7 @@ fn create_index_crash_preserves_pending_data_and_index_commit_boundary() {
 
 #[test]
 fn data_wal_unlinked_before_delta_wal_crash_does_not_resurrect_rows() {
+    let _case = CASE_LOCK.lock();
     if std::env::var_os("MILVUS_LITE_WAL_UNLINK_CRASH").is_some() {
         wal_unlink_crash_child();
     }
@@ -302,6 +318,7 @@ fn data_wal_unlinked_before_delta_wal_crash_does_not_resurrect_rows() {
 
 #[test]
 fn collection_directory_rename_crashes_preserve_commit_boundary() {
+    let _case = CASE_LOCK.lock();
     use milvus_lite_core::db::{
         DirectoryFault, DirectoryOperation, DirectoryPoint, inject_directory_fault_once,
     };
@@ -421,6 +438,7 @@ fn collection_directory_rename_crashes_preserve_commit_boundary() {
 
 #[test]
 fn failed_wal_append_then_process_exit_never_applies_failed_insert_upsert_or_delete() {
+    let _case = CASE_LOCK.lock();
     use milvus_lite_core::storage::wal::inject_storage_full_after_bytes;
     if let Ok(case) = std::env::var("MILVUS_LITE_FAILED_WAL_CASE") {
         let path = std::env::var("MILVUS_LITE_CRASH_DIR").unwrap();

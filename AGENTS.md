@@ -137,6 +137,7 @@ pymilvus ──server_manager──▶ adapter/grpc ──▶ db（多 collectio
 | lint | `cargo clippy --workspace --all-targets -- -D warnings` |
 | Rust 单测 | `cargo test --workspace` |
 | M2 持久化点故障注入单测（feature 默认关闭） | `cargo test -p milvus-lite-core --features fault-injection` |
+| 子进程与关闭重开测试的隔离 / 默认并行 30 轮复验 | [进程内测试隔离记录与命令](docs/testing/process-test-isolation.md) |
 | S1 语法真值核验（参照实现须可编辑安装、HEAD 为 `43d1257`） | `<3.x 的 venv>/bin/python tests/differential/generate_filter_parse_fixtures.py --verify` |
 | 顶层动态过滤组件真值核验（真实 3.x / `43d1257`） | `<3.x 的 venv>/bin/python tests/differential/generate_dynamic_filter_fixtures.py --verify` |
 | ISO 时间组件直接模糊对照（不经服务；参照环境为 CPython 3.12，报告放仓库外） | `cargo build -p milvus-lite-core --example filter_parse_probe`，再 `<3.x 的 venv>/bin/python tests/differential/fuzz_temporal.py --cases 200000 --seed 29 --output <work_dir>/temporal.json` |
