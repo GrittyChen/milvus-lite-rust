@@ -643,13 +643,13 @@ def test_query_load_state(env):
 # ── 索引 ─────────────────────────────────────────────────────
 
 
-def test_create_index_m1_unsupported(env):
-    # 0002「结论」：FLAT 阶段只支持 FLAT、BRUTE_FORCE 与按 FLAT 执行的 AUTOINDEX。
+def test_create_index_unsupported_types_and_json(env):
+    # 0014：仍拒绝 3.x 自身无法构建的类型与无法保存的 JSON 参数。
     _, stub, _ = env
     basic(stub)
     kv = lambda **p: [common_pb2.KeyValuePair(key=k, value=v) for k, v in p.items()]
     unimplemented(stub.CreateIndex, milvus_pb2.CreateIndexRequest(
-        collection_name="c", field_name="v", extra_params=kv(index_type="HNSW", metric_type="L2")))
+        collection_name="c", field_name="v", extra_params=kv(index_type="IVF_PQ", metric_type="L2")))
     # 3.x 能解析并保存的 params，serde_json 解析不了时不能当作空对象。
     unimplemented(stub.CreateIndex, milvus_pb2.CreateIndexRequest(
         collection_name="c", field_name="v", extra_params=kv(index_type="FLAT", metric_type="L2",
@@ -773,7 +773,6 @@ def test_pymilvus_entry_points_remaining_unsupported(env):
         (lambda: client.search("q", [[1, 0]], filter="id > 1 or id < 0"), "filter expressions: only scalar or top-level dynamic field/literal comparisons joined by 'and', dynamic field 'in', or a top-level primary-key 'in', are supported"),
         (lambda: client.search("q", [[1, 0]], ranker=decay), f"rerank and function chains: {feature}"),
         (lambda: client.query_iterator("q", batch_size=2).next(), f"query iterators: {feature}"),
-        (lambda: client.drop_index("q", "vector"), f"DropIndex: {rpc}"),
     ]
     for call, details in cases:
         with pytest.raises(grpc.RpcError) as info:
@@ -792,3 +791,87 @@ def test_pymilvus_entry_points_remaining_unsupported(env):
         it.next()
     assert info.value.code() == grpc.StatusCode.UNIMPLEMENTED
     assert info.value.details().startswith(f"MilvusLite does not support range search: {feature}")
+
+
+@pytest.mark.parametrize(
+    "kind", ["AUTOINDEX", "HNSW", "HNSW_SQ", "IVF_FLAT", "IVF_SQ8"]
+)
+@pytest.mark.parametrize("metric", ["BM25", "NONE"])
+def test_faiss_metric_rejection_is_unimplemented_and_does_not_create_index(
+    env, kind, metric
+):
+    _, stub, _ = env
+    basic(stub)
+    request = milvus_pb2.CreateIndexRequest(
+        collection_name="c",
+        field_name="v",
+        extra_params=[
+            common_pb2.KeyValuePair(key="index_type", value=kind),
+            common_pb2.KeyValuePair(key="metric_type", value=metric),
+        ],
+    )
+    assert "requires COSINE / L2 / IP" in unimplemented(stub.CreateIndex, request)
+    indexes = stub.DescribeIndex(milvus_pb2.DescribeIndexRequest(collection_name="c"))
+    assert not indexes.index_descriptions
+    # 原有缺少 metric / 非法枚举的错误优先于本实现的兼容性拒绝。
+    request.extra_params[1].value = "bad"
+    assert status_of(stub.CreateIndex(request)) == (
+        1,
+        0,
+        "metric_type must be one of COSINE/L2/IP/BM25/NONE, got 'bad'",
+    )
+    del request.extra_params[1]
+    assert status_of(stub.CreateIndex(request)) == (
+        6,
+        6,
+        "create_index missing required 'metric_type' parameter",
+    )
+
+
+def test_drop_index_status_priority_names_and_loaded_transition(env):
+    _, stub, _ = env
+    basic(stub)
+    request = lambda **p: milvus_pb2.DropIndexRequest(collection_name="c", **p)
+    assert status_of(stub.DropIndex(request())) == (700, 11, "no index to drop")
+    kv = lambda **p: [common_pb2.KeyValuePair(key=k, value=v) for k, v in p.items()]
+    assert status_of(
+        stub.CreateIndex(
+            milvus_pb2.CreateIndexRequest(
+                collection_name="c",
+                field_name="v",
+                extra_params=kv(index_type="HNSW", metric_type="L2"),
+            )
+        )
+    ) == (0, 0, "")
+    assert status_of(
+        stub.CreateIndex(
+            milvus_pb2.CreateIndexRequest(
+                collection_name="c",
+                field_name="id",
+                extra_params=kv(index_type="INVERTED"),
+            )
+        )
+    ) == (0, 0, "")
+    assert status_of(
+        stub.DropIndex(request(field_name="absent", index_name="v_idx"))
+    ) == (700, 11, "no index on field 'absent'; indexed fields: ['v', 'id']")
+    assert status_of(stub.DropIndex(request(index_name="v_idx"))) == (
+        6,
+        6,
+        "index cannot be dropped on loaded collection; call release() first",
+    )
+    assert status_of(
+        stub.ReleaseCollection(milvus_pb2.ReleaseCollectionRequest(collection_name="c"))
+    ) == (0, 0, "")
+    assert status_of(stub.DropIndex(request(index_name="id_idx"))) == (0, 0, "")
+    assert [
+        d.field_name
+        for d in stub.DescribeIndex(
+            milvus_pb2.DescribeIndexRequest(collection_name="c")
+        ).index_descriptions
+    ] == ["v"]
+    assert status_of(stub.DropIndex(request(index_name="arbitrary"))) == (0, 0, "")
+    assert (
+        stub.GetLoadState(milvus_pb2.GetLoadStateRequest(collection_name="c")).state
+        == common_pb2.LoadStateLoaded
+    )

@@ -1,6 +1,5 @@
 # 复制自 milvus-lite v3.2.1（43d1257）的 tests/adapter/test_grpc_quickstart.py，Apache-2.0 许可。
 # 只保留 M1 范围内的用例（逐条状态见 INVENTORY.md），并删去随之不再使用的 import、helper 与分节标题。
-# 改动：HNSW 换成 FLAT（M1 只有 FLAT，用例少于 1 万行时 3.x 不会 flush，结果不变）。
 # 改动：删去上游因 HNSW 需要 faiss 而加的 skipif（它导入了 3.x 内部模块）。
 """Phase 10.5 — pymilvus quickstart full end-to-end smoke test.
 
@@ -38,10 +37,8 @@ def test_quickstart_multi_query_search(grpc_server):
             for i in range(50)
         ])
         idx = client.prepare_index_params()
-        # 上游为 HNSW（M=16）。M1 只有 FLAT；50 行时 3.x 不会 flush，一直在 memtable 上
-        # 暴力检索，换成 FLAT 不改变结果。上游因 HNSW 需要 faiss 而加的 skipif 随之去掉。
-        idx.add_index(field_name="vec", index_type="FLAT",
-                      metric_type="L2", params={})
+        idx.add_index(field_name="vec", index_type="HNSW",
+                      metric_type="L2", params={"M": 16})
         client.create_index("multi", idx)
         client.load_collection("multi")
 

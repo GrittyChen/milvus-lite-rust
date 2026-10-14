@@ -1,6 +1,5 @@
 # 复制自 milvus-lite v3.2.1（43d1257）的 tests/adapter/test_grpc_search.py，Apache-2.0 许可。
 # 仅保留 INVENTORY.md 中已复用的用例；S1 表达式及断言保持上游原文。
-# HNSW 换成 FLAT 并去除 HNSW 参数；小数据集在 3.x 的 MemTable 上按相同度量检索。
 """Phase 10.4 — pymilvus search end-to-end tests.
 
 Validates the Search RPC: SearchRequest decoding (placeholder_group +
@@ -27,9 +26,9 @@ def _hnsw_idx(client):
     idx = client.prepare_index_params()
     idx.add_index(
         field_name="vec",
-        index_type="FLAT",
+        index_type="HNSW",
         metric_type="COSINE",
-        params={},
+        params={"M": 16, "efConstruction": 200},
     )
     return idx
 

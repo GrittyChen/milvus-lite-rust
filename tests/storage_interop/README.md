@@ -25,3 +25,6 @@ MILVUS_LITE_ARROW25_PYTHON=<work_dir>/v3/bin/python \
 WAL 故障矩阵另覆盖 data/delta 多批流的每个字节截断位置、中间消息格式损坏与零填充：直接运行参照实现 v3.2.1（43d1257）的 `_read_wal_file`，并以 pyarrow 15/25 完整校验，对照 Rust 的批前缀和内容。结构仍有效的向量符号位变化被双方接受，用例不把完整校验误称为校验和；真实 3.x 目录的 schema 整数宽度位翻转另证明未捕获的 ArrowNotImplementedError 会使 collection 访问失败。
 
 真实客户端还读取 Rust 在 ENOSPC 部分追加失败后退出留下的两类目录：失败恢复 flush 完成、WAL 已清理，以及恢复 flush 预同步失败、半截 WAL 仍在盘上。用例先断言 WAL 文件集合，再分别检查 count/get/主键 query/search。ENOSPC 来自测试构建的 File 层注入，发布 wheel 不包含该接缝。
+
+
+0014 的索引互通在 `test_index_storage_interop.py` 中：本实现写的四种 ANN 定义由真实 3.x 构建，3.x 侧车由本实现删除或按 snapshot 定义保留，同类型换 metric 与旧文件清理通过 3.x 检索距离验证。历史 Windows snapshot 的反斜杠引用同样保留侧车并校验定义。FAISS 类型的 BM25 / NONE 在创建时拒绝，断言 manifest 与旧侧车不变，再由真实 3.x 读取原有数据。ANN 的近似 / 量化距离不要求与精确基准相同，本实现的 FLAT 结果单独核对。`M="abc"` 的删除后、提交前失败使用 Cargo 的 `index_change_fault` example（仅 fault-injection 构建）固定 3.x 重新构建失败的已登记影响，因此本组测试需要 Rust 工具链。只有 WAL 的额外 flush 影响也做两侧对照。

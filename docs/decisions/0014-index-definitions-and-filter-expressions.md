@@ -37,7 +37,7 @@
 
 - 稠密向量字段在现有 FLAT、BRUTE_FORCE、AUTOINDEX 之外，接受 HNSW、HNSW_SQ、IVF_FLAT、IVF_SQ8。定义按 3.x 的形态持久化（类型大写、metric 原样、params 与 search_params 原样），DescribeIndex / list_indexes 照实返回；检索一律按 FLAT 精确执行，不建 ANN、不写索引文件。
 - 标量字段接受 INVERTED，类型范围沿用现有校验（3.x 另支持的 TIMESTAMPTZ 随该类型另行接入）；过滤按扫描执行。
-- 创建的校验顺序与错误原文不变，只解除 FLAT 阶段对上述类型的限制。3.x 自身无法构建的定义（IVF_PQ、DISKANN 等未知类型、向量字段上的 INVERTED）和稀疏字段上的任何索引，继续在创建时返回 UNIMPLEMENTED（见[已确认的取舍](#已确认的取舍) 2）。
+- 先保留 3.x 原有的校验顺序与错误原文，再做本实现的兼容性限制：解除 FLAT 阶段对上述类型的限制；AUTOINDEX 与这四种 ANN 类型只接受 COSINE / L2 / IP，BM25 / NONE 返回 UNIMPLEMENTED。3.x 自身无法构建的定义（IVF_PQ、DISKANN 等未知类型、向量字段上的 INVERTED）和稀疏字段上的任何索引，继续在创建时返回 UNIMPLEMENTED（见[已确认的取舍](#已确认的取舍) 2）。
 - load / release 与 rc2 的 load 检查合同不变；已 load 时创建不改变状态。检索请求中的 ef、nprobe 等参数照常接受，不解析。
 
 ### 创建时的旧索引文件
@@ -90,6 +90,7 @@
 | 行为 | 3.x | 本实现 |
 | --- | --- | --- |
 | 新建的 HNSW / HNSW_SQ / IVF_FLAT / IVF_SQ8 上的检索 | 近似检索，召回取决于参数 | 精确 FLAT，召回不低于 ANN；结果与顺序可能不同，大数据量时更慢 |
+| 稠密向量 FAISS 类型的 BM25 / NONE | 保存定义，有已提交行且需要构建时 load 报错 | 创建时返回 UNIMPLEMENTED，防止写出不可互通的定义；包括已发布 rc2 允许的 AUTOINDEX 组合 |
 | 构建参数与检索参数 | build 时解析 build_params、检索时解析 ef / nprobe，非法值报错 | 不解析，照常执行（扩展 0002 第 28 行已登记的参数差异） |
 | 新建的标量 INVERTED | 已建索引的 segment 与 memtable 的结果可能不同 | 按扫描求值（扩展 0006 已登记的 INVERTED 差异） |
 | 创建时遇到同字段、同类型的旧 3.x 索引文件 | 不处理，load 时直接加载；定义不同时结果错误（0002 已记录的继承风险） | 未被钉住的删除；被钉住且与钉住它的 snapshot 中的定义不同（或无法判定）时拒绝创建 |
@@ -101,7 +102,7 @@
 ### 验证要求
 
 - core：
-  - 创建的接受与拒绝矩阵：各类型 × 字段类型 × 已 load / 未 load；
+  - 创建的接受与拒绝矩阵：各类型 × 字段类型 × 已 load / 未 load，以及五种 FAISS 类型 × 五种 metric；FLAT / BRUTE_FORCE 的 BM25 / NONE 继续接受；
   - DropIndex 的名字解析、错误与 Loaded 转换；
   - 创建与 DropIndex 各自的故障注入以实施设计中的「实施验收矩阵」和「fault-injection 与证据」为准，覆盖准备、意图写入、删除、提交与清理的全部规定出口；断言 RPC、定义、load 状态、文件与重试状态，不限于原来的四个注入位置。
 - 差分：create / describe / list / drop 的结果与错误原文。检索：对 3.x 使用 FLAT 定义的相同数据断言结果一致；对 HNSW 只断言本实现返回精确结果。
@@ -115,7 +116,7 @@
 
 ### 实施设计
 
-状态：切片 A 的实施设计按完整失败流程收敛。采用已确认的方案乙；本节冻结入口、锁、预检范围、标记与提交协议。当前只修改设计文档，实现与测试另行评审。
+状态：切片 A 的实施设计按完整失败流程收敛。采用已确认的方案乙；本节冻结入口、锁、预检范围、标记与提交协议。当前源码已实现切片 A，开发验证见 [实施记录](../testing/index-definitions-acceptance.md)；实现已通过约定范围内的评审，切片 B 尚未实施。
 
 **冻结的不变量。**
 
@@ -129,14 +130,14 @@
 2. **flush**：`flush_handle(include_active)` 提交待 flush 的 WAL，并完成既有的 manifest 重试。DropIndex 沿用此入口。3.x 两者都不 flush；对后续 load 检查的影响已登记，不撤销已完成的 flush。
 3. **取 flush 锁**，持有到本次操作及清理结束。它串行化 manifest、索引定义与意图标记的操作。标记 I/O 之前先以 `symlink_metadata` 确认 collection 根仍是真目录；子目录链在第 5 步继续检查。
 4. **请求校验与标记判定**：创建沿用 `build_spec`；DropIndex 按 3.x 名字解析，依次检查「没有索引」「字段没有索引」「已 load」。检查 collection 未删除、持久化状态未损坏、不需重新提交、版本号不溢出。纯计算持状态读锁；标记 I/O 不持状态锁，按下文状态表处理。
-5. **索引文件预检**（只持 flush 锁）：检查完整目录链；列出与目标字段、类型匹配的 `.idx` / `.sidx`；用 `load_pins` 区分钉住的文件。创建时，对被钉住且 source stem 仍在当前 manifest 中的文件，比较每一份钉住它的 snapshot manifest 中的类型、metric 与构建参数；不同、缺失或无法读取都拒绝。只把未钉住的匹配文件列为待删集合，并检查其删除能力。
-6. **准备 manifest**（只持 flush 锁）：执行现有继承文件同步；校验 target / prev / tmp 的形态；创建、写入并同步候选 tmp，复制 prev。再检查新 tmp 与 manifest 目标的替换能力。`create_new` 成功后 tmp 归本次操作所有；准备本身或后续替换前失败、panic 都清理 tmp，清理错误附在原错误后。`prev_copy_error` 保持既有的非阻断语义。
+5. **索引文件预检**（只持 flush 锁）：检查完整目录链；列出与目标字段、类型匹配的 `.idx` / `.sidx`；读取与 `load_pins` 共用的、已把反斜杠规范化为 `/` 的 snapshot 引用，区分钉住的文件并保留每份 snapshot 的归属。创建时，对被钉住且 source stem 仍在当前 manifest 中的文件，比较每一份钉住它的 snapshot manifest 中的类型、metric 与构建参数；不同、缺失或无法读取都拒绝。只把未钉住的匹配文件列为待删集合，并检查其删除能力。
+6. **准备 manifest**（只持 flush 锁）：执行现有继承文件同步；校验 target / prev / tmp 的形态；创建、写入并同步候选 tmp，复制 prev。仅当待删索引文件非空时，再检查新 tmp 与 manifest 目标的替换能力；无删除时沿用实际 rename 的提交点与错误协议。`create_new` 成功后 tmp 归本次操作所有；准备本身或后续替换前失败、panic 都清理 tmp，清理错误附在原错误后。`prev_copy_error` 保持既有的非阻断语义。
 7. **持久化删除意图**（仅待删集合非空）：按下文格式写 tmp、同步文件、rename、同步 collection 目录，全部成功后才进入删除阶段。失败时不碰索引文件，清理两种 tmp；若最终标记已经出现，当前实例记为 `CleanupPending` 并尝试清理。进程在此阶段退出后，新实例无法证明删除未开始，按磁盘标记保守判断。
 8. **删除**：先同步 `indexes/` 做能力检查，再逐个删除未钉住的候选文件（NotFound 视为已删除），最后同步 `indexes/`。标记落盘后、最后一次同步确认前为 `Unconfirmed`；本阶段任何错误或 panic 都保留标记、清理 manifest tmp、报替换前错误，并封锁该 collection 的索引变更。局部 guard / `catch_unwind` 保证提前返回与 panic 同样收尾。最后一次同步成功后，立即转为 `CleanupPending`。
 9. **提交**（持状态写锁）：重新确认第 4 步的状态前提。DropIndex 若被并发 load 抢先，按替换前错误返回，不回滚并发 load。否则执行 manifest rename 与 collection 目录同步，按下表发布定义及 load 状态；`AfterReplace` 沿用现有 `commit_index` 的重试与 RPC 语义。
 10. **清理已安全的标记**（释放状态写锁，仍持 flush 锁）：第 7 步未开始删除，或第 8 步已经同步确认，才允许清理。第 9 步的所有出口都执行此收尾，包括重新校验失败、`BeforeReplace`、`AfterReplace` 与成功。清理失败只记录独立的清理错误、保留 `CleanupPending`，不覆盖 manifest 提交结果，也不改写其重试状态。
 
-没有待删文件时跳过第 7、8 步，不写标记，也不为索引删除同步目录；manifest 本身的同步照常执行。
+没有待删文件时还跳过第 6 步的替换权限预检，并跳过第 7、8 步，不写标记，也不为索引删除同步目录；manifest 本身的同步照常执行。
 
 **删除前的形态与能力清单。** 两个入口共用一处检查，不以「目录能 fsync」推断写入、删除或替换权限。
 
@@ -146,10 +147,10 @@
 | 匹配的侧车与 snapshot 副本 | 候选必须为普通文件；先完成钉住判定和定义比对 | 同上 |
 | `indexes/` 中待删文件 | 目录有效用户 W/X 权限、粘滞位所有权；macOS 还检查每个文件的实际删除权限与目录 / 文件 immutable、append-only 标志 | 同上，不写新标记 |
 | manifest target / prev / tmp | target、prev 若存在必须为普通文件，tmp 异物规则沿用现状；实际创建、写入、同步 tmp；复制 prev 的错误仍按既有协议报告 | 同上；本次拥有的 tmp 清理 |
-| manifest tmp → target 的 rename | collection 目录的 W/X 与粘滞位；macOS 检查 tmp 的删除权限、已有 target 的删除权限及相关保护标志，不能仅凭 tmp 写入成功判定 | 同上，不写新标记 |
+| manifest tmp → target 的 rename（仅保护后续索引删除时） | collection 目录的 W/X 与粘滞位；macOS 检查 tmp 的删除权限、已有 target 的删除权限及相关保护标志，不能仅凭 tmp 写入成功判定 | 同上，不写新标记 |
 | 意图 tmp → 最终标记 | 形态与所有权规则同上；实际完成写入、同步、rename 与父目录同步 | 任一步失败均不删除索引；当前实例只处理安全的标记清理 |
 
-- 通用目录权限使用 `faccessat(AT_EACCESS)`。Linux 的旧 glibc 在部分凭据情形下会模拟此检查；遇到实际凭据不符合该检查前提时保守拒绝，不把模拟成功当作删除许可。普通服务的 real / effective UID、GID 相同路径须在 manylinux_2_28 环境实测。
+- 通用目录权限使用 `faccessat(AT_EACCESS)`。此能力检查仅在存在待删索引文件时执行；没有删除时不因凭据差异或粘滞位的保守判定阻止普通索引变更。存在删除时粘滞位按目录或文件归有效用户所有判定，不假定 root 一定拥有绕过权限的能力。Linux 的旧 glibc 在部分凭据情形下会模拟此检查；遇到实际凭据不符合该检查前提时保守拒绝，不把模拟成功当作删除许可。普通服务的 real / effective UID、GID 相同路径须在 manylinux_2_28 环境实测。
 - macOS 使用 `faccessat(..., _DELETE_OK, AT_EACCESS)` 检查文件删除权限，涵盖 ACL 的 `delete` 拒绝；目录 W/X 与保护标志另查。该检查同样用于 manifest tmp 与已有 target。`_DELETE_OK` 是 Darwin 扩展，不传给 Linux。[Apple 定义](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/sys/unistd.h)
 - Linux 的 chattr / ioctl 标志、LSM 与文件系统专有拒绝不在本切片的预检保证内；稳定的目录同步不支持由第 8 步能力检查发现。实际操作发生这些拒绝仍走持久化封锁，不静默，也不扩大为通用权限框架。
 - 检查后目录、条目或权限被外部改变，属于持有 LOCK 期间的外部修改；预检不消除该竞态。实际错误照常处理，删除已完成的部分不恢复，可用性影响沿用上文登记。
@@ -210,7 +211,7 @@
 
 **组件边界。**
 
-- core index：解除已确认类型的创建限制，3.x 文件名解析统一一处，复用或替换 recovery 的 `sidecar_source_stem`。
+- core index：解除已确认类型的创建限制、拒绝 FAISS 类型无法构建的 metric 组合，3.x 文件名解析统一一处，复用或替换 recovery 的 `sidecar_source_stem`。
 - storage：`commit_manifest` 拆为准备与替换，旧调用方组合调用，保留提交点分类与 `prev_copy_error`；snapshot 增加逐份钉住 manifest 的读取；runtime 增加 DropIndex 提交与三种意图状态；一个模块负责意图格式、启动来源与清理；索引文件扫描与权限预检共用一处。
 - collection / db：新增 `Db::drop_index`，定义顺序保持与 3.x 一致；所有持久化索引变更必须经过上述闸门和 flush 锁。
 - grpc：`IMPLEMENTED_METHODS` 增加 DropIndex，只翻译 field_name / index_name、进入 Db 闸门及映射错误。
@@ -225,6 +226,7 @@
 | 没有 `_default/` 或 `indexes/`；没有待删文件；全部文件被钉住且创建定义相同 | 正常请求成功，无新意图、无索引删除或删除目录同步；DropIndex 的「无索引」错误仍保留 |
 | 缓存句柄下三级目录各自为软链 / 文件；候选非普通文件；snapshot 定义冲突或读取失败 | 拒绝，库外文件、旧索引与候选 manifest 不变，snapshot 仍可恢复 |
 | 索引目录只读 / 粘滞位；macOS 第二个候选的 delete ACL / immutable / append-only | 删除前拒绝，所有旧文件保留，无新最终标记 |
+| 无待删文件时 real / effective 凭据不同；对照存在待删文件的操作 | 无删除的创建与 DropIndex 照常提交；有删除时仍在预检阶段保守拒绝，旧文件与 manifest 保留 |
 | collection 目录只读；manifest target / prev / tmp 异物；版本溢出 / 损坏 / 未完成提交 | 删除前拒绝；tmp 所有权和清理按合同，旧索引与候选 manifest 不变 |
 | macOS manifest target 的 delete ACL / immutable / append-only，及 tmp 继承删除拒绝 ACL | tmp 准备不能冒充替换能力；删除任何索引前拒绝，旧文件保留 |
 | 意图 tmp 写入、文件同步、rename、父目录同步各点失败或退出 | 没有索引删除；当前实例对自己留下的标记只重试安全清理，新实例保守处理最终标记 |
@@ -300,6 +302,6 @@
 1. **DropIndex 的名字行为照 3.x 对齐。**
    - 3.x 的这一行为属于缺陷，规则要求由负责人决定，决定是对齐而不修正。
    - README 写明：普通字段名与匹配不到的名字都会删除全部索引；`<字段名>_idx` 或显式的 field_name 才定向删除。
-2. **3.x 无法构建的定义继续在创建时拒绝**，保留现有的错误与校验顺序。3.x 会持久化它们、直到 load 时才报错；0002 约束 1 要求本实现不写出 3.x 无法 load 的定义。
+2. **3.x 无法构建的定义继续在创建时拒绝**，保留现有的错误与校验顺序。3.x 会持久化它们、直到 load 时才报错；0002 约束 1 要求本实现不写出 3.x 无法 load 的定义。稠密向量字段上的 FAISS 类型（AUTOINDEX、HNSW、HNSW_SQ、IVF_FLAT、IVF_SQ8）只接受 COSINE / L2 / IP；BM25 / NONE 在原有 metric 枚举校验之后返回 UNIMPLEMENTED。FLAT / BRUTE_FORCE 保留原行为。AUTOINDEX 的这一限制修正了已发布 rc2 可创建、却无法由 3.x load 的组合；已发布发行物不变。
 3. **算术运算不纳入切片 B，继续明确拒绝**，后续单独评估。Arrow 路线的整数溢出与 Python 精确运算的语义不同，复刻成本高；统计中涉及的用例很少。
 4. **索引文件删除的持久化确认采用持久化标记（方案乙）。** 删除前持久化意图，删除未确认时跨服务重开保持封锁；可信的内核重启允许自动恢复，启动来源或缓存边界不可信时保守保留、人工恢复。删除已确认后的标记清理另作可重试状态，不改动 manifest 提交语义。这是新增、不可从目录重建的私有安全状态，登记在 0002。

@@ -259,12 +259,7 @@ fn entries(dir: &Path) -> Result<Vec<fs::DirEntry>, RecoveryError> {
 }
 
 fn sidecar_source_stem(name: &str) -> Option<&str> {
-    let base = name
-        .strip_suffix(".idx")
-        .or_else(|| name.strip_suffix(".sidx"))?;
-    let (stem_field, index_type) = base.rsplit_once('.')?;
-    let (source, field) = stem_field.rsplit_once('.')?;
-    (!source.is_empty() && !field.is_empty() && !index_type.is_empty()).then_some(source)
+    crate::index::parse_sidecar_name(name).map(|name| name.source_stem)
 }
 
 enum WalOperation {

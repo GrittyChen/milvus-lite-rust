@@ -1204,6 +1204,34 @@ impl Db {
         field: &str,
         request: IndexRequest,
     ) -> Result<()> {
+        self.change_index(database, name, |c| {
+            c.prepare_create_index(field, request)
+                .map(crate::index::IndexChange::Create)
+        })
+    }
+
+    pub fn drop_index(
+        &self,
+        database: &str,
+        name: &str,
+        field: &str,
+        index_name: &str,
+    ) -> Result<()> {
+        self.change_index(database, name, |c| {
+            c.prepare_drop_index(field, index_name)
+                .map(crate::index::IndexChange::Drop)
+        })
+    }
+
+    fn change_index(
+        &self,
+        database: &str,
+        name: &str,
+        make_change: impl FnOnce(&Collection) -> Result<crate::index::IndexChange>,
+    ) -> Result<()> {
+        #[cfg(feature = "fault-injection")]
+        use crate::storage::index_intent;
+        use crate::storage::{flush, index_files, index_platform};
         require_database(database)?;
         let blocked = self.write_gate.read();
         if *blocked {
@@ -1219,12 +1247,122 @@ impl Db {
             .ok_or_else(|| storage("persistent state missing"))?
             .flush_lock();
         let _flush = lock.lock();
-        state_change(&mut handle.write(), |collection| {
-            collection.create_index_from_db(field, request)?;
+        let (change, dir, candidate, inherited, mut intent) = {
+            let collection = handle.read();
+            let change = make_change(&collection)?;
+            let p = collection
+                .persistent()
+                .ok_or_else(|| storage("persistent state missing"))?;
+            (
+                change.clone(),
+                p.dir.clone(),
+                p.index_manifest(&change).map_err(storage)?,
+                p.inherited_synced(),
+                p.index_intent.clone(),
+            )
+        };
+        let mut prepared = None;
+        let mut cleanup_needed = false;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
+            index_files::check_root(&dir).map_err(EngineError::invalid)?;
+            intent.check(&dir).map_err(EngineError::invalid)?;
+            let original = handle
+                .read()
+                .persistent()
+                .ok_or_else(|| storage("persistent state missing"))?
+                .manifest
+                .clone();
+            let files =
+                index_files::preflight(&dir, &original, &change).map_err(EngineError::invalid)?;
+            if !inherited {
+                #[cfg(feature = "fault-injection")]
+                index_intent::fault(index_intent::IndexPoint::InheritedSync).map_err(storage)?;
+                flush::sync_inherited(&dir, &original).map_err(storage)?;
+                handle
+                    .write()
+                    .persistent_mut()
+                    .ok_or_else(|| storage("persistent state missing"))?
+                    .mark_inherited_synced();
+            }
+            prepared = Some(fs_commit::prepare_manifest(&dir, &candidate).map_err(storage)?);
+            let tmp = prepared
+                .as_ref()
+                .ok_or_else(|| storage("manifest preparation missing"))?
+                .tmp_path();
+            if !files.is_empty() {
+                // 此预检保护后续不可回滚的侧车删除；无删除时沿用实际 manifest 替换的错误协议。
+                index_platform::check_replace(&dir, &tmp, &dir.join("manifest.json"))
+                    .map_err(EngineError::invalid)?;
+                cleanup_needed = true;
+                intent
+                    .persist(
+                        &dir,
+                        change.operation(),
+                        change
+                            .specs()
+                            .iter()
+                            .map(|s| s.field_name.clone())
+                            .collect(),
+                        &files,
+                    )
+                    .map_err(storage)?;
+                intent.delete(&dir, &files).map_err(storage)?;
+            }
             #[cfg(feature = "fault-injection")]
-            state_panic(StatePanicPoint::Index);
-            Ok(())
-        })
+            index_intent::before_commit().map_err(storage)?;
+            state_change(&mut handle.write(), |c| {
+                c.validate_index_change(&change)?;
+                c.persistent_mut()
+                    .ok_or_else(|| storage("persistent state missing"))?
+                    .commit_index_manifest(
+                        candidate.clone(),
+                        prepared
+                            .as_mut()
+                            .ok_or_else(|| storage("manifest preparation missing"))?,
+                    )
+                    .map_err(storage)?;
+                c.publish_index_change(change.clone());
+                #[cfg(feature = "fault-injection")]
+                state_panic(StatePanicPoint::Index);
+                Ok(())
+            })
+        }));
+        let mut result = match result {
+            Ok(result) => result,
+            Err(payload) => Err(storage(format!(
+                "index operation panicked: {}",
+                crate::error::panic_description(payload.as_ref())
+            ))),
+        };
+        if let Some(prepared) = prepared.as_mut()
+            && let Err(error) = prepared.cleanup()
+        {
+            result = match result {
+                Err(original) => Err(index_cleanup_error(
+                    original,
+                    format!("manifest tmp cleanup failed: {error}"),
+                )),
+                Ok(()) => {
+                    eprintln!("manifest tmp cleanup failed at {dir:?}: {error}");
+                    Ok(())
+                }
+            };
+        }
+        if cleanup_needed && let Err(error) = intent.cleanup(&dir) {
+            result = match result {
+                Err(original) => Err(index_cleanup_error(original, error)),
+                Ok(()) => {
+                    eprintln!("{error}");
+                    Ok(())
+                }
+            };
+        }
+        handle
+            .write()
+            .persistent_mut()
+            .ok_or_else(|| storage("persistent state missing"))?
+            .index_intent = intent;
+        result
     }
 
     fn flush_handle(&self, handle: &CollectionHandle, include_active: bool) -> Result<()> {
@@ -2080,6 +2218,26 @@ fn validate_filesystem_name(name: &str, kind: &str) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+// 清理失败不改变原业务错误的类别，尤其不能把并发 load 的 code 6 改为存储 code 1。
+fn index_cleanup_error(original: EngineError, cleanup: String) -> EngineError {
+    match original {
+        EngineError::SchemaValidation(reason) => {
+            EngineError::SchemaValidation(format!("{reason}; {cleanup}"))
+        }
+        EngineError::InvalidArgument(reason) => {
+            EngineError::InvalidArgument(format!("{reason}; {cleanup}"))
+        }
+        EngineError::IndexNotFound(reason) => {
+            EngineError::IndexNotFound(format!("{reason}; {cleanup}"))
+        }
+        EngineError::Storage(reason) => EngineError::Storage(format!("{reason}; {cleanup}")),
+        other => {
+            eprintln!("index cleanup failed after {other}: {cleanup}");
+            other
+        }
+    }
 }
 
 #[cfg(test)]

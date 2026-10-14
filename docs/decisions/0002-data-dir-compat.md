@@ -22,10 +22,10 @@
   - 下列分类都以**字段类型**为前提。3.x 只对标量字段校验索引类型，只放行 INVERTED（[collection.py:1463](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/milvus_lite/engine/collection.py#L1463)）；对稠密与稀疏向量字段则不校验，同一个类型名放在错误的向量字段上也会被持久化，只是 build 失败（见约束 1）。
   - **稠密向量字段上的 FLAT / BRUTE_FORCE**：原生支持。
   - **稠密向量字段上的 AUTOINDEX**：新建与存量都按 FLAT 精确执行，并登记为已知差异。AUTOINDEX 的含义本来就是「由实现选择」，pymilvus 的快速建表 `create_collection(name, dimension=...)` 固定使用它；3.x 在没有 faiss 时自己也退回暴力检索，装了 faiss 时（3.2.1 的必装依赖）建成 HNSW。
-  - **稠密向量字段上的显式 ANN 类型**（HNSW、HNSW_SQ、IVF_FLAT、IVF_SQ8）与**标量字段上的 INVERTED**：新建时明确报错。打开 3.x 写的、带这类定义的目录时，**原样保留**定义，让 3.x 回来后还能照常使用。向量检索按 FLAT 精确执行，召回只高不低，但更慢；标量过滤按扫描执行，更慢，结果也不一定相同：3.x 自身在已建索引的 segment 与 memtable 上结果就不一致，索引又是 load 之后在后台构建的，本实现按扫描求值并登记差异（[0006](0006-m2-scope.md) 第 14 项）。
+  - **稠密向量字段上的显式 ANN 类型**（HNSW、HNSW_SQ、IVF_FLAT、IVF_SQ8）与**标量字段上的 INVERTED**：按 [0014 切片 A](0014-index-definitions-and-filter-expressions.md#切片-a索引定义与-dropindex)，当前源码接受新建定义；存量定义也**原样保留**，让 3.x 回来后还能照常使用。`0.1.0rc2` 及以前的发行物新建时仍返回 UNIMPLEMENTED，本切片尚未发布。向量检索按 FLAT 精确执行，召回只高不低，但更慢；标量过滤按扫描执行，更慢，结果也不一定相同：3.x 自身在已建索引的 segment 与 memtable 上结果就不一致，索引又是 load 之后在后台构建的，本实现按扫描求值并登记差异（[0006](0006-m2-scope.md) 第 14 项）。
   - **稀疏向量字段**：第一阶段在稀疏字段上新建任何索引都明确报错。存量的 SPARSE_INVERTED_INDEX 定义原样保留，稀疏向量检索在全文检索阶段之前明确报错。
   - 以上执行方式与 3.x 不同的地方，都登记为已知的对外差异（[AGENTS.md](../../AGENTS.md) 规则 2）。
-  - **3.x 自身也无法 load 的索引定义**：包括 3.x 会原样持久化的 DISKANN、IVF_PQ 等无法 build 的类型，以及放错字段类型的定义，例如向量字段上的 INVERTED、稀疏字段上的 AUTOINDEX / FLAT / HNSW（见约束 1）。处理与 3.x 一致：目录照常打开，只有该 collection 在 build 索引时报错，即存在有行的已提交 segment 时 load 报错，错误信息与 3.x 相同；被删除的行仍计入，只有 WAL 时不报错，load 之后新提交的 segment 要到 release 之后再次 load 才判定。如果 collection 已处于 load 状态，`create_index` 持久化定义后会立刻 build 并报错。例外是索引参数：3.x 在 build ANN 索引时才解析 `build_params`（例如 `M` 不是整数时 load 报错），本实现不 build ANN、不解析这些参数，照常 load 并按 FLAT 执行，登记为差异；实测 pymilvus 3.0.2 的 `MilvusClient` 两种常见传参写法，3.x 存下的参数都为空，不触发这一差异。
+  - **3.x 自身也无法 load 的索引定义**：包括 3.x 会原样持久化的 DISKANN、IVF_PQ 等无法 build 的类型，以及放错字段类型的定义，例如向量字段上的 INVERTED、稀疏字段上的 AUTOINDEX / FLAT / HNSW（见约束 1）。处理与 3.x 一致：目录照常打开，只有该 collection 在 build 索引时报错，即存在有行的已提交 segment 时 load 报错，错误信息与 3.x 相同；被删除的行仍计入，只有 WAL 时不报错，load 之后新提交的 segment 要到 release 之后再次 load 才判定。如果 collection 已处于 load 状态，`create_index` 持久化定义后会立刻 build 并报错。例外是索引参数：3.x 在 build ANN 索引时才解析 `build_params`（例如 `M` 不是整数时 load 报错），本实现不 build ANN、不解析这些参数，照常 load 并按 FLAT 执行，登记为差异；实测 pymilvus 3.0.2 的 `MilvusClient` 两种常见传参写法，3.x 存下的参数都为空，不触发这一差异。另有 rc2 遗留缺口：存量稠密向量 FAISS 类型的 BM25 / NONE 在 3.x 需要构建时 load 失败，本实现的 `unbuildable` 只检查类型，仍会 load 成功。切片 A 拒绝新写入这类组合，但不扩大既有 load 合同；存量检查的 metric 维度单独留待修复。
 
 互通的前提是**共享文件的语义也完全一致**，不只是格式能读。下面「共享状态的语义约束」中标注「实测」的条目，都已在 3.2.1 上复现：违反它们会造成数据丢失、已删除的行复活、主键重复覆盖，或检索结果静默出错。
 
@@ -44,6 +44,7 @@
 | schema | 是 | `schema_format_version = 2`，含 functions（BM25 等）的定义 |
 | snapshot 元数据 | 是 | `snapshot_format_version = 1`；snapshot 同时钉住 data、delta 与**索引**文件，见约束 6 |
 | 向量索引 / 标量索引 | **否** | 3.x 为 `indexes/<data_stem>.<field>.<index_type>.idx` / `.sidx`；Rust 的命名与放置规则见约束 5 |
+| 索引删除意图 | **Rust 私有** | collection 根的 `milvus-lite-rust.index-intent.json`，格式版本 1；记录删除可能开始而持久化未确认的状态。旧目录无标记无需迁移，3.x 保留最终标记、snapshot restore 不复制；格式、tmp、可信启动来源及人工恢复协议见 [0014](0014-index-definitions-and-filter-expressions.md#实施设计) |
 | Rust 独有的派生状态 | **否** | 只能放在 3.x 不会删除的位置（约束 5），并且必须能从数据文件重建 |
 
 ## 共享状态的语义约束
@@ -52,7 +53,7 @@
    - 3.x 读 manifest 时只读它认识的键，重写时会丢掉未知的键（顶层和嵌套都会丢）。
    - 更危险的是**值**：3.x 解析 manifest 时一旦出现 `KeyError`、`ValueError` 或 `TypeError`，就回退到 `manifest.json.prev`，只打两条 warning 日志，调用方不会收到任何错误（[manifest.py:164](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/milvus_lite/storage/manifest.py#L164)）。随后 recovery 会把只登记在新 manifest 里的数据文件当作孤儿删掉。实测：把 `index_specs` 的 metric 改成 3.x 不接受的 `HAMMING` 后，10 行数据变成 5 行，较新的 Parquet 文件被删除。
    - 注意「能解析」与「能使用」不同：3.x 解析 manifest 时并不校验 index_type（[spec.py:58](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/milvus_lite/index/spec.py#L58) 只要求非空字符串），`create_index` 也只做大写化就持久化（[collection.py:1454](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/milvus_lite/engine/collection.py#L1454)）。实测：向量字段上的 `DISKANN` 被写进 manifest，3.x 重开照常，只在该 collection build 索引时（load 时，或已 load 时的 `create_index`）报 `unknown index_type`。
-   - 因此，Rust 写入共享文件的枚举值必须落在 3.x 能 build / load 的集合内，而且要**按字段类型**判断。index_type 的值域为：稠密向量字段上的 FLAT、BRUTE_FORCE、AUTOINDEX、HNSW、HNSW_SQ、IVF_FLAT、IVF_SQ8（出自 [factory.py:53](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/milvus_lite/index/factory.py#L53) 的 `KNOWN_VECTOR_INDEX_TYPES`，去掉 3.x 自己也无法 build 的 `IVF_PQ`）；稀疏向量字段上只有 SPARSE_INVERTED_INDEX；标量字段上只有 INVERTED（[capabilities.py:6](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/milvus_lite/index/scalar/capabilities.py#L6)）。实测：稀疏字段上的 AUTOINDEX / FLAT / HNSW 都会被 3.x 持久化，但 load 时报 `vector column must be FixedSizeList, got binary`。metric 限于 COSINE / L2 / IP / BM25 / NONE（[spec.py:60](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/milvus_lite/index/spec.py#L60)）；dtype、function 类型同理。Rust 需要的额外状态只能放进独立的、可重建的文件。
+   - 因此，Rust 写入共享文件的枚举值必须落在 3.x 能 build / load 的集合内，而且要**按字段类型**判断。index_type 的值域为：稠密向量字段上的 FLAT、BRUTE_FORCE、AUTOINDEX、HNSW、HNSW_SQ、IVF_FLAT、IVF_SQ8（出自 [factory.py:53](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/milvus_lite/index/factory.py#L53) 的 `KNOWN_VECTOR_INDEX_TYPES`，去掉 3.x 自己也无法 build 的 `IVF_PQ`）；稀疏向量字段上只有 SPARSE_INVERTED_INDEX；标量字段上只有 INVERTED（[capabilities.py:6](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/milvus_lite/index/scalar/capabilities.py#L6)）。实测：稀疏字段上的 AUTOINDEX / FLAT / HNSW 都会被 3.x 持久化，但 load 时报 `vector column must be FixedSizeList, got binary`。metric 的可解析枚举限于 COSINE / L2 / IP / BM25 / NONE（[spec.py:60](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/milvus_lite/index/spec.py#L60)）；稠密向量上的 FAISS 类型（AUTOINDEX、HNSW、HNSW_SQ、IVF_FLAT、IVF_SQ8）能构建的 metric 仅为 COSINE / L2 / IP，创建时必须按类型与 metric 联合判定；FLAT / BRUTE_FORCE 保留 BM25 / NONE 的可 load 定义。dtype、function 类型同理。Rust 额外状态放进独立文件；索引等缓存可重建。例外是 0014 的索引删除意图：它是不可从当前目录重建的持久化安全状态，格式版本及旧目录处理必须显式登记，不往共享 manifest 增加私有字段。
    - `.prev` 的维护协议与 3.x 相同：写 `manifest.json.tmp` 并 fsync，把当前 `manifest.json` 复制为 `.prev`，replace 为 `manifest.json`（提交点），再 fsync 父目录（[manifest.py:86](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/milvus_lite/storage/manifest.py#L86)）。
 2. **文件名中的 seq 范围是 tombstone GC 的依据，必须覆盖文件内容。**
    - 3.x 用 data 文件名里 seq_min 的全局最小值（[compaction.py:483](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/milvus_lite/engine/compaction.py#L483)），判断 delta 文件名里 seq_max 更小的 delta 文件可以删除（[compaction.py:446](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/milvus_lite/engine/compaction.py#L446)）。
@@ -133,7 +134,7 @@
 - **索引文件共存**：两种索引文件同时存在时，各自只加载自己的格式；删除 segment、drop_index、修改索引定义之后，陈旧文件被正确清理，被 snapshot 钉住的文件保留（约束 5–7）。
 - **snapshot**：一方创建、另一方 restore；GC 不删除被钉住的文件。
 - **删除判定的分区语义**：tombstone 与其对应的数据行分处不同分区（包括约束 3 所述的误路由目录，以及 `_all` 删除），Rust 与 3.x 读出的结果一致（约束 13）。
-- **第一阶段的索引定义**：pymilvus 快速建表（AUTOINDEX）可用；新建 HNSW / INVERTED 以及稀疏字段上的任何索引都明确报错；打开 3.x 写的 HNSW / AUTOINDEX / INVERTED / SPARSE_INVERTED_INDEX 目录时，定义原样保留，检索与过滤结果正确（稀疏检索明确报错），3.x 再次打开时仍能使用原索引；Rust 写出的任何索引定义，3.x 都能 load。
+- **第一阶段的索引定义**：pymilvus 快速建表（AUTOINDEX）可用；当前源码新建 HNSW / HNSW_SQ / IVF_FLAT / IVF_SQ8 / 标量 INVERTED 可用，定义原样保存，向量按 FLAT、标量按扫描执行；3.x 自身无法构建的类型与稀疏字段继续拒绝；打开 3.x 写的 HNSW / AUTOINDEX / INVERTED / SPARSE_INVERTED_INDEX 目录时，定义原样保留，检索与过滤结果正确（稀疏检索明确报错），3.x 再次打开时仍能使用原索引；Rust 写出的任何索引定义，3.x 都能 load。
 - **互斥**：一方持有 `LOCK` 时，另一方打开失败并明确报错。Linux（flock 与 fcntl 互不感知）与 Windows（字节范围锁）需要在对应平台上实测。
 - **fail-closed**：伪造未知的格式版本号、未知的键，以及未知的 dtype、metric 时，Rust 拒绝打开该 collection、其余 collection 照常，不改动任何文件；未知的 index_type 与 3.x 一致，只在该 collection build 索引时报错。
 - **库版本组合**：arrow-rs 写、pyarrow（3.x 支持的版本范围内）读，以及反过来，覆盖 IPC 与 Parquet；包括 TIMESTAMPTZ 时区串的写法。
@@ -147,7 +148,7 @@
 
 - manifest 解析失败时回退 `.prev` 并删除「孤儿」文件，任何解析错误都可能静默丢数据（约束 1 正是为此）。
 - 在不区分大小写的文件系统上，manifest 与 snapshot 的文件引用按精确路径字符串判断；外部工具若只改变被引用文件名的大小写，路径读取仍可能成功，但孤儿清理会把实际目录项判为未引用并删除。3.x 与本实现均继承这一风险；本实现首次打开可能读到内存中的行，随后重开会因被引用文件缺失而拒绝打开。此条针对分区内文件名，与 collection 名字的大小写处理不同；互通目录中的持久化文件名须保持引用中的原始拼写。
-- 某个 snapshot 钉住旧 `.idx` 之后，如果先 drop_index，再以同类型、不同 metric 重建，3.x 自身也会加载到陈旧索引。
+- 某个 snapshot 钉住旧 `.idx` 之后，如果先 drop_index，再以同类型、不同 metric 重建，3.x 自身也会加载到陈旧索引。本实现按 0014 在创建前删除未钉住的匹配旧文件；钉住且被当前 segment 使用的文件，须与所有钉住它的 snapshot manifest 中定义一致，否则拒绝创建。这限制本实现的新触发入口，不修复 3.x 自己的历史行为。
 - 非有限 JSON 编码的边界：3.x 可能把 raw gRPC 的 `{"a":1e999}` 写成含 `Infinity` 的文本，raw Query 可成功返回这些字节，但 pymilvus 的严格 JSON 解码会失败。本实现对新的 JSON 字段写入提前拒绝这类浮点溢出，差异与用例见 [0006「与 3.x 的差异」](0006-m2-scope.md#与-3x-的差异)；已有 JSON 列仍按文本读取，不代表能由严格客户端解析或再次编码。
 - **历史互通限制（尚未修复）**：`$meta` 含 `Infinity/-Infinity/NaN` 时，3.x 的 `json.loads` 可加载目录；本实现的 `$meta` 解码使用严格的 serde_json，collection 懒打开会返回 storage error，提示 `$meta is not a JSON object` 与解析位置。raw `$meta` 输入 `{"x":1e999}` 仍可能被双方接受写入并返回含 `Infinity` 的 raw 结果；本实现后续 flush 的批解码可在提交点前失败，并进入待提交重试状态；失败后一秒窗口内写入因节流被拒，窗口后重试仍会因同一元数据解析错误而失败，故故障未消除时对该 collection 的后续写入持续被拒绝。显式 Flush 和关闭同样不能完成该代提交；重启后该 collection 又会因 `$meta` 解码失败而拒绝打开，不能靠等待或重启自动恢复。其他健康 collection 不受影响。因此不能保证直接打开这类非标准元数据目录。此限制独立于 JSON 列的新写入政策；本轮仅登记，不改变 `$meta` 解析或 `pyjson` 输出规则。确认目录类型时，应检查 Arrow IPC/Parquet 的 `$meta` 文本，而不能将所有 `$meta` 解析错误都归因于非有限值，也不自动改写文件。
 - nullable 向量用全零表示 null，与真正的零向量无法区分。

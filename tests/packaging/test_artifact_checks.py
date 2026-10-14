@@ -352,3 +352,40 @@ def test_confirmed_links_and_local_rpc_examples_remain_accepted(addition):
     readme = (Path(__file__).resolve().parents[2] / "README.md").read_text()
     body = readme + "\n" + addition
     check_description(body, body)
+
+
+@pytest.mark.parametrize(
+    "addition",
+    [
+        "python -m pip install milvus-lite-rust.index-intent.json",
+        "最终标记：`<data_dir>/collections/<collection>/milvus-lite-rust.index-intent.json`。; python -m pip install foo",
+        "python -m pip install foo # 最终标记：`<data_dir>/collections/<collection>/milvus-lite-rust.index-intent.json`。",
+        "最终标记：`<data_dir>/collections/<collection>/milvus-lite-rust.index-intent.json`。\npython -m pip install milvus-lite-rust",
+    ],
+)
+def test_intent_file_reference_cannot_hide_install_commands(addition):
+    from check_artifacts import (
+        check_install_commands,
+        release_install_commands,
+        VERSION,
+    )
+
+    body = "\n".join(sorted(release_install_commands(VERSION))) + "\n" + addition
+    with pytest.raises(ValueError, match="install command check"):
+        check_install_commands(body, VERSION)
+
+
+def test_exact_intent_reference_is_allowed_with_release_commands():
+    from check_artifacts import (
+        check_install_commands,
+        release_install_commands,
+        INDEX_INTENT_REFERENCE,
+        VERSION,
+    )
+
+    body = (
+        "\n".join(sorted(release_install_commands(VERSION)))
+        + "\n"
+        + INDEX_INTENT_REFERENCE
+    )
+    check_install_commands(body, VERSION)

@@ -291,6 +291,24 @@ impl Service for MilvusService {
         .await
     }
 
+    async fn drop_index(
+        &self,
+        request: Request<svc::DropIndexRequest>,
+    ) -> Result<Response<common::Status>, Status> {
+        let database = database(&request, |r| &r.db_name);
+        let req = request.into_inner();
+        self.run(Branch::Engine, move |db| {
+            db.drop_index(
+                &database,
+                &req.collection_name,
+                &req.field_name,
+                &req.index_name,
+            )?;
+            Ok(success())
+        })
+        .await
+    }
+
     async fn describe_index(
         &self,
         request: Request<svc::DescribeIndexRequest>,

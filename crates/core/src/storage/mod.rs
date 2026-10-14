@@ -13,3 +13,7 @@ pub mod schema_file;
 pub mod snapshot;
 pub mod visibility;
 pub mod wal;
+
+pub(crate) mod index_files;
+pub mod index_intent;
+pub(crate) mod index_platform;

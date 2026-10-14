@@ -808,6 +808,7 @@ dependencies = [
  "arrow-array",
  "arrow-ipc",
  "arrow-schema",
+ "libc",
  "parking_lot",
  "parquet",
  "rayon-core",

@@ -1336,15 +1336,17 @@ impl Collection {
         self.create_index_inner(field_name, req)
     }
 
-    pub(crate) fn create_index_from_db(
-        &mut self,
-        field_name: &str,
-        req: IndexRequest,
-    ) -> Result<()> {
-        self.create_index_inner(field_name, req)
+    fn create_index_inner(&mut self, field_name: &str, req: IndexRequest) -> Result<()> {
+        let spec = self.prepare_create_index(field_name, req)?;
+        self.indexes.push(spec);
+        Ok(())
     }
 
-    fn create_index_inner(&mut self, field_name: &str, req: IndexRequest) -> Result<()> {
+    pub(crate) fn prepare_create_index(
+        &self,
+        field_name: &str,
+        req: IndexRequest,
+    ) -> Result<IndexSpec> {
         if self.deleted {
             return Err(EngineError::CollectionNotFound(self.name.clone()));
         }
@@ -1357,14 +1359,98 @@ impl Collection {
                 py_repr(field_name)
             ))
         })?;
-        let spec = build_spec(field, req)?;
-        if let Some(persistent) = self.persistent.as_mut() {
-            persistent
-                .commit_index(&spec)
-                .map_err(EngineError::Storage)?;
+        build_spec(field, req)
+    }
+
+    pub(crate) fn prepare_drop_index(
+        &self,
+        field_name: &str,
+        index_name: &str,
+    ) -> Result<Vec<IndexSpec>> {
+        if self.deleted {
+            return Err(EngineError::CollectionNotFound(self.name.clone()));
         }
-        self.indexes.push(spec);
+        if self.indexes.is_empty() {
+            return Err(EngineError::IndexNotFound("no index to drop".to_owned()));
+        }
+        let field = if !field_name.is_empty() {
+            Some(field_name)
+        } else {
+            self.indexes
+                .iter()
+                .find(|spec| format!("{}_idx", spec.field_name) == index_name)
+                .map(|spec| spec.field_name.as_str())
+        };
+        if let Some(field) = field
+            && self.index(field).is_none()
+        {
+            return Err(self.drop_field_error(field));
+        }
+        if self.load_state == LoadState::Loaded {
+            return Err(EngineError::schema(
+                "index cannot be dropped on loaded collection; call release() first",
+            ));
+        }
+        Ok(self
+            .indexes
+            .iter()
+            .filter(|spec| field.is_none_or(|f| f == spec.field_name))
+            .cloned()
+            .collect())
+    }
+
+    fn drop_field_error(&self, field: &str) -> EngineError {
+        EngineError::IndexNotFound(format!(
+            "no index on field {}; indexed fields: [{}]",
+            py_repr(field),
+            self.indexes
+                .iter()
+                .map(|s| py_repr(&s.field_name))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))
+    }
+
+    pub(crate) fn validate_index_change(&self, change: &crate::index::IndexChange) -> Result<()> {
+        if self.deleted {
+            return Err(EngineError::CollectionNotFound(self.name.clone()));
+        }
+        match change {
+            crate::index::IndexChange::Create(spec) => {
+                if self.index(&spec.field_name).is_some() {
+                    return Err(EngineError::IndexAlreadyExists(spec.field_name.clone()));
+                }
+            }
+            crate::index::IndexChange::Drop(specs) => {
+                if self.indexes.is_empty() {
+                    return Err(EngineError::IndexNotFound("no index to drop".to_owned()));
+                }
+                for spec in specs {
+                    if self.index(&spec.field_name).is_none() {
+                        return Err(self.drop_field_error(&spec.field_name));
+                    }
+                }
+                if self.load_state == LoadState::Loaded {
+                    return Err(EngineError::schema(
+                        "index cannot be dropped on loaded collection; call release() first",
+                    ));
+                }
+            }
+        }
         Ok(())
+    }
+
+    pub(crate) fn publish_index_change(&mut self, change: crate::index::IndexChange) {
+        match change {
+            crate::index::IndexChange::Create(spec) => self.indexes.push(spec),
+            crate::index::IndexChange::Drop(specs) => {
+                self.indexes
+                    .retain(|old| !specs.iter().any(|spec| spec.field_name == old.field_name));
+                if self.indexes.is_empty() {
+                    self.load_state = LoadState::Loaded;
+                }
+            }
+        }
     }
 
     /// 写入一批数据，逐行返回主键（批内重复的主键原样重复）。

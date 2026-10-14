@@ -174,6 +174,7 @@ pub struct PersistentCollection {
     last_published_generation: Option<u64>,
     last_failure: Option<(Instant, String)>,
     inherited_synced: bool,
+    pub(crate) index_intent: super::index_intent::IntentState,
     poisoned: bool,
     /// 与状态写锁分开：Parquet 写入、fsync 和 manifest 提交不阻塞读者。
     flush_lock: Arc<crate::lock_order::Mutex<(), 4>>,
@@ -216,6 +217,7 @@ impl PersistentCollection {
             last_published_generation: None,
             last_failure: None,
             inherited_synced: false,
+            index_intent: Default::default(),
             poisoned: false,
             flush_lock: Arc::new(crate::lock_order::Mutex::new(())),
         })
@@ -248,6 +250,7 @@ impl PersistentCollection {
             last_published_generation: None,
             last_failure: None,
             inherited_synced: false,
+            index_intent: Default::default(),
             poisoned: false,
             flush_lock: Arc::new(crate::lock_order::Mutex::new(())),
         }
@@ -553,34 +556,62 @@ impl PersistentCollection {
         }
     }
 
-    /// 索引定义与 manifest 同一提交点；replace 后的同步失败仍视为定义已生效。
-    pub fn commit_index(&mut self, spec: &crate::index::IndexSpec) -> Result<(), String> {
+    pub(crate) fn mark_inherited_synced(&mut self) {
+        self.inherited_synced = true;
+    }
+
+    pub(crate) fn index_manifest(
+        &self,
+        change: &crate::index::IndexChange,
+    ) -> Result<Manifest, String> {
         if self.poisoned || self.needs_retry() {
             return Err("collection has unfinished storage work".to_owned());
-        }
-        if !self.inherited_synced {
-            flush::sync_inherited(&self.dir, &self.manifest).map_err(err)?;
-            self.inherited_synced = true;
         }
         let mut candidate = self.manifest.clone();
         candidate.version = candidate
             .version
             .checked_add(1)
             .ok_or("manifest version space exhausted")?;
-        candidate.index_specs.insert(
-            spec.field_name.clone(),
-            StoredIndexSpec {
-                field_name: spec.field_name.clone(),
-                index_type: spec.index_type.clone(),
-                metric_type: spec.metric_type.clone(),
-                build_params: spec.params.clone(),
-                search_params: spec.search_params.clone(),
-            },
-        );
-        match fs_commit::commit_manifest(&self.dir, &candidate) {
-            Ok(_) => self.manifest = candidate,
+        match change {
+            crate::index::IndexChange::Create(spec) => {
+                candidate.index_specs.insert(
+                    spec.field_name.clone(),
+                    StoredIndexSpec {
+                        field_name: spec.field_name.clone(),
+                        index_type: spec.index_type.clone(),
+                        metric_type: spec.metric_type.clone(),
+                        build_params: spec.params.clone(),
+                        search_params: spec.search_params.clone(),
+                    },
+                );
+            }
+            crate::index::IndexChange::Drop(specs) => {
+                for spec in specs {
+                    candidate.index_specs.remove(&spec.field_name);
+                }
+            }
+        }
+        Ok(candidate)
+    }
+
+    pub(crate) fn commit_index_manifest(
+        &mut self,
+        candidate: Manifest,
+        prepared: &mut fs_commit::PreparedManifest,
+    ) -> Result<(), String> {
+        if self.poisoned || self.needs_retry() {
+            return Err("collection has unfinished storage work".to_owned());
+        }
+        match prepared.replace() {
+            Ok(report) => {
+                if let Some(error) = report.prev_copy_error {
+                    eprintln!(
+                        "index manifest prev copy failed for {:?}: {error}",
+                        self.dir
+                    );
+                }
+            }
             Err(error) if error.phase == CommitPhase::AfterReplace => {
-                self.manifest = candidate;
                 self.retry_manifest = true;
                 self.record_failure(error.to_string());
                 eprintln!(
@@ -590,6 +621,7 @@ impl PersistentCollection {
             }
             Err(error) => return Err(error.to_string()),
         }
+        self.manifest = candidate;
         Ok(())
     }
 

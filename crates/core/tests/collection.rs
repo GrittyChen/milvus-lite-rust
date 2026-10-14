@@ -1170,17 +1170,16 @@ fn missing_key_columns_are_reported_before_allocating_per_row_state() {
 
 #[test]
 fn scalar_index_with_empty_metric_is_none() {
-    // 3.x：标量索引的 metric_type 为空串时按 `or "NONE"` 处理，随后才是 FLAT 阶段的限制。
+    // 3.x：标量索引的 metric_type 为空串时按 `or "NONE"` 处理。
     let mut c = basic(false, false);
-    let e = c
-        .create_index(
-            "t",
-            IndexRequest {
-                index_type: "INVERTED".to_owned(),
-                metric_type: Some(String::new()),
-                ..Default::default()
-            },
-        )
-        .unwrap_err();
-    assert!(matches!(e, EngineError::Unsupported { .. }), "{e}");
+    c.create_index(
+        "t",
+        IndexRequest {
+            index_type: "INVERTED".to_owned(),
+            metric_type: Some(String::new()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(c.index("t").unwrap().metric_type, "NONE");
 }

@@ -1,12 +1,11 @@
 # 复制自 milvus-lite v3.2.1（43d1257）的 tests/adapter/test_grpc_index.py，Apache-2.0 许可。
-# 只保留 M1 范围内的用例（逐条状态见 INVENTORY.md），并删去随之不再使用的 import、helper 与分节标题。
-# 改动：HNSW 换成 FLAT（M1 只有 FLAT，用例少于 1 万行时 3.x 不会 flush，结果不变）。
+# 接受索引定义、按 FLAT 执行，不需要 faiss；依赖直接导入，缺少依赖时报错。
 """Phase 10.4 — Index lifecycle RPC tests via pymilvus.
 
 Covers CreateIndex / DropIndex / DescribeIndex / LoadCollection /
 ReleaseCollection / GetLoadState / GetLoadingProgress.
 
-Skipped automatically when pymilvus / grpcio is not installed.
+依赖直接导入；缺少依赖会报错。
 """
 
 import pytest
@@ -21,15 +20,15 @@ def _make_schema():
     return schema
 
 
-# 上游为 _hnsw_params（HNSW，M=16、efConstruction=200）。M1 只有 FLAT；用例都少于 1 万行，
-# 3.x 不会 flush，一直在 memtable 上暴力检索，换成 FLAT 不改变结果。
-def _flat_params(client):
+
+
+def _hnsw_params(client):
     idx = client.prepare_index_params()
     idx.add_index(
         field_name="vec",
-        index_type="FLAT",
+        index_type="HNSW",
         metric_type="COSINE",
-        params={},
+        params={"M": 16, "efConstruction": 200},
     )
     return idx
 
@@ -47,19 +46,26 @@ def _brute_params(client):
 
 @pytest.fixture
 def populated(milvus_client):
-    """A collection with 10 records and a FLAT index; state=loaded."""
+    """A collection with 10 records and a HNSW index; state=loaded."""
     milvus_client.create_collection("demo", schema=_make_schema())
     milvus_client.insert("demo", [
         {"id": i, "vec": [float(i), float(i+1), 0.0, 0.0], "title": f"t{i}"}
         for i in range(10)
     ])
-    milvus_client.create_index("demo", _flat_params(milvus_client))
+    milvus_client.create_index("demo", _hnsw_params(milvus_client))
     return milvus_client
 
 
 # ---------------------------------------------------------------------------
 # CreateIndex
 # ---------------------------------------------------------------------------
+
+def test_create_index_hnsw(milvus_client):
+    milvus_client.create_collection("demo", schema=_make_schema())
+    milvus_client.create_index("demo", _hnsw_params(milvus_client))
+    desc = milvus_client.describe_index("demo", "vec")
+    assert desc["index_type"] == "HNSW"
+
 
 def test_create_index_brute_force(milvus_client):
     milvus_client.create_collection("demo", schema=_make_schema())
@@ -70,19 +76,40 @@ def test_create_index_brute_force(milvus_client):
 
 def test_create_index_duplicate_raises(milvus_client):
     milvus_client.create_collection("demo", schema=_make_schema())
-    milvus_client.create_index("demo", _flat_params(milvus_client))
+    milvus_client.create_index("demo", _hnsw_params(milvus_client))
     with pytest.raises(Exception):
-        milvus_client.create_index("demo", _flat_params(milvus_client))
+        milvus_client.create_index("demo", _hnsw_params(milvus_client))
 
 
 def test_create_index_unknown_collection_raises(milvus_client):
     with pytest.raises(Exception):
-        milvus_client.create_index("ghost", _flat_params(milvus_client))
+        milvus_client.create_index("ghost", _hnsw_params(milvus_client))
 
 
 def test_create_index_metric_round_trip(populated):
     desc = populated.describe_index("demo", "vec")
     assert desc["metric_type"] == "COSINE"
+
+
+# ---------------------------------------------------------------------------
+# DropIndex
+# ---------------------------------------------------------------------------
+
+def test_drop_index(populated):
+    # Milvus semantics: drop_index requires released state.
+    populated.release_collection("demo")
+    populated.drop_index("demo", "vec")
+    # After drop, describe_index returns None (pymilvus parses
+    # INDEX_NOT_FOUND status as None, not as a raise)
+    desc = populated.describe_index("demo", "vec")
+    assert desc is None
+
+
+def test_drop_index_unknown_raises(milvus_client):
+    milvus_client.create_collection("demo", schema=_make_schema())
+    # No index created → drop should raise
+    with pytest.raises(Exception):
+        milvus_client.drop_index("demo", "vec")
 
 
 # ---------------------------------------------------------------------------
@@ -135,6 +162,13 @@ def test_get_load_state_unknown_collection(milvus_client):
 # ---------------------------------------------------------------------------
 # DescribeIndex
 # ---------------------------------------------------------------------------
+
+def test_describe_index_returns_params(populated):
+    desc = populated.describe_index("demo", "vec")
+    assert desc["field_name"] == "vec"
+    assert desc["index_type"] == "HNSW"
+    assert desc["metric_type"] == "COSINE"
+
 
 def test_describe_index_state_is_finished(populated):
     """Phase 9 builds indexes synchronously, so state is always

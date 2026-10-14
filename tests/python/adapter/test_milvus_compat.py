@@ -1,7 +1,6 @@
 # 复制自 milvus-lite v3.2.1（43d1257）的 tests/adapter/test_milvus_compat.py，Apache-2.0 许可。
 # 仅保留 INVENTORY.md 中已复用的用例；范围内过滤表达式及断言保持上游原文。
-# HNSW 换成 FLAT 并去除 HNSW 参数；小数据集在 3.x 的 MemTable 上按相同度量检索。
-# 直接导入依赖；FLAT 不需要 faiss，移除上游的 faiss 跳过条件。
+# 直接导入依赖；接受 HNSW 定义并按 FLAT 执行，不需要 faiss。
 """Milvus pymilvus compatibility tests — adapted from milvus-io/milvus
 python_client/milvus_client/ test suite.
 
@@ -73,8 +72,8 @@ def _create_loaded(client, name, rows=None, metric="COSINE", dynamic=False):
     client.create_collection(name, schema=_schema(client, dynamic=dynamic))
     client.insert(name, rows)
     idx = client.prepare_index_params()
-    idx.add_index(field_name="vec", index_type="FLAT", metric_type=metric,
-                  params={})
+    idx.add_index(field_name="vec", index_type="HNSW", metric_type=metric,
+                  params={"M": 16, "efConstruction": 200})
     client.create_index(name, idx)
     client.load_collection(name)
     return rows
@@ -110,8 +109,8 @@ class TestInsert:
                 r["id"] = batch * 20 + i
             milvus_client.insert("batch", rows)
         idx = milvus_client.prepare_index_params()
-        idx.add_index(field_name="vec", index_type="FLAT", metric_type="L2",
-                      params={})
+        idx.add_index(field_name="vec", index_type="HNSW", metric_type="L2",
+                      params={"M": 16})
         milvus_client.create_index("batch", idx)
         milvus_client.load_collection("batch")
         result = milvus_client.query("batch", filter="id >= 0", output_fields=["id"])

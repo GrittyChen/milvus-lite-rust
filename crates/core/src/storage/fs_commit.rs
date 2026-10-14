@@ -211,113 +211,181 @@ pub struct ManifestCommit {
     pub prev_copy_error: Option<io::Error>,
 }
 
-/// 与 3.x 相同的五步提交，replace 是逻辑提交点；目录 sync 失败单独标为提交后错误。
+/// 与 3.x 相同的五步提交；调用方也可在删除旧索引之前单独完成准备。
 pub fn commit_manifest(dir: &Path, manifest: &Manifest) -> Result<ManifestCommit, CommitError> {
-    let mut replaced = false;
-    // panic 与 I/O 必须使用实际 replace 状态分类，不能让上层误把已提交数据当成未提交。
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        commit_manifest_inner(dir, manifest, &mut replaced)
-    })) {
-        Ok(result) => result,
-        Err(payload) => Err(CommitError {
-            path: dir.join("manifest.json"),
-            phase: if replaced {
-                CommitPhase::AfterReplace
-            } else {
-                CommitPhase::BeforeReplace
-            },
-            source: io::Error::other(format!(
-                "manifest commit panicked: {}",
-                crate::error::panic_description(payload.as_ref())
-            )),
-        }),
+    let mut prepared = prepare_manifest(dir, manifest)?;
+    match prepared.replace() {
+        Ok(report) => Ok(report),
+        Err(error) => Err(prepared.abort(error)),
     }
 }
 
-fn commit_manifest_inner(
-    dir: &Path,
-    manifest: &Manifest,
-    replaced: &mut bool,
-) -> Result<ManifestCommit, CommitError> {
-    let target = dir.join("manifest.json");
-    let prev = dir.join("manifest.json.prev");
-    let tmp = dir.join("manifest.json.tmp");
-    let bytes = manifest
-        .to_bytes()
-        .map_err(|source| CommitError::before(&tmp, io::Error::other(source)))?;
-    match fs::symlink_metadata(&tmp) {
-        Ok(meta) if meta.file_type().is_file() => {
-            fs::remove_file(&tmp).map_err(|source| CommitError::before(&tmp, source))?;
-        }
-        Ok(_) => {
-            return Err(CommitError::before(
-                &tmp,
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "manifest tmp is not a regular file",
-                ),
-            ));
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(CommitError::before(&tmp, error)),
-    }
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&tmp)
-        .map_err(|source| CommitError::before(&tmp, source))?;
-    file.write_all(&bytes)
-        .and_then(|()| sync_file(&file, &tmp))
-        .map_err(|source| CommitError::before(&tmp, source))?;
-    drop(file);
-    let prev_copy_error = match fs::symlink_metadata(&target) {
-        Ok(meta) if meta.file_type().is_file() => {
-            match fs::symlink_metadata(&prev) {
-                Ok(meta) if meta.file_type().is_file() => {}
-                Ok(_) => {
-                    return Err(CommitError::before(
-                        &prev,
-                        io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "manifest prev is not a regular file",
-                        ),
-                    ));
-                }
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => return Err(CommitError::before(&prev, error)),
-            }
-            fs::copy(&target, &prev).err()
-        }
-        Ok(_) => {
-            return Err(CommitError::before(
-                &target,
-                io::Error::new(io::ErrorKind::InvalidData, "manifest is not a regular file"),
-            ));
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-        Err(error) => return Err(CommitError::before(&target, error)),
+#[derive(Debug)]
+pub struct PreparedManifest {
+    dir: PathBuf,
+    tmp_owned: bool,
+    prev_copy_error: Option<io::Error>,
+}
+
+pub fn prepare_manifest(dir: &Path, manifest: &Manifest) -> Result<PreparedManifest, CommitError> {
+    let mut prepared = PreparedManifest {
+        dir: dir.to_owned(),
+        tmp_owned: false,
+        prev_copy_error: None,
     };
-    #[cfg(feature = "fault-injection")]
-    exit_at_manifest_replace(CommitPhase::BeforeReplace);
-    #[cfg(feature = "fault-injection")]
-    panic_at_manifest_replace(CommitPhase::BeforeReplace);
-    fs::rename(&tmp, &target).map_err(|source| CommitError::before(&target, source))?;
-    *replaced = true;
-    #[cfg(feature = "fault-injection")]
-    record_fs(FsAction::Rename, &target);
-    #[cfg(feature = "fault-injection")]
-    exit_at_manifest_replace(CommitPhase::AfterReplace);
-    #[cfg(feature = "fault-injection")]
-    panic_at_manifest_replace(CommitPhase::AfterReplace);
-    #[cfg(feature = "fault-injection")]
-    if FAIL_NEXT_MANIFEST_DIR_SYNC.with(|flag| flag.replace(false)) {
-        return Err(CommitError::after(
-            dir,
-            io::Error::other("injected manifest directory sync failure"),
-        ));
+    let result =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| prepared.prepare(manifest)));
+    match result {
+        Ok(Ok(())) => Ok(prepared),
+        Ok(Err(error)) => Err(prepared.abort(error)),
+        Err(payload) => {
+            let error = CommitError::before(
+                &dir.join("manifest.json.tmp"),
+                io::Error::other(format!(
+                    "manifest preparation panicked: {}",
+                    crate::error::panic_description(payload.as_ref())
+                )),
+            );
+            Err(prepared.abort(error))
+        }
     }
-    sync_dir(dir).map_err(|source| CommitError::after(dir, source))?;
-    Ok(ManifestCommit { prev_copy_error })
+}
+
+impl PreparedManifest {
+    pub fn tmp_path(&self) -> PathBuf {
+        self.dir.join("manifest.json.tmp")
+    }
+
+    fn prepare(&mut self, manifest: &Manifest) -> Result<(), CommitError> {
+        let target = self.dir.join("manifest.json");
+        let prev = self.dir.join("manifest.json.prev");
+        let tmp = self.tmp_path();
+        let bytes = manifest
+            .to_bytes()
+            .map_err(|e| CommitError::before(&tmp, io::Error::other(e)))?;
+        let target_exists = regular_optional(&target)?;
+        if target_exists {
+            regular_optional(&prev)?;
+        }
+        if regular_optional(&tmp)? {
+            fs::remove_file(&tmp).map_err(|e| CommitError::before(&tmp, e))?;
+        }
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+            .map_err(|e| CommitError::before(&tmp, e))?;
+        self.tmp_owned = true;
+        #[cfg(feature = "fault-injection")]
+        super::index_intent::fault(super::index_intent::IndexPoint::ManifestWrite)
+            .map_err(|e| CommitError::before(&tmp, e))?;
+        file.write_all(&bytes)
+            .map_err(|e| CommitError::before(&tmp, e))?;
+        #[cfg(feature = "fault-injection")]
+        super::index_intent::fault(super::index_intent::IndexPoint::ManifestSync)
+            .map_err(|e| CommitError::before(&tmp, e))?;
+        sync_file(&file, &tmp).map_err(|e| CommitError::before(&tmp, e))?;
+        drop(file);
+        if target_exists {
+            self.prev_copy_error = fs::copy(target, prev).err();
+        }
+        Ok(())
+    }
+
+    pub fn replace(&mut self) -> Result<ManifestCommit, CommitError> {
+        let mut replaced = false;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let target = self.dir.join("manifest.json");
+            #[cfg(feature = "fault-injection")]
+            exit_at_manifest_replace(CommitPhase::BeforeReplace);
+            #[cfg(feature = "fault-injection")]
+            panic_at_manifest_replace(CommitPhase::BeforeReplace);
+            fs::rename(self.tmp_path(), &target).map_err(|e| CommitError::before(&target, e))?;
+            replaced = true;
+            self.tmp_owned = false;
+            #[cfg(feature = "fault-injection")]
+            record_fs(FsAction::Rename, &target);
+            #[cfg(feature = "fault-injection")]
+            exit_at_manifest_replace(CommitPhase::AfterReplace);
+            #[cfg(feature = "fault-injection")]
+            panic_at_manifest_replace(CommitPhase::AfterReplace);
+            #[cfg(feature = "fault-injection")]
+            if FAIL_NEXT_MANIFEST_DIR_SYNC.with(|flag| flag.replace(false)) {
+                return Err(CommitError::after(
+                    &self.dir,
+                    io::Error::other("injected manifest directory sync failure"),
+                ));
+            }
+            sync_dir(&self.dir).map_err(|e| CommitError::after(&self.dir, e))?;
+            Ok(ManifestCommit {
+                prev_copy_error: self.prev_copy_error.take(),
+            })
+        }));
+        match result {
+            Ok(result) => result,
+            Err(payload) => Err(CommitError {
+                path: self.dir.join("manifest.json"),
+                phase: if replaced {
+                    CommitPhase::AfterReplace
+                } else {
+                    CommitPhase::BeforeReplace
+                },
+                source: io::Error::other(format!(
+                    "manifest commit panicked: {}",
+                    crate::error::panic_description(payload.as_ref())
+                )),
+            }),
+        }
+    }
+
+    pub fn cleanup(&mut self) -> io::Result<()> {
+        if self.tmp_owned {
+            let tmp = self.tmp_path();
+            match fs::remove_file(&tmp) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+            self.tmp_owned = false;
+        }
+        Ok(())
+    }
+
+    fn abort(&mut self, mut error: CommitError) -> CommitError {
+        if let Err(cleanup) = self.cleanup() {
+            error.source = io::Error::other(format!(
+                "{}; manifest tmp cleanup failed: {cleanup}",
+                error.source
+            ));
+        }
+        error
+    }
+}
+
+impl Drop for PreparedManifest {
+    fn drop(&mut self) {
+        if let Err(error) = self.cleanup() {
+            eprintln!(
+                "manifest tmp cleanup failed for {:?}: {error}",
+                self.tmp_path()
+            );
+        }
+    }
+}
+
+fn regular_optional(path: &Path) -> Result<bool, CommitError> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_file() => Ok(true),
+        Ok(_) => Err(CommitError::before(
+            path,
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "manifest path is not a regular file",
+            ),
+        )),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(CommitError::before(path, e)),
+    }
 }
 
 #[cfg(test)]

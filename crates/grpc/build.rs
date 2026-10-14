@@ -19,6 +19,7 @@ const IMPLEMENTED_METHODS: &[&str] = &[
     "ShowCollections",
     "GetCollectionStatistics",
     "CreateIndex",
+    "DropIndex",
     "DescribeIndex",
     "LoadCollection",
     "ReleaseCollection",

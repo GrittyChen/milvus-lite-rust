@@ -76,6 +76,57 @@ pub struct IndexSpec {
     pub search_params: Map<String, Value>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) enum IndexChange {
+    Create(IndexSpec),
+    Drop(Vec<IndexSpec>),
+}
+
+impl IndexChange {
+    pub(crate) fn specs(&self) -> &[IndexSpec] {
+        match self {
+            Self::Create(spec) => std::slice::from_ref(spec),
+            Self::Drop(specs) => specs,
+        }
+    }
+    pub(crate) fn operation(&self) -> &'static str {
+        match self {
+            Self::Create(_) => "create_index",
+            Self::Drop(_) => "drop_index",
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct SidecarName<'a> {
+    pub source_stem: &'a str,
+    pub field_name: &'a str,
+    pub index_type: &'a str,
+    pub extension: &'a str,
+}
+
+pub(crate) fn parse_sidecar_name(name: &str) -> Option<SidecarName<'_>> {
+    let extension = if name.ends_with(".idx") {
+        ".idx"
+    } else if name.ends_with(".sidx") {
+        ".sidx"
+    } else {
+        return None;
+    };
+    let base = name.strip_suffix(extension)?;
+    let (stem_field, index_type) = base.rsplit_once('.')?;
+    let (source_stem, field_name) = stem_field.rsplit_once('.')?;
+    if source_stem.is_empty() || field_name.is_empty() || index_type.is_empty() {
+        return None;
+    }
+    Some(SidecarName {
+        source_stem,
+        field_name,
+        index_type,
+        extension,
+    })
+}
+
 /// 3.x 识别的向量索引类型（`index/factory.py`），用于拒绝在标量字段上建向量索引。
 const KNOWN_VECTOR_INDEX_TYPES: [&str; 9] = [
     "AUTOINDEX",
@@ -90,10 +141,18 @@ const KNOWN_VECTOR_INDEX_TYPES: [&str; 9] = [
 ];
 const KNOWN_SCALAR_INDEX_TYPES: [&str; 5] = ["INVERTED", "BITMAP", "STL_SORT", "TRIE", "NGRAM"];
 const SPEC_METRICS: [&str; 5] = ["COSINE", "L2", "IP", "BM25", "NONE"];
-/// FLAT 阶段在稠密向量字段上原生支持的类型（0002「结论」）；AUTOINDEX 按 FLAT 执行。
-const FLAT_STAGE_VECTOR_TYPES: [&str; 3] = ["FLAT", "BRUTE_FORCE", "AUTOINDEX"];
+/// 接受 3.x 可构建的稠密向量定义；实际检索保持 FLAT（0014）。
+const ACCEPTED_DENSE_INDEX_TYPES: [&str; 7] = [
+    "FLAT",
+    "BRUTE_FORCE",
+    "AUTOINDEX",
+    "HNSW",
+    "HNSW_SQ",
+    "IVF_FLAT",
+    "IVF_SQ8",
+];
 
-/// 按 3.x `Collection.create_index` 的顺序校验，再按 FLAT 阶段的规则收窄。
+/// 按 3.x `Collection.create_index` 的顺序校验，再拒绝本阶段无法写出的类型。
 /// 调用方已检查「索引已存在」与「字段不存在」。
 pub(crate) fn build_spec(field: &FieldSchema, req: IndexRequest) -> Result<IndexSpec> {
     let index_type = req.index_type.to_uppercase();
@@ -123,23 +182,32 @@ pub(crate) fn build_spec(field: &FieldSchema, req: IndexRequest) -> Result<Index
         )));
     }
 
-    // 以上都是 3.x 会接受的定义；下面是 FLAT 阶段的限制（0002「结论」、0004「范围」）。
-    if field.data_type.is_vector() {
-        if !FLAT_STAGE_VECTOR_TYPES.contains(&index_type.as_str()) {
-            return Err(EngineError::unsupported(
-                "vector index type",
-                format!(
-                    "index_type {} is not supported in this build of milvus-lite-rust yet; \
-                     supported: FLAT, BRUTE_FORCE, AUTOINDEX (executed as FLAT)",
-                    py_repr(&index_type)
-                ),
-            ));
-        }
-    } else {
+    // 3.x 的必装 FAISS 后端（含 AUTOINDEX → HNSW）只构建这三种度量。
+    // 先保留 IndexSpec 的原有校验，再拒绝能解析、但切回 3.x 无法 load 的组合。
+    if field.data_type.is_vector()
+        && matches!(
+            index_type.as_str(),
+            "AUTOINDEX" | "HNSW" | "HNSW_SQ" | "IVF_FLAT" | "IVF_SQ8"
+        )
+        && !matches!(metric_type.as_str(), "COSINE" | "L2" | "IP")
+    {
         return Err(EngineError::unsupported(
-            "scalar index",
+            "vector index metric",
             format!(
-                "index_type {} on scalar fields is not supported in this build of milvus-lite-rust yet",
+                "index_type {} requires COSINE / L2 / IP for compatibility with 3.x; got {}",
+                py_repr(&index_type),
+                py_repr(&metric_type)
+            ),
+        ));
+    }
+
+    // 3.x 会保存无法构建的定义；本实现只写它能构建的类型（0002 约束 1、0014）。
+    if field.data_type.is_vector() && !ACCEPTED_DENSE_INDEX_TYPES.contains(&index_type.as_str()) {
+        return Err(EngineError::unsupported(
+            "vector index type",
+            format!(
+                "index_type {} is not supported in this build of milvus-lite-rust yet; \
+                     supported: FLAT, BRUTE_FORCE, AUTOINDEX, HNSW, HNSW_SQ, IVF_FLAT, IVF_SQ8 (executed as FLAT)",
                 py_repr(&index_type)
             ),
         ));
@@ -243,7 +311,16 @@ mod tests {
 
     #[test]
     fn flat_stage_vector_types_are_accepted_and_uppercased() {
-        for t in ["FLAT", "flat", "BRUTE_FORCE", "AUTOINDEX"] {
+        for t in [
+            "FLAT",
+            "flat",
+            "BRUTE_FORCE",
+            "AUTOINDEX",
+            "HNSW",
+            "HNSW_SQ",
+            "IVF_FLAT",
+            "IVF_SQ8",
+        ] {
             let spec = build_spec(&vector(), req(t, Some("L2"))).unwrap();
             assert_eq!(spec.index_type, t.to_uppercase());
             assert_eq!(spec.metric_type, "L2");
@@ -265,12 +342,70 @@ mod tests {
     }
 
     #[test]
-    fn non_flat_vector_types_are_unsupported() {
-        for t in ["HNSW", "IVF_FLAT", "FOO"] {
+    fn faiss_definitions_only_accept_buildable_metrics() {
+        for kind in ["AUTOINDEX", "HNSW", "HNSW_SQ", "IVF_FLAT", "IVF_SQ8"] {
+            for metric in ["BM25", "NONE"] {
+                assert!(
+                    matches!(
+                        build_spec(&vector(), req(&kind.to_lowercase(), Some(metric))),
+                        Err(EngineError::Unsupported { .. })
+                    ),
+                    "{kind}/{metric}"
+                );
+            }
+            for metric in ["COSINE", "L2", "IP"] {
+                let spec = build_spec(&vector(), req(kind, Some(metric))).unwrap();
+                assert_eq!(spec.metric_type, metric);
+            }
+            assert_eq!(
+                err(&vector(), req(kind, None)).to_string(),
+                "create_index missing required 'metric_type' parameter"
+            );
+            assert!(matches!(
+                err(&vector(), req(kind, Some("bad"))),
+                EngineError::InvalidArgument(_)
+            ));
+        }
+        for kind in ["FLAT", "BRUTE_FORCE"] {
+            for metric in SPEC_METRICS {
+                assert_eq!(
+                    build_spec(&vector(), req(kind, Some(metric)))
+                        .unwrap()
+                        .metric_type,
+                    metric
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unbuildable_vector_types_remain_unsupported() {
+        for t in ["IVF_PQ", "DISKANN", "INVERTED", "FOO"] {
             assert!(matches!(
                 err(&vector(), req(t, Some("L2"))),
                 EngineError::Unsupported { .. }
             ));
+        }
+    }
+
+    #[test]
+    fn inverted_accepts_all_supported_scalar_types_without_changing_parameters() {
+        for data_type in [
+            DataType::Int8,
+            DataType::Int16,
+            DataType::Int32,
+            DataType::Int64,
+            DataType::Float,
+            DataType::Double,
+            DataType::VarChar,
+            DataType::Bool,
+        ] {
+            let mut request = req("inverted", Some(""));
+            request.params.insert("value".into(), 1.into());
+            let spec = build_spec(&FieldSchema::new("s", data_type), request).unwrap();
+            assert_eq!(spec.index_type, "INVERTED");
+            assert_eq!(spec.metric_type, "NONE");
+            assert_eq!(spec.params["value"], 1);
         }
     }
 
@@ -294,9 +429,9 @@ mod tests {
             err(&j, req("INVERTED", None)).to_string(),
             "field type JSON does not support scalar index"
         );
-        assert!(matches!(
-            err(&t, req("INVERTED", None)),
-            EngineError::Unsupported { .. }
-        ));
+        assert_eq!(
+            build_spec(&t, req("INVERTED", None)).unwrap().metric_type,
+            "NONE"
+        );
     }
 }

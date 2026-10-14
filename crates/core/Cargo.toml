@@ -11,6 +11,7 @@ publish.workspace = true
 fault-injection = []
 
 [dependencies]
+libc.workspace = true
 arrow-array.workspace = true
 arrow-ipc.workspace = true
 arrow-schema.workspace = true
@@ -26,3 +27,7 @@ tempfile = "3.27.0"
 
 [lints]
 workspace = true
+
+[[example]]
+name = "index_change_fault"
+required-features = ["fault-injection"]

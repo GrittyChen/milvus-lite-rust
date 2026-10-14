@@ -11,6 +11,7 @@ license = "Apache-2.0"
 publish = false
 
 [workspace.dependencies]
+libc = "0.2"
 arrow-array = "~60.0"
 arrow-ipc = "~60.0"
 arrow-schema = "~60.0"

@@ -6,18 +6,18 @@
 
 | 状态 | 含义 | 条数 |
 | --- | --- | --- |
-| 已复制 | 原样复制到本目录 | 122 |
-| 改后复制 | 仅按 0004「验收」第 2 项与 0006 第 25 项授权的条件替换，逐条说明改动 | 46 |
-| 范围外 | 用到当前切片不支持的功能，不复制；未实现能力的代表性入口见「范围外功能的 `UNIMPLEMENTED` 断言」 | 127 |
+| 已复制 | 原样复制到本目录 | 172 |
+| 改后复制 | 仅按 0004「验收」第 2 项与 0006 第 25 项授权的条件替换，逐条说明改动 | 0 |
+| 范围外 | 用到当前切片不支持的功能，不复制；未实现能力的代表性入口见「范围外功能的 `UNIMPLEMENTED` 断言」 | 123 |
 | 待复用 | S1 已解除原过滤阻断，尚须核对 fixture 并迁移；不计入已运行套件 | 0 |
 | 依赖内部模块 | 导入或使用 3.x 的内部模块、内部对象，换成本实现后无法运行 | 33 |
 | 不运行 | 上游被同名定义覆盖，上游自己也不运行 | 1 |
 
 以上是逐条列出的 23 个文件中的 329 条；其余 24 个文件的 308 条整个文件记一行原因，见「整个文件不复用的文件」。
 
-「已复制」与「改后复制」共 168 个用例函数，参数化展开后 182 条。S1 恢复 [test_grpc_crud.py](test_grpc_crud.py) 中的原过滤表达式，并纳入除 LIKE 外的全部 19 条；它们在本实现与真实 3.x 上的两条客户端线均作为 S1 验收。随后迁移全部 40 条待复用用例，恢复此前为绕过过滤限制而替换的原表达式；顶层动态字段切片另加入原样的 TestDynamicField 用例。HNSW→FLAT 的授权替换继续逐条登记。
+「已复制」与「改后复制」共 172 个用例函数，参数化展开后 186 条。S1 恢复 [test_grpc_crud.py](test_grpc_crud.py) 中的原过滤表达式，并纳入除 LIKE 外的全部 19 条；它们在本实现与真实 3.x 上的两条客户端线均作为 S1 验收。随后迁移全部 40 条待复用用例，恢复此前为绕过过滤限制而替换的原表达式；顶层动态字段切片另加入原样的 TestDynamicField 用例。0014 已恢复原 HNSW 定义，并新增创建 HNSW、DropIndex 和 describe 参数的原用例；检索仍按 FLAT 执行。
 
-HNSW 换成 FLAT、`== N` 换成 `in [N]` 的条件见 0004「验收」第 2 项及 0006 第 25 项。已接通 S1 的 CRUD 副本不再替换表达式或读回方式。其余副本只删去随范围外用例一起不再使用的 import、helper 与空的分节标题；上游用于跳过的 `importorskip` 改为直接导入（本仓不允许因缺依赖静默跳过），上游因 HNSW 需要 faiss 而加的 `skipif` 随 HNSW 一起去掉。起服务的 fixture 与清理见 [conftest.py](conftest.py)。
+历史的 HNSW→FLAT 授权替换按 0014 恢复原定义；`== N` 换成 `in [N]` 的条件见 0004「验收」第 2 项及 0006 第 25 项。已接通 S1 的 CRUD 副本不再替换表达式或读回方式。其余副本只删去随范围外用例一起不再使用的 import、helper 与空的分节标题；上游用于跳过的 `importorskip` 改为直接导入（本仓不允许因缺依赖静默跳过），上游因 HNSW 需要 faiss 而加的 `skipif` 随 HNSW 一起去掉。起服务的 fixture 与清理见 [conftest.py](conftest.py)。
 
 ## 逐条列出的文件
 
@@ -78,29 +78,29 @@ HNSW 换成 FLAT、`== N` 换成 `in [N]` 的条件见 0004「验收」第 2 项
 
 ### [test_grpc_search.py](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_search.py)（0004 候选文件）
 
-15 条：已复制 2，改后复制 11，范围外 1，不运行 1。
+15 条：已复制 13，范围外 1。
 
 | 用例 | 状态 | 说明 |
 | --- | --- | --- |
-| [`test_search_returns_top_k`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_search.py#L69) | 改后复制 | HNSW 换成 FLAT |
-| [`test_search_multiple_queries`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_search.py#L77) | 改后复制 | HNSW 换成 FLAT |
-| [`test_search_self_query_returns_self_top1`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_search.py#L91) | 改后复制 | HNSW 换成 FLAT |
-| [`test_search_with_output_fields`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_search.py#L105) | 改后复制 | HNSW 换成 FLAT |
-| [`test_search_default_output_fields_is_empty`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_search.py#L117) | 改后复制 | HNSW 换成 FLAT |
-| [`test_search_with_filter_active_only`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_search.py#L132) | 改后复制 | HNSW 换成 FLAT |
-| [`test_search_with_complex_filter`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_search.py#L144) | 改后复制 | HNSW 换成 FLAT |
-| [`test_search_with_filter_no_match`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_search.py#L157) | 改后复制 | HNSW 换成 FLAT |
+| [`test_search_returns_top_k`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_search.py#L69) | 已复制 | 恢复 HNSW 原定义（0014，按 FLAT 执行，无需 faiss） |
+| [`test_search_multiple_queries`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_search.py#L77) | 已复制 | 恢复 HNSW 原定义（0014，按 FLAT 执行，无需 faiss） |
+| [`test_search_self_query_returns_self_top1`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_search.py#L91) | 已复制 | 恢复 HNSW 原定义（0014，按 FLAT 执行，无需 faiss） |
+| [`test_search_with_output_fields`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_search.py#L105) | 已复制 | 恢复 HNSW 原定义（0014，按 FLAT 执行，无需 faiss） |
+| [`test_search_default_output_fields_is_empty`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_search.py#L117) | 已复制 | 恢复 HNSW 原定义（0014，按 FLAT 执行，无需 faiss） |
+| [`test_search_with_filter_active_only`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_search.py#L132) | 已复制 | 恢复 HNSW 原定义（0014，按 FLAT 执行，无需 faiss） |
+| [`test_search_with_complex_filter`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_search.py#L144) | 已复制 | 恢复 HNSW 原定义（0014，按 FLAT 执行，无需 faiss） |
+| [`test_search_with_filter_no_match`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_search.py#L157) | 已复制 | 恢复 HNSW 原定义（0014，按 FLAT 执行，无需 faiss） |
 | [`test_search_after_release_raises`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_search.py#L171) | 不运行 | 被 [L184](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_search.py#L184) 的同名定义覆盖，上游也不运行 |
-| [`test_search_after_release_raises`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_search.py#L184) | 改后复制 | HNSW 换成 FLAT |
+| [`test_search_after_release_raises`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_search.py#L184) | 已复制 | 恢复 HNSW 原定义（0014，按 FLAT 执行，无需 faiss） |
 | [`test_search_unknown_collection_raises`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_search.py#L190) | 已复制 |  |
 | [`test_search_brute_force_backend`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_search.py#L199) | 已复制 |  |
-| [`test_search_distances_returned`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_search.py#L218) | 改后复制 | HNSW 换成 FLAT |
-| [`test_search_results_sorted_by_cosine_score_descending`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_search.py#L227) | 改后复制 | HNSW 换成 FLAT |
+| [`test_search_distances_returned`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_search.py#L218) | 已复制 | 恢复 HNSW 原定义（0014，按 FLAT 执行，无需 faiss） |
+| [`test_search_results_sorted_by_cosine_score_descending`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_search.py#L227) | 已复制 | 恢复 HNSW 原定义（0014，按 FLAT 执行，无需 faiss） |
 | [`test_hnsw_search_recall_against_brute_force`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_search.py#L245) | 范围外 | 写入 1 万行，3.x 会 flush 并真正建出 HNSW |
 
 ### [test_grpc_server_startup.py](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_server_startup.py)（0004 候选文件）
 
-6 条：已复制 4，依赖内部模块 2。
+6 条：已复制 4。
 
 | 用例 | 状态 | 说明 |
 | --- | --- | --- |
@@ -113,7 +113,7 @@ HNSW 换成 FLAT、`== N` 换成 `in [N]` 的条件见 0004「验收」第 2 项
 
 ### [test_auto_id.py](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_auto_id.py)（0004 候选文件）
 
-12 条：已复制 4，依赖内部模块 8。
+12 条：已复制 4。
 
 | 用例 | 状态 | 说明 |
 | --- | --- | --- |
@@ -132,16 +132,16 @@ HNSW 换成 FLAT、`== N` 换成 `in [N]` 的条件见 0004「验收」第 2 项
 
 ### [test_grpc_quickstart.py](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_quickstart.py)（0004 候选文件）
 
-2 条：改后复制 1，范围外 1。
+2 条：已复制 1，范围外 1。
 
 | 用例 | 状态 | 说明 |
 | --- | --- | --- |
 | [`test_pymilvus_quickstart`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_quickstart.py#L26) | 范围外 | 过滤表达式（`score > 0.5`）、delete、分区、flush、HNSW |
-| [`test_quickstart_multi_query_search`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_quickstart.py#L146) | 改后复制 | HNSW 换成 FLAT |
+| [`test_quickstart_multi_query_search`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_quickstart.py#L146) | 已复制 | 恢复 HNSW 原定义（0014，按 FLAT 执行，无需 faiss） |
 
 ### [test_grpc_error_mapping.py](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_error_mapping.py)（0004 候选文件）
 
-9 条：已复制 2，范围外 2，依赖内部模块 5。
+9 条：已复制 2，范围外 2。
 
 | 用例 | 状态 | 说明 |
 | --- | --- | --- |
@@ -199,7 +199,7 @@ HNSW 换成 FLAT、`== N` 换成 `in [N]` 的条件见 0004「验收」第 2 项
 
 ### [test_function_chain.py](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_function_chain.py)
 
-22 条：已复制 1，范围外 15，依赖内部模块 6。
+22 条：已复制 1，范围外 15。
 
 | 用例 | 状态 | 说明 |
 | --- | --- | --- |
@@ -228,26 +228,26 @@ HNSW 换成 FLAT、`== N` 换成 `in [N]` 的条件见 0004「验收」第 2 项
 
 ### [test_grpc_index.py](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_index.py)
 
-18 条：已复制 4，改后复制 9，范围外 5。
+18 条：已复制 17，范围外 1。
 
 | 用例 | 状态 | 说明 |
 | --- | --- | --- |
-| [`test_create_index_hnsw`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_index.py#L66) | 范围外 | 断言索引类型为 HNSW |
+| [`test_create_index_hnsw`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_index.py#L66) | 已复制 | 0014 接入索引定义与 DropIndex；错误码由差分及翻译测试补充验证 |
 | [`test_create_index_brute_force`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_index.py#L73) | 已复制 |  |
-| [`test_create_index_duplicate_raises`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_index.py#L80) | 改后复制 | HNSW 换成 FLAT |
-| [`test_create_index_unknown_collection_raises`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_index.py#L87) | 改后复制 | HNSW 换成 FLAT |
-| [`test_create_index_metric_round_trip`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_index.py#L92) | 改后复制 | HNSW 换成 FLAT |
-| [`test_drop_index`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_index.py#L101) | 范围外 | DropIndex、HNSW |
-| [`test_drop_index_unknown_raises`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_index.py#L111) | 范围外 | DropIndex；只断言抛出异常，`UNIMPLEMENTED` 也会通过（3.x 为 code 700） |
+| [`test_create_index_duplicate_raises`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_index.py#L80) | 已复制 | 恢复 HNSW 原定义（0014，按 FLAT 执行，无需 faiss） |
+| [`test_create_index_unknown_collection_raises`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_index.py#L87) | 已复制 | 恢复 HNSW 原定义（0014，按 FLAT 执行，无需 faiss） |
+| [`test_create_index_metric_round_trip`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_index.py#L92) | 已复制 | 恢复 HNSW 原定义（0014，按 FLAT 执行，无需 faiss） |
+| [`test_drop_index`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_index.py#L101) | 已复制 | 0014 接入索引定义与 DropIndex；错误码由差分及翻译测试补充验证 |
+| [`test_drop_index_unknown_raises`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_index.py#L111) | 已复制 | 0014 接入索引定义与 DropIndex；错误码由差分及翻译测试补充验证 |
 | [`test_load_state_before_create_index`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_index.py#L122) | 已复制 |  |
-| [`test_load_state_after_create_index_is_loaded`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_index.py#L131) | 改后复制 | HNSW 换成 FLAT |
-| [`test_load_collection`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_index.py#L137) | 改后复制 | HNSW 换成 FLAT |
-| [`test_release_collection`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_index.py#L143) | 改后复制 | HNSW 换成 FLAT |
-| [`test_load_release_cycle`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_index.py#L150) | 改后复制 | HNSW 换成 FLAT |
+| [`test_load_state_after_create_index_is_loaded`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_index.py#L131) | 已复制 | 恢复 HNSW 原定义（0014，按 FLAT 执行，无需 faiss） |
+| [`test_load_collection`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_index.py#L137) | 已复制 | 恢复 HNSW 原定义（0014，按 FLAT 执行，无需 faiss） |
+| [`test_release_collection`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_index.py#L143) | 已复制 | 恢复 HNSW 原定义（0014，按 FLAT 执行，无需 faiss） |
+| [`test_load_release_cycle`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_index.py#L150) | 已复制 | 恢复 HNSW 原定义（0014，按 FLAT 执行，无需 faiss） |
 | [`test_get_load_state_unknown_collection`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_index.py#L158) | 已复制 |  |
-| [`test_describe_index_returns_params`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_index.py#L169) | 范围外 | 断言 HNSW 的索引类型与参数 |
-| [`test_describe_index_state_is_finished`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_index.py#L176) | 改后复制 | HNSW 换成 FLAT |
-| [`test_describe_index_name_matches_field_name`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_index.py#L183) | 改后复制 | HNSW 换成 FLAT |
+| [`test_describe_index_returns_params`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_index.py#L169) | 已复制 | 0014 接入索引定义与 DropIndex；错误码由差分及翻译测试补充验证 |
+| [`test_describe_index_state_is_finished`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_index.py#L176) | 已复制 | 恢复 HNSW 原定义（0014，按 FLAT 执行，无需 faiss） |
+| [`test_describe_index_name_matches_field_name`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_index.py#L183) | 已复制 | 恢复 HNSW 原定义（0014，按 FLAT 执行，无需 faiss） |
 | [`test_describe_index_empty_when_no_index`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_index.py#L190) | 已复制 |  |
 | [`test_create_scalar_inverted_index_query_and_search`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_index.py#L196) | 范围外 | 过滤表达式（`age >= 20`）、flush、标量索引、nullable |
 
@@ -266,7 +266,7 @@ HNSW 换成 FLAT、`== N` 换成 `in [N]` 的条件见 0004「验收」第 2 项
 
 ### [test_issue_19_20.py](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_issue_19_20.py)
 
-10 条：已复制 6，依赖内部模块 4。
+10 条：已复制 6。
 
 | 用例 | 状态 | 说明 |
 | --- | --- | --- |
@@ -283,7 +283,7 @@ HNSW 换成 FLAT、`== N` 换成 `in [N]` 的条件见 0004「验收」第 2 项
 
 ### [test_issue_fixes.py](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_issue_fixes.py)
 
-9 条：已复制 5，范围外 2，依赖内部模块 2。
+9 条：已复制 5，范围外 2。
 
 | 用例 | 状态 | 说明 |
 | --- | --- | --- |
@@ -299,42 +299,42 @@ HNSW 换成 FLAT、`== N` 换成 `in [N]` 的条件见 0004「验收」第 2 项
 
 ### [test_milvus_compat.py](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py)
 
-40 条：已复制 5，改后复制 25，范围外 10。
+40 条：已复制 30，范围外 10。
 
 | 用例 | 状态 | 说明 |
 | --- | --- | --- |
-| [`TestInsert::test_insert_and_count`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L88) | 改后复制 | HNSW 换成 FLAT |
+| [`TestInsert::test_insert_and_count`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L88) | 已复制 | 恢复 HNSW 原定义（0014，按 FLAT 执行，无需 faiss） |
 | [`TestInsert::test_insert_string_pk`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L94) | 已复制 |  |
-| [`TestInsert::test_insert_multiple_batches`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L104) | 改后复制 | HNSW 换成 FLAT |
-| [`TestSearch::test_search_basic`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L127) | 改后复制 | HNSW 换成 FLAT |
-| [`TestSearch::test_search_self_query_l2`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L135) | 改后复制 | HNSW 换成 FLAT |
-| [`TestSearch::test_search_metric_types`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L145) | 改后复制 | HNSW 换成 FLAT |
-| [`TestSearch::test_search_with_filter_int`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L152) | 改后复制 | HNSW 换成 FLAT |
-| [`TestSearch::test_search_with_filter_bool`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L164) | 改后复制 | HNSW 换成 FLAT |
+| [`TestInsert::test_insert_multiple_batches`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L104) | 已复制 | 恢复 HNSW 原定义（0014，按 FLAT 执行，无需 faiss） |
+| [`TestSearch::test_search_basic`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L127) | 已复制 | 恢复 HNSW 原定义（0014，按 FLAT 执行，无需 faiss） |
+| [`TestSearch::test_search_self_query_l2`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L135) | 已复制 | 恢复 HNSW 原定义（0014，按 FLAT 执行，无需 faiss） |
+| [`TestSearch::test_search_metric_types`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L145) | 已复制 | 恢复 HNSW 原定义（0014，按 FLAT 执行，无需 faiss） |
+| [`TestSearch::test_search_with_filter_int`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L152) | 已复制 | 恢复 HNSW 原定义（0014，按 FLAT 执行，无需 faiss） |
+| [`TestSearch::test_search_with_filter_bool`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L164) | 已复制 | 恢复 HNSW 原定义（0014，按 FLAT 执行，无需 faiss） |
 | [`TestSearch::test_search_with_filter_varchar_like`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L176) | 范围外 | 过滤表达式（`varchar like "str_01%"`）、HNSW |
 | [`TestSearch::test_search_with_filter_and_or`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L188) | 范围外 | 过滤表达式（`id >= 100 and (bool_field == true or float_field < 50.0)`）、HNSW |
-| [`TestSearch::test_search_with_filter_in`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L202) | 改后复制 | HNSW 换成 FLAT |
+| [`TestSearch::test_search_with_filter_in`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L202) | 已复制 | 恢复 HNSW 原定义（0014，按 FLAT 执行，无需 faiss） |
 | [`TestSearch::test_search_with_filter_not`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L215) | 范围外 | 过滤表达式（`not (id < 100)`）、HNSW |
-| [`TestSearch::test_search_multi_query`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L227) | 改后复制 | HNSW 换成 FLAT |
-| [`TestSearch::test_search_with_output_fields`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L237) | 改后复制 | HNSW 换成 FLAT |
-| [`TestSearch::test_search_results_sorted_by_cosine_score_descending`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L249) | 改后复制 | HNSW 换成 FLAT |
-| [`TestQuery::test_query_all`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L263) | 改后复制 | HNSW 换成 FLAT |
-| [`TestQuery::test_query_with_limit`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L269) | 改后复制 | HNSW 换成 FLAT |
-| [`TestQuery::test_query_id_in_list`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L275) | 改后复制 | HNSW 换成 FLAT |
-| [`TestQuery::test_query_range_expression`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L285) | 改后复制 | HNSW 换成 FLAT |
+| [`TestSearch::test_search_multi_query`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L227) | 已复制 | 恢复 HNSW 原定义（0014，按 FLAT 执行，无需 faiss） |
+| [`TestSearch::test_search_with_output_fields`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L237) | 已复制 | 恢复 HNSW 原定义（0014，按 FLAT 执行，无需 faiss） |
+| [`TestSearch::test_search_results_sorted_by_cosine_score_descending`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L249) | 已复制 | 恢复 HNSW 原定义（0014，按 FLAT 执行，无需 faiss） |
+| [`TestQuery::test_query_all`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L263) | 已复制 | 恢复 HNSW 原定义（0014，按 FLAT 执行，无需 faiss） |
+| [`TestQuery::test_query_with_limit`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L269) | 已复制 | 恢复 HNSW 原定义（0014，按 FLAT 执行，无需 faiss） |
+| [`TestQuery::test_query_id_in_list`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L275) | 已复制 | 恢复 HNSW 原定义（0014，按 FLAT 执行，无需 faiss） |
+| [`TestQuery::test_query_range_expression`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L285) | 已复制 | 恢复 HNSW 原定义（0014，按 FLAT 执行，无需 faiss） |
 | [`TestQuery::test_query_varchar_like_prefix`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L296) | 范围外 | 过滤表达式（`varchar like "str_00%"`）、HNSW |
-| [`TestQuery::test_query_bool_filter`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L308) | 改后复制 | HNSW 换成 FLAT |
+| [`TestQuery::test_query_bool_filter`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L308) | 已复制 | 恢复 HNSW 原定义（0014，按 FLAT 执行，无需 faiss） |
 | [`TestQuery::test_query_not_in`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L319) | 范围外 | 过滤表达式（`id not in [0, 1, 2]`）、HNSW |
-| [`TestQuery::test_get_by_ids`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L332) | 改后复制 | HNSW 换成 FLAT |
-| [`TestQuery::test_get_missing_ids_returns_empty`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L338) | 改后复制 | HNSW 换成 FLAT |
-| [`TestQuery::test_query_output_fields_subset`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L344) | 改后复制 | HNSW 换成 FLAT |
-| [`TestDelete::test_delete_by_ids`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L361) | 改后复制 | HNSW 换成 FLAT |
-| [`TestDelete::test_delete_by_filter`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L370) | 改后复制 | HNSW 换成 FLAT |
+| [`TestQuery::test_get_by_ids`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L332) | 已复制 | 恢复 HNSW 原定义（0014，按 FLAT 执行，无需 faiss） |
+| [`TestQuery::test_get_missing_ids_returns_empty`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L338) | 已复制 | 恢复 HNSW 原定义（0014，按 FLAT 执行，无需 faiss） |
+| [`TestQuery::test_query_output_fields_subset`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L344) | 已复制 | 恢复 HNSW 原定义（0014，按 FLAT 执行，无需 faiss） |
+| [`TestDelete::test_delete_by_ids`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L361) | 已复制 | 恢复 HNSW 原定义（0014，按 FLAT 执行，无需 faiss） |
+| [`TestDelete::test_delete_by_filter`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L370) | 已复制 | 恢复 HNSW 原定义（0014，按 FLAT 执行，无需 faiss） |
 | [`TestDelete::test_delete_then_search_excludes_deleted`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L379) | 范围外 | delete、HNSW |
-| [`TestDelete::test_delete_nonexistent_pk_no_error`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L388) | 改后复制 | HNSW 换成 FLAT |
-| [`TestUpsert::test_upsert_existing_pk_overwrites`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L401) | 改后复制 | HNSW 换成 FLAT |
-| [`TestUpsert::test_upsert_new_pk_inserts`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L418) | 改后复制 | HNSW 换成 FLAT |
-| [`TestUpsert::test_upsert_multiple_times`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L435) | 改后复制 | HNSW 换成 FLAT |
+| [`TestDelete::test_delete_nonexistent_pk_no_error`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L388) | 已复制 | 恢复 HNSW 原定义（0014，按 FLAT 执行，无需 faiss） |
+| [`TestUpsert::test_upsert_existing_pk_overwrites`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L401) | 已复制 | 恢复 HNSW 原定义（0014，按 FLAT 执行，无需 faiss） |
+| [`TestUpsert::test_upsert_new_pk_inserts`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L418) | 已复制 | 恢复 HNSW 原定义（0014，按 FLAT 执行，无需 faiss） |
+| [`TestUpsert::test_upsert_multiple_times`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L435) | 已复制 | 恢复 HNSW 原定义（0014，按 FLAT 执行，无需 faiss） |
 | [`TestPartition::test_partition_lifecycle`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L459) | 范围外 | 分区 |
 | [`TestPartition::test_partition_insert_and_search_scoped`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L468) | 范围外 | 分区、HNSW |
 | [`TestIndexLifecycle::test_index_create_load_release_drop_cycle`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat.py#L507) | 范围外 | DropIndex；断言索引类型为 HNSW |
@@ -461,7 +461,7 @@ HNSW 换成 FLAT、`== N` 换成 `in [N]` 的条件见 0004「验收」第 2 项
 
 ### [test_milvus_lite_compat.py](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_lite_compat.py)
 
-7 条：已复制 6，依赖内部模块 1。
+7 条：已复制 6。
 
 | 用例 | 状态 | 说明 |
 | --- | --- | --- |
@@ -475,7 +475,7 @@ HNSW 换成 FLAT、`== N` 换成 `in [N]` 的条件见 0004「验收」第 2 项
 
 ### [test_offset.py](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_offset.py)
 
-8 条：已复制 3，依赖内部模块 5。
+8 条：已复制 3。
 
 | 用例 | 状态 | 说明 |
 | --- | --- | --- |

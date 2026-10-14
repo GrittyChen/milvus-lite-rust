@@ -683,3 +683,5 @@ M1 证明了整条链路可行，但数据只在内存中，不发布（[0004](0
 M2 的“不做 compaction”是当时冻结范围，后续首发扩展以 [0010](0010-compaction-and-tombstone-gc.md) 与 [0011](0011-committed-delete-state.md) 为准。正常关闭排空的生命周期同步到 0003；共享格式与原有失败协议保持。
 
 该扩展的差异表在 0010：单 Db 串行维护、文件大小桶的编码器影响、准备期并发 flush、create/drop 取消及异常收尾、原子合并 data/delta 提交、打开时 pins 的边界，以及歧义重复主键/序号的整轮拒绝。原保守最大删除表的 20% 残留已触发负责人确认的 0011；最终回收与内存结论以本轮复跑证据为准。
+
+后续索引定义与 DropIndex 的范围及差异统一见 [0014 切片 A](0014-index-definitions-and-filter-expressions.md#切片-a索引定义与-dropindex)；本文保留当时的验收范围。

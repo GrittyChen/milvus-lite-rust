@@ -60,6 +60,8 @@ def release_install_commands(version):
     }
 
 
+INDEX_INTENT_REFERENCE = "最终标记：`<data_dir>/collections/<collection>/milvus-lite-rust.index-intent.json`。"
+
 def names_this_package(text):
     # 同一行内 milvus、lite、rust 依次出现（不区分大小写）即视为引用本包名，三段之间插入的
     # 引号、转义、Markdown 与 HTML 标记或链接拆不开这一判定。已确认仓库地址本身不是安装
@@ -80,7 +82,8 @@ def check_install_commands(body, version):
             require(not re.search(r"[${}]", text), "install command check: shell expansion")
         if line in commands:
             seen.add(line)
-        elif line != "# milvus-lite-rust":
+        # 私有协议文件名含包名；只允许完整的恢复路径说明，不能夹带任何命令。
+        elif line not in {"# milvus-lite-rust", INDEX_INTENT_REFERENCE}:
             for text in (line, html.unescape(line)):
                 require(not names_this_package(text), "install command check: names this package outside the release commands")
     require(seen == commands, "install command check: missing release install command")

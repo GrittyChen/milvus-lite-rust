@@ -46,7 +46,7 @@ pub enum SnapshotError {
     Invalid { path: PathBuf, reason: String },
 }
 
-pub fn load_pins(collection_dir: &Path) -> Result<PinnedFiles, SnapshotError> {
+fn read_snapshots(collection_dir: &Path) -> Result<Vec<SnapshotMetadata>, SnapshotError> {
     let snapshots_dir = collection_dir.join("snapshots");
     match fs::symlink_metadata(&snapshots_dir) {
         Ok(meta) if meta.file_type().is_dir() => {}
@@ -57,7 +57,7 @@ pub fn load_pins(collection_dir: &Path) -> Result<PinnedFiles, SnapshotError> {
             });
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(PinnedFiles::default());
+            return Ok(Vec::new());
         }
         Err(source) => {
             return Err(SnapshotError::Io {
@@ -76,7 +76,7 @@ pub fn load_pins(collection_dir: &Path) -> Result<PinnedFiles, SnapshotError> {
             });
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(PinnedFiles::default());
+            return Ok(Vec::new());
         }
         Err(source) => {
             return Err(SnapshotError::Io {
@@ -95,6 +95,7 @@ pub fn load_pins(collection_dir: &Path) -> Result<PinnedFiles, SnapshotError> {
         }
     };
     let mut pins = PinnedFiles::default();
+    let mut snapshots = Vec::new();
     for entry in entries {
         let entry = entry.map_err(|source| SnapshotError::Io {
             path: metadata_dir.clone(),
@@ -134,6 +135,18 @@ pub fn load_pins(collection_dir: &Path) -> Result<PinnedFiles, SnapshotError> {
         }
         snap.schema_file = snap.schema_file.replace('\\', "/");
         snap.manifest_file = snap.manifest_file.replace('\\', "/");
+        // 保留每一份 snapshot 的归属信息，同时与 load_pins / 3.x _merge_refs 使用同一口径。
+        for files in [
+            &mut snap.data_files,
+            &mut snap.delta_files,
+            &mut snap.index_files,
+        ] {
+            for paths in files.values_mut() {
+                for path in paths {
+                    *path = path.replace('\\', "/");
+                }
+            }
+        }
         if !valid_rel(&snap.schema_file, "snapshots")
             || !valid_rel(&snap.manifest_file, "snapshots")
         {
@@ -145,8 +158,50 @@ pub fn load_pins(collection_dir: &Path) -> Result<PinnedFiles, SnapshotError> {
         add_map(&path, &snap.data_files, "data", &mut pins.data)?;
         add_map(&path, &snap.delta_files, "delta", &mut pins.delta)?;
         add_map(&path, &snap.index_files, "indexes", &mut pins.index)?;
+        snapshots.push(snap);
+    }
+    Ok(snapshots)
+}
+
+pub fn load_pins(collection_dir: &Path) -> Result<PinnedFiles, SnapshotError> {
+    let mut pins = PinnedFiles::default();
+    for snap in read_snapshots(collection_dir)? {
+        let path = collection_dir
+            .join("snapshots/metadata")
+            .join(format!("{}.json", snap.name));
+        add_map(&path, &snap.data_files, "data", &mut pins.data)?;
+        add_map(&path, &snap.delta_files, "delta", &mut pins.delta)?;
+        add_map(&path, &snap.index_files, "indexes", &mut pins.index)?;
     }
     Ok(pins)
+}
+
+pub(crate) fn index_snapshots(
+    collection_dir: &Path,
+) -> Result<Vec<SnapshotMetadata>, SnapshotError> {
+    read_snapshots(collection_dir)
+}
+
+pub(crate) fn manifest_copy(
+    collection_dir: &Path,
+    snap: &SnapshotMetadata,
+) -> Result<super::manifest::Manifest, String> {
+    let mut path = collection_dir.to_path_buf();
+    let parts: Vec<_> = snap.manifest_file.split('/').collect();
+    for (i, part) in parts.iter().enumerate() {
+        path.push(part);
+        let meta = fs::symlink_metadata(&path).map_err(|e| format!("{path:?}: {e}"))?;
+        if if i + 1 == parts.len() {
+            !meta.file_type().is_file()
+        } else {
+            !meta.file_type().is_dir()
+        } {
+            return Err(format!(
+                "snapshot manifest path has invalid shape: {path:?}"
+            ));
+        }
+    }
+    super::manifest::Manifest::read(&path).map_err(|e| format!("{path:?}: {e}"))
 }
 
 fn add_map(

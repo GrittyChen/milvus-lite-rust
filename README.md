@@ -78,7 +78,13 @@ finally:
 
 当前范围包括基本 CRUD、Upsert/Delete、Flush/关闭重开、FLAT 的 L2/IP/COSINE、S1 标量比较与 and、主键 in、顶层动态字段比较/in、后台 compaction 与 tombstone 回收。BM25/function chain、iterator、嵌套 JSON 等范围外能力保持明确的 UNIMPLEMENTED，不静默忽略条件。官方 3.x 数据互通仍受类型、索引与已登记历史目录限制约束，不宣称兼容它的全部功能。
 
-向量检索只有 FLAT（精确暴力检索）。新建索引时，FLAT 与 BRUTE_FORCE 原生支持，AUTOINDEX（pymilvus 快速建表使用）按 FLAT 执行；显式 ANN 类型（HNSW、HNSW_SQ、IVF_FLAT、IVF_SQ8）与标量字段上的 INVERTED 返回 UNIMPLEMENTED。打开官方 3.x 写入的目录时，HNSW、INVERTED 等定义原样保留，向量按 FLAT 执行，召回不低于 ANN 但数据量大时更慢；标量过滤按扫描执行，结果可能与官方在已建索引数据上的结果不同。官方 3.x 也无法构建的索引类型（如 IVF_PQ、DISKANN、向量字段上的 INVERTED），在 collection 尚未 load 且已有 flush 落盘的数据（包括已删除的行）时，与官方一样 load 报错；0.1.0rc1 不做这项检查，会照常 load。索引构建参数不校验：官方因参数无效而 load 失败的目录，这里仍会照常 load。
+当前发布的 `0.1.0rc2` 向量检索只有 FLAT（精确暴力检索）。新建索引时，FLAT 与 BRUTE_FORCE 原生支持，AUTOINDEX（pymilvus 快速建表使用）按 FLAT 执行；显式 ANN 类型（HNSW、HNSW_SQ、IVF_FLAT、IVF_SQ8）与标量字段上的 INVERTED 返回 UNIMPLEMENTED。打开官方 3.x 写入的目录时，HNSW、INVERTED 等定义原样保留，向量按 FLAT 执行，召回不低于 ANN 但数据量大时更慢；标量过滤按扫描执行，结果可能与官方在已建索引数据上的结果不同。官方 3.x 也无法构建的索引类型（如 IVF_PQ、DISKANN、向量字段上的 INVERTED），在 collection 尚未 load 且已有 flush 落盘的数据（包括已删除的行）时，与官方一样 load 报错；0.1.0rc1 不做这项检查，会照常 load。索引构建参数不校验：官方因参数无效而 load 失败的目录，这里仍会照常 load。
+
+当前源码另已接入 0014 切片 A（尚未发布，以上安装命令取得的 `0.1.0rc2` 不包含）：创建 HNSW、HNSW_SQ、IVF_FLAT、IVF_SQ8 与标量 INVERTED 可用，定义原样保存，向量仍按 FLAT、标量仍按扫描执行，结果与官方已建索引时可能不同。DropIndex 的名字行为与 3.x 一致：普通字段名或匹配不到的名字会删除全部索引；`<字段名>_idx` 或明确传入 field_name 才定向删除。collection 需先 release，删完全部索引后自动变为 Loaded。新建稠密向量索引时，AUTOINDEX、HNSW、HNSW_SQ、IVF_FLAT、IVF_SQ8 只接受 COSINE / L2 / IP；BM25 / NONE 返回 UNIMPLEMENTED，避免写出官方 3.x 无法 load 的定义。此限制也修正了 rc2 曾接受的 AUTOINDEX 组合；FLAT / BRUTE_FORCE 保持原行为。
+
+索引变更在旧索引文件删除落盘未确认时，会只封锁该 collection 的 CreateIndex / DropIndex。服务重开或容器重启不能证明恢复；可信的内核重启可自动解除，overlayfs、共享目录或启动来源不可信时需要人工恢复：确认承载数据目录的系统已经真实重启，停止对应服务或退出 Python 进程，删除下面列出的最终标记，再启动服务。最终标记为异常目录等条目时移出这个保留路径，不递归删内容；符号链接只移除链接本身。不要改 manifest、索引文件或 snapshot，也不要仅修改标记里的启动标识。若只是已安全操作的标记清理失败，可在**同一个服务实例内**重试，无需系统重启；实例退出后按磁盘标记重新判定，仍可能保守封锁。完整协议见源码仓库中的 0014 设计决策。
+
+最终标记：`<data_dir>/collections/<collection>/milvus-lite-rust.index-intent.json`。
 
 ## 独立 CLI server
 
