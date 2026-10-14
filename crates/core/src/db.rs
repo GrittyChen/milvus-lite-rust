@@ -357,6 +357,8 @@ impl Drop for Db {
         if self.gate.get_mut().data_dir.is_some() {
             self.finish_storage(false);
         }
+        let data_dir = self.gate.get_mut().data_dir.take();
+        self.release_data_dir(data_dir);
     }
 }
 
@@ -415,6 +417,17 @@ impl Db {
         eprintln!("{reason}");
     }
 
+    fn release_data_dir(&self, data_dir: Option<DataDir>) {
+        if let Some(data_dir) = data_dir
+            && let Err(error) = data_dir.unlock()
+        {
+            self.report_shutdown_failure(format!(
+                "cannot unlock data directory {:?}: {error}",
+                data_dir.path()
+            ));
+        }
+    }
+
     pub(crate) fn record_maintenance_shutdown_failure(&self) {
         if self.gate.lock().cleanup_started {
             self.shutdown_failed.store(true, Ordering::Release);
@@ -442,7 +455,7 @@ impl Db {
         }
         self.finish_storage(false);
         let mut gate = self.gate.lock();
-        gate.data_dir = None;
+        self.release_data_dir(gate.data_dir.take());
         self.idle.notify_all();
     }
 
@@ -475,7 +488,7 @@ impl Db {
                     db.maintenance.stop(false);
                     db.finish_storage(false);
                     let mut gate = db.gate.lock();
-                    gate.data_dir = None;
+                    db.release_data_dir(gate.data_dir.take());
                     db.idle.notify_all();
                 })
         };
@@ -489,7 +502,7 @@ impl Db {
             self.maintenance.stop(false);
             self.finish_storage(false);
             let mut gate = self.gate.lock();
-            gate.data_dir = None;
+            self.release_data_dir(gate.data_dir.take());
             self.idle.notify_all();
         }
     }
@@ -2357,6 +2370,80 @@ mod tests {
             Compute::new(std::num::NonZeroUsize::MIN).unwrap(),
         )
         .unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn all_close_paths_unlock_while_a_duplicated_descriptor_remains_open() {
+        #[cfg(not(feature = "fault-injection"))]
+        let modes = ["close", "nowait", "drop"];
+        #[cfg(feature = "fault-injection")]
+        let modes = ["close", "nowait", "drop", "spawn-failure"];
+        for mode in modes {
+            let root = tempfile::tempdir().unwrap();
+            let dir = DataDir::open(root.path()).unwrap();
+            // dup 与 fork 共享打开文件描述，保留这个引用能识别仅 close fd 的旧实现。
+            let inherited = dir.duplicate_lock_for_test().unwrap();
+            let db = Db::new(dir, Compute::new(std::num::NonZeroUsize::MIN).unwrap()).unwrap();
+            assert!(matches!(
+                DataDir::open(root.path()),
+                Err(crate::data_dir::DataDirError::Locked { .. })
+            ));
+            match mode {
+                "close" => db.close(),
+                "nowait" => {
+                    db.close_nowait();
+                    db.close();
+                }
+                "drop" => drop(db),
+                #[cfg(feature = "fault-injection")]
+                "spawn-failure" => {
+                    inject_close_worker_spawn_failure_once();
+                    db.close_nowait();
+                    db.close();
+                }
+                _ => unreachable!(),
+            }
+            let reopened = DataDir::open(root.path()).unwrap_or_else(|e| panic!("{mode}: {e}"));
+            assert!(inherited.metadata().is_ok());
+            drop(reopened);
+            drop(inherited);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unlock_failure_is_reported_by_synchronous_and_asynchronous_close() {
+        #[cfg(not(feature = "fault-injection"))]
+        let modes = ["close", "nowait"];
+        #[cfg(feature = "fault-injection")]
+        let modes = ["close", "nowait", "spawn-failure"];
+        for mode in modes {
+            let root = tempfile::tempdir().unwrap();
+            crate::data_dir::inject_unlock_failure_for_next_open();
+            let dir = DataDir::open(root.path()).unwrap();
+            let inherited = dir.duplicate_lock_for_test().unwrap();
+            let db = Db::new(dir, Compute::new(std::num::NonZeroUsize::MIN).unwrap()).unwrap();
+            match mode {
+                "close" => db.close(),
+                "nowait" => db.close_nowait(),
+                #[cfg(feature = "fault-injection")]
+                "spawn-failure" => {
+                    inject_close_worker_spawn_failure_once();
+                    db.close_nowait();
+                }
+                _ => unreachable!(),
+            }
+            db.close();
+            assert!(db.shutdown_failed(), "{mode}");
+            assert!(matches!(db.enter(), Err(EngineError::Closed)));
+            assert!(matches!(
+                DataDir::open(root.path()),
+                Err(crate::data_dir::DataDirError::Locked { .. })
+            ));
+            drop(inherited);
+            DataDir::open(root.path()).unwrap();
+        }
     }
 
     #[test]

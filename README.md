@@ -74,7 +74,7 @@ finally:
     client.close()
 ```
 
-`.db` 的父目录必须存在。同路径服务复用，`MilvusClient.close()` 关闭客户端而非本地服务；正常脚本退出会收尾服务并排空已接受的后台合并。Unix 上，子进程若仍持有继承的 LOCK 描述符，服务关闭后重开可能暂时遇到目录被锁定的启动错误；请协调子进程启动与同库停启，等待相关继承描述符释放后再打开，不删除 LOCK 文件。
+`.db` 的父目录必须存在。同路径服务复用，`MilvusClient.close()` 关闭客户端而非本地服务；正常脚本退出会收尾服务并排空已接受的后台合并。
 
 当前范围包括基本 CRUD、Upsert/Delete、Flush/关闭重开、FLAT 的 L2/IP/COSINE、S1 标量比较与 and、主键 in、顶层动态字段比较/in、后台 compaction 与 tombstone 回收。BM25/function chain、iterator、嵌套 JSON 等范围外能力保持明确的 UNIMPLEMENTED，不静默忽略条件。官方 3.x 数据互通仍受类型、索引与已登记历史目录限制约束，不宣称兼容它的全部功能。
 

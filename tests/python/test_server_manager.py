@@ -6,6 +6,7 @@ fork 用例只在有 os.fork 的平台上跑（Windows 没有 fork）。
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -455,6 +456,24 @@ def fork_and_wait(child):
     _, status = os.waitpid(pid, 0)
     print("OUT child-exit", os.waitstatus_to_exitcode(status), flush=True)
 """
+
+
+@needs_fork
+@pytest.mark.parametrize("child_stop", [False, True])
+def test_explicit_unlock_and_inherited_native_stop_guard(tmp_path, child_stop):
+    probe = Path(__file__).with_name("inherited_lock_probe.py")
+    command = [sys.executable, str(probe), "rust", str(tmp_path / "held.db")]
+    if child_stop:
+        command.append("--child-stop")
+    result = subprocess.run(command, capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {
+        "held_before_close": True,
+        "free_after_close": True,
+        "reopen_while_child_alive": True,
+        "child_stop_rejected": child_stop,
+        "child_exit": 0,
+    }
 
 
 @needs_fork

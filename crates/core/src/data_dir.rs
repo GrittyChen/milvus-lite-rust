@@ -6,6 +6,13 @@ use std::path::{Path, PathBuf};
 
 pub const LOCK_FILENAME: &str = "LOCK";
 
+#[cfg(any(test, feature = "fault-injection"))]
+thread_local! { static UNLOCK_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+#[cfg(any(test, feature = "fault-injection"))]
+pub fn inject_unlock_failure_for_next_open() {
+    UNLOCK_FAILURE.with(|slot| slot.set(true));
+}
+
 #[cfg(feature = "fault-injection")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StagingFault {
@@ -32,13 +39,15 @@ pub enum DataDirError {
     Locked { path: PathBuf },
 }
 
-/// 持有期间独占数据目录；析构时关闭 `LOCK` 的 fd，锁随之释放。
+/// 持有期间独占数据目录；Db 排空后显式解锁，裸句柄析构只关闭自身描述符。
 ///
 /// 永不删除或重建 `LOCK` 文件：否则两个进程会锁在不同的 inode 上（0002 约束 10）。
 #[derive(Debug)]
 pub struct DataDir {
     path: PathBuf,
-    _lock: File,
+    lock: File,
+    #[cfg(any(test, feature = "fault-injection"))]
+    fail_unlock: bool,
 }
 
 impl DataDir {
@@ -69,12 +78,29 @@ impl DataDir {
         cleanup_staging(path).map_err(io_err)?;
         Ok(Self {
             path: path.to_path_buf(),
-            _lock: lock,
+            lock,
+            #[cfg(any(test, feature = "fault-injection"))]
+            fail_unlock: UNLOCK_FAILURE.with(|slot| slot.replace(false)),
         })
     }
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    // 只有已排空的 Db 收尾调用；不能放进 DataDir::drop，否则 fork 子进程关闭
+    // 继承句柄也会解开父进程的共享 flock（0003「fork」）。
+    pub(crate) fn unlock(&self) -> io::Result<()> {
+        #[cfg(any(test, feature = "fault-injection"))]
+        if self.fail_unlock {
+            return Err(io::Error::other("injected LOCK unlock failure"));
+        }
+        self.lock.unlock()
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn duplicate_lock_for_test(&self) -> io::Result<File> {
+        self.lock.try_clone()
     }
 }
 
@@ -252,6 +278,21 @@ mod tests {
         let err = DataDir::open(root.path()).unwrap_err();
         assert!(matches!(err, DataDirError::Locked { .. }), "{err}");
         drop(first);
+        DataDir::open(root.path()).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dropping_a_bare_handle_does_not_unlock_a_shared_description() {
+        let root = tmp();
+        let dir = DataDir::open(root.path()).unwrap();
+        let inherited = dir.duplicate_lock_for_test().unwrap();
+        drop(dir);
+        assert!(matches!(
+            DataDir::open(root.path()),
+            Err(DataDirError::Locked { .. })
+        ));
+        drop(inherited);
         DataDir::open(root.path()).unwrap();
     }
 

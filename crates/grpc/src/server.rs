@@ -868,6 +868,26 @@ mod tests {
 
     #[cfg(feature = "fault-injection")]
     #[test]
+    fn unlock_failure_is_reported_by_stop_after_storage_finishes() {
+        use milvus_lite_core::data_dir::inject_unlock_failure_for_next_open;
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("unlock.db");
+        inject_unlock_failure_for_next_open();
+        let mut server = Server::start(config(path.clone(), 0)).unwrap();
+        let db = Arc::clone(&server.running.as_ref().unwrap().db);
+        assert!(matches!(
+            server.stop(Duration::from_secs(2)),
+            Err(ServerError::StorageShutdown { .. })
+        ));
+        assert!(db.shutdown_failed());
+        assert!(db.enter().is_err());
+        assert!(server.stop(Duration::ZERO).is_ok());
+        // 无继承引用时 close fd 仍会释放锁，但错误不能因此被吞。
+        DataDir::open(&path).unwrap();
+    }
+
+    #[cfg(feature = "fault-injection")]
+    #[test]
     fn storage_close_failure_is_reported_after_releasing_lock_and_keeps_rows() {
         use milvus_lite_core::{InputValues, InsertBatch, Pk};
         for fault in 0..4 {
