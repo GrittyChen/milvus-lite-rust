@@ -28,3 +28,5 @@ WAL 故障矩阵另覆盖 data/delta 多批流的每个字节截断位置、中�
 
 
 0014 的索引互通在 `test_index_storage_interop.py` 中：本实现写的四种 ANN 定义由真实 3.x 构建，3.x 侧车由本实现删除或按 snapshot 定义保留，同类型换 metric 与旧文件清理通过 3.x 检索距离验证。历史 Windows snapshot 的反斜杠引用同样保留侧车并校验定义。FAISS 类型的 BM25 / NONE 在创建时拒绝，断言 manifest 与旧侧车不变，再由真实 3.x 读取原有数据。ANN 的近似 / 量化距离不要求与精确基准相同，本实现的 FLAT 结果单独核对。`M="abc"` 的删除后、提交前失败使用 Cargo 的 `index_change_fault` example（仅 fault-injection 构建）固定 3.x 重新构建失败的已登记影响，因此本组测试需要 Rust 工具链。只有 WAL 的额外 flush 影响也做两侧对照。
+
+存量 FAISS 度量检查见 `test_index_load_metrics.py`：五种类型 × BM25 / NONE × 侧车全有 / 部分缺失 / 全无 / 全删 / WAL-only，共 50 项；由真实 3.x 写两个非空 segment 与侧车，再分别复制冷重开。直接断言 LoadCollection 的 code / error_code / 原文、load 状态、失败后的三个读取入口 101，以及 DropIndex 后恢复。

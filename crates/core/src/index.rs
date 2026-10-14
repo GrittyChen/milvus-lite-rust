@@ -141,6 +141,7 @@ const KNOWN_VECTOR_INDEX_TYPES: [&str; 9] = [
 ];
 const KNOWN_SCALAR_INDEX_TYPES: [&str; 5] = ["INVERTED", "BITMAP", "STL_SORT", "TRIE", "NGRAM"];
 const SPEC_METRICS: [&str; 5] = ["COSINE", "L2", "IP", "BM25", "NONE"];
+const FAISS_DENSE_TYPES: [&str; 5] = ["AUTOINDEX", "HNSW", "HNSW_SQ", "IVF_FLAT", "IVF_SQ8"];
 /// 接受 3.x 可构建的稠密向量定义；实际检索保持 FLAT（0014）。
 const ACCEPTED_DENSE_INDEX_TYPES: [&str; 7] = [
     "FLAT",
@@ -185,10 +186,7 @@ pub(crate) fn build_spec(field: &FieldSchema, req: IndexRequest) -> Result<Index
     // 3.x 的必装 FAISS 后端（含 AUTOINDEX → HNSW）只构建这三种度量。
     // 先保留 IndexSpec 的原有校验，再拒绝能解析、但切回 3.x 无法 load 的组合。
     if field.data_type.is_vector()
-        && matches!(
-            index_type.as_str(),
-            "AUTOINDEX" | "HNSW" | "HNSW_SQ" | "IVF_FLAT" | "IVF_SQ8"
-        )
+        && FAISS_DENSE_TYPES.contains(&index_type.as_str())
         && !matches!(metric_type.as_str(), "COSINE" | "L2" | "IP")
     {
         return Err(EngineError::unsupported(
@@ -251,6 +249,19 @@ pub(crate) fn unbuildable(spec: &IndexSpec, field: &FieldSchema) -> Option<Engin
         other => format!("unknown index_type: {}", py_repr(other)),
     };
     Some(EngineError::invalid(message))
+}
+
+/// 已有侧车的 load 不校验度量；调用方仅在至少一个非空 segment 缺少侧车时使用此错误。
+pub(crate) fn unbuildable_metric(spec: &IndexSpec, field: &FieldSchema) -> Option<EngineError> {
+    (field.data_type.is_vector()
+        && FAISS_DENSE_TYPES.contains(&spec.index_type.as_str())
+        && matches!(spec.metric_type.as_str(), "BM25" | "NONE"))
+    .then(|| {
+        EngineError::invalid(format!(
+            "unsupported metric {}; expected COSINE / L2 / IP",
+            py_repr(&spec.metric_type)
+        ))
+    })
 }
 
 fn validate_scalar_request(data_type: DataType, index_type: &str) -> Result<()> {

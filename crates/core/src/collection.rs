@@ -1251,21 +1251,32 @@ impl Collection {
     /// 3.x：已 loaded 时直接返回；否则为有行的已提交 segment 建索引，建不成就保持 released。
     /// 只有 WAL 的数据不触发，load 之后新提交的 segment 要等 release 后再次 load 才判定。
     pub fn load(&mut self) -> Result<()> {
+        // 懒打开返回句柄后可能被并发 drop 退役；不得再读取旧目录的侧车元数据。
+        if self.deleted {
+            return Err(EngineError::CollectionNotFound(self.name.clone()));
+        }
         if self.load_state == LoadState::Loaded {
             return Ok(());
         }
-        let failure = self.indexes.iter().find_map(|spec| {
-            let field = self
+        for spec in &self.indexes {
+            let Some(field) = self
                 .schema
                 .fields
                 .iter()
-                .find(|f| f.name == spec.field_name)?;
-            crate::index::unbuildable(spec, field)
-        });
-        if let Some(error) = failure
-            && self.has_committed_rows()?
-        {
-            return Err(error);
+                .find(|f| f.name == spec.field_name)
+            else {
+                continue;
+            };
+            if let Some(error) = crate::index::unbuildable(spec, field)
+                && self.has_committed_rows()?
+            {
+                return Err(error);
+            }
+            if let Some(error) = crate::index::unbuildable_metric(spec, field)
+                && self.has_committed_rows_without_sidecar(spec)?
+            {
+                return Err(error);
+            }
         }
         self.load_state = LoadState::Loaded;
         Ok(())
@@ -1283,6 +1294,44 @@ impl Collection {
                 .ok_or_else(|| EngineError::Storage("manifest read source missing".into()))?;
             if rows > 0 {
                 return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn has_committed_rows_without_sidecar(&self, spec: &IndexSpec) -> Result<bool> {
+        let Some(p) = &self.persistent else {
+            return Ok(false);
+        };
+        let dir = p.dir.join("partitions/_default/indexes");
+        for (file, source) in &p.data_sources {
+            let rows = p
+                .visibility
+                .source_len(*source)
+                .ok_or_else(|| EngineError::Storage("manifest read source missing".into()))?;
+            if rows == 0 {
+                continue;
+            }
+            let stem = std::path::Path::new(file)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .ok_or_else(|| {
+                    EngineError::Storage("manifest data filename has no source stem".into())
+                })?;
+            let path = dir.join(format!(
+                "{stem}.{}.{}.idx",
+                spec.field_name,
+                spec.index_type.to_lowercase()
+            ));
+            // os.path.exists 跟随链接；只看存在性，不读取或校验 3.x 的索引内容。
+            match std::fs::metadata(&path) {
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+                Err(e) => {
+                    return Err(EngineError::Storage(format!(
+                        "index sidecar metadata at {path:?}: {e}"
+                    )));
+                }
             }
         }
         Ok(false)
@@ -2544,6 +2593,53 @@ fn check_loaded(name: &str, state: LoadState, deleted: bool, unusable: bool) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn zero_row_source_skips_sidecar_metadata() {
+        use crate::{DataDir, Db};
+        let root = tempfile::tempdir().unwrap();
+        let mut id = FieldSchema::new("id", DataType::Int64);
+        id.is_primary = true;
+        let mut v = FieldSchema::new("v", DataType::FloatVector);
+        v.dim = Some(2);
+        let db = Db::new(
+            DataDir::open(root.path()).unwrap(),
+            Compute::for_host().unwrap(),
+        )
+        .unwrap();
+        db.create_collection(
+            "",
+            "c",
+            CollectionSchema {
+                fields: vec![id, v],
+                enable_dynamic_field: false,
+                properties: vec![],
+            },
+        )
+        .unwrap();
+        let handle = db.collection("", "c").unwrap();
+        {
+            let mut c = handle.write();
+            c.indexes.push(IndexSpec {
+                field_name: "v".into(),
+                index_type: "HNSW".into(),
+                metric_type: "NONE".into(),
+                params: Map::new(),
+                search_params: Map::new(),
+            });
+            c.release();
+            let p = c.persistent_mut().unwrap();
+            // 零行数据文件在恢复入口已拒绝；直接验证 load 原语对零行来源的跳过边界。
+            p.data_sources
+                .insert("data/zero.parquet".into(), p.active.source);
+            let parent = p.dir.join("partitions/_default");
+            std::fs::create_dir_all(&parent).unwrap();
+            std::fs::write(parent.join("indexes"), b"stat would fail").unwrap();
+            c.load().unwrap();
+            assert_eq!(c.load_state(), LoadState::Loaded);
+        }
+        db.close();
+    }
 
     #[test]
     fn recovered_segments_move_buffers_into_read_blocks_while_wal_keeps_its_batch() {

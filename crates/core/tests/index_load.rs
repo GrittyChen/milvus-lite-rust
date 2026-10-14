@@ -1,6 +1,7 @@
 //! 存量索引定义的 load 判定：3.x 自身建不成的向量索引定义，在有行的已提交 segment 存在时
 //! load 失败并保持 released（0002「结论」）。3.x 的 `create_index` 不校验向量字段的
-//! index_type，这类定义只会出现在 3.x 写的目录中，这里直接改写 manifest 模拟。
+//! index_type，且 FAISS 的非法 metric 只在需要构建时失败。这里改写 manifest 并控制侧车，
+//! 验证不读内容、逐来源判断、状态与恢复；正式的两侧生产 / 消费另有 storage_interop。
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -256,4 +257,344 @@ fn failed_load_leaves_other_collections_usable() {
         LoadState::Released
     );
     db.close();
+}
+
+fn rewrite_metric(path: &Path, kind: &str, metric: &str) {
+    let file = manifest_path(path, "c");
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+    value["index_specs"]["v"]["index_type"] = kind.into();
+    value["index_specs"]["v"]["metric_type"] = metric.into();
+    std::fs::write(file, serde_json::to_vec(&value).unwrap()).unwrap();
+}
+
+fn sidecars(path: &Path, kind: &str) -> Vec<std::path::PathBuf> {
+    let dir = path.join("collections/c/partitions/_default/indexes");
+    std::fs::create_dir_all(&dir).unwrap();
+    let value: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(manifest_path(path, "c")).unwrap()).unwrap();
+    value["partitions"]["_default"]["data_files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|file| {
+            let stem = Path::new(file.as_str().unwrap())
+                .file_stem()
+                .unwrap()
+                .to_str()
+                .unwrap();
+            let file = dir.join(format!("{stem}.v.{}.idx", kind.to_lowercase()));
+            // load 只看存在性；损坏内容属于原有“不读 3.x 侧车”的约定。
+            std::fs::write(&file, b"not a FAISS file").unwrap();
+            file
+        })
+        .collect()
+}
+
+#[test]
+fn invalid_metric_checks_each_nonempty_segment_and_recovers_after_drop() {
+    for kind in ["AUTOINDEX", "HNSW", "HNSW_SQ", "IVF_FLAT", "IVF_SQ8"] {
+        for metric in ["BM25", "NONE"] {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("metric.db");
+            let db = open(&path);
+            create(&db, "c", &[1], true, &[]);
+            db.insert("", "c", batch(&[2])).unwrap();
+            db.flush_collection("", "c").unwrap();
+            create(&db, "healthy", &[9], true, &[]);
+            db.close();
+            rewrite_metric(&path, kind, metric);
+            let files = sidecars(&path, kind);
+            assert_eq!(files.len(), 2);
+            let db = open(&path);
+            let handle = db.collection("", "c").unwrap();
+            handle.write().load().unwrap();
+            assert_eq!(live_pks(&db, "c", &[1, 2]), [Pk::Int64(1), Pk::Int64(2)]);
+            handle.write().release();
+            std::fs::remove_file(&files[1]).unwrap();
+            let before = std::fs::read(manifest_path(&path, "c")).unwrap();
+            for _ in 0..2 {
+                assert_eq!(
+                    load_error(&db, "c"),
+                    format!("unsupported metric '{metric}'; expected COSINE / L2 / IP")
+                );
+                assert_eq!(handle.read().load_state(), LoadState::Released);
+                assert!(matches!(
+                    handle.read().require_loaded(),
+                    Err(EngineError::CollectionNotLoaded(_))
+                ));
+            }
+            assert_eq!(std::fs::read(manifest_path(&path, "c")).unwrap(), before);
+            assert_eq!(std::fs::read(&files[0]).unwrap(), b"not a FAISS file");
+            db.collection("", "healthy")
+                .unwrap()
+                .write()
+                .load()
+                .unwrap();
+            assert_eq!(live_pks(&db, "healthy", &[9]), [Pk::Int64(9)]);
+            std::fs::remove_file(&files[0]).unwrap();
+            db.drop_index("", "c", "v", "").unwrap();
+            assert!(handle.read().indexes().is_empty());
+            assert_eq!(handle.read().load_state(), LoadState::Loaded);
+            handle.write().load().unwrap();
+            assert_eq!(live_pks(&db, "c", &[1, 2]), [Pk::Int64(1), Pk::Int64(2)]);
+            db.close();
+        }
+    }
+}
+
+#[test]
+fn invalid_metric_wal_flush_loaded_and_deleted_physical_rows() {
+    for flushed in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("lifecycle.db");
+        let db = open(&path);
+        create(&db, "c", &[], false, &[]);
+        db.close();
+        rewrite_metric(&path, "HNSW", "NONE");
+        let db = open(&path);
+        db.insert("", "c", batch(&[1])).unwrap();
+        if flushed {
+            db.flush_collection("", "c").unwrap();
+            sidecars(&path, "HNSW");
+        }
+        let handle = db.collection("", "c").unwrap();
+        handle.write().load().unwrap();
+        db.insert("", "c", batch(&[2])).unwrap();
+        db.flush_collection("", "c").unwrap();
+        // 新 segment 不会导致已 loaded 的 collection 重新检查。
+        handle.write().load().unwrap();
+        assert_eq!(live_pks(&db, "c", &[1, 2]), [Pk::Int64(1), Pk::Int64(2)]);
+        handle.write().release();
+        assert!(load_error(&db, "c").contains("unsupported metric 'NONE'"));
+        db.delete("", "c", &[Pk::Int64(1), Pk::Int64(2)]).unwrap();
+        db.flush_collection("", "c").unwrap();
+        assert_eq!(handle.read().count(), 0);
+        assert!(load_error(&db, "c").contains("unsupported metric 'NONE'"));
+        db.close();
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn metric_metadata_follows_symlinks_and_does_not_read_present_content() {
+    use std::os::unix::fs::symlink;
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("links.db");
+    let db = open(&path);
+    create(&db, "c", &[1], true, &[]);
+    db.close();
+    rewrite_metric(&path, "AUTOINDEX", "BM25");
+    let files = sidecars(&path, "AUTOINDEX");
+    let db = open(&path);
+    let handle = db.collection("", "c").unwrap();
+    std::fs::remove_file(&files[0]).unwrap();
+    let target = root.path().join("target.idx");
+    std::fs::write(&target, b"present").unwrap();
+    symlink(&target, &files[0]).unwrap();
+    handle.write().load().unwrap();
+    handle.write().release();
+    std::fs::remove_file(&target).unwrap();
+    assert!(load_error(&db, "c").contains("unsupported metric 'BM25'"));
+    std::fs::remove_file(&files[0]).unwrap();
+    std::fs::create_dir(&files[0]).unwrap();
+    handle.write().load().unwrap();
+    db.close();
+}
+
+#[test]
+fn metadata_errors_are_reported_and_normal_metrics_do_not_stat_sidecars() {
+    for (kind, metric, expected_error) in [
+        ("HNSW", "NONE", true),
+        ("HNSW", "L2", false),
+        ("FLAT", "NONE", false),
+        ("BRUTE_FORCE", "BM25", false),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("metadata.db");
+        let db = open(&path);
+        create(&db, "c", &[1], true, &[]);
+        db.close();
+        rewrite_metric(&path, kind, metric);
+        let db = open(&path);
+        let handle = db.collection("", "c").unwrap();
+        std::fs::write(
+            path.join("collections/c/partitions/_default/indexes"),
+            b"directory replaced after open",
+        )
+        .unwrap();
+        let result = handle.write().load();
+        if expected_error {
+            assert!(matches!(result, Err(EngineError::Storage(_))));
+            assert_eq!(handle.read().load_state(), LoadState::Released);
+        } else {
+            result.unwrap();
+        }
+        db.close();
+    }
+}
+
+#[test]
+fn retired_load_handle_cannot_stat_a_recreated_collection() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("retired.db");
+    let db = open(&path);
+    create(&db, "c", &[1], true, &[]);
+    let old = db.collection("", "c").unwrap();
+    db.drop_collection("", "c").unwrap();
+    create(&db, "c", &[2], true, &[]);
+    assert!(matches!(
+        old.write().load(),
+        Err(EngineError::CollectionNotFound(_))
+    ));
+    db.close();
+}
+
+#[cfg(feature = "fault-injection")]
+#[test]
+fn confirmed_sidecar_deletion_before_manifest_failure_blocks_next_metric_load() {
+    use milvus_lite_core::storage::fs_commit::{CommitPhase, inject_manifest_panic_once};
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("commit-failure.db");
+    let db = open(&path);
+    create(&db, "c", &[1], true, &[]);
+    db.close();
+    rewrite_metric(&path, "HNSW", "NONE");
+    let files = sidecars(&path, "HNSW");
+    let db = open(&path);
+    let handle = db.collection("", "c").unwrap();
+    handle.write().load().unwrap();
+    handle.write().release();
+    let before = std::fs::read(manifest_path(&path, "c")).unwrap();
+    inject_manifest_panic_once(CommitPhase::BeforeReplace);
+    assert!(db.drop_index("", "c", "v", "").is_err());
+    assert_eq!(std::fs::read(manifest_path(&path, "c")).unwrap(), before);
+    assert!(files.iter().all(|p| !p.exists()));
+    assert_eq!(
+        load_error(&db, "c"),
+        "unsupported metric 'NONE'; expected COSINE / L2 / IP"
+    );
+    assert_eq!(handle.read().load_state(), LoadState::Released);
+    db.drop_index("", "c", "v", "").unwrap();
+    handle.write().load().unwrap();
+    assert_eq!(live_pks(&db, "c", &[1]), [Pk::Int64(1)]);
+    db.close();
+}
+
+#[cfg(feature = "fault-injection")]
+#[test]
+fn compaction_new_source_requires_a_sidecar_on_the_next_metric_load() {
+    use milvus_lite_core::ColumnData;
+    use milvus_lite_core::storage::{arrow_data, parquet_file};
+    use std::sync::mpsc;
+    use std::time::Duration;
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("compact.db");
+    let db = open(&path);
+    create(&db, "c", &[1], true, &[]);
+    db.close();
+    let file = manifest_path(&path, "c");
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+    let parent = path.join("collections/c/partitions/_default");
+    for i in 2..=4 {
+        let other = format!("data/data_{i:06}_{i:06}.parquet");
+        let batch = arrow_data::data_batch(
+            &schema(),
+            &[i],
+            &[
+                ColumnData::Int64(vec![i as i64]),
+                ColumnData::FloatVector {
+                    dim: 2,
+                    values: vec![1., 0.],
+                },
+            ],
+            None,
+        )
+        .unwrap();
+        parquet_file::write_new(&parent.join(&other), &batch).unwrap();
+        value["partitions"]["_default"]["data_files"]
+            .as_array_mut()
+            .unwrap()
+            .push(other.into());
+    }
+    value["index_specs"]["v"]["index_type"] = "HNSW".into();
+    value["index_specs"]["v"]["metric_type"] = "BM25".into();
+    value["current_seq"] = 4.into();
+    std::fs::write(&file, serde_json::to_vec(&value).unwrap()).unwrap();
+    let db = open(&path);
+    let (entered, arrived) = mpsc::channel();
+    let (resume, continued) = mpsc::channel();
+    db.pause_compaction_once(
+        milvus_lite_core::CompactionPausePoint::BeforePrepare,
+        entered,
+        continued,
+    );
+    let handle = db.collection("", "c").unwrap();
+    arrived.recv_timeout(Duration::from_secs(15)).unwrap();
+    sidecars(&path, "HNSW");
+    handle.write().load().unwrap();
+    resume.send(()).unwrap();
+    let report = db
+        .wait_for_maintenance("", "c", Duration::from_secs(15))
+        .unwrap();
+    assert_eq!(report.failed, 0, "{report:?}");
+    assert_eq!(data_files(&path, "c"), 1);
+    handle.write().load().unwrap();
+    handle.write().release();
+    assert_eq!(
+        load_error(&db, "c"),
+        "unsupported metric 'BM25'; expected COSINE / L2 / IP"
+    );
+    db.drop_index("", "c", "v", "").unwrap();
+    handle.write().load().unwrap();
+    db.close();
+}
+
+#[cfg(feature = "fault-injection")]
+#[test]
+fn load_drop_interleaving_preserves_the_observed_metric_state() {
+    use milvus_lite_core::storage::index_intent::{before_commit_once, before_delete_once};
+    for load_first in [true, false] {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("interleaving.db");
+        let db = open(&path);
+        create(&db, "c", &[1], true, &[]);
+        db.close();
+        rewrite_metric(&path, "HNSW", "NONE");
+        let files = sidecars(&path, "HNSW");
+        let db = open(&path);
+        let handle = db.collection("", "c").unwrap();
+        let other = handle.clone();
+        if load_first {
+            before_delete_once(move || other.write().load().unwrap());
+        } else {
+            before_commit_once(move || {
+                assert!(
+                    other
+                        .write()
+                        .load()
+                        .unwrap_err()
+                        .to_string()
+                        .contains("unsupported metric 'NONE'")
+                );
+            });
+        }
+        let result = db.drop_index("", "c", "v", "");
+        assert!(files.iter().all(|p| !p.exists()));
+        if load_first {
+            assert!(matches!(result, Err(EngineError::SchemaValidation(_))));
+            assert_eq!(handle.read().load_state(), LoadState::Loaded);
+            // 已 loaded 的幂等请求仍成功；下一次 release 后检查缺失侧车。
+            handle.write().load().unwrap();
+            handle.write().release();
+            assert!(load_error(&db, "c").contains("unsupported metric 'NONE'"));
+            db.drop_index("", "c", "v", "").unwrap();
+        } else {
+            result.unwrap();
+        }
+        assert!(handle.read().indexes().is_empty());
+        assert_eq!(handle.read().load_state(), LoadState::Loaded);
+        db.close();
+    }
 }

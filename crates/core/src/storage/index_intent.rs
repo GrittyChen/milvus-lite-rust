@@ -242,6 +242,13 @@ impl IntentState {
         let index_dir = dir.join("partitions/_default/indexes");
         guarded(|| {
             #[cfg(feature = "fault-injection")]
+            {
+                let f = BEFORE_DELETE.with(|s| s.borrow_mut().take());
+                if let Some(f) = f {
+                    f();
+                }
+            }
+            #[cfg(feature = "fault-injection")]
             fault(IndexPoint::CapabilitySync).map_err(|e| e.to_string())?;
             fs_commit::sync_dir(&index_dir).map_err(|e| e.to_string())?;
             // 删除位次只用于隔离构建中的逐文件故障注入。
@@ -381,6 +388,7 @@ thread_local! {
     static FAULT: std::cell::RefCell<Vec<(IndexPoint, FaultKind)>> = const { std::cell::RefCell::new(Vec::new()) };
     static BOOT_OVERRIDE: std::cell::RefCell<Option<BootContext>> = const { std::cell::RefCell::new(None) };
     static BEFORE_COMMIT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    static BEFORE_DELETE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }
 #[cfg(feature = "fault-injection")]
 pub fn inject_fault(point: IndexPoint, kind: FaultKind) {
@@ -393,6 +401,10 @@ pub fn override_boot_context(context: Option<BootContext>) {
 #[cfg(feature = "fault-injection")]
 pub fn before_commit_once(f: impl FnOnce() + 'static) {
     BEFORE_COMMIT.with(|s| *s.borrow_mut() = Some(Box::new(f)));
+}
+#[cfg(feature = "fault-injection")]
+pub fn before_delete_once(f: impl FnOnce() + 'static) {
+    BEFORE_DELETE.with(|s| *s.borrow_mut() = Some(Box::new(f)));
 }
 #[cfg(feature = "fault-injection")]
 pub(crate) fn before_commit() -> io::Result<()> {

@@ -60,3 +60,33 @@
 | 跨实现 | 真实 3.x 写定义和有效侧车，各自复制后冷重开；比较 load 状态及后续读取错误；覆盖 snapshot 旧文件的正常 API 生产路径 |
 
 本修复独立收口，不并入已提交的切片 A；锁边界已接受，按合同实现并跑 core、gRPC、两条 SDK 与完整存储互通，随后做实现复审。本文件的调查结果不作为尚未执行的修复验收。
+
+## 实现与验证（2026-10-14，实现复审通过）
+
+当前源码在 `Collection::load` 中逐非空来源读取跟随链接的 metadata；类型错误仍先按旧规则处理，正常 metric 不新增 stat。创建与存量分类共用五种 FAISS 类型集合。新增只读 I/O 之前确认句柄未被 drop 退役，旧句柄不能在同名重建后访问新目录。没有新增持久化状态或 flush 锁。
+
+core 的 `index_load.rs` 覆盖十个非法组合、全部 / 部分侧车、损坏内容仍忽略、有效 / 悬空链接与目录、真实 metadata 错误、WAL / flush / 已 loaded 幂等、全删后的物理行、健康 collection 及移除定义后恢复。fault-injection 额外控制删除之前 / 之后的 load、删除确认但 manifest 替换前失败，以及 compaction 生成新来源：load 抢先成功时 DropIndex 拒绝，定义保留，下一次 release / load 失败；文件已删时并发 load 失败，DropIndex 可继续提交。
+
+零行的原语跳过由 collection 内部单测核验。恢复层本来拒绝没有 RecordBatch 的空 Parquet，且 compaction 要求合法序号范围文件名；本修复不改变这些格式边界，也不使用非法夹具迁就测试。
+
+跨实现覆盖在 `test_index_load_metrics.py`：由真实 3.x 写两个 segment / 侧车或 WAL，再各自复制冷重开，直接核对 code / error_code / 原文、状态、三个读取入口的 101 和 DropIndex 恢复。五种类型 × 两个 metric × 五种形态为 50 项，另外两项固定参数与 metric 同时无效时的错误理由差异，一项用真实 snapshot / DropIndex / CreateIndex API 生产 HNSW / NONE 定义而非手工改写 manifest。
+
+macOS arm64，CPython 3.12.14 / pymilvus 3.0.2，以及 CPython 3.10.21 / pymilvus 2.6.17，都安装当前开发 wheel。原生库 SHA256 为 `1e9b0cbae366f852c2f46577f6decc5f8394b5013853a24234a1fa086724ccfa`；仍标识 0.1.0rc2 的开发构建，未替换任何公开发行物。
+
+| 检查 | 实跑结果 |
+| --- | --- |
+| Rust workspace 默认 | 280 passed |
+| core fault-injection 最终全套 | 365 passed（顶层 363，子进程 2） |
+| grpc all-features | 22 passed |
+| 两条 SDK 端到端 | 各 287 passed |
+| 两条 SDK 存储互通 | 各完整 157 passed，补充的组合参数 / snapshot 三项各 3 passed；共覆盖 160 项 |
+| 索引定义 / 重开 / 跨来源检索差分 | 27 passed（pymilvus 3.0.2）；本轮不宣称两条 SDK 全量差分已复跑 |
+| Linux arm64 manylinux_2_28 | load 矩阵 13、索引变更矩阵 25 passed |
+| 打包 / 平台脚本自检 | 170 passed |
+| fmt、两种 Clippy、wheel / sdist 与原生库检查 | 通过 |
+
+反证在仓库外副本和独立 target 上执行，确认编译来源：切片 A 旧实现不能通过逐非空来源的 metric 测试；将 metadata 改成 symlink_metadata 后，悬空链接反例失败。实际修复及 Linux 对应反例通过，未放宽旧期望。
+
+**单独记录（已与本修复分离）：** 首轮 core fault-injection 在未修改的 `interrupted_deletion_blocks_both_endpoints_and_same_boot_reopen` 用例里，关闭后重开一次遇到 LOCK busy。独立重跑和最终全套均通过；清理隔离 core 产物、确认源码后，切片 A 基线的同一套件先通过一次、连续六次也通过，尚不能称为已经复现的历史问题或归因于 metric。未修改底层 LOCK 或原测试断言，原始失败日志保留在开发工作目录。随后复审方以并行 / 单线程 / 排除子进程三组对照确认测试间派生子进程的干扰，并确认与 load 修复无因果；测试隔离另行修复，flock 在 exec 前可能保留继承引用的机制仍与测试层改动区分。
+
+未实跑真实系统重启 / 断电、Linux x86_64 或 Intel Mac 的本修复完整候选验收。切片 B 引擎尚未实施；本次复审只覆盖独立的 load 修复及直接关联状态、失败和恢复路径。
