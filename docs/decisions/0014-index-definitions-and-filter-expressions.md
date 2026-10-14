@@ -1,6 +1,6 @@
 # 0014 rc2 之后的兼容面：索引定义与过滤表达式
 
-- 状态：范围与取舍已确认，切片 A 的实施设计见下文。负责人于 2026-10-14 确认本文两个切片、索引方案（接受 ANN 定义、按 FLAT 执行）与[已确认的取舍](#已确认的取舍)。实现与测试另做评审，发布另行授权
+- 状态：范围与取舍已确认，切片 A 已实现、评审并提交；切片 B 的实施设计已评审通过，补充边界见下文。负责人于 2026-10-14 确认本文两个切片、索引方案（接受 ANN 定义、按 FLAT 执行）与[已确认的取舍](#已确认的取舍)。实现与测试另做评审，发布另行授权
 - 日期：2026-10-14
 - 参照：v3.2.1 / `43d1257`；pymilvus 3.0.2 / 2.6.17
 - 前置：[0002 结论与约束 1、5、7](0002-data-dir-compat.md)、[0006 第 13、14 项](0006-m2-scope.md)、[0007 提交协议](0007-m2-storage-engine.md)、[0009 顶层动态过滤](0009-top-level-dynamic-filter.md)、[0013 发布流程](0013-first-release-platform-and-packaging.md)
@@ -283,6 +283,109 @@
 - 差分：Search / Query / count / Delete、分页、发布与重开、两条 SDK 线；恢复 INVENTORY 中因过滤而列为范围外的用例。
 - 性能：本切片重写了求值结构，需按 [S1 专项](../../benchmarks/s1/README.md)复测既有形式不退化；新增形式不声明性能。
 
+### 实施设计
+
+状态：实施设计已评审通过，按评审补充 INVERTED、叶子三值及字符串 JSON 解码边界后冻结。本节以切片 A 提交 `a10477f` 为实现基线；调查与参照探针已完成，尚未修改过滤引擎。构造范围与上面的语义合同保持一致。
+
+**当前结构与最小改动。**
+
+- [parser.rs](../../crates/core/src/filter/parser.rs) 已正确识别完整语法，但 `or`、`not`、LIKE、is null / exists、函数最终折叠成 `Unsupported`，路径只留下 `Path`，操作数、参数及路径内容已经丢失。不能在求值层从这些占位节点恢复语义，也不二次解析原字符串。沿用同一解析入口、token、源码位置与深度限制，为本切片节点保存子节点、模式、参数和路径分量；算术、时间、全文与几何等范围外构造保留能力拒绝。
+- [eval.rs](../../crates/core/src/filter/eval.rs) 的 `Predicate` 目前是平面的 and `Term` 列表；[dynamic.rs](../../crates/core/src/filter/dynamic.rs) 负责整源绑定及 Python 规则。保留这组已有比较、成员转换与有效位内核，增加已绑定的布尔树和静态路线标记。旧的 schema 比较 / and 与顶层主键 in 继续走原快路径，不能为了统一结构给这些路径增加动态行物化。
+- Python 规则的值读取与求值从 dynamic 中收敛到 `filter::python`，供直接 Python 路线与 hybrid 回退共用。这个名称表示用 Rust 实现 Python 的可观察语义，不嵌入解释器，也不引入 Python、正则或 Arrow 计算库依赖。dynamic 保留源级推断、合成列绑定与回退决策，不复制两套逐行求值。
+- 复用当前 JSON 列中的 UTF-8 字节与 meta 快照；标量字符串比较 / LIKE 使用真实存储文本，路径与 JSON 函数按需要解码。只读取表达式引用的值，向量及无关 JSON 列不深拷贝；不改变 JSON 的写出或恢复格式。
+
+**编译与路由。**
+
+1. Query / Search 的 load 与 deleted 错误优先级、schema 无关的单次解析、Delete 的既有入口保持现状。`ParsedFilter::primary_keys` 仍只识别顶层、不取反、作用于主键的 in；其顺序、重复、类型转换及忽略分页等行为不迁入通用布尔树。
+2. 仍在范围外的语法构造沿用 0006 的能力拒绝优先规则，不能因 `true or <范围外表达式>` 短路而静默成功。本切片已接入的构造则按参照的源码顺序完成语义检查：每个 and / or 子节点检查完立即验证 bool，再访问下一节点，保留字段诊断、类型、位置与原文。
+3. 字段绑定区分 schema 列与动态键；已声明字段优先。路径保存基值及字符串键 / 非负整数字面量，不能把无法表示为 usize 的合法大下标当成溢出错误：参照将越界访问视为缺失。
+4. 按**整条表达式**选择路线：含路径或 JSON / 数组函数为 Python，否则含动态键为 hybrid，否则为 Arrow 语义的列式路线。路径、函数出现在运行时不会访问的分支，仍影响静态路由。不是每个子表达式独立选路线。
+5. 类型检查、能力拒绝与执行期错误分开。宽整数字面量不能在所有路线的编译阶段一律转成 i64；Arrow 路线在求值时转换，Python 路线保留宽整数。LIKE 模式的内部准备也不能提前暴露原本被 Python 短路跳过的执行期错误。
+
+**三个求值入口。**
+
+| 路线 | 求值单位与行为 | 保留的错误边界 |
+| --- | --- | --- |
+| Arrow 语义 | 按列及既有有效位求值；and / or 的所有操作数均求值，之后做 Kleene 合并；not 反转三值 | 先前分支已经决定结果也不能遮蔽后续转换错误；FLOAT / DOUBLE 的安全转换边界沿用 S1，字段之间比较另用对应类型的真值核对 |
+| hybrid | 一个 segment 或 memtable 的全部活行一次绑定所有引用键，再对整树执行列式路线 | 参照允许回退的推断、类型、内核或合成列冲突失败，丢弃本次局部掩码，对同一源的整树从头走 Python；不是逐行、逐项或整个 collection 回退 |
+| Python 语义 | 每条活行按表达式顺序求值；and 遇 False、or 遇 True 才短路，Unknown 不能误当成 False / True | 未访问节点不产生执行期错误；类型比较的 TypeError 按参照变为 Unknown，成员查找的不可哈希值等真实错误向上传递 |
+
+内部布尔结果区分 True、False、Unknown；列式掩码至少保存 True 与 Unknown 两组位，False 从当前活行集合中派生。and / or / not 的中间结果不能先把 Unknown 清为 False；只在表达式根将 Unknown 视为不匹配。每个掩码的长度及行位都属于当前数据源，失效行不参与转换或类型推断，继续沿用 0006 / 0009 已登记的有效位差异。
+
+hybrid 的回退使用私有、明确的失败类别，不通过捕获任意 `EngineError::InvalidArgument` 实现。参照捕获 ArrowInvalid / ArrowTypeError / ArrowNotImplementedError、TypeError / NotImplementedError / KeyError；`OverflowError` 不在其中，必须报原错误。编译错误、存储错误与其他引擎错误也不能变成 Python 回退。
+
+现有 `ReadSnapshot::filtered_chunks_compiled` 的 source 分组、已提交源物理位次与内存代位次继续使用；hybrid 和 Python 路线在此统一收集活行引用。内部小块拆分、合并和 Parquet 批切分不改变一次绑定的范围或首个错误。纯 schema 的 S1 路径继续直接使用列与位图，不构建这些行引用。过滤求值保持串行的既有源序，完成后才进入检索计算池，不通过并行求值改变错误顺序。
+
+**各操作的边界。**
+
+- schema 字段的 in / not in 复用 Arrow 的值集合转换口径，not in 对三值成员结果取反；缺失动态值不能因取反而变为匹配。通用 in 的行序不能借用顶层主键 in 的请求序。
+- LIKE 复用一份按模式编译的 token 匹配器，模式保存在本次 Predicate 内，按 Unicode 字符及 `%` / `_` 求值；两条语义保留不同的反斜杠和结束条件。Arrow 会用反斜杠转义通配符，Python 将它当普通字符；Python 的 `$` 还接受一个末尾换行。不能把两者统一成 SQL glob 或统一的正则 full-match；不建立跨请求缓存。
+- JSON schema 列作为普通字段参与字符串比较时使用原文本；路径先读取基值，字符串基值按参照解析一次 JSON，再逐层访问。缺键、容器类型不符或下标越界为缺失；不额外递归解码每层字符串。参照允许的非 JSON 字段路径也按运行时值处理，不新增静态类型拒绝。
+- is null / is not null 区分普通字段与路径 / 动态值；exists 沿用语义层对整字段的限制，合法路径的缺失和显式 null 按参照处理。JSON 列的文本 `null` 不等于 Arrow 列空值。
+- json_contains 与 array_contains 共用参照的同一组模式：不为数组时 contains 返回 False，array_length 返回 0；all / any 的空目标列表分别遵守 Python all / any。Python 容器的相等和次序、bool 与数字相等、宽整数与浮点比较使用值语义，不能直接使用 `serde_json::Value` 的相等或数值转成 f64。
+- **负责人已确认保留 3.x 的 ListLit 缺陷**：`json_contains(j, [1])` 语法合法，但单目标模式实际访问列表字面量时返回 code 1、`unknown AST node: ListLit`；`true or json_contains(j, [1])` 被 Python 短路时成功。array_contains 的同类入口及其他合法的 ListLit 普通取值按同一真值检查，不在本切片补齐参照缺失的求值能力。all / any 模式对列表参数的专门处理仍可用，不能一起拒绝。
+
+**Python 叶子的三值结果。**
+
+| 叶子输入 | 结果 | 外层 not |
+| --- | --- | --- |
+| 比较或 in 的值为 None / 缺失 | Unknown | Unknown，根不匹配 |
+| LIKE 的值为 None / 缺失 | Unknown | Unknown，根不匹配 |
+| LIKE 的值非字符串且非 None | False | True，匹配 |
+| contains 的值缺失、null 或非数组 | False | True，匹配 |
+| is null / is not null / 合法 exists | 确定的 bool | 正常反转，不产生 Unknown |
+
+这张表与三值组合矩阵一起核验；不能把所有无效叶子统一成 Unknown。array_length 对非数组返回整数 0，再参与比较。
+
+**字符串基值的 JSON 解码。**
+
+只在路径或 JSON / 数组函数要求解析字符串时解码，普通动态字符串比较不自动解码。输入集以 Python `json.loads` 为准：接受 NaN / Infinity / -Infinity、溢出指数（1e999 为 inf）、重复键最后值，以及孤立代理项；Unicode 转义的有效代理对合并，孤立代理项在内部字符串中保留，不能替换为 U+FFFD 或返回缺失。JSON schema 列继续使用既有归一化，不改变写入、恢复或输出格式。
+
+解码器放在 Python 求值组件内部，使用显式容器栈和节点存储，避免深层输入的解析或析构消耗宿主调用栈。值模型可保留非有限浮点及非 Unicode scalar 的字符串码点，不直接套用 serde_json::Value。重复键、空白、无效控制字符与整数数字长度限制按固定参照环境核验。JSON 语法 / 值错误按参照变为缺失或函数的 False / 0；RecursionError 单独返回 code 1，不能被当成 JSONDecodeError。
+
+CPython 3.12.14、默认 Python recursion limit 1000 的标准 C 解码器，数组与对象单链均在 9997 层成功、9998 层返回对应的 RecursionError；is null、增加 not 层数和 contains 的组件入口结果一致。实施语料固定记录解码器与版本及边界；不能直接使用 serde_json 的 128 层限制，其他 Python / 解码器配置不由这个局部探针宣称等价。NaN 常量在 Python JSON 解码结果间共享对象：直接 NaN 比较仍不相等，但 [NaN] 与另一次解码的 [NaN] 相等；此容器行为加入成员 / 比较语料。
+
+**INVERTED 计划与扫描的已登记差异。**
+
+继续扩展 [0006 的 INVERTED 过滤差异](0006-m2-scope.md#与-3x-的差异)：比较、in / not in、is null、and / or 在 3.x 已建索引 segment 上可能走 scalar planner；Rust 统一扫描。差异包含结果、排序及成功 / 报错，不能仅按距离或结果数放宽。例如 INT64 列 [1, 2, 3] 上的 in [1, 2.5]，索引计划将 2.5 转成 2，命中 1、2，扫描只命中 1；列中再有 2^53+1 时，索引仍返回结果，扫描报安全转 double 的 ArrowInvalid。不能把“跳过小数”或“任意整数列都报错”写成参照行为。
+
+三条求值路线的普通差分以未建标量索引的数据为真值。恢复的 adapter / compatibility 用例若创建 INVERTED，先确认其 segment / memtable 与索引状态；已建索引路径出现差异时，明确按扫描断言并链接登记，另有测试固定参照索引结果，不以 skip 或通用异常白名单掩盖。这一策略适用于新建与存量 INVERTED，不加入过滤索引实现。
+
+**失败与发布。**
+
+过滤只在不可变读快照上产生临时掩码，全部求值成功后才向 Query / count / Search 返回选择结果；后一个源或行失败时，不返回前面已成功的部分结果，不改原快照位图。Delete 继续先对同一快照完成匹配，再经同一句柄进入既有 WAL-first 删除入口；求值失败不分配本次删除序号、不写本次删除 WAL、不删行。进入时既有持久化失败的重试仍按 0007，不把它当成本次过滤写入，也不更改隔离方式、load 状态或锁序。
+
+暂不改变 gRPC 消息、分页、输出投影、存储、compaction、计算池和 schema 支持范围；nullable、默认值及 ARRAY 字段仍未接入。新增模块落地时更新 AGENTS 架构地图；错误信息的支持范围和已恢复的参照用例同步到 README、0004 / 0006 / 0009 与 INVENTORY。
+
+**实施验收矩阵。**
+
+组件真值生成器直接调用 `43d1257` 的 parse / compile / evaluate，保存 schema、输入值、静态 backend、掩码或失败阶段 / 类型 / 原文。Arrow 15 与 25 分别执行 `--verify`；NaN、Inf 用明确的值标记，不能在语料 JSON 中写非法数字。旧语法、Unicode、S1 和 dynamic 语料继续核验，不覆盖成新期望来迁就实现。
+
+| 维度 | 必须区分的反例与观察 |
+| --- | --- |
+| AST 与语法 | 旧 7791 条语法真值；or / not / like / 路径 / 函数不再丢子节点与参数；路径 in 与路径 array_length 的 code 6 保留 |
+| 路由 | 同一比较分别置于 schema、meta、路径与 JSON 函数树中；不可访问分支仍改变整条表达式路线 |
+| 三值逻辑 | and / or / not 与 null、缺失、空集合；Unknown 的否定仍不匹配；逐项验证上表的 False 叶子取反会匹配；False and / True or 的三条路线错误可达性不同 |
+| hybrid 回退 | 同质、异构、全 null、嵌套容器、合成列冲突、多个引用键；源中一个后期失败触发整树重算，不保留此前的列式结果 |
+| 宽整数与提升 | ±2^24、±2^53、±2^63、负零、NaN / Inf；字段与字段、字段与字面量；溢出不可回退；既有跨架构例外保持窄范围 |
+| 成员与比较 | in / not in；布尔、整数、浮点、字符串、容器；空成员集、不可哈希值；主键快路径与通用路径分别核对顺序及分页 |
+| LIKE | `%`、`_`、反斜杠、尾反斜杠、Unicode、换行及末尾换行、空模式；schema / hybrid / Python 各自的匹配结果 |
+| 路径与 JSON | 缺键、null、嵌套字符串、非容器、大下标、字典 / 数组比较；contains 单目标 / all / any、空列表、array_length 非数组；已确认 ListLit 错误及短路 |
+| 字符串 JSON 解码 | 非有限常量、1e999、孤立代理项 / 有效代理对、重复键、无效 JSON、深度边界和 RecursionError；函数输入与路径基值，未访问节点不解码；NaN 容器语义 |
+| INVERTED | 未建索引的普通差分；已建索引 segment 的结果与成功 / 报错差异单独固定，复用用例注明扫描口径 |
+| 错误顺序 | 左节点类型错误与右节点未知字段、多个求值错误；空 collection、全删源、先 load 错误的 Query / Search、无需 load 的 Delete |
+| 源与生命周期 | 一个源拆成多个块；不同源绑定结果不同；active / frozen / committed / 重开；覆盖、删除及旧快照；元数据与原始位图不变 |
+| Delete 原子边界 | 前一源匹配、后一源报错；断言行集、next_seq、本次 WAL 字节和 manifest；并发覆盖与删除后复用旧读快照沿用 0007 |
+| 外部入口 | Search / Query / count / Delete、两条 SDK、字段类型与分页；恢复 adapter / compatibility 中进入范围的过滤用例 |
+
+至少做四个隔离反证：过早清除 Unknown、把 hybrid 回退变为逐项、把 OverflowError 变成回退、在 Python 路线取消短路。对应测试必须在错误实现上失败。变异使用仓库外的源码副本与独立 target，不改工作区期望。
+
+性能复用既有 S1 专项：切片 A 基线与 B 候选使用独立 wheel / venv，与 2.5.1 / 3.x 在同机、相同数据布局、两个规模轮换三轮，结果逐次核验。逐项报告前后 p50 中位数及轮间范围，不拿历史表替代新测量；出现稳定退化须定位修复，证据不能区分噪声与退化时补采样，不直接声明“不退化”。新增形式只验正确性，不作性能声明。
+
+**本轮已核实与未核实。**
+
+已读参照 semantic / 三个 evaluator、Rust parser / eval / dynamic，以及 Query / Search / Delete 到快照和写入的入口。按三组动态值、有 / 无合成列冲突，共 162 个组件调用在 Arrow 15.0.0 与 25.0.1 上掩码或错误一致；另对 8 个 LIKE 模式、10 个字符串、两条路线做 16 次调用，两版结果一致，固定了反斜杠、尾反斜杠和末尾换行差别。FLOAT / DOUBLE 与大整数列的安全转换也已探测。真实 pymilvus Query 另核对单目标 ListLit 的 code 1、同类 array_contains、短路成功及 contains_all 成功。它们是设计依据，不能替代尚未执行的 Rust 实现、全套真值、两条 SDK、跨架构或 S1 性能验收。
+
 ## 实施顺序与验收
 
 1. A 先于 B：A 改动小，并且能解开上游子集的主要失败。
@@ -305,3 +408,4 @@
 2. **3.x 无法构建的定义继续在创建时拒绝**，保留现有的错误与校验顺序。3.x 会持久化它们、直到 load 时才报错；0002 约束 1 要求本实现不写出 3.x 无法 load 的定义。稠密向量字段上的 FAISS 类型（AUTOINDEX、HNSW、HNSW_SQ、IVF_FLAT、IVF_SQ8）只接受 COSINE / L2 / IP；BM25 / NONE 在原有 metric 枚举校验之后返回 UNIMPLEMENTED。FLAT / BRUTE_FORCE 保留原行为。AUTOINDEX 的这一限制修正了已发布 rc2 可创建、却无法由 3.x load 的组合；已发布发行物不变。
 3. **算术运算不纳入切片 B，继续明确拒绝**，后续单独评估。Arrow 路线的整数溢出与 Python 精确运算的语义不同，复刻成本高；统计中涉及的用例很少。
 4. **索引文件删除的持久化确认采用持久化标记（方案乙）。** 删除前持久化意图，删除未确认时跨服务重开保持封锁；可信的内核重启允许自动恢复，启动来源或缓存边界不可信时保守保留、人工恢复。删除已确认后的标记清理另作可重试状态，不改动 manifest 提交语义。这是新增、不可从目录重建的私有安全状态，登记在 0002。
+5. **保留 3.x 的单目标 ListLit 求值缺陷及 Python 短路行为。** 负责人在切片 B 调查后确认对齐；具体可达路径与验收见切片 B 的实施设计，不将其改为支持列表目标。
