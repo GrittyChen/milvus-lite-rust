@@ -315,3 +315,32 @@ Intel Mac：同一 x86_64 wheel 在 CPython 3.10 / 3.15、SDK 3.0.2 下通过无
 - 平台与持久化证据的边界同 rc1 候选验收。
 - 与 rc1 的行为变化：官方 3.x 写入、自身也无法构建的存量索引类型（IVF_PQ、DISKANN 等未知类型、向量字段上的 INVERTED），在 collection 尚未 load 且已有 flush 落盘的数据（包括已删除的行）时，rc1 照常 load，rc2 与官方一样 load 报错。索引构建参数仍不校验（0002 已登记）。
 - 候选验收不包括发布：tag、Release 草稿核对与发布、发布后从公开地址下载冒烟按 0013 候选阶段决策 6 逐项授权与执行。
+
+## 0.1.0rc2 发布
+
+2026-10-14，按 [0013](../decisions/0013-first-release-platform-and-packaging.md) 候选阶段决策 6 逐项授权执行：附注 tag `v0.1.0rc2` 指向冻结提交 `fe56005`，Release 草稿核对通过后发布；仓库已在 rc1 时公开。
+
+### 草稿核对
+
+- 草稿为预发布、绑定该 tag，正文为评审通过的 Release 说明；附件为上节的四个正式 wheel、sdist 与 `SHA256SUMS`，GitHub 记录的各附件 SHA256 与上节一致。
+- 附件下载到新目录后与上节产物逐字节相同，`SHA256SUMS` 核对通过。
+- 以下载的文件在新环境中按[打包验收](../../tests/packaging/README.md)的复用模式（不含全套测试）重做归档与二进制检查和安装冒烟：macOS arm64、macOS x86_64（Rosetta）、Linux x86_64、Linux arm64 各 CPython 3.10 × SDK 2.6.17 与 3.15 × 3.0.2，均通过；macOS arm64 上另以下载的 sdist 经 uv pip（PEP 517）源码构建安装，SDK 冒烟通过。
+
+### 发布
+
+2026-10-14T03:42:28Z 发布为预发布，未设为 Latest。Release 标为不可变；发布前后正文与各附件 SHA256 不变。
+
+### 公开地址下载冒烟
+
+从公开地址匿名下载全部六个附件，与上节产物逐字节相同，`SHA256SUMS` 与上节文本一致；以这组文件按上述复用模式在四个平台各以 CPython 3.10 × SDK 3.0.2 重做归档与二进制检查、导入、无 SDK 环境的 CLI 启停与 SDK `.db` 冒烟，均通过，已安装的原生库哈希与上节一致。
+
+另按 README 的安装方式验证：不带登录凭证、不用 pip 缓存、不读取 pip 配置文件，在新虚拟环境中逐字执行 `v0.1.0rc2` 的 README 中卸载官方包、安装 pymilvus 与本包的命令，再运行 [install_smoke.py](../../tests/packaging/install_smoke.py) 的 SDK 冒烟（`.db` 写入、过滤、flush、upsert、删除、关闭重开后读取与检索）。pymilvus 解析为 3.0.2。路径 A 为 README 中以 Release 为 `--find-links` 的安装命令；路径 B 为下载本平台 wheel 与 `SHA256SUMS`，核对后安装本地文件。
+
+| 平台 | 路径 A | 路径 B | 已安装的原生库 SHA256 |
+| --- | --- | --- | --- |
+| macOS arm64 | CPython 3.10 通过 | CPython 3.15 通过 | `7251892f…`，与上节一致 |
+| macOS x86_64（Rosetta） | CPython 3.10 通过 | CPython 3.15 通过 | `9b73e6e7…`，与上节一致 |
+| Linux x86_64 | CPython 3.10 通过 | CPython 3.12 通过 | `c5a21dc9…`，与上节一致 |
+| Linux arm64 | CPython 3.10 通过 | CPython 3.12 通过 | `ce835e0d…`，与上节一致 |
+
+Linux 两种架构在 rc1 候选验收所记的 manylinux_2_28 固定镜像的新容器中以非 root 执行，x86_64 为原生主机。
