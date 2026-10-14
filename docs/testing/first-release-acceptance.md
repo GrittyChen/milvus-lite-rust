@@ -260,3 +260,58 @@ Linux 两种架构在上节所记的 manylinux_2_28 固定镜像的新容器中�
 
 - 冻结在 tag 中的 README 写“ANN … 保持明确的 UNIMPLEMENTED”，过于笼统，应按 [0002](../decisions/0002-data-dir-compat.md#结论) 区分新建与存量：新建时显式 ANN 类型与标量 INVERTED 返回 UNIMPLEMENTED，AUTOINDEX 按 FLAT 执行；官方 3.x 写入的 HNSW、INVERTED 定义原样保留并按 FLAT 或扫描执行。rc1 以 Release 说明的表述为准，rc2 修正 README。
 - 发布后的跨实现复现发现一项未登记的行为差异：官方 3.x 写入、自身无法 load 的稠密向量索引定义（实测 IVF_PQ、DISKANN），3.x 重开后 load 报错，rc1 则照常 load 并按 FLAT 返回检索结果。[0002](../decisions/0002-data-dir-compat.md#结论) 要求这类定义与 3.x 一样在 load 时报错，rc1 没有实现，也没有对应测试。rc2 按 0002 修复并补跨实现测试；rc1 的 tag 与发行物不变。
+
+## 0.1.0rc2 候选验收
+
+2026-10-14。冻结提交 `fe56005`（`git archive` 的 SHA256 为 `ced98d43428b8d434446ab84668970d067cdae9d4940816e9baa05eb83b490aa`），参照 milvus-lite v3.2.1 / `43d1257`。相对 rc1 的变更是上节「留待 rc2」的两项：`c25fc46` 使官方 3.x 自身无法构建的存量向量索引定义在 load 时报错（[0002](../decisions/0002-data-dir-compat.md#结论)），`9801600` 修正 README 的索引表述；`fe56005` 切换版本。三个平台各自从该提交的源码构建并验收，使用与 rc1 候选验收相同的镜像、工具链、命令与参照环境；Linux arm64 的 Rust 构建并行数为 4（Docker VM 内存 7.7G）。
+
+### 发行物身份
+
+| 产物 | 文件 SHA256 | 原生库 SHA256 | 二进制检查 |
+| --- | --- | --- | --- |
+| `milvus_lite_rust-0.1.0rc2-cp310-abi3-macosx_11_0_arm64.whl` | `f23a7a389bcccbea2edabbc7c98610127eb59755b37b410b5ee50cb5b8dc0866` | `7251892f5d08ef064997c2a97a516d0754002bd39f176fe186815d332056d865` | 单架构 arm64，Mach-O 最低 11.0 |
+| `milvus_lite_rust-0.1.0rc2-cp310-abi3-macosx_11_0_x86_64.whl` | `9910a96c994fce23514ec77a652b0531ece9168774bd6e0030946525fc08ff7e` | `9b73e6e7e11a947b71af4c189e5b7cebfad2543d3eddcc00a3fa6a94908e9e2f` | 单架构 x86_64，Mach-O 最低 11.0 |
+| `milvus_lite_rust-0.1.0rc2-cp310-abi3-manylinux_2_28_x86_64.whl` | `83d891640cf6db28f7a56f591cb948c7ba0956fb19c982891d1414f7268b2dc9` | `c5a21dc913a2b6cf6e3ad347961c8cfe02b6539dbcb84ce5646b8a33254059e7` | GLIBC 依赖最高 2.28 |
+| `milvus_lite_rust-0.1.0rc2-cp310-abi3-manylinux_2_28_aarch64.whl` | `cb180652d7491ee200cc9f562e3823219851f922b4a7edfda906dbff3fa02c1f` | `ce835e0d380793557e07a4e3aea1f6b415d53bfb9612d7b55a4906c40d3bc50c` | GLIBC 依赖最高 2.28 |
+| `milvus_lite_rust-0.1.0rc2.tar.gz` | `b64f9e79855dc45e7d513f63bf1efe9c64eeed384154681e302c9ec8dc23f7d7` | — | 三个平台分别构建，逐字节相同 |
+
+隔离 FI wheel 只用于测试，不随 Release 发布：macOS arm64 `1364295c…`（原生库 `a539062f…`）、Linux x86_64 `7ddaf5a8…`（`743c0f2b…`）、Linux arm64 `5c19b4cf…`（`6695dafb…`），均由检查器确认含隔离入口；正式 wheel 均确认不含测试入口。
+
+Release 附件的 `SHA256SUMS` 为下列内容，覆盖四个正式 wheel 与 sdist：
+
+```text
+f23a7a389bcccbea2edabbc7c98610127eb59755b37b410b5ee50cb5b8dc0866  milvus_lite_rust-0.1.0rc2-cp310-abi3-macosx_11_0_arm64.whl
+9910a96c994fce23514ec77a652b0531ece9168774bd6e0030946525fc08ff7e  milvus_lite_rust-0.1.0rc2-cp310-abi3-macosx_11_0_x86_64.whl
+cb180652d7491ee200cc9f562e3823219851f922b4a7edfda906dbff3fa02c1f  milvus_lite_rust-0.1.0rc2-cp310-abi3-manylinux_2_28_aarch64.whl
+83d891640cf6db28f7a56f591cb948c7ba0956fb19c982891d1414f7268b2dc9  milvus_lite_rust-0.1.0rc2-cp310-abi3-manylinux_2_28_x86_64.whl
+b64f9e79855dc45e7d513f63bf1efe9c64eeed384154681e302c9ec8dc23f7d7  milvus_lite_rust-0.1.0rc2.tar.gz
+```
+
+### 实跑结果
+
+| 检查 | macOS arm64 | Linux x86_64（原生） | Linux arm64 |
+| --- | --- | --- | --- |
+| fmt；workspace 默认 / all-features Clippy | 通过 | 通过 | 通过 |
+| 默认 workspace / core FI / grpc all-features | 260 / 330 / 22 passed | 260 / 330 / 22 passed | 260 / 330 / 22 passed |
+| 构建拒绝 | Windows 目标、free-threaded 3.14 | free-threaded 3.14 / 3.15、PyPy 3.11 | free-threaded 3.14 / 3.15、PyPy 3.11 |
+| Windows core/grpc 默认与 FI 的 check/Clippy | 四项通过（交叉静态检查） | — | — |
+| CPython 3.10 / 3.15 × SDK 2.6.17 / 3.0.2 全套 | 四组各 272 passed | 四组各 272 passed | 四组各 272 passed |
+| CPython 3.11–3.14 安装冒烟（SDK 3.0.2） | 通过 | 通过 | 通过 |
+| 隔离 FI 的 compaction 套件 | 两条 SDK 各 5 passed | 5 passed | 5 passed |
+| 与 3.x 的差分（两条 SDK） | 各 123 passed | 各 123 passed | 各 123 passed |
+| 存储互通（两条 SDK；Arrow 15/25；含 18 个存量索引 load 用例） | 各 86 passed | 各 86 passed | 各 86 passed |
+| Rust 与 3.2.1 的 LOCK 双向互斥 | — | 通过 | 通过 |
+| strace 同步/提交/删除顺序 | — | 通过，83 次成功调用 | 通过，83 次成功调用 |
+| PID 1 正常 / 排空 / 监督器强杀 | — | 退出 0 / 0 / 137，重开 3 / 4 / 4 行 | 退出 0 / 0 / 137，重开 3 / 4 / 4 行 |
+| sdist 解包：Rust 1.89.0 默认与 all-features all-targets check | 通过 | — | — |
+| sdist 解包：cargo test 默认 / core FI | 260 / 330 passed | — | — |
+| sdist 解包：根入口与 `-m crates/py/Cargo.toml` 构建、PEP 517 安装冒烟 | 通过 | — | — |
+| 脚本自检（benchmark + packaging + platform，仓库内 `fe56005`） | 222 passed | — | — |
+
+Intel Mac：同一 x86_64 wheel 在 CPython 3.10 / 3.15、SDK 3.0.2 下通过无 SDK CLI 与 SDK `.db` 生命周期冒烟，在 Apple Silicon 上经 Rosetta 运行，不是原生 Intel 证据。环境与 CPython、SDK 依赖版本同 rc1 候选验收。
+
+### 边界
+
+- 平台与持久化证据的边界同 rc1 候选验收。
+- 与 rc1 的行为变化：官方 3.x 写入、自身也无法构建的存量索引类型（IVF_PQ、DISKANN 等未知类型、向量字段上的 INVERTED），在 collection 尚未 load 且已有 flush 落盘的数据（包括已删除的行）时，rc1 照常 load，rc2 与官方一样 load 报错。索引构建参数仍不校验（0002 已登记）。
+- 候选验收不包括发布：tag、Release 草稿核对与发布、发布后从公开地址下载冒烟按 0013 候选阶段决策 6 逐项授权与执行。
