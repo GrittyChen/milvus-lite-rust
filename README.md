@@ -2,7 +2,7 @@
 
 以 Rust 实现的非官方 milvus-lite，与 Milvus / Zilliz 无隶属关系。目标是让 `pymilvus` 用户继续使用 `MilvusClient("./demo.db")`，并读取官方 3.x 的数据目录。
 
-**`0.1.0rc2` 是预发布试用版本，不建议用于生产。** 它只通过本项目 GitHub 仓库的 Release 分发，目前未发布到 PyPI；PyPI 上若出现同名包，并非本项目发布。以下平台表是首发候选及验收边界，各行实际达到的证据层级以 Release 说明为准。
+**`0.1.0rc3` 是预发布试用版本，不建议用于生产。** 它只通过本项目 GitHub 仓库的 Release 分发，目前未发布到 PyPI；PyPI 上若出现同名包，并非本项目发布。以下平台表是首发候选及验收边界，各行实际达到的证据层级以 Release 说明为准。
 
 源码：<https://github.com/GrittyChen/milvus-lite-rust>；问题反馈：<https://github.com/GrittyChen/milvus-lite-rust/issues>。设计决策与验收记录在源码树的 docs 目录中维护。
 
@@ -20,13 +20,13 @@ pymilvus 从 PyPI 安装；本包只从 GitHub Release 的附件安装，`--no-i
 
 ```bash
 python -m pip install pymilvus
-python -m pip install --no-index --only-binary :all: --find-links https://github.com/GrittyChen/milvus-lite-rust/releases/expanded_assets/v0.1.0rc2 milvus-lite-rust==0.1.0rc2
+python -m pip install --no-index --only-binary :all: --find-links https://github.com/GrittyChen/milvus-lite-rust/releases/expanded_assets/v0.1.0rc3 milvus-lite-rust==0.1.0rc3
 ```
 
-需要先核对文件时，从 [v0.1.0rc2 Release](https://github.com/GrittyChen/milvus-lite-rust/releases/tag/v0.1.0rc2) 下载本平台的 wheel 与 `SHA256SUMS`，在同一目录核对后安装本地文件：
+需要先核对文件时，从 [v0.1.0rc3 Release](https://github.com/GrittyChen/milvus-lite-rust/releases/tag/v0.1.0rc3) 下载本平台的 wheel 与 `SHA256SUMS`，在同一目录核对后安装本地文件：
 
 ```bash
-shasum -a 256 -c --ignore-missing SHA256SUMS && python -m pip install --no-index ./milvus_lite_rust-0.1.0rc2-*.whl
+shasum -a 256 -c --ignore-missing SHA256SUMS && python -m pip install --no-index ./milvus_lite_rust-0.1.0rc3-*.whl
 ```
 
 核对失败时不会执行安装。Linux 上也可以用 `sha256sum -c --ignore-missing SHA256SUMS` 代替 `shasum -a 256 -c --ignore-missing SHA256SUMS`。
@@ -76,11 +76,15 @@ finally:
 
 `.db` 的父目录必须存在。同路径服务复用，`MilvusClient.close()` 关闭客户端而非本地服务；正常脚本退出会收尾服务并排空已接受的后台合并。
 
-当前源码范围包括基本 CRUD、Upsert/Delete、Flush/关闭重开、FLAT 的 L2/IP/COSINE、标量与动态字段比较、and/or/not、in/not in、LIKE、is null/exists、JSON 与动态字段路径、json_contains/array_contains 系列及 array_length、后台 compaction 与 tombstone 回收。过滤按官方 3.x 的整条表达式路线执行，各路线对缺失值、短路和类型错误的处理不同；范围与参照缺陷见 0014。算术运算、ARRAY 字段、text_match、几何与时间谓词、BM25/function chain、iterator 等范围外能力保持明确的 UNIMPLEMENTED，不静默忽略条件。官方 3.x 数据互通仍受类型、索引与已登记历史目录限制约束，不宣称兼容它的全部功能。
+`0.1.0rc3` 的范围包括基本 CRUD、Upsert/Delete、Flush/关闭重开、FLAT 的 L2/IP/COSINE、标量与动态字段比较、and/or/not、in/not in、LIKE、is null/exists、JSON 与动态字段路径、json_contains/array_contains 系列及 array_length、后台 compaction 与 tombstone 回收。过滤按官方 3.x 的整条表达式路线执行，各路线对缺失值、短路和类型错误的处理不同；范围与参照缺陷见 0014。算术运算、ARRAY 字段、text_match、几何与时间谓词、BM25/function chain、iterator 等范围外能力保持明确的 UNIMPLEMENTED，不静默忽略条件。官方 3.x 数据互通仍受类型、索引与已登记历史目录限制约束，不宣称兼容它的全部功能。
 
-当前发布的 `0.1.0rc2` 向量检索只有 FLAT（精确暴力检索）。新建索引时，FLAT 与 BRUTE_FORCE 原生支持，AUTOINDEX（pymilvus 快速建表使用）按 FLAT 执行；显式 ANN 类型（HNSW、HNSW_SQ、IVF_FLAT、IVF_SQ8）与标量字段上的 INVERTED 返回 UNIMPLEMENTED。打开官方 3.x 写入的目录时，HNSW、INVERTED 等定义原样保留，向量按 FLAT 执行，召回不低于 ANN 但数据量大时更慢；标量过滤按扫描执行，结果可能与官方在已建索引数据上的结果不同。官方 3.x 也无法构建的索引类型（如 IVF_PQ、DISKANN、向量字段上的 INVERTED），在 collection 尚未 load 且已有 flush 落盘的数据（包括已删除的行）时，与官方一样 load 报错；0.1.0rc1 不做这项检查，会照常 load。索引构建参数不校验：官方因参数无效而 load 失败的目录，这里仍会照常 load。
+向量检索只有 FLAT（精确暴力检索）。新建索引时，FLAT 与 BRUTE_FORCE 原生支持；AUTOINDEX（pymilvus 快速建表使用）、HNSW、HNSW_SQ、IVF_FLAT、IVF_SQ8 可创建并原样保存定义，向量仍按 FLAT 执行，召回不低于 ANN 但数据量大时更慢。标量字段上的 INVERTED 可创建，过滤仍按扫描执行，结果可能与官方在已建索引数据上的结果不同。新建稠密向量索引时，AUTOINDEX、HNSW、HNSW_SQ、IVF_FLAT、IVF_SQ8 只接受 COSINE / L2 / IP；BM25 / NONE 返回 UNIMPLEMENTED，避免写出官方 3.x 无法 load 的定义。FLAT / BRUTE_FORCE 保持原度量校验。
 
-当前源码另已接入 0014 切片 A（尚未发布，以上安装命令取得的 `0.1.0rc2` 不包含）：创建 HNSW、HNSW_SQ、IVF_FLAT、IVF_SQ8 与标量 INVERTED 可用，定义原样保存，向量仍按 FLAT、标量仍按扫描执行，结果与官方已建索引时可能不同。DropIndex 的名字行为与 3.x 一致：普通字段名或匹配不到的名字会删除全部索引；`<字段名>_idx` 或明确传入 field_name 才定向删除。collection 需先 release，删完全部索引后自动变为 Loaded。新建稠密向量索引时，AUTOINDEX、HNSW、HNSW_SQ、IVF_FLAT、IVF_SQ8 只接受 COSINE / L2 / IP；BM25 / NONE 返回 UNIMPLEMENTED，避免写出官方 3.x 无法 load 的定义。此限制也修正了 rc2 曾接受的 AUTOINDEX 组合；FLAT / BRUTE_FORCE 保持原行为。存量 FAISS 定义配 BM25 / NONE 时，collection 尚未 load 且至少一个有物理行的当前 segment 缺少匹配的 3.x 侧车，load 与官方一样报错；已删除的行仍计入。匹配路径全有、只有 WAL 或已经 loaded 时仍成功。此度量检查同样尚未发布，rc2 发行物不包含；侧车内容和构建参数仍不校验，组合错误的原因可能与官方不同，见源码 0002。
+DropIndex 的名字行为与 3.x 一致：普通字段名或匹配不到的名字会删除全部索引；`<字段名>_idx` 或明确传入 field_name 才定向删除。collection 需先 release，删完全部索引后自动变为 Loaded。
+
+打开官方 3.x 写入的目录时，索引定义原样保留；load 成功后，向量仍按 FLAT、标量仍按扫描执行。官方 3.x 也无法构建的索引类型（如 IVF_PQ、DISKANN、向量字段上的 INVERTED），在 collection 尚未 load 且已有 flush 落盘的数据（包括已删除的行）时，与官方一样 load 报错。存量 AUTOINDEX、HNSW、HNSW_SQ、IVF_FLAT、IVF_SQ8 定义配 BM25 / NONE 时，collection 尚未 load 且至少一个有物理行的当前 segment 缺少匹配的 3.x 侧车，load 与官方一样报错；已删除的行仍计入。匹配路径全有、只有 WAL 或已经 loaded 时，度量检查不拒绝 load。侧车内容和构建参数仍不校验：官方因参数无效而 load 失败的目录，这里可能照常 load；参数与度量同时无效时，报错原因也可能不同，见源码 0002。
+
+上述新建 ANN / INVERTED、DropIndex 和存量度量检查是 rc3 的变化，已发布的 rc2 不包含；rc2 也允许新建 AUTOINDEX 配 BM25 / NONE。or / not、not in、LIKE、is null / exists、JSON 路径与 contains 等过滤扩展同样从 rc3 开始提供。对于官方 3.x 也无法构建的索引类型（如 IVF_PQ、DISKANN）的 load 检查，rc1 不做，会照常 load。
 
 索引变更在旧索引文件删除落盘未确认时，会只封锁该 collection 的 CreateIndex / DropIndex。服务重开或容器重启不能证明恢复；可信的内核重启可自动解除，overlayfs、共享目录或启动来源不可信时需要人工恢复：确认承载数据目录的系统已经真实重启，停止对应服务或退出 Python 进程，删除下面列出的最终标记，再启动服务。最终标记为异常目录等条目时移出这个保留路径，不递归删内容；符号链接只移除链接本身。不要改 manifest、索引文件或 snapshot，也不要仅修改标记里的启动标识。若只是已安全操作的标记清理失败，可在**同一个服务实例内**重试，无需系统重启；实例退出后按磁盘标记重新判定，仍可能保守封锁。完整协议见源码仓库中的 0014 设计决策。
 
