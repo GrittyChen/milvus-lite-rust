@@ -685,3 +685,5 @@ M2 的“不做 compaction”是当时冻结范围，后续首发扩展以 [0010
 该扩展的差异表在 0010：单 Db 串行维护、文件大小桶的编码器影响、准备期并发 flush、create/drop 取消及异常收尾、原子合并 data/delta 提交、打开时 pins 的边界，以及歧义重复主键/序号的整轮拒绝。原保守最大删除表的 20% 残留已触发负责人确认的 0011；最终回收与内存结论以本轮复跑证据为准。
 
 后续索引定义与 DropIndex 的范围及差异统一见 [0014 切片 A](0014-index-definitions-and-filter-expressions.md#切片-a索引定义与-dropindex)；本文保留当时的验收范围。
+
+后续过滤表达式的扩展范围、参照缺陷与路线差异见 [0014 切片 B](0014-index-definitions-and-filter-expressions.md#切片-b过滤表达式)。上述 INVERTED 扫描差异扩展到比较、in/not in、is null 与 and/or，包括结果、排序以及成功/报错；已建索引 segment 的普通差分不能假定与扫描真值相同。Arrow 15/25 的浮点截断诊断原文差别也在该合同登记，本实现对齐固定的 Arrow 25.0.1。

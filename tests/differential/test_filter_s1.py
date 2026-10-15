@@ -336,9 +336,11 @@ def test_filter_errors_and_full_syntax_before_unsupported(diff):
     diff.step("bad_ids_parser",lambda c:c.delete(name,ids=["bad"]),error=True)
     for vectors,metric in [([[1,0]],"bad"),([[1]],"L2")]:
         diff.step("filter_before_search_parameters",lambda c:c.search(name,data=vectors,filter="age = 1",search_params={"metric_type":metric},limit=2),error=True)
-    for expr in ["age > 1 or age < 0", "not age > 1", "age in [1]", "age + 1 > 0", "true and missing>1", "active and missing>1",
-                 "title like '三%'", "age is null", "text_match(title, 'x')",
-                 "array_length(age) > 0", "ISO '2025-01-01T00:00:00Z' == ISO '2025-01-01T00:00:00Z'"]:
+    for expr in ["age > 1 or age < 0", "not age > 1", "age in [1]", "title like '三%'", "age is null"]:
+        diff.step(expr, lambda c: c.query(name, filter=expr))
+    for expr in ["true and missing>1", "active and missing>1", "array_length(age) > 0"]:
+        diff.step(expr, lambda c: c.query(name, filter=expr), error=True)
+    for expr in ["age + 1 > 0", "text_match(title, 'x')", "ISO '2025-01-01T00:00:00Z' == ISO '2025-01-01T00:00:00Z'"]:
         assert run(lambda c: c.query(name, filter=expr), diff.rust)[:2] == ("rpc", "UNIMPLEMENTED"), expr
     diff.step("disabled_meta_access",lambda c:c.query(name,filter="$meta['x'] == 1"),error=True)
 

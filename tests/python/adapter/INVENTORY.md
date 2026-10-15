@@ -6,16 +6,16 @@
 
 | 状态 | 含义 | 条数 |
 | --- | --- | --- |
-| 已复制 | 原样复制到本目录 | 172 |
+| 已复制 | 原样复制到本目录 | 180 |
 | 改后复制 | 仅按 0004「验收」第 2 项与 0006 第 25 项授权的条件替换，逐条说明改动 | 0 |
-| 范围外 | 用到当前切片不支持的功能，不复制；未实现能力的代表性入口见「范围外功能的 `UNIMPLEMENTED` 断言」 | 123 |
+| 范围外 | 用到当前切片不支持的功能，不复制；未实现能力的代表性入口见「范围外功能的 `UNIMPLEMENTED` 断言」 | 115 |
 | 待复用 | S1 已解除原过滤阻断，尚须核对 fixture 并迁移；不计入已运行套件 | 0 |
 | 依赖内部模块 | 导入或使用 3.x 的内部模块、内部对象，换成本实现后无法运行 | 33 |
 | 不运行 | 上游被同名定义覆盖，上游自己也不运行 | 1 |
 
 以上是逐条列出的 23 个文件中的 329 条；其余 24 个文件的 308 条整个文件记一行原因，见「整个文件不复用的文件」。
 
-「已复制」与「改后复制」共 172 个用例函数，参数化展开后 186 条。S1 恢复 [test_grpc_crud.py](test_grpc_crud.py) 中的原过滤表达式，并纳入除 LIKE 外的全部 19 条；它们在本实现与真实 3.x 上的两条客户端线均作为 S1 验收。随后迁移全部 40 条待复用用例，恢复此前为绕过过滤限制而替换的原表达式；顶层动态字段切片另加入原样的 TestDynamicField 用例。0014 已恢复原 HNSW 定义，并新增创建 HNSW、DropIndex 和 describe 参数的原用例；检索仍按 FLAT 执行。
+「已复制」与「改后复制」共 180 个用例函数，参数化展开后 209 条。S1 恢复 [test_grpc_crud.py](test_grpc_crud.py) 中的原过滤表达式，并纳入除 LIKE 外的全部 19 条；它们在本实现与真实 3.x 上的两条客户端线均作为 S1 验收。随后迁移全部 40 条待复用用例，恢复此前为绕过过滤限制而替换的原表达式；顶层动态字段切片另加入原样的 TestDynamicField 用例。0014 已恢复原 HNSW 定义，并新增创建 HNSW、DropIndex 和 describe 参数的原用例；检索仍按 FLAT 执行。
 
 历史的 HNSW→FLAT 授权替换按 0014 恢复原定义；`== N` 换成 `in [N]` 的条件见 0004「验收」第 2 项及 0006 第 25 项。已接通 S1 的 CRUD 副本不再替换表达式或读回方式。其余副本只删去随范围外用例一起不再使用的 import、helper 与空的分节标题；上游用于跳过的 `importorskip` 改为直接导入（本仓不允许因缺依赖静默跳过），上游因 HNSW 需要 faiss 而加的 `skipif` 随 HNSW 一起去掉。起服务的 fixture 与清理见 [conftest.py](conftest.py)。
 
@@ -50,7 +50,7 @@
 
 ### [test_grpc_crud.py](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_crud.py)（0004 候选文件）
 
-20 条：已复制 19，范围外 1。
+20 条：已复制 20，范围外 0。
 
 | 用例 | 状态 | 说明 |
 | --- | --- | --- |
@@ -64,7 +64,7 @@
 | [`test_query_by_id_with_output_fields`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_crud.py#L128) | 已复制 | |
 | [`test_query_by_filter_expression`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_crud.py#L143) | 已复制 | |
 | [`test_query_with_complex_expression`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_crud.py#L151) | 已复制 | |
-| [`test_query_with_like_pattern`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_crud.py#L162) | 范围外 | 过滤表达式（`title like 't%'`） |
+| [`test_query_with_like_pattern`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_crud.py#L162) | 已复制 | 0014 切片 B，保留参照原用例 |
 | [`test_query_with_no_matches`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_crud.py#L169) | 已复制 | |
 | [`test_query_unknown_collection_raises`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_crud.py#L176) | 已复制 | |
 | [`test_get_by_ids`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_crud.py#L185) | 已复制 | |
@@ -184,15 +184,15 @@
 
 ### [test_dynamic_field_coverage.py](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_dynamic_field_coverage.py)
 
-8 条：已复制 3，范围外 5。
+8 条：已复制 5，范围外 3。
 
 | 用例 | 状态 | 说明 |
 | --- | --- | --- |
 | [`test_dynamic_get_projection`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_dynamic_field_coverage.py#L88) | 已复制 |  |
 | [`test_dynamic_wildcard_preserves_all_json_types`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_dynamic_field_coverage.py#L101) | 已复制 |  |
-| [`test_dynamic_path_and_array_filters_through_grpc`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_dynamic_field_coverage.py#L132) | 范围外 | 过滤表达式（JSON 路径与数组下标，参数化给出） |
+| [`test_dynamic_path_and_array_filters_through_grpc`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_dynamic_field_coverage.py#L132) | 已复制 | 0014 切片 B，保留参照原用例 |
 | [`test_dynamic_multi_query_search_with_meta_projection`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_dynamic_field_coverage.py#L160) | 已复制 |  |
-| [`test_dynamic_zero_hit_search_with_meta_projection`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_dynamic_field_coverage.py#L180) | 范围外 | 过滤表达式（`payload["items"][99]["score"] > 0`） |
+| [`test_dynamic_zero_hit_search_with_meta_projection`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_dynamic_field_coverage.py#L180) | 已复制 | 0014 切片 B，保留参照原用例 |
 | [`test_dynamic_star_survives_grpc_group_by`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_dynamic_field_coverage.py#L198) | 范围外 | group_by |
 | [`test_dynamic_star_survives_grpc_ranker`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_dynamic_field_coverage.py#L218) | 范围外 | rerank |
 | [`test_dynamic_star_survives_hybrid_search_group_by`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_dynamic_field_coverage.py#L246) | 范围外 | hybrid search、rerank、group_by |
@@ -428,23 +428,23 @@
 
 ### [test_milvus_compat_v3.py](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat_v3.py)
 
-26 条：已复制 17，范围外 9。
+26 条：已复制 22，范围外 4。
 
 | 用例 | 状态 | 说明 |
 | --- | --- | --- |
 | [`TestVarcharPK::test_search_varchar_pk_equality`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat_v3.py#L129) | 已复制 |  |
-| [`TestVarcharPK::test_query_varchar_pk_like_prefix`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat_v3.py#L147) | 范围外 | 过滤表达式（`pk like "doc_00%"`） |
+| [`TestVarcharPK::test_query_varchar_pk_like_prefix`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat_v3.py#L147) | 已复制 | 0014 切片 B，保留参照原用例 |
 | [`TestVarcharPK::test_upsert_varchar_pk`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat_v3.py#L165) | 已复制 |  |
 | [`TestPaginationConsistency::test_paginated_search_matches_full`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat_v3.py#L195) | 已复制 |  |
 | [`TestPaginationConsistency::test_offset_beyond_count_returns_empty`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat_v3.py#L222) | 已复制 |  |
 | [`TestPaginationConsistency::test_search_pagination_with_filter`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat_v3.py#L235) | 已复制 |  |
 | [`TestPartitionPagination::test_search_in_partition_returns_only_partition_data`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat_v3.py#L270) | 范围外 | 分区 |
-| [`TestJsonFieldFilters::test_query_json_nested_field`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat_v3.py#L330) | 范围外 | 过滤表达式（`meta['count'] < 10`） |
-| [`TestJsonFieldFilters::test_search_json_string_filter`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat_v3.py#L346) | 范围外 | 过滤表达式（`meta["label"] == "item_0"`） |
+| [`TestJsonFieldFilters::test_query_json_nested_field`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat_v3.py#L330) | 已复制 | 0014 切片 B，保留参照原用例 |
+| [`TestJsonFieldFilters::test_search_json_string_filter`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat_v3.py#L346) | 已复制 | 0014 切片 B，保留参照原用例 |
 | [`TestMultiNullableTypes::test_query_multi_null_checks`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat_v3.py#L398) | 范围外 | 过滤表达式（`int_val is null and text is not null`）、nullable |
 | [`TestMultiNullableTypes::test_query_or_with_nullable`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat_v3.py#L419) | 范围外 | 过滤表达式（`int_val is null or float_val > 2.0`）、nullable |
-| [`TestStringInFilter::test_search_varchar_in_list`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat_v3.py#L452) | 范围外 | 检索带过滤表达式（`tag in ["tag_001", "tag_003"]`） |
-| [`TestStringInFilter::test_query_varchar_not_in`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat_v3.py#L467) | 范围外 | 过滤表达式（`tag not in ["tag_000", "tag_001", "tag_002"]`） |
+| [`TestStringInFilter::test_search_varchar_in_list`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat_v3.py#L452) | 已复制 | 0014 切片 B，保留参照原用例 |
+| [`TestStringInFilter::test_query_varchar_not_in`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat_v3.py#L467) | 已复制 | 0014 切片 B，保留参照原用例 |
 | [`TestMixedFilter::test_search_mixed_int_varchar`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat_v3.py#L489) | 已复制 |  |
 | [`TestDistanceOrdering::test_cosine_scores_descending`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat_v3.py#L512) | 已复制 |  |
 | [`TestDistanceOrdering::test_self_query_cosine_score_near_one`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat_v3.py#L523) | 已复制 |  |
@@ -519,7 +519,7 @@
 
 | 功能 | 用例 |
 | --- | --- |
-| S1 之外的过滤构造（如 `or`、`not`、JSON / 动态字段与 LIKE） | [test_grpc_translation.py](../test_grpc_translation.py) 的 `test_search_m1_unsupported`、`test_query_m1_unsupported`、`test_pymilvus_entry_points_remaining_unsupported` |
+| 0014 之外的过滤构造（算术、时间、text_match 与几何） | [test_grpc_translation.py](../test_grpc_translation.py) 的 `test_search_m1_unsupported`、`test_query_m1_unsupported`、`test_pymilvus_entry_points_remaining_unsupported` |
 | query iterator；search iterator 的第二批起 | `test_query_m1_unsupported`、`test_pymilvus_entry_points_remaining_unsupported` |
 | 分区 RPC；写入、检索、查询指定 `_default` 以外的分区；partition key | `test_insert_m1_unsupported`、`test_search_m1_unsupported`、`test_query_m1_unsupported`、`test_pymilvus_entry_points_remaining_unsupported` |
 | 数据库 RPC、alias | `test_pymilvus_entry_points_remaining_unsupported` |
@@ -570,3 +570,5 @@
 ## CLI 入口用例（独立来源）
 
 [test_cli_entrypoints.py](../test_cli_entrypoints.py) 另原样复制参照 tests/test_dump_tool.py 的 test_main_dispatches_server 和 test_package_module_main_delegates_to_cmdline，共 2 条。它们不属于 tests/adapter 的 637 条统计，起服务/信号与参数的真实验证见 test_cli.py 和差分的 test_cli_server.py；dump 尚未复用。
+
+0014 切片 B 原样恢复 8 个函数、参数化 23 条：CRUD LIKE、动态路径/数组及零命中投影、VARCHAR 主键 LIKE、JSON 路径、VARCHAR in/not in。nullable、分区、ARRAY 字段、算术等其他阻断仍保留，不因新增过滤能力扩大复制范围。

@@ -127,3 +127,63 @@ def test_dynamic_multi_query_search_with_meta_projection(milvus_client):
         assert "page" in hits[0]["entity"]
         assert "source" in hits[0]["entity"]
     milvus_client.drop_collection(name)
+
+
+@pytest.mark.parametrize("method", ["query", "search"])
+@pytest.mark.parametrize(
+    "expr, expected_ids",
+    [
+        ('payload["items"][0]["score"] > 0', {1}),
+        ('payload["items"][99]["score"] > 0', set()),
+        ('payload["missing"][0] > 0', set()),
+        ('source[0] == "f"', set()),
+        ("array_contains(array_field, 0)", {1}),
+        ("array_contains_all(array_field, [1, 2])", {1, 2}),
+        ("array_contains_any(array_field, [0, 9])", {1}),
+        ("array_length(array_field) == 0", {3}),
+    ],
+)
+def test_dynamic_path_and_array_filters_through_grpc(
+    milvus_client, method, expr, expected_ids
+):
+    name = _create_dynamic_collection(
+        milvus_client, "dynamic_path_array_filter"
+    )
+
+    if method == "query":
+        rows = milvus_client.query(
+            name, filter=expr, output_fields=["page"], limit=10
+        )
+        actual_ids = {row["id"] for row in rows}
+    else:
+        results = milvus_client.search(
+            name,
+            data=[[0.0, 0.0]],
+            anns_field="vec",
+            search_params={"metric_type": "L2", "params": {}},
+            limit=10,
+            filter=expr,
+            output_fields=["page"],
+        )
+        actual_ids = {hit["id"] for hit in results[0]}
+
+    assert actual_ids == expected_ids
+    milvus_client.drop_collection(name)
+
+
+def test_dynamic_zero_hit_search_with_meta_projection(milvus_client):
+    name = _create_dynamic_collection(milvus_client, "dynamic_zero_hit")
+
+    results = milvus_client.search(
+        name,
+        data=[[0.0, 0.0]],
+        anns_field="vec",
+        search_params={"metric_type": "L2", "params": {}},
+        limit=3,
+        filter='payload["items"][99]["score"] > 0',
+        output_fields=["$meta"],
+    )
+
+    assert len(results) == 1
+    assert list(results[0]) == []
+    milvus_client.drop_collection(name)

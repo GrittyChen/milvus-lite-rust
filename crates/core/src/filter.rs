@@ -1,9 +1,15 @@
-//! 3.x 完整过滤语法与 S1 的列式求值；范围与拒绝边界见 0006 第 1 项。
+//! 3.x 完整过滤语法与三路线求值；范围与拒绝边界见 0006、0009 和 0014。
 
+mod columns;
 mod dynamic;
 mod eval;
 mod parser;
+mod python;
+mod python_json;
 mod temporal;
+mod tree;
+#[cfg(test)]
+mod tree_tests;
 mod unicode;
 pub(crate) use dynamic::DynamicRow;
 pub(crate) use eval::Predicate;

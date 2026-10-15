@@ -35,7 +35,7 @@ pub(super) enum Comparison {
 }
 
 impl Comparison {
-    fn parse(op: &str) -> Result<Self> {
+    pub(super) fn parse(op: &str) -> Result<Self> {
         match op {
             "==" => Ok(Self::Equal),
             "!=" => Ok(Self::NotEqual),
@@ -61,21 +61,22 @@ impl Comparison {
 pub(crate) struct Predicate {
     pub(super) terms: Vec<Term>,
     pub(super) field_names: Option<Vec<String>>,
+    pub(super) tree: Option<super::tree::Tree>,
 }
 
-fn unsupported() -> EngineError {
+pub(super) fn unsupported() -> EngineError {
     EngineError::unsupported(
         "filter expressions",
-        "only scalar or top-level dynamic field/literal comparisons joined by 'and', dynamic field 'in', or a top-level primary-key 'in', are supported",
+        "arithmetic, temporal literals, text_match, and geometry predicates are not supported",
     )
 }
-fn compatible(a: &str, b: &str) -> bool {
+pub(super) fn compatible(a: &str, b: &str) -> bool {
     a == b
         || a == "dynamic"
         || b == "dynamic"
         || matches!((a, b), ("int", "float") | ("float", "int"))
 }
-fn sem(dtype: DataType) -> Option<&'static str> {
+pub(super) fn sem(dtype: DataType) -> Option<&'static str> {
     match dtype {
         DataType::Bool => Some("bool"),
         DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => Some("int"),
@@ -140,7 +141,12 @@ fn ratio(a: &str, b: &str) -> f64 {
     }
     2.0 * matched as f64 / (a.len() + b.len()) as f64
 }
-fn field_error(name: &str, pos: usize, source: &str, schema: &CollectionSchema) -> EngineError {
+pub(super) fn field_error(
+    name: &str,
+    pos: usize,
+    source: &str,
+    schema: &CollectionSchema,
+) -> EngineError {
     let reserved = matches!(name, "_seq" | "_partition" | "$meta");
     let message = if reserved {
         format!(
@@ -152,7 +158,7 @@ fn field_error(name: &str, pos: usize, source: &str, schema: &CollectionSchema) 
     };
     field_diagnostic(&message, name, pos, source, schema)
 }
-fn field_diagnostic(
+pub(super) fn field_diagnostic(
     message: &str,
     name: &str,
     pos: usize,
@@ -172,7 +178,7 @@ fn field_diagnostic(
     }
     parser::diagnostic(message, source, pos, name.chars().count(), Some(&tail))
 }
-fn describe(ast: &Ast, id: usize, t: &str) -> String {
+pub(super) fn describe(ast: &Ast, id: usize, t: &str) -> String {
     match &ast.nodes[id].kind {
         Kind::Field(name) => format!("{t} (field {})", py_repr(name)),
         _ => t.to_owned(),
@@ -193,16 +199,23 @@ impl Predicate {
             return Ok(Self {
                 terms: Vec::new(),
                 field_names: None,
+                tree: None,
             });
         };
         // 语法总是完整检查；范围外构造优先 UNIMPLEMENTED，不执行其语义检查（0006 第 1 项）。
-        if ast.nodes.iter().any(|node| {
-            matches!(
-                node.kind,
-                Kind::Unsupported | Kind::Path | Kind::Lit(Literal::Temporal)
-            )
-        }) {
+        if ast
+            .nodes
+            .iter()
+            .any(|node| matches!(node.kind, Kind::Unsupported | Kind::Lit(Literal::Temporal)))
+        {
             return Err(unsupported());
+        }
+        if !super::tree::legacy_shape(ast, schema) {
+            return Ok(Self {
+                terms: Vec::new(),
+                field_names: Some(schema.fields.iter().map(|f| f.name.clone()).collect()),
+                tree: Some(super::tree::Tree::compile(parsed, schema)?),
+            });
         }
         for node in &ast.nodes {
             if let Kind::And(ids) = &node.kind
@@ -394,7 +407,7 @@ impl Predicate {
                     }
                     "bool"
                 }
-                Kind::Unsupported | Kind::Path => return Err(unsupported()),
+                _ => return Err(unsupported()),
             };
             types[id] = t;
         }
@@ -467,6 +480,7 @@ impl Predicate {
         Ok(Self {
             terms,
             field_names: dynamic.then(|| schema.fields.iter().map(|f| f.name.clone()).collect()),
+            tree: None,
         })
     }
 
@@ -484,9 +498,10 @@ impl Predicate {
                     columns,
                     meta: meta.map(|rows| &rows[row]),
                     row,
+                    sequence: None,
                 })
                 .collect();
-            let matching = super::dynamic::evaluate_rows(self, &rows)?;
+            let matching = self.evaluate_source_rows(&rows)?;
             let mut out = live.clone();
             for (index, row) in live.live_rows().enumerate() {
                 if !matching.get(index) {
@@ -499,7 +514,7 @@ impl Predicate {
         }
     }
 
-    pub(crate) fn has_dynamic_fields(&self) -> bool {
+    pub(crate) fn requires_source_rows(&self) -> bool {
         self.field_names.is_some()
     }
 
@@ -507,7 +522,11 @@ impl Predicate {
         &self,
         rows: &[super::dynamic::DynamicRow<'_>],
     ) -> Result<SourceBits> {
-        super::dynamic::evaluate_rows(self, rows)
+        if let Some(tree) = &self.tree {
+            tree.evaluate_rows(rows)
+        } else {
+            super::dynamic::evaluate_rows(self, rows)
+        }
     }
 
     pub(crate) fn evaluate(&self, columns: &[ColumnData], live: &SourceBits) -> Result<SourceBits> {
@@ -635,21 +654,21 @@ impl Predicate {
 }
 
 #[derive(Clone, Copy)]
-enum Scalar<'a> {
+pub(super) enum Scalar<'a> {
     Int(i64),
     Float(f64),
     String(&'a str),
     Bool(bool),
 }
 #[derive(PartialEq, Eq, Hash)]
-enum ScalarKey<'a> {
+pub(super) enum ScalarKey<'a> {
     Int(i64),
     Float(u64),
     String(&'a str),
     Bool(bool),
 }
 impl<'a> Scalar<'a> {
-    fn key(&self) -> ScalarKey<'a> {
+    pub(super) fn key(&self) -> ScalarKey<'a> {
         match self {
             Self::Int(v) => ScalarKey::Int(*v),
             Self::Float(v) => ScalarKey::Float(v.to_bits()),
@@ -665,7 +684,7 @@ pub(super) fn validate_literal(op: &Operand) -> Result<()> {
     }
     Ok(())
 }
-fn operand_precision<C: std::ops::Index<usize, Output = ColumnData> + ?Sized>(
+pub(super) fn operand_precision<C: std::ops::Index<usize, Output = ColumnData> + ?Sized>(
     op: &Operand,
     columns: &C,
 ) -> u8 {
@@ -679,7 +698,7 @@ fn operand_precision<C: std::ops::Index<usize, Output = ColumnData> + ?Sized>(
         _ => 0,
     }
 }
-fn value<'a, C: std::ops::Index<usize, Output = ColumnData> + ?Sized>(
+pub(super) fn value<'a, C: std::ops::Index<usize, Output = ColumnData> + ?Sized>(
     op: &'a Operand,
     columns: &'a C,
     row: usize,

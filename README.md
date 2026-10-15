@@ -76,7 +76,7 @@ finally:
 
 `.db` 的父目录必须存在。同路径服务复用，`MilvusClient.close()` 关闭客户端而非本地服务；正常脚本退出会收尾服务并排空已接受的后台合并。
 
-当前范围包括基本 CRUD、Upsert/Delete、Flush/关闭重开、FLAT 的 L2/IP/COSINE、S1 标量比较与 and、主键 in、顶层动态字段比较/in、后台 compaction 与 tombstone 回收。BM25/function chain、iterator、嵌套 JSON 等范围外能力保持明确的 UNIMPLEMENTED，不静默忽略条件。官方 3.x 数据互通仍受类型、索引与已登记历史目录限制约束，不宣称兼容它的全部功能。
+当前源码范围包括基本 CRUD、Upsert/Delete、Flush/关闭重开、FLAT 的 L2/IP/COSINE、标量与动态字段比较、and/or/not、in/not in、LIKE、is null/exists、JSON 与动态字段路径、json_contains/array_contains 系列及 array_length、后台 compaction 与 tombstone 回收。过滤按官方 3.x 的整条表达式路线执行，各路线对缺失值、短路和类型错误的处理不同；范围与参照缺陷见 0014。算术运算、ARRAY 字段、text_match、几何与时间谓词、BM25/function chain、iterator 等范围外能力保持明确的 UNIMPLEMENTED，不静默忽略条件。官方 3.x 数据互通仍受类型、索引与已登记历史目录限制约束，不宣称兼容它的全部功能。
 
 当前发布的 `0.1.0rc2` 向量检索只有 FLAT（精确暴力检索）。新建索引时，FLAT 与 BRUTE_FORCE 原生支持，AUTOINDEX（pymilvus 快速建表使用）按 FLAT 执行；显式 ANN 类型（HNSW、HNSW_SQ、IVF_FLAT、IVF_SQ8）与标量字段上的 INVERTED 返回 UNIMPLEMENTED。打开官方 3.x 写入的目录时，HNSW、INVERTED 等定义原样保留，向量按 FLAT 执行，召回不低于 ANN 但数据量大时更慢；标量过滤按扫描执行，结果可能与官方在已建索引数据上的结果不同。官方 3.x 也无法构建的索引类型（如 IVF_PQ、DISKANN、向量字段上的 INVERTED），在 collection 尚未 load 且已有 flush 落盘的数据（包括已删除的行）时，与官方一样 load 报错；0.1.0rc1 不做这项检查，会照常 load。索引构建参数不校验：官方因参数无效而 load 失败的目录，这里仍会照常 load。
 

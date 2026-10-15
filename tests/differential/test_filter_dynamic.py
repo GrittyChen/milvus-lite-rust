@@ -83,12 +83,12 @@ def test_dynamic_mixed_values_and_runtime_errors_preserve_failed_deletes(diff,va
     if error:assert diff.step('after',lambda c:c.query(name,output_fields=['*']))==before
 
 
-def test_dynamic_scope_rejects_nested_and_other_unimplemented_constructs(diff):
+def test_dynamic_scope_accepts_tree_forms_and_keeps_parser_rejections(diff):
     name='dynamic_scope'
     diff.step('create',lambda c:c.create_collection(name,schema=schema(),index_params=index('L2')))
     diff.step('meta_in_parser_contract',lambda c:c.query(name,filter="$meta['x'] in [1]"),error=True)
     for expr in ["x['key'] == 1","$meta['x']['key'] == 1","x in [1] or x == 2","not x == 1","x not in [1]","x is null","x like 'a%'","x == age","age in [1]","id in [1] and x == 1"]:
-        assert run(lambda c:c.query(name,filter=expr),diff.rust)[:2]==('rpc','UNIMPLEMENTED'),expr
+        diff.step(expr, lambda c: c.query(name, filter=expr))
 
 
 @pytest.mark.parametrize('committed',[False,True])

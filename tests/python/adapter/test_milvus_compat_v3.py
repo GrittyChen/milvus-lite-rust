@@ -167,6 +167,24 @@ class TestVarcharPK:
         milvus_client.drop_collection("vpk3")
 
 
+    def test_query_varchar_pk_like_prefix(self, milvus_client):
+        """Query with LIKE prefix on VARCHAR PK.
+        Adapted from test_search_string_field_index."""
+        rows = self._rows()
+        milvus_client.create_collection("vpk2", schema=self._schema(milvus_client))
+        milvus_client.insert("vpk2", rows)
+        _index_and_load(milvus_client, "vpk2")
+
+        result = milvus_client.query(
+            "vpk2", filter='pk like "doc_00%"',
+            output_fields=["pk"],
+        )
+        for r in result:
+            assert r["pk"].startswith("doc_00")
+        # doc_000 through doc_009 = 10 matches
+        assert len(result) == 10
+        milvus_client.drop_collection("vpk2")
+
 # ===========================================================================
 # 2. Pagination consistency -- offset pages match full search
 # ===========================================================================
@@ -492,3 +510,95 @@ class TestGetPartialMiss:
         result = milvus_client.get("gp2", ids=[9997, 9998, 9999])
         assert result == []
         milvus_client.drop_collection("gp2")
+
+
+class TestJsonFieldFilters:
+    """Adapted from test_milvus_client_e2e query_cases with JSON."""
+
+    def _schema(self, client):
+        schema = MilvusClient.create_schema(auto_id=False,
+                                            enable_dynamic_field=False)
+        schema.add_field("id", DataType.INT64, is_primary=True)
+        schema.add_field("vec", DataType.FLOAT_VECTOR, dim=DIM)
+        schema.add_field("meta", DataType.JSON)
+        return schema
+
+    def _rows(self, n=NB):
+        rng = _rng()
+        return [
+            {
+                "id": i,
+                "vec": rng.standard_normal(DIM).astype(np.float32).tolist(),
+                "meta": {"count": i, "label": f"item_{i % 5}"},
+            }
+            for i in range(n)
+        ]
+
+    def test_query_json_nested_field(self, milvus_client):
+        """Query with JSON path filter: meta['count'] < 10."""
+        rows = self._rows()
+        milvus_client.create_collection("js1", schema=self._schema(milvus_client))
+        milvus_client.insert("js1", rows)
+        _index_and_load(milvus_client, "js1")
+
+        result = milvus_client.query(
+            "js1", filter="meta['count'] < 10",
+            output_fields=["id", "meta"],
+        )
+        for r in result:
+            assert r["meta"]["count"] < 10
+        assert len(result) == 10
+        milvus_client.drop_collection("js1")
+
+    def test_search_json_string_filter(self, milvus_client):
+        """Search with JSON string field filter."""
+        rows = self._rows()
+        milvus_client.create_collection("js2", schema=self._schema(milvus_client))
+        milvus_client.insert("js2", rows)
+        _index_and_load(milvus_client, "js2")
+
+        q = _rng(42).standard_normal((1, DIM)).astype(np.float32).tolist()
+        res = milvus_client.search(
+            "js2", data=q, limit=NB,
+            filter='meta["label"] == "item_0"',
+            output_fields=["meta"],
+        )
+        for hit in res[0]:
+            assert hit["entity"]["meta"]["label"] == "item_0"
+        # ids 0,5,10,15,20,25 -> 6 matches
+        assert len(res[0]) == NB // 5
+        milvus_client.drop_collection("js2")
+
+
+class TestStringInFilter:
+    """Adapted from test_search_with_different_string_expr (IN operator
+    with varchar values)."""
+
+    def test_search_varchar_in_list(self, milvus_client):
+        """Search with varchar IN ["tag_001", "tag_003"]."""
+        rows = _create_simple(milvus_client, "si1")
+        q = _rng(42).standard_normal((1, DIM)).astype(np.float32).tolist()
+
+        res = milvus_client.search(
+            "si1", data=q, limit=NB,
+            filter='tag in ["tag_001", "tag_003"]',
+            output_fields=["tag"],
+        )
+        for hit in res[0]:
+            assert hit["entity"]["tag"] in ["tag_001", "tag_003"]
+        assert len(res[0]) == 2
+        milvus_client.drop_collection("si1")
+
+    def test_query_varchar_not_in(self, milvus_client):
+        """Query with varchar NOT IN list."""
+        _create_simple(milvus_client, "si2")
+
+        result = milvus_client.query(
+            "si2",
+            filter='tag not in ["tag_000", "tag_001", "tag_002"]',
+            output_fields=["tag"],
+        )
+        for r in result:
+            assert r["tag"] not in ["tag_000", "tag_001", "tag_002"]
+        assert len(result) == NB - 3
+        milvus_client.drop_collection("si2")

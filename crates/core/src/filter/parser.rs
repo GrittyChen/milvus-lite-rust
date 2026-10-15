@@ -37,27 +37,54 @@ impl Literal {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
+pub(super) enum PathPart {
+    Key(String),
+    Index(String),
+}
+
+#[derive(Debug, Clone)]
 pub(super) enum Kind {
     Lit(Literal),
     Field(String),
     Meta(String),
     Cmp(String, usize, usize),
     And(Vec<usize>),
+    Or(Vec<usize>),
+    Not(usize),
+    Like {
+        value: usize,
+        pattern: String,
+    },
+    IsNull {
+        value: usize,
+        negate: bool,
+        exists: bool,
+    },
+    Contains {
+        value: usize,
+        targets: usize,
+        mode: String,
+    },
+    Length(usize),
     In {
         field: usize,
         list: usize,
         negate: bool,
     },
     List(Vec<usize>),
-    Path,
+    Path {
+        base: usize,
+        parts: Vec<PathPart>,
+    },
     Unsupported,
 }
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(super) struct Node {
     pub kind: Kind,
     pub pos: usize,
 }
+#[derive(Debug, Clone)]
 pub(super) struct Ast {
     pub nodes: Vec<Node>,
     pub root: usize,
@@ -439,14 +466,7 @@ impl Parser<'_> {
             Ok(first)
         } else {
             let pos = self.nodes[first].pos;
-            Ok(self.node(
-                if is_or {
-                    Kind::Unsupported
-                } else {
-                    Kind::And(ids)
-                },
-                pos,
-            ))
+            Ok(self.node(if is_or { Kind::Or(ids) } else { Kind::And(ids) }, pos))
         }
     }
     fn not(&mut self) -> Result<usize> {
@@ -455,8 +475,7 @@ impl Parser<'_> {
             self.enter()?;
             let inner = self.not();
             self.depth -= 1;
-            inner?;
-            Ok(self.node(Kind::Unsupported, tok.pos))
+            Ok(self.node(Kind::Not(inner?), tok.pos))
         } else {
             self.cmp()
         }
@@ -527,14 +546,23 @@ impl Parser<'_> {
                         Some("example: title like 'AI%'"),
                     ));
                 }
-                self.take();
-                return Ok(self.node(Kind::Unsupported, tok.pos));
+                let pattern = self.take();
+                let Some(Literal::String(pattern)) = pattern.lit else {
+                    return Err(EngineError::invalid("LIKE pattern has no string value"));
+                };
+                return Ok(self.node(
+                    Kind::Like {
+                        value: left,
+                        pattern,
+                    },
+                    tok.pos,
+                ));
             }
             if self.has("is") {
                 let tok = self.take();
                 if !matches!(
                     self.nodes[left].kind,
-                    Kind::Field(_) | Kind::Meta(_) | Kind::Path
+                    Kind::Field(_) | Kind::Meta(_) | Kind::Path { .. }
                 ) {
                     return Err(self.error(
                         "left side of 'is null' must be a field reference or JSON path",
@@ -560,7 +588,14 @@ impl Parser<'_> {
                     ));
                 }
                 self.take();
-                return Ok(self.node(Kind::Unsupported, tok.pos));
+                return Ok(self.node(
+                    Kind::IsNull {
+                        value: left,
+                        negate,
+                        exists: false,
+                    },
+                    tok.pos,
+                ));
             }
             break;
         }
@@ -606,7 +641,7 @@ impl Parser<'_> {
             let id = self.primary()?;
             if !matches!(
                 self.nodes[id].kind,
-                Kind::Field(_) | Kind::Meta(_) | Kind::Path
+                Kind::Field(_) | Kind::Meta(_) | Kind::Path { .. }
             ) {
                 return Err(self.error(
                     "'exists' must be followed by a field reference or JSON path",
@@ -615,7 +650,14 @@ impl Parser<'_> {
                     Some("example: exists metadata[\"key\"]"),
                 ));
             }
-            Ok(self.node(Kind::Unsupported, tok.pos))
+            Ok(self.node(
+                Kind::IsNull {
+                    value: id,
+                    negate: true,
+                    exists: true,
+                },
+                tok.pos,
+            ))
         } else {
             self.primary()
         }
@@ -642,8 +684,8 @@ impl Parser<'_> {
             }
             let id = self.node(Kind::Field(tok.text), tok.pos);
             if self.has("[") {
-                self.path()?;
-                return Ok(self.node(Kind::Path, tok.pos));
+                let parts = self.path()?;
+                return Ok(self.node(Kind::Path { base: id, parts }, tok.pos));
             }
             return Ok(id);
         }
@@ -685,26 +727,26 @@ impl Parser<'_> {
                 ));
             }
             self.take();
-            let nested = self.has("[");
-            self.path()?;
-            return Ok(self.node(
-                if nested {
-                    Kind::Path
-                } else {
-                    Kind::Meta(match key.lit {
-                        Some(Literal::String(key)) => key,
-                        _ => {
-                            return Err(self.error(
-                                "$meta key must be a string literal",
-                                key.pos,
-                                1,
-                                None,
-                            ));
-                        }
-                    })
-                },
+            let parts = self.path()?;
+            let base = self.node(
+                Kind::Meta(match key.lit {
+                    Some(Literal::String(key)) => key,
+                    _ => {
+                        return Err(self.error(
+                            "$meta key must be a string literal",
+                            key.pos,
+                            1,
+                            None,
+                        ));
+                    }
+                }),
                 tok.pos,
-            ));
+            );
+            return Ok(if parts.is_empty() {
+                base
+            } else {
+                self.node(Kind::Path { base, parts }, tok.pos)
+            });
         }
         if tok.kind == "(" {
             self.take();
@@ -738,7 +780,8 @@ impl Parser<'_> {
             Some("expected literal, identifier, or '('"),
         ))
     }
-    fn path(&mut self) -> Result<()> {
+    fn path(&mut self) -> Result<Vec<PathPart>> {
+        let mut parts = Vec::new();
         while self.has("[") {
             self.take();
             if self.has("-") {
@@ -757,10 +800,15 @@ impl Parser<'_> {
                     None,
                 ));
             }
-            self.take();
+            let token = self.take();
+            parts.push(match token.lit {
+                Some(Literal::String(key)) => PathPart::Key(key),
+                Some(Literal::Int(index)) => PathPart::Index(index),
+                _ => return Err(EngineError::invalid("path token has no literal value")),
+            });
             self.required("]", "field access: expected ']'")?;
         }
-        Ok(())
+        Ok(parts)
     }
     fn list(&mut self) -> Result<usize> {
         let tok = self.take();
@@ -890,13 +938,24 @@ impl Parser<'_> {
             };
             return Err(self.error(message, self.peek().pos, 1, None));
         }
-        self.take();
+        let field = self.take();
+        let mut value = self.node(Kind::Field(field.text), field.pos);
         if contains {
-            self.path()?;
+            let parts = self.path()?;
+            if !parts.is_empty() {
+                value = self.node(Kind::Path { base: value, parts }, field.pos);
+            }
         }
         if name == "array_length" || matches!(name.as_str(), "st_isvalid" | "geometry_isvalid") {
             self.required(")", &format!("{display}: expected ')'"))?;
-            return Ok(self.node(Kind::Unsupported, tok.pos));
+            return Ok(self.node(
+                if name == "array_length" {
+                    Kind::Length(value)
+                } else {
+                    Kind::Unsupported
+                },
+                tok.pos,
+            ));
         }
         let comma = if name == "text_match" {
             "text_match: expected ',' after field name".into()
@@ -906,11 +965,11 @@ impl Parser<'_> {
             format!("{}: expected ','", tok.text)
         };
         self.required(",", &comma)?;
-        if contains {
+        let targets = if contains {
             if self.has("[") {
-                self.list()?;
+                Some(self.list()?)
             } else {
-                self.primary()?;
+                Some(self.primary()?)
             }
         } else {
             if !self.has("string") {
@@ -949,9 +1008,28 @@ impl Parser<'_> {
                     }
                 }
             }
-        }
+            None
+        };
         self.required(")", &format!("{display}: expected ')'"))?;
-        Ok(self.node(Kind::Unsupported, tok.pos))
+        Ok(self.node(
+            if let Some(targets) = targets {
+                Kind::Contains {
+                    value,
+                    targets,
+                    mode: if name.ends_with("_all") {
+                        "all"
+                    } else if name.ends_with("_any") {
+                        "any"
+                    } else {
+                        "any_one"
+                    }
+                    .into(),
+                }
+            } else {
+                Kind::Unsupported
+            },
+            tok.pos,
+        ))
     }
 }
 

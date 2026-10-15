@@ -1,5 +1,5 @@
 # 复制自 milvus-lite v3.2.1（43d1257）的 tests/adapter/test_grpc_crud.py，Apache-2.0 许可。
-# S1 保留原用例与过滤表达式；只排除范围外的 LIKE 用例（逐条状态见 INVENTORY.md）。
+# S1 与 0014 切片 B 保留全部 CRUD 原用例与表达式，逐条状态见 INVENTORY.md。
 """Phase 10.3 — pymilvus CRUD end-to-end tests.
 
 The 4 RPCs added in Phase 10.3 (Insert / Upsert / Delete / Query)
@@ -232,4 +232,11 @@ def test_delete_by_filter_active_true(populated_client):
 def test_delete_by_filter_no_match(populated_client):
     populated_client.delete("demo", filter="id > 1000")
     rows = populated_client.query("demo", filter="id >= 0", output_fields=["id"])
+    assert len(rows) == 5
+
+
+def test_query_with_like_pattern(populated_client):
+    rows = populated_client.query(
+        "demo", filter="title like 't%'", output_fields=["id", "title"]
+    )
     assert len(rows) == 5

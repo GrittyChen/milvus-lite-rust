@@ -194,3 +194,5 @@ M1 只在本机（macOS）验收。Linux 与 Windows 的 CI 与 wheel 构建单�
 跨平台 CI 还要验证：本实现在 x86 与 aarch64 上对同一输入算出的距离逐位相同（求和顺序只由源码决定，见 [flat.rs](../../crates/core/src/flat.rs)），与 3.x 之间仍按「决策」中的误差比较。NaN 距离只要求仍为 NaN：Rust 不保证 NaN 的符号与 payload，随平台与代码生成而变，同一查询单独打分与按 4 条一组打分也可能不同，因此对外 NaN 分数的符号与 payload 不作保证；排序把所有 NaN 视为相同，结果顺序不受影响。
 
 后续索引定义与 DropIndex 的范围及差异统一见 [0014 切片 A](0014-index-definitions-and-filter-expressions.md#切片-a索引定义与-dropindex)；本文保留当时的验收范围。
+
+后续过滤表达式的扩展范围、参照缺陷与路线差异见 [0014 切片 B](0014-index-definitions-and-filter-expressions.md#切片-b过滤表达式)。

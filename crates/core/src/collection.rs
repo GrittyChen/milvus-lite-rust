@@ -261,7 +261,7 @@ impl ReadSnapshot {
         parsed: &crate::filter::ParsedFilter,
     ) -> Result<std::borrow::Cow<'_, [Chunk]>> {
         let predicate = crate::filter::Predicate::from_parsed(parsed, &self.schema)?;
-        // 无过滤不复制块表；terms 为空只可能是空表达式（编译拒绝了独立 bool 谓词）。
+        // 只有空表达式可直接借用块表；通用布尔树也可能没有旧 Term。
         if parsed.is_empty() {
             return Ok(std::borrow::Cow::Borrowed(&self.chunks));
         }
@@ -276,7 +276,7 @@ impl ReadSnapshot {
             return Ok(std::borrow::Cow::Borrowed(&self.chunks));
         };
         let mut chunks = self.chunks.clone();
-        if predicate.has_dynamic_fields() {
+        if predicate.requires_source_rows() {
             let mut start = 0;
             while start < chunks.len() {
                 let source = chunks[start].source;
@@ -305,6 +305,7 @@ impl ReadSnapshot {
                             columns: &chunks[i].columns,
                             meta: chunks[i].meta.as_ref().map(|m| &m[row]),
                             row,
+                            sequence: Some(chunks[i].seqs[row]),
                         })
                         .collect();
                     let matching = predicate.evaluate_source_rows(&rows)?;
