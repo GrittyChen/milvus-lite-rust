@@ -26,17 +26,30 @@ HAS_FORK = hasattr(os, "fork")
 needs_fork = pytest.mark.skipif(not HAS_FORK, reason="os.fork 在 Windows 上不存在")
 
 
-def run_script(code: str, cwd: Path, timeout: float = 60) -> list[str]:
-    """在新的 Python 进程里运行脚本，返回以 ``OUT `` 开头的输出行（去掉前缀）。"""
+def run_script_process(
+    code: str, cwd: Path, timeout: float = 60, env: dict[str, str] | None = None
+) -> subprocess.CompletedProcess:
+    """在新的 Python 进程里运行脚本，断言其成功退出并返回进程结果。"""
     proc = subprocess.run(
         [sys.executable, "-c", textwrap.dedent(code)],
         cwd=cwd,
         capture_output=True,
         text=True,
         timeout=timeout,
+        env=env,
     )
     assert proc.returncode == 0, proc.stderr
+    return proc
+
+
+def out_lines(proc: subprocess.CompletedProcess) -> list[str]:
+    """以 ``OUT `` 开头的输出行（去掉前缀）。"""
     return [line[4:] for line in proc.stdout.splitlines() if line.startswith("OUT ")]
+
+
+def run_script(code: str, cwd: Path, timeout: float = 60) -> list[str]:
+    """在新的 Python 进程里运行脚本，返回以 ``OUT `` 开头的输出行（去掉前缀）。"""
+    return out_lines(run_script_process(code, cwd, timeout))
 
 
 def can_open_in_other_process(path: Path) -> bool:
@@ -526,32 +539,42 @@ print("OUT child-lock-released", other_process_can_open("c.db"))
 
 @needs_fork
 def test_fork_during_parallel_search(tmp_path):
-    # 0005「验证」：父进程的计算池正在并行检索时 fork。子进程为新路径启动自己的服务与计算池并检索；
-    # 父进程的检索照常完成。行数足够多，使每次检索主要是服务端的计算；第一次检索返回后才开始 fork，
+    # 0005「验证」：父进程服务的计算池正在并行检索时 fork。子进程为新路径启动自己的服务与计算池并检索；
+    # 父进程服务上的检索照常完成。行数足够多，使每次检索主要是服务端的计算；第一次检索返回后才开始 fork，
     # 并连续 fork 几次，每次都落在检索进行之中。子进程设 alarm，死锁时被 SIGALRM 杀掉而不是挂住测试。
-    out = run_script(
+    #
+    # 检索由另一个进程中的客户端经父进程的 URI 发起，父进程自己的客户端在 fork 时空闲：fork 时有在途 gRPC
+    # 调用是 grpcio 不支持的场景，原因见 0003「fork」的客户端在途调用。这个前提由用例结构保证；显式设置
+    # GRPC_VERBOSITY=INFO 后 stderr 中没有 grpcio 跳过 fork 处理的日志，只作为单向的防退化检查。
+    proc = run_script_process(
         FORK_PRELUDE
         + """
-import signal, threading
+import signal
 import numpy as np
 dim = 128
 rng = np.random.default_rng(7)
-parent = MilvusClient(sm.start_and_get_uri("p.db"))
+uri = sm.start_and_get_uri("p.db")
+parent = MilvusClient(uri)
 parent.create_collection("c", dimension=dim)
 data = rng.random((100_000, dim), dtype=np.float32)
 for i in range(0, len(data), 10_000):
     parent.insert("c", [{"id": j, "vector": data[j].tolist()} for j in range(i, i + 10_000)])
-queries = rng.random((200, dim), dtype=np.float32).tolist()
-searching, stop, results = threading.Event(), threading.Event(), []
 
-def search_loop():
-    while not stop.is_set():
-        results.append(len(parent.search("c", data=queries, limit=3)))
-        searching.set()
-
-t = threading.Thread(target=search_loop)
-t.start()
-searching.wait()
+SEARCHER = '''
+import os, sys
+import numpy as np
+from pymilvus import MilvusClient
+client = MilvusClient(sys.argv[1])
+queries = np.random.default_rng(8).random((200, 128), dtype=np.float32).tolist()
+results = []
+while not os.path.exists("stop"):
+    results.append(len(client.search("c", data=queries, limit=3)))
+    if len(results) == 1:
+        print("searching", flush=True)
+print(len(results) >= 2 and all(n == 200 for n in results), flush=True)
+'''
+searcher = subprocess.Popen([sys.executable, "-c", SEARCHER, uri], stdout=subprocess.PIPE, text=True)
+assert searcher.stdout.readline() == "searching\\n"
 
 def child(iteration):
     signal.alarm(20)
@@ -563,16 +586,21 @@ def child(iteration):
 
 for iteration in range(3):
     fork_and_wait(lambda iteration=iteration: child(iteration))
-stop.set()
-t.join()
-print("OUT parent-searches-ok", len(results) >= 2 and all(n == 200 for n in results), flush=True)
+open("stop", "w").close()
+searched, _ = searcher.communicate(timeout=60)
+print("OUT searcher-exit", searcher.returncode, flush=True)
+print("OUT parent-searches-ok", searched.strip(), flush=True)
 """,
         tmp_path,
         timeout=180,
+        env={**os.environ, "GRPC_VERBOSITY": "INFO"},
     )
+    out = out_lines(proc)
     assert out.count("child-exit 0") == 3
     assert out.count("child-search [99, 98]") == 3
+    assert "searcher-exit 0" in out
     assert "parent-searches-ok True" in out
+    assert "skipping fork() handlers" not in proc.stderr
 
 
 @needs_fork

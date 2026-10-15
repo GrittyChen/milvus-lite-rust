@@ -97,6 +97,7 @@ E4、E5 违反了架构不变量 8（单进程独占 data_dir）和不变量 5�
 - **继承来的路径**：子进程返回父进程的 URI，与 3.x 的 E3 一致，multiprocessing 的 fork 子进程可以照常访问父进程打开的库。父进程退出后，这些请求会失败。
 - **新路径**：子进程启动自己的服务，使用新的 runtime 与线程池，服务归子进程所有，退出时由子进程停止。
 - **子进程中的 atexit 与 `release_server`**：跳过继承来的服务，并保留其表项。不关闭、不解锁、不删 WAL，之后对同一路径的调用仍返回父进程的 URI。这修正了 E4、E5，是与 3.x 的行为差异，见下文「与 3.x 的行为差异」。
+- **客户端的在途调用**：grpcio 的 fork 支持以 fork 时没有其他线程正在调用 gRPC 为前提（见其源码 `grpc/_cython/_cygrpc/fork.pyx.pxi` 的说明）。grpcio 1.84.0 在 Linux x86_64 上的实测与符号化 core 如下。fork 时若有线程阻塞在调用中，C-core 跳过自己的 fork 处理，并输出 `skipping fork() handlers`。EventEngine 仍在子进程中重启线程池，并执行遗留的完成回调。这些回调在 `pollset_kick` 中访问父进程那个已消失线程栈上的 pollset worker。这块栈若已被子进程的新线程复用并写过，就会读到垃圾指针，子进程偶发 SIGSEGV。其他版本与平台未实测。这是客户端库在 fork 时的限制，不属于服务实现，本实现不做处理：使用者应在没有在途调用时 fork，或改用 spawn / forkserver。[0005「验证」](0005-search-thread-model.md#验证)中的「检索进行中 fork」因此由另一个进程发起检索。
 - **平台差异**：Windows 没有 fork。macOS 上 multiprocessing 默认用 spawn，Linux 上 3.10–3.13 默认用 fork，3.14 起改为 forkserver；但 `os.fork()` 在这些平台上都可用，规则相同。Python 3.12 起，在多线程进程中 fork 会发出 `DeprecationWarning`，3.x 的 gRPC 线程同样会触发，不做处理。
 
 ### 接受的残余风险
