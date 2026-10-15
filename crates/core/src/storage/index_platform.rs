@@ -1,8 +1,12 @@
 //! 文件删除权限与启动来源的 Unix 原语；不确定的恢复依据只关闭自动恢复。
 #![allow(unsafe_code)]
 
-use super::index_intent::{BootContext, BootSource, valid_uuid};
-use std::fs::{self, File};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use super::index_intent::valid_uuid;
+use super::index_intent::{BootContext, BootSource};
+use std::fs;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::fs::File;
 use std::io;
 #[cfg(target_os = "linux")]
 use std::io::Read;
