@@ -344,3 +344,93 @@ Intel Mac：同一 x86_64 wheel 在 CPython 3.10 / 3.15、SDK 3.0.2 下通过无
 | Linux arm64 | CPython 3.10 通过 | CPython 3.12 通过 | `ce835e0d…`，与上节一致 |
 
 Linux 两种架构在 rc1 候选验收所记的 manylinux_2_28 固定镜像的新容器中以非 root 执行，x86_64 为原生主机。
+
+## 0.1.0rc3 候选验收
+
+2026-10-15。**结论：候选验收通过。** 冻结提交为 `8913a1c6e24f1643efab7921ef1e9072b63713e1`，`git archive` 的 SHA256 为 `9b2db0351b68240779b99838e5f0288dcbf33140c4b34750952b4cc649a3b49a`。三个平台从同一份归档重新构建，「候选产物身份」与「实跑结果」均为该冻结提交的结果；此前的 `aa2e50c` 与 `128fdc8` 候选已作废，原因见「候选过程中的修复」，它们的结果不计入本节。
+
+参照实现为 milvus-lite v3.2.1 / `43d1257`。相对 rc2，功能与差异见 [0014](../decisions/0014-index-definitions-and-filter-expressions.md)、[切片 A 验收](index-definitions-acceptance.md)、[切片 B 验收](filter-tree-acceptance.md)与[兼容性收口](0014-compatibility-closure.md)：接受可构建的 ANN 与标量 INVERTED 定义并按 FLAT / 扫描执行，补齐 DropIndex 与三路线过滤表达式，修正存量 FAISS 类型非法度量的 load 检查，以及关闭时显式释放 LOCK。
+
+### 候选过程中的修复
+
+#### `aa2e50c`：Windows 静态 Clippy
+
+`aa2e50c` 候选因 Windows 静态 Clippy 的平台导入问题作废，修复后以 `128fdc8` 重新冻结。
+
+#### `128fdc8`：并行检索期间 fork 的子进程崩溃
+
+Linux x86_64、CPython 3.15.0 / pymilvus 3.0.2 / grpcio 1.84.0 的首次完整端到端套件中，[test_fork_during_parallel_search](../../tests/python/test_server_manager.py) 的三个子进程退出码依次为 0、-11、0；第二个子进程发生 SIGSEGV，尚未打印检索结果，父进程检索仍成功。原始失败日志与 core 均保存在仓库外。
+
+**定因**：崩溃在 grpcio 的 `pollset_kick`（`ev_epoll1_linux.cc:1083`），本项目代码不在崩溃链上。旧用例让父进程的线程持续检索，fork 时该线程阻塞在 gRPC 调用中。fork 时只要有并发的客户端调用，C-core 就跳过自己的 fork 处理，并输出 `skipping fork() handlers`（同期对照中 1000 次 fork 有 915 次输出）。EventEngine 仍在子进程中重启线程池，并执行遗留的完成回调。回调经 `cq_end_op_for_next` 读取 pollset 的 `root_worker`，它同时也是 `g_active_poller`：这是父进程检索线程在栈上分配的 worker。子进程中，这块栈被新的 EventEngine 线程复用并写过，于是解引用垃圾指针。依据如下：
+
+- 原始 core 与另外 2 个原版 grpcio 复现 core 的崩溃点都是同一偏移 `cygrpc+0x56e64a`；原始 core 与磁盘文件的 build ID 一致。
+- 以相同版本源码构建的带调试信息 grpcio，复现时给出完整的符号化调用栈。
+- core 中 `root_worker` 与 `g_active_poller` 都指向崩溃线程栈上、低于栈指针的位置。
+- 崩溃线程的 `pthread_t` 等于父进程检索线程的 `ident`。
+- 崩溃时子进程尚未创建任何 Rust 线程。
+
+grpcio 的 fork 支持以 fork 时没有其他线程调用 gRPC 为前提，机理与对使用者的限制见 [0003「fork」](../decisions/0003-in-process-server-lifecycle.md#fork)。不加载本项目原生库的纯 gRPC 构造在本轮未复现。
+
+**处理**：该用例改为由另一个进程经父进程的 URI 发起检索，父进程自己的客户端在 fork 时空闲。新增两项断言：检索进程正常退出；显式设置 `GRPC_VERBOSITY=INFO` 后，stderr 中没有跳过 fork 处理的日志。[0005「验证」](../decisions/0005-search-thread-model.md#验证)同步更新，修正提交即本节的冻结提交 `8913a1c`。产品代码未改。改动只涉及 `tests/python` 与 `docs`，两者都不在 wheel 中，也不在本节 sdist 的文件清单中。
+
+**验证**：在原生 Linux x86_64 上用 `128fdc8` 候选的 x86_64 正式 wheel（原生库 `c29c8fc4…`，与本节候选相同）与上述依赖版本执行。放大探针原样提取用例脚本，只把 fork 次数改为 1000，遇到失败也不中断。
+
+| 检查 | 结果 |
+| --- | --- |
+| 新写法放大：CPython 3.15 × SDK 3.0.2，3 轮各 1000 次 fork | 子进程全部退出 0、检索正确；父进程服务上的检索正确；跳过 fork 处理的日志 0 条 |
+| 新写法放大：CPython 3.15 × SDK 2.6.17，1000 次 fork | 同上 |
+| 同期对照：旧写法，CPython 3.15 × SDK 3.0.2，1000 次 fork | 5 个子进程 -11；跳过 fork 处理的日志 915 条 |
+| 反证：新用例中加入父进程线程在 fork 期间检索 | 按预期失败于 stderr 断言；外层设置 `GRPC_VERBOSITY=ERROR` 时同样失败 |
+| CPython 3.10 / 3.15 × SDK 2.6.17 / 3.0.2 全套 | 四组各 312 passed |
+| 最终文件的 `test_server_manager.py`，同四组 | 各 21 passed |
+
+四组全套与放大使用复审前的测试文件，与最终文件的差别只是该用例显式设置 `GRPC_VERBOSITY` 和注释；被 fork 的脚本相同。macOS arm64 上最终文件的全套 312 passed，`GRPC_VERBOSITY=ERROR` 下的反证同样失败于 stderr 断言。
+
+### 候选产物身份
+
+下列文件已构建和检查，**不代表已经发布**。四个正式 wheel 不含测试入口；隔离 FI wheel 不列入发布附件。三个平台生成的 sdist 逐字节相同，也与 `128fdc8` 候选的 sdist 相同：两个提交的差异只在 `tests/python` 与 `docs`，都不进入 sdist。
+
+| 产物 | 文件 SHA256 | 原生库 SHA256 | 二进制检查 |
+| --- | --- | --- | --- |
+| `milvus_lite_rust-0.1.0rc3-cp310-abi3-macosx_11_0_arm64.whl` | `a84b6e4b3cd48531263ba531e387f738956b1b7045c025a0e05e8cc8f16e73a9` | `53b74ce741952c5357835bc7c5c66eb317db4e077b77821d78fa3f0b3e3c84d4` | 单架构 arm64，Mach-O 最低 11.0 |
+| `milvus_lite_rust-0.1.0rc3-cp310-abi3-macosx_11_0_x86_64.whl` | `e585d396c8a8b8aaf2ca1a2e0a9485916595a1b8469510206645628a0e4aca5e` | `db0c51451cf6b495f959055a5b7ea8262e246630efb5b2c8fe1127e4fe5ca97a` | 单架构 x86_64，Mach-O 最低 11.0 |
+| `milvus_lite_rust-0.1.0rc3-cp310-abi3-manylinux_2_28_x86_64.whl` | `d4ceececc0e49603e5c450804a410a0c50cf7ee3410054b7040f9e648b589025` | `c29c8fc4e9be6f8506402679c4c13661e7241cb0c0321777e2bb74e9606214f9` | GLIBC 依赖最高 2.28 |
+| `milvus_lite_rust-0.1.0rc3-cp310-abi3-manylinux_2_28_aarch64.whl` | `9b7238c9d7226ffca10a8a51b8d1438ec756da4171a5c26852142989c5825ce6` | `155068ab5202987ca16e242c8471c713162fb89891bc2b1c35dd608f35dc34f0` | GLIBC 依赖最高 2.28 |
+| `milvus_lite_rust-0.1.0rc3.tar.gz` | `ec1187d49428e20a41a842a403c76092898ad9f0811d5033230b464babc1f4f7` | — | 三个平台分别构建，逐字节相同 |
+
+隔离 FI wheel 只用于测试：macOS arm64 `0f2503fa…`（原生库 `aafff3b9…`）、Linux x86_64 `403906c6…`（原生库 `0ac464a6…`）、Linux arm64 `6ff2e724…`（原生库 `d8684811…`）；均由检查器确认含隔离入口。
+
+### 实跑结果
+
+| 检查 | macOS arm64 | Linux x86_64（原生） | Linux arm64 |
+| --- | --- | --- | --- |
+| fmt；workspace 默认 / all-features Clippy | 通过 | 通过 | 通过 |
+| 默认 workspace / core FI / grpc all-features | 293 / 380 / 23 passed | 294 / 381 / 23 passed | 294 / 381 / 23 passed |
+| 构建拒绝 | Windows 目标、free-threaded 3.14 | free-threaded 3.14 / 3.15、PyPy 3.11 | free-threaded 3.14 / 3.15、PyPy 3.11 |
+| Windows core/grpc 默认与 FI 的 check/Clippy | 四项通过（交叉静态检查） | — | — |
+| CPython 3.10 / 3.15 × SDK 2.6.17 / 3.0.2 全套 | 四组各 312 passed | 四组各 312 passed | 四组各 312 passed |
+| CPython 3.11–3.14 安装冒烟（SDK 3.0.2） | 通过 | 通过 | 通过 |
+| 隔离 FI 的 compaction 套件 | 两条 SDK 各 5 passed | 5 passed | 5 passed |
+| 与 3.x 的差分（两条 SDK） | 各 205 passed | 各 205 passed | 各 205 passed |
+| 存储互通（两条 SDK；Arrow 15/25） | 各 160 passed | 各 160 passed | 各 160 passed |
+| 语法 / 顶层动态 / 布尔树组件真值 | 7,791 / 3,570 / 4,737 条通过；布尔树 Arrow 15/25 各核验 | 同左 | 同左 |
+| Rust 与 3.2.1 的 LOCK 双向互斥 | — | 通过 | 通过 |
+| strace 同步/提交/删除顺序 | — | 通过，85 次成功调用 | 通过，85 次成功调用 |
+| PID 1 正常 / 排空 / 监督器强杀 | — | 退出 0 / 0 / 137，重开 3 / 4 / 4 行 | 退出 0 / 0 / 137，重开 3 / 4 / 4 行 |
+| file capabilities / AT_SECURE 索引预检 | — | 4 项通过 | 4 项通过 |
+| sdist 解包：Rust 1.89.0 默认与 all-features all-targets check | 通过 | — | — |
+| sdist 解包：cargo test 默认 / core FI | 293 / 380 passed | — | — |
+| sdist 解包：根入口与 `-m crates/py/Cargo.toml` 构建、PEP 517 安装冒烟 | 通过 | — | — |
+| 脚本自检（benchmark + packaging + platform） | 227 passed | — | — |
+
+Linux 的 Rust 套件比 macOS 各多一项，来自平台专属权限用例的不同组合，并非跳过测试。Intel Mac 的同一 x86_64 wheel 在 CPython 3.10 / 3.15、SDK 3.0.2 下通过无 SDK CLI 与 SDK `.db` 生命周期冒烟；这是 Apple Silicon 上的 Rosetta 证据，不是原生 Intel 证据。
+
+环境与平台层级同 rc1 候选验收；Rust 1.98.1、maturin 1.15.0，sdist 的 MSRV 为 Rust 1.89.0。Linux arm64 使用 Docker VM 命名卷、非 root、构建并行数 4（VM 内存 7.7G）；x86_64 为原生主机上的固定 manylinux_2_28 容器、非 root、绑定 16 核。三路线组件真值在各平台的 CPython 3.12 参照环境核验。
+
+AT_SECURE 探针使用候选正式 wheel 与带 file capabilities 的独立 CPython 副本，断言非 root 且 `AT_SECURE=1`。没有侧车文件时 FLAT / AUTOINDEX / INVERTED 创建和删除成功；需要删除侧车时预检拒绝，manifest、侧车文件与意图标记不变。探针后移除该解释器副本的 capability。
+
+### 边界与下一门槛
+
+- Windows、Intel Mac、macOS 11、真实断电与任意文件系统持久化证明的边界同 rc1 候选验收；本轮未执行真实系统重启或真实断电。
+- 本节不作新性能声明；切片 B 已记录的 S1 性能结果及其产物边界见[切片 B 验收](filter-tree-acceptance.md)。
+- 尚未推送、创建或推送 rc3 tag，也未创建或发布 GitHub Release；公开地址下载冒烟尚未执行。后续动作仍按 [0013](../decisions/0013-first-release-platform-and-packaging.md) 分别授权。
