@@ -810,7 +810,10 @@ def test_query_m1_unsupported(env):
     seed(stub)
     unimplemented(stub.Query, query_req(expr="id + 1 > 0", output_fields=["count(*)"]))
     iterator = [common_pb2.KeyValuePair(key="iterator", value="False")]
-    unimplemented(stub.Query, query_req(expr="id in [1]", query_params=iterator))
+    response = stub.Query(query_req(expr="id in [3, 1]", query_params=iterator + [
+        common_pb2.KeyValuePair(key="limit", value="1")]))
+    assert status_of(response)[0] == 0
+    assert list(response.fields_data[0].scalars.long_data.data) == [1]
     unimplemented(stub.Query, query_req(expr="id + 1 > 0"))
     unimplemented(stub.Query, query_req(expr="ISO '2025-01-01T00:00:00Z' == ISO '2025-01-01T00:00:00Z'"))
     unimplemented(stub.Query, query_req(expr="id in [1]", partition_names=["p"]))
@@ -965,13 +968,21 @@ def test_pymilvus_entry_points_remaining_unsupported(env):
          f"HybridSearch: {rpc}"),
         (lambda: client.search("q", [[1, 0]], filter="id + 1 > 0"), "filter expressions: arithmetic, temporal literals, text_match, and geometry predicates are not supported"),
         (lambda: client.search("q", [[1, 0]], ranker=decay), f"rerank and function chains: {feature}"),
-        (lambda: client.query_iterator("q", batch_size=2).next(), f"query iterators: {feature}"),
     ]
     for call, details in cases:
         with pytest.raises(grpc.RpcError) as info:
             call()
         assert info.value.code() == grpc.StatusCode.UNIMPLEMENTED, details
         assert info.value.details().startswith(f"MilvusLite does not support {details}"), info.value.details()
+
+    iterator = client.query_iterator("q", batch_size=2, limit=3, offset=1,
+                                     filter="id in [9, 3, 7, 1, 5]", output_fields=["id"])
+    try:
+        assert list(iterator.next()) == [{"id": 3}, {"id": 5}]
+        assert list(iterator.next()) == [{"id": 7}]
+        assert list(iterator.next()) == []
+    finally:
+        iterator.close()
 
     # search_iterator 的第一批是普通检索（3.x 同样忽略 iterator 参数），结果与 3.x 相同；
     # 之后各批要用 range search 与过滤表达式，返回 UNIMPLEMENTED。

@@ -361,7 +361,19 @@ impl ReadSnapshot {
         offset: i64,
     ) -> Result<QueryResult> {
         self.require_loaded()?;
-        self.query_loaded(parsed, output_fields, limit, offset)
+        self.query_loaded(parsed, output_fields, limit, offset, false)
+    }
+
+    /// iterator 每次请求在自己的读快照上按主键排序；跨请求续读条件由客户端提供。
+    pub fn query_ordered_parsed(
+        &self,
+        parsed: &crate::filter::ParsedFilter,
+        output_fields: &[String],
+        limit: Option<i64>,
+        offset: i64,
+    ) -> Result<QueryResult> {
+        self.require_loaded()?;
+        self.query_loaded(parsed, output_fields, limit, offset, true)
     }
 
     /// Delete 不要求 load；只在自己的不可变视图上绕过 load 检查，不临时改动共享状态。
@@ -375,7 +387,7 @@ impl ReadSnapshot {
             ));
         }
         let pk = self.schema.fields[self.pk_pos].name.clone();
-        Ok(self.query_loaded(parsed, &[pk], None, 0)?.rows.pks)
+        Ok(self.query_loaded(parsed, &[pk], None, 0, false)?.rows.pks)
     }
 
     fn query_loaded(
@@ -384,6 +396,7 @@ impl ReadSnapshot {
         output_fields: &[String],
         limit: Option<i64>,
         offset: i64,
+        order_by_pk: bool,
     ) -> Result<QueryResult> {
         let chunks = self.filtered_chunks_parsed(parsed)?;
         let projection = Projection::new(&self.schema, output_fields, ApiKind::Query);
@@ -401,7 +414,21 @@ impl ReadSnapshot {
                 });
             }
         }
-        refs.sort_by_key(|r| (chunks[r.chunk].source_rank, r.order));
+        if order_by_pk {
+            refs.sort_unstable_by(|a, b| {
+                match (
+                    &chunks[a.chunk].columns[self.pk_pos],
+                    &chunks[b.chunk].columns[self.pk_pos],
+                ) {
+                    (ColumnData::Int64(x), ColumnData::Int64(y)) => x[a.row].cmp(&y[b.row]),
+                    (ColumnData::VarChar(x), ColumnData::VarChar(y)) => x[a.row].cmp(&y[b.row]),
+                    // schema 与加载校验保证同一集合的主键为同一种非空 INT64 / VARCHAR。
+                    _ => unreachable!("primary key columns must have the same supported type"),
+                }
+            });
+        } else {
+            refs.sort_by_key(|r| (chunks[r.chunk].source_rank, r.order));
+        }
         // 3.x 在追加第一条后才判断 effective_limit，故 0 / 负 limit 也可能保留一条。
         if let Some(limit) = limit {
             let end = (i128::from(offset) + i128::from(limit)).max(1);

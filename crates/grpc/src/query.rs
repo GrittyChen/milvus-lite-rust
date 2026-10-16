@@ -75,11 +75,9 @@ pub(crate) fn query(
         })?;
     // 按主键读取与通用查询都先检查 load 状态，M1 不支持的形式在此之后报告（0004「决策」）。
     c.require_loaded()?;
-    if iterator {
-        return Err(unsupported("query iterators"));
-    }
     let parsed = parsed?;
-    let literals = parsed.primary_keys(&pk);
+    // Get 保留请求中的主键次序且不分页；iterator 必须走过滤、排序后分页的通用路线。
+    let literals = (!iterator).then(|| parsed.primary_keys(&pk)).flatten();
     if req.partition_names.iter().any(|p| p != "_default") {
         return Err(unsupported("partitions other than '_default'"));
     }
@@ -118,7 +116,11 @@ pub(crate) fn query(
         (
             snapshot.name(),
             snapshot.schema(),
-            snapshot.query_parsed(&parsed, &req.output_fields, limit, offset)?,
+            if iterator {
+                snapshot.query_ordered_parsed(&parsed, &req.output_fields, limit, offset)?
+            } else {
+                snapshot.query_parsed(&parsed, &req.output_fields, limit, offset)?
+            },
         )
     };
     Ok(svc::QueryResults {
@@ -250,78 +252,88 @@ mod tests {
 
     #[test]
     fn query_gathers_and_encodes_after_releasing_state_lock() {
-        let root = tempfile::tempdir().unwrap();
-        let db = Db::new(
-            DataDir::open(root.path()).unwrap(),
-            Compute::for_host().unwrap(),
-        )
-        .unwrap();
-        let mut id = FieldSchema::new("id", DataType::Int64);
-        id.is_primary = true;
-        let mut v = FieldSchema::new("v", DataType::FloatVector);
-        v.dim = Some(2);
-        db.create_collection(
-            "",
-            "c",
-            CollectionSchema {
-                fields: vec![id, v],
-                enable_dynamic_field: false,
-                properties: vec![],
-            },
-        )
-        .unwrap();
-        db.insert(
-            "",
-            "c",
-            InsertBatch {
-                num_rows: 1,
-                columns: vec![
-                    ("id".into(), InputValues::Int(vec![1])),
-                    (
-                        "v".into(),
-                        InputValues::FloatVector {
-                            dim: 2,
-                            values: vec![1.0, 0.0],
-                        },
-                    ),
-                ],
-            },
-        )
-        .unwrap();
-        let handle = db.collection("", "c").unwrap();
-        let req = svc::QueryRequest {
-            collection_name: "c".into(),
-            expr: "id in [1, 1, 999]".into(),
-            output_fields: vec!["v".into()],
-            ..Default::default()
-        };
-        let expected = query(&handle, req.clone()).unwrap();
-        let (ready_tx, ready_rx) = mpsc::channel();
-        let (resume_tx, resume_rx) = mpsc::channel();
-        let reader = std::thread::spawn(move || {
-            AFTER_PREPARE.with(|hook| {
-                *hook.borrow_mut() = Some(Box::new(move || {
-                    ready_tx.send(()).unwrap();
-                    resume_rx.recv_timeout(Duration::from_secs(10)).unwrap();
-                }))
+        for iterator in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let db = Db::new(
+                DataDir::open(root.path()).unwrap(),
+                Compute::for_host().unwrap(),
+            )
+            .unwrap();
+            let mut id = FieldSchema::new("id", DataType::Int64);
+            id.is_primary = true;
+            let mut v = FieldSchema::new("v", DataType::FloatVector);
+            v.dim = Some(2);
+            db.create_collection(
+                "",
+                "c",
+                CollectionSchema {
+                    fields: vec![id, v],
+                    enable_dynamic_field: false,
+                    properties: vec![],
+                },
+            )
+            .unwrap();
+            db.insert(
+                "",
+                "c",
+                InsertBatch {
+                    num_rows: 1,
+                    columns: vec![
+                        ("id".into(), InputValues::Int(vec![1])),
+                        (
+                            "v".into(),
+                            InputValues::FloatVector {
+                                dim: 2,
+                                values: vec![1.0, 0.0],
+                            },
+                        ),
+                    ],
+                },
+            )
+            .unwrap();
+            let handle = db.collection("", "c").unwrap();
+            let req = svc::QueryRequest {
+                collection_name: "c".into(),
+                expr: "id in [1, 1, 999]".into(),
+                output_fields: vec!["v".into()],
+                query_params: if iterator {
+                    vec![crate::pb::common::KeyValuePair {
+                        key: "iterator".into(),
+                        value: "false".into(),
+                    }]
+                } else {
+                    vec![]
+                },
+                ..Default::default()
+            };
+            let expected = query(&handle, req.clone()).unwrap();
+            let (ready_tx, ready_rx) = mpsc::channel();
+            let (resume_tx, resume_rx) = mpsc::channel();
+            let reader = std::thread::spawn(move || {
+                AFTER_PREPARE.with(|hook| {
+                    *hook.borrow_mut() = Some(Box::new(move || {
+                        ready_tx.send(()).unwrap();
+                        resume_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                    }))
+                });
+                assert_eq!(query(&handle, req).unwrap(), expected);
             });
-            assert_eq!(query(&handle, req).unwrap(), expected);
-        });
-        ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
-        let writer_db = Arc::clone(&db);
-        let (done_tx, done_rx) = mpsc::channel();
-        let writer = std::thread::spawn(move || {
-            writer_db
-                .delete("", "c", &[milvus_lite_core::Pk::Int64(1)])
-                .unwrap();
-            writer_db.flush_collection("", "c").unwrap();
-            done_tx.send(()).unwrap();
-        });
-        let completed = done_rx.recv_timeout(Duration::from_secs(10));
-        resume_tx.send(()).unwrap();
-        reader.join().unwrap();
-        writer.join().unwrap();
-        completed.unwrap();
-        db.close();
+            ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            let writer_db = Arc::clone(&db);
+            let (done_tx, done_rx) = mpsc::channel();
+            let writer = std::thread::spawn(move || {
+                writer_db
+                    .delete("", "c", &[milvus_lite_core::Pk::Int64(1)])
+                    .unwrap();
+                writer_db.flush_collection("", "c").unwrap();
+                done_tx.send(()).unwrap();
+            });
+            let completed = done_rx.recv_timeout(Duration::from_secs(10));
+            resume_tx.send(()).unwrap();
+            reader.join().unwrap();
+            writer.join().unwrap();
+            completed.unwrap();
+            db.close();
+        }
     }
 }
