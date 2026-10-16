@@ -9,7 +9,7 @@ use arrow_array::{
 use arrow_schema::{DataType as ArrowType, Field, Schema};
 use serde_json::{Map, Value};
 
-use crate::data::{ColumnData, Pk};
+use crate::data::{ColumnData, Pk, Validity};
 use crate::pyjson;
 use crate::schema::{CollectionSchema, DataType};
 
@@ -109,7 +109,7 @@ pub(crate) fn normalize_data_json(
     columns: &mut [ColumnData],
 ) -> Result<(), ArrowDataError> {
     for (field, column) in schema.fields.iter().zip(columns) {
-        if let ColumnData::Json(values) = column {
+        if let ColumnData::Json(values) = column.values_mut() {
             *values = json_strings(&field.name, values)?
                 .into_iter()
                 .map(String::into_bytes)
@@ -373,7 +373,7 @@ fn user_fields(schema: &CollectionSchema) -> Result<Vec<Field>, ArrowDataError> 
                     )
                 }
             };
-            Ok(Field::new(&field.name, dtype, false))
+            Ok(Field::new(&field.name, dtype, field.nullable))
         })
         .collect()
 }
@@ -423,6 +423,9 @@ fn build_batch(
             });
         }
         let array: ArrayRef = match column {
+            ColumnData::Nullable { values, validity } => {
+                nullable_array(&field.name, values, validity)?
+            }
             ColumnData::Bool(v) => Arc::new(BooleanArray::from(v.clone())),
             ColumnData::Int8(v) => Arc::new(Int8Array::from(v.clone())),
             ColumnData::Int16(v) => Arc::new(Int16Array::from(v.clone())),
@@ -470,6 +473,54 @@ fn build_batch(
         data_schema(schema)?
     };
     Ok(RecordBatch::try_new(Arc::new(arrow_schema), arrays)?)
+}
+
+fn nullable_array(
+    name: &str,
+    values: &ColumnData,
+    validity: &Validity,
+) -> Result<ArrayRef, ArrowDataError> {
+    if values.len() != validity.len() {
+        return Err(ArrowDataError::RowCount {
+            name: name.into(),
+            actual: validity.len(),
+            expected: values.len(),
+        });
+    }
+    macro_rules! numbers {
+        ($array:ident, $values:expr) => {
+            Arc::new($array::from_iter(
+                $values
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| validity.get(i).then_some(*v)),
+            )) as ArrayRef
+        };
+    }
+    Ok(match values {
+        ColumnData::Bool(v) => numbers!(BooleanArray, v),
+        ColumnData::Int8(v) => numbers!(Int8Array, v),
+        ColumnData::Int16(v) => numbers!(Int16Array, v),
+        ColumnData::Int32(v) => numbers!(Int32Array, v),
+        ColumnData::Int64(v) => numbers!(Int64Array, v),
+        ColumnData::Float(v) => numbers!(Float32Array, v),
+        ColumnData::Double(v) => numbers!(Float64Array, v),
+        ColumnData::VarChar(v) => Arc::new(StringArray::from_iter(
+            v.iter()
+                .enumerate()
+                .map(|(i, v)| validity.get(i).then_some(v.as_str())),
+        )),
+        ColumnData::Json(v) => {
+            let strings = json_strings(name, v)?;
+            Arc::new(StringArray::from_iter(
+                strings
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| validity.get(i).then_some(v.as_str())),
+            ))
+        }
+        _ => return Err(ArrowDataError::TypeMismatch { name: name.into() }),
+    })
 }
 
 pub fn decode_data_batch(
@@ -537,7 +588,7 @@ fn decode_batch(
     for (offset, field) in schema.fields.iter().enumerate() {
         require_name(batch, start + offset, &field.name)?;
         let array = batch.column(start + offset);
-        if array.null_count() != 0 {
+        if array.null_count() != 0 && !field.nullable {
             return Err(ArrowDataError::TypeMismatch {
                 name: field.name.clone(),
             });
@@ -608,7 +659,17 @@ fn decode_batch(
                     .as_any()
                     .downcast_ref::<StringArray>()
                     .ok_or_else(bad)?;
-                ColumnData::VarChar((0..n).map(|row| strings.value(row).to_owned()).collect())
+                ColumnData::VarChar(
+                    (0..n)
+                        .map(|row| {
+                            if strings.is_null(row) {
+                                String::new()
+                            } else {
+                                strings.value(row).to_owned()
+                            }
+                        })
+                        .collect(),
+                )
             }
             DataType::Json => {
                 let strings = array
@@ -617,7 +678,13 @@ fn decode_batch(
                     .ok_or_else(bad)?;
                 ColumnData::Json(
                     (0..n)
-                        .map(|row| strings.value(row).as_bytes().to_vec())
+                        .map(|row| {
+                            if strings.is_null(row) {
+                                b"null".to_vec()
+                            } else {
+                                strings.value(row).as_bytes().to_vec()
+                            }
+                        })
                         .collect(),
                 )
             }
@@ -645,7 +712,11 @@ fn decode_batch(
                 }
             }
         };
-        columns.push(values);
+        columns.push(if array.null_count() == 0 {
+            values
+        } else {
+            values.with_validity(&(0..n).map(|row| array.is_valid(row)).collect::<Vec<_>>())
+        });
     }
     let meta = if schema.enable_dynamic_field {
         require_name(batch, start + schema.fields.len(), "$meta")?;

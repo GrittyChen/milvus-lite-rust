@@ -349,12 +349,19 @@ fn evaluate(
                     return Err(kernel("ambiguous synthetic column"));
                 }
                 values[id] = Some(match op {
-                    Operand::Column(i) => Column {
-                        data: Cow::Borrowed(&base[*i]),
-                        shape: shape(&base[*i]),
-                        valid: live.clone(),
-                        scalar: false,
-                    },
+                    Operand::Column(i) => {
+                        let column = &base[*i];
+                        let mut valid = live.clone();
+                        if let Some(mask) = column.validity() {
+                            valid.intersect(mask.bits());
+                        }
+                        Column {
+                            data: Cow::Borrowed(column.values()),
+                            shape: shape(column.values()),
+                            valid,
+                            scalar: false,
+                        }
+                    }
                     Operand::Dynamic(key) => {
                         let column = bound.get(key.as_str()).ok_or_else(|| {
                             Failure::Fatal(EngineError::Storage(

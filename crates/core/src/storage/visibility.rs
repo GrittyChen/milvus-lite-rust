@@ -21,7 +21,7 @@ pub(crate) struct CompactionRow {
     pub target: Option<(SourceId, usize)>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SourceBits {
     pub(crate) len: usize,
     bits: Arc<Vec<u64>>,
@@ -103,6 +103,30 @@ impl SourceBits {
             *word |= mask;
         } else {
             *word &= !mask;
+        }
+    }
+
+    pub(crate) fn push(&mut self, valid: bool) {
+        if self.len.is_multiple_of(64) {
+            Arc::make_mut(&mut self.bits).push(0);
+        }
+        let row = self.len;
+        self.len += 1;
+        if valid {
+            self.set(row, true);
+        }
+    }
+
+    pub(crate) fn intersect(&mut self, other: &Self) {
+        assert_eq!(
+            self.len, other.len,
+            "source masks refer to the same physical rows"
+        );
+        for (word, other) in Arc::make_mut(&mut self.bits)
+            .iter_mut()
+            .zip(other.bits.iter())
+        {
+            *word &= other;
         }
     }
 }

@@ -412,8 +412,18 @@ fn validate_decoded(schema: &CollectionSchema, decoded: &DecodedData) -> Result<
     }
     let n = decoded.seqs.len();
     for (field, column) in schema.fields.iter().zip(&decoded.columns) {
+        if let Some(validity) = column.validity()
+            && (!field.nullable
+                || validity.len() != n
+                || matches!(
+                    column.values(),
+                    ColumnData::Nullable { .. } | ColumnData::FloatVector { .. }
+                ))
+        {
+            return Err(MemTableError::Column(field.name.clone()));
+        }
         let matches_type = matches!(
-            (field.data_type, column),
+            (field.data_type, column.values()),
             (DataType::Bool, ColumnData::Bool(_))
                 | (DataType::Int8, ColumnData::Int8(_))
                 | (DataType::Int16, ColumnData::Int16(_))

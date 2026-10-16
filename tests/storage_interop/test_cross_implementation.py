@@ -226,14 +226,27 @@ def interpreters():
         actual = run([python, "-c", expression])
         valid = actual == expected if name == PYTHONS[0] else actual.startswith(expected)
         assert valid, f"{name} has {actual}, expected {expected}"
-    imported = run([
-        result[PYTHONS[0]],
-        "-c",
-        "from pathlib import Path; import milvus_lite; print(Path(milvus_lite.__file__).resolve())",
-    ])
-    assert Path(imported).is_relative_to(REPO / "references" / "milvus-lite"), (
-        f"reference interpreter imports {imported}, not the local checkout"
-    )
+    # Arrow 15/25 既校验文件，也运行参照引擎；提前报告缺失依赖，避免到子用例才失败。
+    for name, python in result.items():
+        probe = subprocess.run([
+            python, "-c",
+            "import json; from pathlib import Path; from importlib.metadata import version; "
+            "import milvus_lite, numpy; from milvus_lite.db import MilvusLite; "
+            "print(json.dumps({'path': str(Path(milvus_lite.__file__).resolve()), "
+            "'version': version('milvus-lite'), 'numpy': numpy.__version__}))",
+        ], cwd=REPO, text=True, capture_output=True, check=False)
+        if probe.returncode != 0:
+            raise pytest.UsageError(
+                f"{name} ({python}) cannot import the reference engine milvus_lite.db.MilvusLite; "
+                f"prepare this interpreter as described in tests/storage_interop/README.md.\n{probe.stderr}"
+            )
+        info = json.loads(probe.stdout)
+        assert info["version"] == "3.2.1", f"{name} has milvus-lite {info['version']}, expected 3.2.1"
+        assert Path(info["path"]).is_relative_to(REPO / "references" / "milvus-lite"), (
+            f"{name} imports {info['path']}, not the local reference checkout"
+        )
+        if name == PYTHONS[1]:
+            assert info["numpy"] == "1.26.4", f"{name} has NumPy {info['numpy']}, expected 1.26.4"
     return result
 
 

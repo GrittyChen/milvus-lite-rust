@@ -41,9 +41,8 @@ pub(crate) fn decode(
                 )));
             }
         };
-        let checked = extracted.and_then(|values| {
-            check_valid_data(&fd.field_name, &fd.valid_data, &values, n).map(|()| values)
-        });
+        let checked = extracted
+            .and_then(|values| check_valid_data(&fd.field_name, &fd.valid_data, values, n));
         let values = match checked {
             Ok(values) => values,
             Err(e @ EngineError::Unsupported { .. }) => {
@@ -94,6 +93,8 @@ fn scalar(name: &str, t: i32, sf: pb::ScalarField) -> Result<InputValues, Engine
         (10 | 11, _) => InputValues::Float(Vec::new()),
         (21, Some(Data::StringData(a))) => InputValues::Str(a.data),
         (21, _) => InputValues::Str(Vec::new()),
+        // JSON 的内容错误由引擎在该行主键、向量等业务检查之后报告。
+        // 保留所有原始列，让同名后列覆盖时也不能隐藏前列的坏 JSON。
         (23, Some(Data::JsonData(a))) => InputValues::Json(a.data),
         (23, _) => InputValues::Json(Vec::new()),
         _ => {
@@ -146,21 +147,25 @@ fn vector(name: &str, t: i32, vf: pb::VectorField) -> Result<InputValues, Engine
 fn check_valid_data(
     name: &str,
     valid: &[bool],
-    values: &InputValues,
+    values: InputValues,
     n: usize,
-) -> Result<(), EngineError> {
+) -> Result<InputValues, EngineError> {
     if valid.is_empty() {
-        return Ok(());
+        return Ok(values);
     }
     let n_valid = valid.iter().filter(|v| **v).count();
-    if let InputValues::FloatVector { dim, values } = values {
-        let len = values.len();
+    if let InputValues::FloatVector {
+        dim,
+        values: vector,
+    } = &values
+    {
+        let len = vector.len();
         // 按完整长度发送时 3.x 忽略 valid_data；按紧凑长度发送才表示含空值。
         // 长度都不符时由随后的行数检查报 3.x 的错误。
         if len != n.saturating_mul(*dim) && len == n_valid.saturating_mul(*dim) {
             return Err(unsupported("null values"));
         }
-        return Ok(());
+        return Ok(values);
     }
     if valid.len() != n {
         return Err(EngineError::SchemaValidation(format!(
@@ -176,10 +181,50 @@ fn check_valid_data(
             values.len()
         )));
     }
-    if n_valid != n {
-        return Err(unsupported("null values"));
+    if n_valid == n {
+        return Ok(values);
     }
-    Ok(())
+    let full = values.len() == n;
+    macro_rules! expand {
+        ($variant:ident,$values:expr,$placeholder:expr) => {{
+            let values = $values;
+            if full {
+                InputValues::$variant(values)
+            } else {
+                let mut index = 0;
+                InputValues::$variant(
+                    valid
+                        .iter()
+                        .map(|&valid| {
+                            if valid {
+                                let value = values[index].clone();
+                                index += 1;
+                                value
+                            } else {
+                                $placeholder
+                            }
+                        })
+                        .collect(),
+                )
+            }
+        }};
+    }
+    let expanded = match values {
+        InputValues::Bool(v) => expand!(Bool, v, false),
+        InputValues::Int(v) => expand!(Int, v, 0),
+        InputValues::Float(v) => expand!(Float, v, 0.0),
+        InputValues::Str(v) => expand!(Str, v, String::new()),
+        InputValues::Json(v) => expand!(Json, v, b"null".to_vec()),
+        _ => {
+            return Err(EngineError::Storage(
+                "non-scalar input reached scalar validity expansion".into(),
+            ));
+        }
+    };
+    Ok(InputValues::Nullable {
+        values: Box::new(expanded),
+        validity: milvus_lite_core::data::Validity::from_bools(valid),
+    })
 }
 
 /// MutationResult.IDs：主键为 VARCHAR 时用 str_id，否则 int_id；没有行时不设置。

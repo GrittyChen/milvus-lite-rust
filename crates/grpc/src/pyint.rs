@@ -60,6 +60,73 @@ pub(crate) fn int(v: &Value) -> Result<i64, PyError> {
     }
 }
 
+/// protobuf 的整数槽位必须拒绝越界；请求参数的历史饱和规则不能用于 schema 默认值。
+pub(crate) fn proto_integer(value: &Value) -> Result<i64, PyError> {
+    let bounded = |text: String| {
+        text.parse::<i64>()
+            .map_err(|_| PyError::Value(format!("Value out of range: {text}")))
+    };
+    match value {
+        Value::Number(number) if !number.as_str().contains(['.', 'e', 'E']) => {
+            bounded(number.as_str().to_owned())
+        }
+        Value::String(text) => {
+            let normalized: String = text
+                .chars()
+                .map(|c| {
+                    milvus_lite_core::filter::python_decimal_digit(c)
+                        .and_then(|v| char::from_digit(v, 10))
+                        .unwrap_or(c)
+                })
+                .collect();
+            let Some(digits) = strip_number(normalized.trim()) else {
+                return int(value);
+            };
+            let (negative, digits) = if let Some(d) = digits.strip_prefix('-') {
+                (true, d)
+            } else {
+                (false, digits.strip_prefix('+').unwrap_or(&digits))
+            };
+            if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+                return int(value);
+            }
+            if digits.len() > 4300 {
+                return Err(PyError::Value(format!(
+                    "Exceeds the limit (4300 digits) for integer string conversion: value has {} digits; use sys.set_int_max_str_digits() to increase the limit",
+                    digits.len()
+                )));
+            }
+            let digits = digits.trim_start_matches('0');
+            let normalized = if digits.is_empty() {
+                "0".into()
+            } else if negative {
+                format!("-{digits}")
+            } else {
+                digits.to_owned()
+            };
+            bounded(normalized)
+        }
+        Value::Number(number) => {
+            let float = number
+                .as_str()
+                .parse::<f64>()
+                .map_err(|_| PyError::Value("invalid floating default".into()))?;
+            if !float.is_finite() {
+                return float_to_int(float);
+            }
+            if !(-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0).contains(&float.trunc())
+            {
+                return Err(PyError::Value(format!(
+                    "Value out of range: {:.0}",
+                    float.trunc()
+                )));
+            }
+            Ok(float.trunc() as i64)
+        }
+        _ => int(value),
+    }
+}
+
 fn float_to_int(f: f64) -> Result<i64, PyError> {
     if f.is_nan() {
         return Err(PyError::Value(
@@ -73,6 +140,35 @@ fn float_to_int(f: f64) -> Result<i64, PyError> {
     }
     // `as` 向零截断并在超出范围时饱和，与 Python 的截断一致（超出 int64 的部分见模块说明）。
     Ok(f.trunc() as i64)
+}
+
+pub(crate) fn proto_float(value: &Value) -> Result<f64, PyError> {
+    match value {
+        Value::Number(number) => {
+            let parsed = number
+                .as_str()
+                .parse::<f64>()
+                .map_err(|_| PyError::Value("invalid floating default".into()))?;
+            if !number.as_str().contains(['.', 'e', 'E']) && !parsed.is_finite() {
+                return Err(PyError::Overflow(
+                    "int too large to convert to float".into(),
+                ));
+            }
+            Ok(parsed)
+        }
+        Value::String(text) => {
+            let normalized: String = text
+                .chars()
+                .map(|c| {
+                    milvus_lite_core::filter::python_decimal_digit(c)
+                        .and_then(|v| char::from_digit(v, 10))
+                        .unwrap_or(c)
+                })
+                .collect();
+            float_str(&normalized).map_or_else(|| float(value), Ok)
+        }
+        _ => float(value),
+    }
 }
 
 /// Python `int(s)`（十进制）：去掉首尾空白，可带正负号，数字之间可有单个下划线。
@@ -160,6 +256,46 @@ pub(crate) fn py_str(v: &Value) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn schema_proto_integers_never_saturate_wide_defaults() {
+        assert_eq!(proto_integer(&json!(i64::MAX)), Ok(i64::MAX));
+        assert_eq!(proto_integer(&json!(i64::MIN)), Ok(i64::MIN));
+        assert_eq!(proto_integer(&json!("+0007")), Ok(7));
+        for (value, expected) in [
+            (json!(u64::MAX), "Value out of range: 18446744073709551615"),
+            (
+                json!("9223372036854775808"),
+                "Value out of range: 9223372036854775808",
+            ),
+            (
+                json!(9_223_372_036_854_775_808.0),
+                "Value out of range: 9223372036854775808",
+            ),
+            (json!(1e20), "Value out of range: 100000000000000000000"),
+        ] {
+            assert_eq!(proto_integer(&value).unwrap_err().message(), expected);
+        }
+        assert_eq!(int(&json!(u64::MAX)), Ok(i64::MAX));
+    }
+
+    #[test]
+    fn schema_default_coercion_matches_unicode_and_python_digit_limits() {
+        assert_eq!(proto_integer(&json!("١_٢")), Ok(12));
+        assert_eq!(proto_integer(&json!("１２")), Ok(12));
+        assert_eq!(proto_float(&json!("١.٥")), Ok(1.5));
+        let text = "0".repeat(4301);
+        assert_eq!(
+            proto_integer(&json!(text)).unwrap_err().message(),
+            "Exceeds the limit (4300 digits) for integer string conversion: value has 4301 digits; use sys.set_int_max_str_digits() to increase the limit"
+        );
+        let big: Value = serde_json::from_str(&format!("1{}", "0".repeat(400))).unwrap();
+        assert_eq!(
+            proto_float(&big).unwrap_err().message(),
+            "int too large to convert to float"
+        );
+        assert!(int(&json!("١")).is_err());
+    }
 
     // 期望值取自 Python 3.12。
     #[test]

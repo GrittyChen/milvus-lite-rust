@@ -190,11 +190,42 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<CollectionSchema, EngineError> {
                 note("text analyzer and text match");
             }
         }
-        if f.nullable {
-            note("nullable fields");
+        if f.nullable && data_type == Some(DataType::FloatVector) {
+            note("nullable vectors");
         }
-        if f.default_value.as_ref().is_some_and(|d| d.data.is_some()) {
-            note("default values");
+        let default_value = match f.default_value.as_ref().and_then(|v| v.data.as_ref()) {
+            None => None,
+            Some(pb::value_field::Data::BoolData(v)) => Some(Value::from(*v)),
+            Some(pb::value_field::Data::IntData(v) | pb::value_field::Data::DateData(v)) => {
+                Some(Value::from(*v))
+            }
+            Some(
+                pb::value_field::Data::LongData(v)
+                | pb::value_field::Data::TimestamptzData(v)
+                | pb::value_field::Data::TimeData(v),
+            ) => Some(Value::from(*v)),
+            Some(pb::value_field::Data::FloatData(v)) => {
+                serde_json::Number::from_f64(f64::from(*v))
+                    .map(Value::Number)
+                    .or_else(|| {
+                        note("non-finite default values");
+                        None
+                    })
+            }
+            Some(pb::value_field::Data::DoubleData(v)) => serde_json::Number::from_f64(*v)
+                .map(Value::Number)
+                .or_else(|| {
+                    note("non-finite default values");
+                    None
+                }),
+            Some(pb::value_field::Data::StringData(v)) => Some(Value::String(v.clone())),
+            Some(pb::value_field::Data::BytesData(_)) => {
+                note("binary default values");
+                None
+            }
+        };
+        if default_value.is_some() && data_type == Some(DataType::FloatVector) {
+            note("vector default values");
         }
         if f.is_partition_key {
             note("partition key");
@@ -208,6 +239,8 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<CollectionSchema, EngineError> {
                 auto_id: f.auto_id,
                 dim,
                 max_length,
+                nullable: f.nullable,
+                default_value,
                 ..FieldSchema::new(f.name.clone(), data_type)
             });
         }
@@ -259,7 +292,10 @@ pub(crate) fn kv(key: &str, value: impl Into<String>) -> common::KeyValuePair {
 }
 
 /// DescribeCollection 中的 schema，只填 3.x 填的字段（`milvus_lite_to_milvus_schema`）。
-pub(crate) fn encode(name: &str, schema: &CollectionSchema) -> pb::CollectionSchema {
+pub(crate) fn encode(
+    name: &str,
+    schema: &CollectionSchema,
+) -> Result<pb::CollectionSchema, EngineError> {
     let fields = schema
         .fields
         .iter()
@@ -271,22 +307,70 @@ pub(crate) fn encode(name: &str, schema: &CollectionSchema) -> pb::CollectionSch
             if let Some(max) = f.max_length.filter(|_| f.data_type == DataType::VarChar) {
                 type_params.push(kv("max_length", max.to_string()));
             }
-            pb::FieldSchema {
+            Ok(pb::FieldSchema {
                 name: f.name.clone(),
                 data_type: milvus_type(f.data_type),
                 is_primary_key: f.is_primary,
                 auto_id: f.auto_id,
                 type_params,
+                nullable: f.nullable,
+                default_value: f
+                    .default_value
+                    .as_ref()
+                    .map(|v| encode_default(f.data_type, v))
+                    .transpose()?
+                    .flatten(),
                 ..Default::default()
-            }
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>, EngineError>>()?;
     #[allow(deprecated)]
-    pb::CollectionSchema {
+    Ok(pb::CollectionSchema {
         name: name.to_owned(),
         auto_id: schema.fields.iter().any(|f| f.is_primary && f.auto_id),
         fields,
         enable_dynamic_field: schema.enable_dynamic_field,
         ..Default::default()
-    }
+    })
+}
+
+fn encode_default(dtype: DataType, value: &Value) -> Result<Option<pb::ValueField>, EngineError> {
+    use pb::value_field::Data;
+    let int = || {
+        pyint::proto_integer(value)
+            .map_err(|error| EngineError::InvalidArgument(error.message().to_owned()))
+    };
+    let float = || {
+        pyint::proto_float(value)
+            .map_err(|error| EngineError::InvalidArgument(error.message().to_owned()))
+    };
+    let data = match dtype {
+        DataType::Bool => Data::BoolData(
+            if let Value::Number(number) = value
+                && !number.as_str().contains(['.', 'e', 'E'])
+            {
+                number
+                    .as_str()
+                    .bytes()
+                    .any(|b| b.is_ascii_digit() && b != b'0')
+            } else {
+                truthy(value)
+            },
+        ),
+        DataType::Int8 | DataType::Int16 | DataType::Int32 => {
+            let integer = int()?;
+            Data::IntData(i32::try_from(integer).map_err(|_| {
+                EngineError::InvalidArgument(format!("Value out of range: {integer}"))
+            })?)
+        }
+        DataType::Int64 => Data::LongData(int()?),
+        DataType::Float => Data::FloatData(float()? as f32),
+        DataType::Double => Data::DoubleData(float()?),
+        DataType::VarChar => Data::StringData(match value {
+            Value::String(v) => v.clone(),
+            other => milvus_lite_core::error::py_json_repr(other),
+        }),
+        DataType::Json | DataType::FloatVector => return Ok(None),
+    };
+    Ok(Some(pb::ValueField { data: Some(data) }))
 }

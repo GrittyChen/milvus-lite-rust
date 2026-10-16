@@ -318,16 +318,16 @@ def test_create_collection_values_3x_treats_as_unset(env):
     assert status_of(r) == (0, 0, "")
 
 
-def test_create_collection_m1_unsupported(env):
+def test_create_collection_remaining_unsupported(env):
     _, stub, _ = env
     pk = field("id", DataType.INT64, primary=True)
     v = field("v", DataType.FLOAT_VECTOR, dim=2)
     arr = field("a", DataType.ARRAY, max_capacity=4)
     arr.element_type = DataType.INT32
     unimplemented(create, stub, "c", pk, v, arr)
-    nullable = field("n", DataType.INT64)
+    nullable = field("v", DataType.FLOAT_VECTOR, dim=2)
     nullable.nullable = True
-    unimplemented(create, stub, "c", pk, v, nullable)
+    unimplemented(create, stub, "c", pk, nullable)
     unimplemented(create, stub, "c", pk, v, field("t", DataType.VARCHAR, max_length=8, enable_analyzer="True"))
     unimplemented(create, stub, "c", pk, v, field("t", DataType.VARCHAR, max_length=8,
                                                   analyzer_params='{"type": "english", "x": NaN}'))
@@ -416,7 +416,194 @@ def test_insert_m1_unsupported(env):
                   partition_name="p")
     t = str_fd("t", [])
     t.valid_data.append(False)
-    unimplemented(insert, stub, "c", long_fd("id", [3]), vec_fd("v", [[1, 0]]), t)
+    r = insert(stub, "c", long_fd("id", [3]), vec_fd("v", [[1, 0]]), t)
+    assert status_of(r) == (6, 6, "field 't' is None but not nullable")
+
+
+@pytest.mark.parametrize("valid", [[], [False], [True]])
+@pytest.mark.parametrize("mutation", ["Insert", "Upsert"])
+def test_bad_json_is_decoded_before_null_masks_and_later_duplicate_fields(env, valid, mutation):
+    client, stub, _ = env
+    basic(stub)
+    bad = schema_pb2.FieldData(type=DataType.JSON, field_name="t", valid_data=valid)
+    bad.scalars.json_data.data.append(b"{bad")
+    request = getattr(milvus_pb2, mutation + "Request")(
+        collection_name="c", num_rows=1,
+        fields_data=[long_fd("id", [1]), vec_fd("v", [[1, 0]]), bad, str_fd("t", ["ok"])],
+    )
+    r = getattr(stub, mutation)(request)
+    assert status_of(r) == (6, 6, "field 't' value is not valid JSON: key must be a string at line 1 column 2")
+    assert list(client.query("c", filter="id >= 0", output_fields=["id"])) == []
+
+
+@pytest.mark.parametrize("mutation", ["Insert", "Upsert"])
+@pytest.mark.parametrize("json_name", ["j", "$meta"])
+@pytest.mark.parametrize("earlier_error", ["missing_pk", "vector_length", "vector_dim", "mask_length"])
+def test_bad_json_preserves_protocol_and_business_error_priority(env, mutation, json_name, earlier_error):
+    client, stub, _ = env
+    assert status_of(create(
+        stub, "c", field("id", DataType.INT64, primary=True),
+        field("v", DataType.FLOAT_VECTOR, dim=2), field("j", DataType.JSON), dynamic=True,
+    )) == (0, 0, "")
+    bad = json_fd(json_name, [b"{bad"], dynamic=json_name == "$meta")
+    fds = [long_fd("id", [1]), vec_fd("v", [[1, 0]]), bad]
+    if json_name == "$meta":
+        fds.append(json_fd("j", [b"{} "]))
+    if earlier_error == "missing_pk":
+        fds.pop(0)
+        expected = "primary key 'id' missing or None"
+    elif earlier_error == "vector_length":
+        fds[1] = vec_fd("v", [[1, 0], [2, 0]])
+        expected = "FieldData 'v' float_vector data has 4 elements, expected num_rows(1) * dim(2) = 2"
+    elif earlier_error == "vector_dim":
+        fds[1] = vec_fd("v", [[1, 0, 0]], dim=3)
+        expected = "vector field 'v' expected dim 2, got 3"
+    else:
+        bad.valid_data.extend([False, True])
+        expected = f"FieldData '{json_name}' valid_data length 2 != num_rows 1"
+    r = getattr(stub, mutation)(getattr(milvus_pb2, mutation + "Request")(
+        collection_name="c", num_rows=1, fields_data=fds,
+    ))
+    assert status_of(r) == (6, 6, expected)
+    assert client.query("c", output_fields=["count(*)"]) == [{"count(*)": 0}]
+
+
+@pytest.mark.parametrize("mutation", ["Insert", "Upsert"])
+@pytest.mark.parametrize("json_name", ["t", "$meta"])
+def test_later_row_bad_json_does_not_hide_first_row_business_error(env, mutation, json_name):
+    client, stub, _ = env
+    basic(stub)
+    t = str_fd("t", ["unused", "ok"])
+    t.valid_data.extend([False, True])
+    bad = json_fd(json_name, [b"{}", b"{bad"], dynamic=json_name == "$meta")
+    # typed 的坏 JSON 即使被后列覆盖，也只在其原行的字段检查阶段报告。
+    fds = [long_fd("id", [1, 2]), vec_fd("v", [[1, 0], [0, 1]]), bad, t]
+    r = getattr(stub, mutation)(getattr(milvus_pb2, mutation + "Request")(
+        collection_name="c", num_rows=2, fields_data=fds,
+    ))
+    assert status_of(r) == (6, 6, "field 't' is None but not nullable")
+    assert client.query("c", output_fields=["count(*)"]) == [{"count(*)": 0}]
+
+
+@pytest.mark.parametrize("mutation", ["Insert", "Upsert"])
+@pytest.mark.parametrize("json_name", ["t", "v"])
+def test_second_row_shadowed_bad_json_keeps_existing_rows_unchanged(env, mutation, json_name):
+    client, stub, _ = env
+    basic(stub)
+    assert status_of(insert(stub, "c", long_fd("id", [99]), vec_fd("v", [[1, 0]]), str_fd("t", ["seed"]))) == (0, 0, "")
+    fds = [long_fd("id", [1, 2]), json_fd(json_name, [b"123", b"{bad"]),
+           vec_fd("v", [[1, 0], [0, 1]]), str_fd("t", ["ok", "ok"])]
+    r = getattr(stub, mutation)(getattr(milvus_pb2, mutation + "Request")(
+        collection_name="c", num_rows=2, fields_data=fds,
+    ))
+    assert status_of(r) == (6, 6, f"field '{json_name}' value is not valid JSON: key must be a string at line 1 column 2")
+    assert client.query("c", output_fields=["count(*)"]) == [{"count(*)": 1}]
+    assert list(client.get("c", [1, 2, 99], output_fields=["t"])) == [{"id": 99, "t": "seed"}]
+
+
+@pytest.mark.parametrize("mutation", ["Insert", "Upsert"])
+@pytest.mark.parametrize("vector_problem", ["missing", "dim", "valid"])
+def test_json_in_primary_slot_keeps_vector_checks_and_scalar_type_error(env, mutation, vector_problem):
+    client, stub, _ = env
+    basic(stub)
+    fds = [json_fd("id", [b"{bad"]), str_fd("t", ["ok"])]
+    if vector_problem != "missing":
+        fds.append(vec_fd("v", [[1, 0, 0]] if vector_problem == "dim" else [[1, 0]],
+                          dim=3 if vector_problem == "dim" else 2))
+    expected = {
+        "missing": "vector field 'v' missing or None",
+        "dim": "vector field 'v' expected dim 2, got 3",
+        "valid": "field 'id' value '{bad' does not match dtype DataType.INT64",
+    }[vector_problem]
+    r = getattr(stub, mutation)(getattr(milvus_pb2, mutation + "Request")(
+        collection_name="c", num_rows=1, fields_data=fds,
+    ))
+    assert status_of(r) == (6, 6, expected)
+    assert client.query("c", output_fields=["count(*)"]) == [{"count(*)": 0}]
+
+
+@pytest.mark.parametrize("mutation", ["Insert", "Upsert"])
+def test_json_in_vector_slot_keeps_vector_type_error(env, mutation):
+    client, stub, _ = env
+    basic(stub)
+    r = getattr(stub, mutation)(getattr(milvus_pb2, mutation + "Request")(
+        collection_name="c", num_rows=1,
+        fields_data=[long_fd("id", [1]), json_fd("v", [b"{bad"]), str_fd("t", ["ok"])],
+    ))
+    assert status_of(r) == (6, 6, "vector field 'v' must be list/tuple, got str")
+    assert client.query("c", output_fields=["count(*)"]) == [{"count(*)": 0}]
+
+
+@pytest.mark.parametrize("mutation", ["Insert", "Upsert"])
+@pytest.mark.parametrize("auto_id", [False, True])
+def test_masked_bad_json_is_not_hidden_by_defaults_or_generated_primary(env, mutation, auto_id):
+    client, stub, _ = env
+    primary = field("id", DataType.INT64, primary=True)
+    primary.autoID = auto_id
+    title = field("t", DataType.VARCHAR, max_length=16)
+    title.nullable = True
+    title.default_value.string_data = "fallback"
+    assert status_of(create(stub, "c", primary, field("v", DataType.FLOAT_VECTOR, dim=2), title)) == (0, 0, "")
+    name = "id" if auto_id else "t"
+    bad = json_fd(name, [b"{bad"])
+    bad.valid_data.append(False)
+    fds = [vec_fd("v", [[1, 0]]), bad]
+    fds.append(str_fd("t", ["ok"]) if auto_id else long_fd("id", [1]))
+    r = getattr(stub, mutation)(getattr(milvus_pb2, mutation + "Request")(
+        collection_name="c", num_rows=1, fields_data=fds,
+    ))
+    assert status_of(r) == (6, 6, f"field '{name}' value is not valid JSON: key must be a string at line 1 column 2")
+    assert client.query("c", output_fields=["count(*)"]) == [{"count(*)": 0}]
+
+
+@pytest.mark.parametrize("mutation", ["Insert", "Upsert"])
+@pytest.mark.parametrize("raw,expected,valid", [
+    (b" \t\r\nnull\r\n\t ", None, True),
+    (b'"null"', "null", True),
+    (b'{"v": null}', {"v": None}, True),
+    (b'[null, 1]', [None, 1], True),
+    (b'false', False, True),
+    (b'\x0cnull', None, False),
+    (b'null\x0b', None, False),
+    (b'n ull', None, False),
+    (b'null null', None, False),
+    (b'\xef\xbb\xbfnull', None, False),
+    (b'\xffnull', None, False),
+    (b' \r\t\n', None, False),
+])
+def test_json_null_text_preserves_whitespace_rules_validation_and_stored_values(env, mutation, raw, expected, valid):
+    client, stub, _ = env
+    column = field("j", DataType.JSON)
+    column.nullable = True
+    assert status_of(create(stub, "c", field("id", DataType.INT64, primary=True),
+                            field("v", DataType.FLOAT_VECTOR, dim=2), column)) == (0, 0, "")
+    r = getattr(stub, mutation)(getattr(milvus_pb2, mutation + "Request")(
+        collection_name="c", num_rows=1,
+        fields_data=[long_fd("id", [1]), vec_fd("v", [[1, 0]]), json_fd("j", [raw])],
+    ))
+    if valid:
+        assert status_of(r) == (0, 0, "")
+        assert list(client.get("c", [1], output_fields=["j"])) == [{"id": 1, "j": expected}]
+    else:
+        code, error_code, reason = status_of(r)
+        assert (code, error_code) == (6, 6)
+        assert reason.startswith("field 'j' value is not valid JSON:")
+        assert client.query("c", output_fields=["count(*)"]) == [{"count(*)": 0}]
+        assert status_of(insert(stub, "c", long_fd("id", [2]), vec_fd("v", [[1, 0]]), json_fd("j", [b"{}"]))) == (0, 0, "")
+        assert list(client.get("c", [1, 2], output_fields=["j"])) == [{"id": 2, "j": {}}]
+
+
+@pytest.mark.parametrize("mutation", ["Insert", "Upsert"])
+def test_valid_json_in_shadowed_column_keeps_last_column_wins(env, mutation):
+    client, stub, _ = env
+    basic(stub)
+    r = getattr(stub, mutation)(getattr(milvus_pb2, mutation + "Request")(
+        collection_name="c", num_rows=1,
+        fields_data=[long_fd("id", [1]), vec_fd("v", [[1, 0]]),
+                     json_fd("t", [b"123"]), str_fd("t", ["ok"])],
+    ))
+    assert status_of(r) == (0, 0, "")
+    assert list(client.get("c", [1], output_fields=["t"])) == [{"id": 1, "t": "ok"}]
 
 
 def test_json_field_values_round_trip_m1_differs(env):
@@ -759,7 +946,7 @@ def test_pymilvus_entry_points_remaining_unsupported(env):
         (lambda: client.list_databases(), f"ListDatabases: {rpc}"),
         (lambda: client.using_database("default"), f"DescribeDatabase: {rpc}"),
         (lambda: client.create_alias("q", "a"), f"CreateAlias: {rpc}"),
-        (with_field("n", DataType.INT64, default_value=1), f"default values: {feature}"),
+        (with_field("n", DataType.FLOAT_VECTOR, dim=2, nullable=True), f"nullable vectors: {feature}"),
         (with_field("v2", DataType.FLOAT_VECTOR, dim=2), "multiple vector fields: "),
         (with_field("s", DataType.SPARSE_FLOAT_VECTOR), f"SPARSE_FLOAT_VECTOR fields: {feature}"),
         (with_field("g", DataType.GEOMETRY), f"GEOMETRY fields: {feature}"),
@@ -773,6 +960,7 @@ def test_pymilvus_entry_points_remaining_unsupported(env):
         (lambda: client.search("q", [[1, 0]], filter="id + 1 > 0"), "filter expressions: arithmetic, temporal literals, text_match, and geometry predicates are not supported"),
         (lambda: client.search("q", [[1, 0]], ranker=decay), f"rerank and function chains: {feature}"),
         (lambda: client.query_iterator("q", batch_size=2).next(), f"query iterators: {feature}"),
+        (with_field("a", DataType.ARRAY, element_type=DataType.INT64, max_capacity=4), f"ARRAY fields: {feature}"),
     ]
     for call, details in cases:
         with pytest.raises(grpc.RpcError) as info:

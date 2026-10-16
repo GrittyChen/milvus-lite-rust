@@ -52,6 +52,8 @@ pub struct FieldSchema {
     pub data_type: DataType,
     pub is_primary: bool,
     pub auto_id: bool,
+    pub nullable: bool,
+    pub default_value: Option<serde_json::Value>,
     /// FLOAT_VECTOR 的维度。保持有符号，以便原样报告 `dim > 0` 的校验错误。
     pub dim: Option<i64>,
     /// VARCHAR 的最大字符数；3.x 允许不设，此时不限长度。
@@ -65,6 +67,8 @@ impl FieldSchema {
             data_type,
             is_primary: false,
             auto_id: false,
+            nullable: false,
+            default_value: None,
             dim: None,
             max_length: None,
         }
@@ -105,6 +109,12 @@ impl CollectionSchema {
         }
         let mut seen = HashSet::new();
         for f in &self.fields {
+            if let Some(feature) = f.default_value.as_ref().and_then(default_limit) {
+                return Err(EngineError::unsupported(
+                    feature,
+                    format!("{feature} are not supported in this build of milvus-lite-rust yet"),
+                ));
+            }
             if f.name.is_empty() {
                 return Err(EngineError::schema("field name must not be empty"));
             }
@@ -153,6 +163,12 @@ impl CollectionSchema {
                 pk.data_type.qualified()
             )));
         }
+        if pk.nullable {
+            return Err(EngineError::schema(format!(
+                "primary key {} must not be nullable",
+                py_repr(&pk.name)
+            )));
+        }
         if pk.auto_id && pk.data_type != DataType::Int64 {
             return Err(EngineError::schema(format!(
                 "auto_id primary key {} must be INT64, got {}",
@@ -178,6 +194,16 @@ impl CollectionSchema {
                 "only one FLOAT_VECTOR field per collection is supported in this build of milvus-lite-rust yet",
             ));
         }
+        if self
+            .fields
+            .iter()
+            .any(|f| f.data_type.is_vector() && (f.nullable || f.default_value.is_some()))
+        {
+            return Err(EngineError::unsupported(
+                "nullable vectors and vector defaults",
+                "nullable vectors and vector defaults are not supported in this build of milvus-lite-rust yet",
+            ));
+        }
         Ok(())
     }
 
@@ -195,9 +221,52 @@ impl CollectionSchema {
     }
 }
 
+fn default_limit(value: &serde_json::Value) -> Option<&'static str> {
+    let mut work = vec![value];
+    while let Some(value) = work.pop() {
+        match value {
+            serde_json::Value::Number(number) if number.as_str().contains(['.', 'e', 'E']) => {
+                if !number.as_str().parse::<f64>().is_ok_and(f64::is_finite) {
+                    return Some("non-finite default values");
+                }
+            }
+            serde_json::Value::Number(number)
+                if number.as_str().bytes().filter(u8::is_ascii_digit).count() > 4300 =>
+            {
+                return Some("oversized integer default values");
+            }
+            serde_json::Value::Array(values) => work.extend(values),
+            serde_json::Value::Object(values) => work.extend(values.values()),
+            _ => {}
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_metadata_rejects_unreadable_python_integers_without_rejecting_strings() {
+        let large: serde_json::Value = serde_json::from_str(&"9".repeat(4301)).unwrap();
+        let mut field = FieldSchema::new("x", DataType::Int64);
+        field.default_value = Some(large);
+        let mut schema = CollectionSchema {
+            fields: vec![pk("id"), vec("v", 2), field],
+            enable_dynamic_field: false,
+            properties: Vec::new(),
+        };
+        assert!(matches!(
+            schema.validate(),
+            Err(EngineError::Unsupported {
+                feature: "oversized integer default values",
+                ..
+            })
+        ));
+        schema.fields[2].default_value = Some(serde_json::Value::String("0".repeat(4301)));
+        assert!(schema.validate().is_ok());
+    }
 
     fn pk(name: &str) -> FieldSchema {
         FieldSchema {

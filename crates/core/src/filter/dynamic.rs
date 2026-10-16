@@ -71,7 +71,7 @@ pub(super) fn source_columns(
             continue;
         }
         // 仅物化表达式引用的标量列，向量、JSON 与整个 meta 对象仍借用原快照。
-        let mut column = match &first.columns[i] {
+        let mut column = match first.columns[i].values() {
             ColumnData::Int8(_) => ColumnData::Int8(Vec::new()),
             ColumnData::Int16(_) => ColumnData::Int16(Vec::new()),
             ColumnData::Int32(_) => ColumnData::Int32(Vec::new()),
@@ -88,14 +88,17 @@ pub(super) fn source_columns(
             }
         };
         for row in rows {
-            if let (ColumnData::VarChar(values), ColumnData::Json(source)) =
-                (&mut column, &row.columns[i])
-            {
-                values.push(
+            if json && let ColumnData::Json(source) = row.columns[i].values() {
+                let valid = !row.columns[i].is_null(row.row);
+                let text = if valid {
                     std::str::from_utf8(&source[row.row])
                         .map_err(|error| EngineError::Storage(error.to_string()))?
-                        .to_owned(),
-                );
+                        .to_owned()
+                } else {
+                    String::new()
+                };
+                let value = ColumnData::VarChar(vec![text]).with_validity(&[valid]);
+                column.push_row(&value, 0);
             } else {
                 column.push_row(&row.columns[i], row.row);
             }

@@ -16,6 +16,177 @@ use milvus_lite_core::{
 static CASE_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
 #[test]
+fn nullable_wal_and_manifest_crashes_preserve_nulls_defaults_and_deletes() {
+    let _case = CASE_LOCK.lock();
+    let make_schema = || {
+        let mut s = schema();
+        let mut x = FieldSchema::new("x", DataType::Int64);
+        x.nullable = true;
+        let mut j = FieldSchema::new("j", DataType::Json);
+        j.nullable = true;
+        let mut flag = FieldSchema::new("flag", DataType::Bool);
+        flag.default_value = Some(serde_json::json!(false));
+        s.fields.extend([x, j, flag]);
+        s
+    };
+    let initial = || {
+        let mut b = batch(&[(1, [1.0, 0.0]), (2, [2.0, 0.0]), (3, [3.0, 0.0])]);
+        b.columns.push((
+            "x".into(),
+            InputValues::Nullable {
+                values: Box::new(InputValues::Int(vec![0, 7, 0])),
+                validity: milvus_lite_core::data::Validity::from_bools(&[false, true, true]),
+            },
+        ));
+        b.columns.push((
+            "j".into(),
+            InputValues::Json(vec![
+                b"null".to_vec(),
+                br#"{"k":1}"#.to_vec(),
+                b"null".to_vec(),
+            ]),
+        ));
+        b
+    };
+    if let Ok(stage) = std::env::var("MILVUS_LITE_NULLABLE_CRASH_STAGE") {
+        let path = std::env::var("MILVUS_LITE_CRASH_DIR").unwrap();
+        let db = Db::new(
+            DataDir::open(std::path::Path::new(&path)).unwrap(),
+            compute(),
+        )
+        .unwrap();
+        db.create_collection("", "c", make_schema()).unwrap();
+        db.insert("", "c", initial()).unwrap();
+        if stage.starts_with("compact-") {
+            for part in 0..4 {
+                if part != 0 {
+                    let mut b = initial();
+                    b.columns[0].1 =
+                        InputValues::Int(vec![part * 3 + 1, part * 3 + 2, part * 3 + 3]);
+                    db.insert("", "c", b).unwrap();
+                }
+                if part == 3 {
+                    db.inject_compaction_fault_once(if stage == "compact-before" {
+                        milvus_lite_core::CompactionFault::ExitBeforeReplace
+                    } else {
+                        milvus_lite_core::CompactionFault::ExitAfterReplace
+                    });
+                }
+                db.flush_collection("", "c").unwrap();
+                db.wait_for_maintenance("", "c", std::time::Duration::from_secs(20))
+                    .unwrap();
+            }
+            panic!("nullable compaction exit did not fire");
+        }
+        if stage == "wal" {
+            std::process::exit(88);
+        }
+        if stage == "append" {
+            milvus_lite_core::storage::wal::inject_storage_full_after_bytes(20);
+            let mut b = batch(&[(4, [4.0, 0.0])]);
+            b.columns.push(("x".into(), InputValues::Null(1)));
+            assert!(db.insert("", "c", b).is_err());
+            std::process::exit(89);
+        }
+        db.flush_collection("", "c").unwrap();
+        db.upsert_with_pk_type(
+            "",
+            "c",
+            InsertBatch {
+                num_rows: 1,
+                columns: vec![
+                    ("id".into(), InputValues::Int(vec![2])),
+                    ("x".into(), InputValues::Null(1)),
+                ],
+            },
+        )
+        .unwrap();
+        db.delete("", "c", &[Pk::Int64(3)]).unwrap();
+        let mut b = batch(&[(4, [4.0, 0.0])]);
+        b.columns.push(("x".into(), InputValues::Null(1)));
+        db.insert("", "c", b).unwrap();
+        if stage == "unlink" {
+            inject_wal_process_exit_after_unlink_once();
+        } else {
+            inject_manifest_process_exit_once(if stage == "before" {
+                CommitPhase::BeforeReplace
+            } else {
+                CommitPhase::AfterReplace
+            });
+        }
+        db.flush_collection("", "c").unwrap();
+        panic!("nullable crash hook did not fire");
+    }
+    for (stage, code) in [
+        ("wal", 88),
+        ("append", 89),
+        ("before", 86),
+        ("after", 86),
+        ("unlink", 87),
+        ("compact-before", 86),
+        ("compact-after", 86),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("nullable.db");
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "nullable_wal_and_manifest_crashes_preserve_nulls_defaults_and_deletes",
+                "--nocapture",
+            ])
+            .env("MILVUS_LITE_NULLABLE_CRASH_STAGE", stage)
+            .env("MILVUS_LITE_CRASH_DIR", &path)
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(code), "{stage}");
+        if stage.starts_with("compact-") {
+            let manifest = milvus_lite_core::storage::manifest::Manifest::read(
+                &path.join("collections/c/manifest.json"),
+            )
+            .unwrap();
+            assert_eq!(
+                manifest.partitions["_default"].data_files.len(),
+                if stage == "compact-before" { 4 } else { 1 },
+                "{stage}"
+            );
+        }
+        let db = Db::new(DataDir::open(&path).unwrap(), compute()).unwrap();
+        let handle = db.collection("", "c").unwrap();
+        handle.write().load().unwrap();
+        let read = handle.read().read_snapshot();
+        if stage.starts_with("compact-") {
+            assert_eq!(
+                read.query("", &[], None, 0).unwrap().rows.pks,
+                (1..=12).map(Pk::Int64).collect::<Vec<_>>()
+            );
+            assert_eq!(read.count_filtered("x is null").unwrap(), 4);
+            assert_eq!(read.count_filtered("j is null").unwrap(), 8);
+            assert_eq!(read.count_filtered("flag == false").unwrap(), 12);
+            db.close();
+            continue;
+        }
+        let original = matches!(stage, "wal" | "append");
+        assert_eq!(
+            read.query("", &[], None, 0).unwrap().rows.pks,
+            if original {
+                vec![Pk::Int64(1), Pk::Int64(2), Pk::Int64(3)]
+            } else {
+                vec![Pk::Int64(1), Pk::Int64(2), Pk::Int64(4)]
+            },
+            "{stage}"
+        );
+        assert_eq!(
+            read.count_filtered("x is null").unwrap(),
+            if original { 1 } else { 3 },
+            "{stage}"
+        );
+        assert_eq!(read.count_filtered("j is null").unwrap(), 2, "{stage}");
+        assert_eq!(read.count_filtered("flag == false").unwrap(), 3, "{stage}");
+        db.close();
+    }
+}
+
+#[test]
 fn failed_case_does_not_poison_the_serialization_lock() {
     let failed = std::panic::catch_unwind(|| {
         let _case = CASE_LOCK.lock();

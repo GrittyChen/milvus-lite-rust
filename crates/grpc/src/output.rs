@@ -133,6 +133,13 @@ fn field_data(
         r#type: milvus_type(data_type),
         field_name: name.to_owned(),
         field: Some(field),
+        valid_data: match column {
+            Column::Data(parts) if parts.iter().any(|c| c.validity().is_some()) => parts
+                .iter()
+                .flat_map(|c| (0..c.len()).map(|row| !c.is_null(row)))
+                .collect(),
+            _ => Vec::new(),
+        },
         ..Default::default()
     }
 }
@@ -143,8 +150,19 @@ fn scalar(data_type: DataType, parts: &[&ColumnData]) -> scalar_field::Data {
         ($variant:ident, $conv:expr) => {
             parts
                 .iter()
-                .flat_map(|c| match c {
-                    ColumnData::$variant(v) => v.iter().map($conv).collect::<Vec<_>>(),
+                .flat_map(|c| match c.values() {
+                    ColumnData::$variant(v) => v
+                        .iter()
+                        .map($conv)
+                        .enumerate()
+                        .map(|(row, value)| {
+                            if c.is_null(row) {
+                                Default::default()
+                            } else {
+                                value
+                            }
+                        })
+                        .collect::<Vec<_>>(),
                     _ => unreachable!("{MISMATCH}"),
                 })
                 .collect()
@@ -176,7 +194,23 @@ fn scalar(data_type: DataType, parts: &[&ColumnData]) -> scalar_field::Data {
             data: collect!(VarChar, Clone::clone),
         }),
         DataType::Json => Data::JsonData(pb::JsonArray {
-            data: collect!(Json, Clone::clone),
+            data: parts
+                .iter()
+                .flat_map(|column| match column.values() {
+                    ColumnData::Json(values) => values
+                        .iter()
+                        .enumerate()
+                        .map(|(row, v)| {
+                            if column.is_null(row) {
+                                b"null".to_vec()
+                            } else {
+                                v.clone()
+                            }
+                        })
+                        .collect::<Vec<_>>(),
+                    _ => unreachable!("{MISMATCH}"),
+                })
+                .collect(),
         }),
         // 向量列在 field_data 中单独处理。
         DataType::FloatVector => Data::FloatData(pb::FloatArray { data: Vec::new() }),

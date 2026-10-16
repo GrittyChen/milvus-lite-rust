@@ -4,6 +4,33 @@ use serde_json::{Map, Value};
 
 use crate::error::{EngineError, Result, py_repr};
 use crate::schema::{DataType, FieldSchema};
+use crate::storage::visibility::SourceBits;
+
+/// 列空值独立于行的删除有效位；全部有效的列不持有此对象。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Validity(SourceBits);
+
+impl Validity {
+    pub fn from_bools(values: &[bool]) -> Self {
+        Self(SourceBits::from_live(values))
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn get(&self, row: usize) -> bool {
+        self.0.get(row)
+    }
+
+    pub(crate) fn bits(&self) -> &SourceBits {
+        &self.0
+    }
+}
 
 /// 主键值。
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -16,6 +43,12 @@ pub enum Pk {
 /// 字段类型的检查与转换在引擎里做，与 3.x 的 `validate_record` 一致。
 #[derive(Debug, Clone, PartialEq)]
 pub enum InputValues {
+    Null(usize),
+    JsonValues(Vec<Value>),
+    Nullable {
+        values: Box<InputValues>,
+        validity: Validity,
+    },
     Bool(Vec<bool>),
     /// proto 的 int_data / long_data。
     Int(Vec<i64>),
@@ -31,8 +64,26 @@ pub enum InputValues {
 }
 
 impl InputValues {
+    pub fn values(&self) -> &Self {
+        match self {
+            Self::Nullable { values, .. } => values,
+            _ => self,
+        }
+    }
+
+    pub fn is_null(&self, row: usize) -> bool {
+        match self {
+            Self::Null(_) => true,
+            Self::Nullable { validity, .. } => !validity.get(row),
+            _ => false,
+        }
+    }
+
     pub fn len(&self) -> usize {
         match self {
+            Self::Null(n) => *n,
+            Self::JsonValues(values) => values.len(),
+            Self::Nullable { values, .. } => values.len(),
             Self::Bool(v) => v.len(),
             Self::Int(v) => v.len(),
             Self::Float(v) => v.len(),
@@ -114,6 +165,10 @@ impl<V> PkMap<V> {
 /// 按字段类型存储的一列。
 #[derive(Debug, Clone, PartialEq)]
 pub enum ColumnData {
+    Nullable {
+        values: Box<ColumnData>,
+        validity: Validity,
+    },
     Bool(Vec<bool>),
     Int8(Vec<i8>),
     Int16(Vec<i16>),
@@ -131,6 +186,58 @@ pub enum ColumnData {
 }
 
 impl ColumnData {
+    pub fn values(&self) -> &Self {
+        match self {
+            Self::Nullable { values, .. } => values,
+            _ => self,
+        }
+    }
+
+    pub fn validity(&self) -> Option<&Validity> {
+        match self {
+            Self::Nullable { validity, .. } => Some(validity),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn values_mut(&mut self) -> &mut Self {
+        match self {
+            Self::Nullable { values, .. } => values,
+            _ => self,
+        }
+    }
+
+    pub(crate) fn nulls(field: &FieldSchema, n: usize) -> Self {
+        let values = match field.data_type {
+            DataType::Bool => Self::Bool(vec![false; n]),
+            DataType::Int8 => Self::Int8(vec![0; n]),
+            DataType::Int16 => Self::Int16(vec![0; n]),
+            DataType::Int32 => Self::Int32(vec![0; n]),
+            DataType::Int64 => Self::Int64(vec![0; n]),
+            DataType::Float => Self::Float(vec![0.0; n]),
+            DataType::Double => Self::Double(vec![0.0; n]),
+            DataType::VarChar => Self::VarChar(vec![String::new(); n]),
+            DataType::Json => Self::Json(vec![b"null".to_vec(); n]),
+            DataType::FloatVector => unreachable!("nullable vector schema is rejected"),
+        };
+        values.with_validity(&vec![false; n])
+    }
+
+    pub fn is_null(&self, row: usize) -> bool {
+        self.validity().is_some_and(|valid| !valid.get(row))
+    }
+
+    pub(crate) fn with_validity(self, valid: &[bool]) -> Self {
+        if valid.iter().all(|&value| value) {
+            self
+        } else {
+            Self::Nullable {
+                values: Box::new(self),
+                validity: Validity::from_bools(valid),
+            }
+        }
+    }
+
     pub(crate) fn empty(field: &FieldSchema) -> Self {
         match field.data_type {
             DataType::Bool => Self::Bool(Vec::new()),
@@ -151,6 +258,7 @@ impl ColumnData {
 
     pub fn len(&self) -> usize {
         match self {
+            Self::Nullable { values, .. } => values.len(),
             Self::Bool(v) => v.len(),
             Self::Int8(v) => v.len(),
             Self::Int16(v) => v.len(),
@@ -170,6 +278,36 @@ impl ColumnData {
 
     /// 把 `src` 的第 `row` 行追加到本列。两列来自同一 schema 字段，变体必然相同。
     pub(crate) fn push_row(&mut self, src: &ColumnData, row: usize) {
+        if let Self::Nullable { values, validity } = self {
+            values.push_row(src.values(), row);
+            validity.0.push(!src.is_null(row));
+            return;
+        }
+        if src.is_null(row) {
+            let mut valid: Vec<bool> = (0..self.len()).map(|i| !self.is_null(i)).collect();
+            valid.push(!src.is_null(row));
+            let empty = match self.values() {
+                Self::Bool(_) => Self::Bool(Vec::new()),
+                Self::Int8(_) => Self::Int8(Vec::new()),
+                Self::Int16(_) => Self::Int16(Vec::new()),
+                Self::Int32(_) => Self::Int32(Vec::new()),
+                Self::Int64(_) => Self::Int64(Vec::new()),
+                Self::Float(_) => Self::Float(Vec::new()),
+                Self::Double(_) => Self::Double(Vec::new()),
+                Self::VarChar(_) => Self::VarChar(Vec::new()),
+                Self::Json(_) => Self::Json(Vec::new()),
+                _ => unreachable!("nullable storage contains a scalar column"),
+            };
+            let previous = std::mem::replace(self, empty);
+            let mut values = match previous {
+                Self::Nullable { values, .. } => *values,
+                values => values,
+            };
+            values.push_row(src.values(), row);
+            *self = values.with_validity(&valid);
+            return;
+        }
+        let src = src.values();
         match (self, src) {
             (Self::Bool(d), Self::Bool(s)) => d.push(s[row]),
             (Self::Int8(d), Self::Int8(s)) => d.push(s[row]),
@@ -190,6 +328,12 @@ impl ColumnData {
 
     /// 同一 schema 的相邻块只拼接，保留失效行与物理行号。
     pub(crate) fn append_column(&mut self, src: &ColumnData) {
+        if self.validity().is_some() || src.validity().is_some() {
+            for row in 0..src.len() {
+                self.push_row(src, row);
+            }
+            return;
+        }
         macro_rules! append {
             ($($variant:ident),*) => {
                 match (self, src) {
@@ -234,6 +378,24 @@ impl Rows {
 
 /// 3.x 在解码 FieldData 时的行数检查（`translators/records.py`）。
 pub fn check_column_len(name: &str, values: &InputValues, n: usize) -> Result<()> {
+    if let InputValues::Nullable {
+        values: inner,
+        validity,
+    } = values
+    {
+        if validity.len() != n
+            || matches!(
+                inner.as_ref(),
+                InputValues::Nullable { .. } | InputValues::Null(_)
+            )
+        {
+            return Err(EngineError::schema(format!(
+                "invalid nullable input for field {}",
+                py_repr(name)
+            )));
+        }
+        return check_column_len(name, inner, n);
+    }
     if let InputValues::FloatVector { dim, values } = values {
         let expected = n.saturating_mul(*dim);
         if *dim == 0 || values.len() != expected {
@@ -258,6 +420,33 @@ pub fn check_column_len(name: &str, values: &InputValues, n: usize) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nullable_gather_append_and_old_clone_keep_word_boundaries() {
+        let field = FieldSchema::new("x", DataType::Int64);
+        let valid: Vec<_> = (0..130).map(|row| !matches!(row, 63 | 64 | 129)).collect();
+        let source = ColumnData::Int64((0..130).collect()).with_validity(&valid);
+        let mut gathered = ColumnData::empty(&field);
+        for row in 0..130 {
+            gathered.push_row(&source, row);
+        }
+        assert_eq!(gathered, source);
+        let old = gathered.clone();
+        gathered.append_column(&ColumnData::Int64(vec![999]));
+        assert_eq!(old.len(), 130);
+        assert_eq!(gathered.len(), 131);
+        for (row, valid) in valid.iter().enumerate() {
+            assert_eq!(gathered.is_null(row), !valid);
+            assert_eq!(old.is_null(row), !valid);
+        }
+        assert!(!gathered.is_null(130));
+        let mut all_valid = ColumnData::empty(&field);
+        for row in [0, 1, 128, 130] {
+            all_valid.push_row(&gathered, row);
+        }
+        assert_eq!(all_valid, ColumnData::Int64(vec![0, 1, 128, 999]));
+        assert!(all_valid.validity().is_none());
+    }
     use std::collections::HashMap;
 
     #[test]

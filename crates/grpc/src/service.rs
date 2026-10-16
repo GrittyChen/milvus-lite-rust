@@ -208,7 +208,7 @@ impl Service for MilvusService {
             let c = handle.read();
             Ok(svc::DescribeCollectionResponse {
                 status: Some(success()),
-                schema: Some(schema::encode(c.name(), c.schema())),
+                schema: Some(schema::encode(c.name(), c.schema())?),
                 collection_name: c.name().to_owned(),
                 shards_num: 1,
                 num_partitions: 1,

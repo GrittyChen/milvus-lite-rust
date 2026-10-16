@@ -19,6 +19,11 @@ pub(crate) fn printable_char(c: char) -> bool {
     unicode::printable(c)
 }
 
+/// 默认值的协议描述复用过滤器固定的 CPython 十进制数字表，避免两套 Unicode 分类。
+pub fn python_decimal_digit(c: char) -> Option<u32> {
+    unicode::decimal(c)
+}
+
 use crate::error::Result;
 
 /// 与 schema 无关的解析结果；适配层可在取状态锁之前解析，再保留原来的校验错误优先级。

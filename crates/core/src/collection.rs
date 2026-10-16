@@ -1536,11 +1536,16 @@ impl Collection {
         }
         let dynamic = self.decode_dynamic(&batch);
         let mut supplied: HashMap<&str, &InputValues> = HashMap::new();
+        let mut json_checks: HashMap<&str, Vec<&InputValues>> = HashMap::new();
         for (name, values) in &batch.columns {
-            if name != META_FIELD && self.schema.field(name).is_some() {
-                supplied.insert(name, values);
+            if name != META_FIELD
+                && self.schema.field(name).is_some()
+                && let Some(previous) = supplied.insert(name, values)
+            {
+                json_checks.entry(name.as_str()).or_default().push(previous);
             }
         }
+        retain_masked_json(&supplied, &mut json_checks);
         let pk_field = &self.schema.fields[self.pk_pos];
         let mut pending: HashMap<Pk, (Vec<InputValues>, Map<String, Value>)> = HashMap::new();
         let mut fields: Vec<ColumnData> =
@@ -1578,7 +1583,8 @@ impl Collection {
                     present[i] = true;
                 }
             }
-            if !present[self.pk_pos] && pk_field.auto_id {
+            if pk_field.auto_id && (!present[self.pk_pos] || input_is_null(&values[self.pk_pos], 0))
+            {
                 let seq = self
                     .next_seq
                     .checked_add(row as u64)
@@ -1612,9 +1618,9 @@ impl Collection {
                 maps: vec![meta.clone()],
                 errors: vec![dynamic.errors[row].clone()],
             };
-            self.validate_row(&row_fields, &row_dynamic, 0)?;
+            self.validate_row(&row_fields, &row_dynamic, 0, &json_checks, row)?;
             for (i, field) in self.schema.fields.iter().enumerate() {
-                let converted = convert(field, &values[i])?;
+                let converted = convert_optional(field, present[i].then_some(&values[i]), 1)?;
                 fields[i].push_row(&converted, 0);
                 values[i] = input_from_column(&converted, 0);
             }
@@ -1725,7 +1731,7 @@ impl Collection {
         // 为动态字段分配内存（num_rows 由请求给出，没有列时不受列长度检查的约束）。
         let has_column = |name: &str| batch.columns.iter().any(|(n, _)| n == name);
         let pk = &self.schema.fields[self.pk_pos];
-        if !pk.auto_id && !has_column(&pk.name) {
+        if !pk.auto_id && pk.default_value.is_none() && !has_column(&pk.name) {
             return Err(EngineError::schema(format!(
                 "primary key {} missing or None",
                 py_repr(&pk.name)
@@ -1742,13 +1748,18 @@ impl Collection {
         let dynamic = self.decode_dynamic(&batch);
         // 同名列以后出现者为准（3.x 逐列写入同一个 dict）。
         let mut by_name: HashMap<&str, &InputValues> = HashMap::new();
+        let mut json_checks: HashMap<&str, Vec<&InputValues>> = HashMap::new();
         for (name, values) in &batch.columns {
-            if name != META_FIELD && self.schema.field(name).is_some() {
-                by_name.insert(name.as_str(), values);
+            if name != META_FIELD
+                && self.schema.field(name).is_some()
+                && let Some(previous) = by_name.insert(name.as_str(), values)
+            {
+                json_checks.entry(name.as_str()).or_default().push(previous);
             }
         }
+        retain_masked_json(&by_name, &mut json_checks);
         for row in 0..n {
-            self.validate_row(&by_name, &dynamic, row)?;
+            self.validate_row(&by_name, &dynamic, row, &json_checks, row)?;
         }
 
         let pk_field = &self.schema.fields[self.pk_pos];
@@ -1760,21 +1771,35 @@ impl Collection {
         let seqs: Vec<u64> = (first_seq..next_seq).collect();
         let mut columns = Vec::with_capacity(self.schema.fields.len());
         for (i, field) in self.schema.fields.iter().enumerate() {
-            let column = if i == self.pk_pos && auto_pk {
+            let null_auto_pk = if i == self.pk_pos && pk_field.auto_id && !auto_pk {
+                let mut found = false;
+                if let Some(input) = by_name.get(pk_field.name.as_str()) {
+                    for row in 0..n {
+                        found |= input_is_null(input, row);
+                    }
+                }
+                found
+            } else {
+                false
+            };
+            let column = if i == self.pk_pos && (auto_pk || null_auto_pk) {
                 ColumnData::Int64(
                     seqs.iter()
-                        .map(|s| i64::try_from(*s))
+                        .enumerate()
+                        .map(|(row, s)| {
+                            if let Some(input) = by_name.get(pk_field.name.as_str())
+                                && !input.is_null(row)
+                                && let Some(Pk::Int64(id)) = input_pk(input, row)
+                            {
+                                return Ok(id);
+                            }
+                            i64::try_from(*s)
+                        })
                         .collect::<Result<_, _>>()
                         .map_err(|_| EngineError::invalid("auto_id space exhausted"))?,
                 )
             } else {
-                let values = by_name.get(field.name.as_str()).ok_or_else(|| {
-                    EngineError::schema(format!(
-                        "field {} missing and not nullable / no default",
-                        py_repr(&field.name)
-                    ))
-                })?;
-                convert(field, values)?
+                convert_optional(field, by_name.get(field.name.as_str()).copied(), n)?
             };
             columns.push(column);
         }
@@ -2036,12 +2061,18 @@ impl Collection {
     }
 
     fn decode_meta(&self, values: &InputValues, row: usize) -> Result<Vec<(String, Value)>> {
-        let InputValues::Json(texts) = values else {
+        let InputValues::Json(texts) = values.values() else {
             return Err(EngineError::schema(format!(
                 "dynamic field {} must carry JSON data",
                 py_repr(META_FIELD)
             )));
         };
+        if values.is_null(row) {
+            return Err(EngineError::schema(format!(
+                "dynamic field {} value must be a JSON object",
+                py_repr(META_FIELD)
+            )));
+        }
         let Value::Object(obj) = parse_dynamic_json(META_FIELD, &texts[row])? else {
             return Err(EngineError::schema(format!(
                 "dynamic field {} value must be a JSON object",
@@ -2064,9 +2095,16 @@ impl Collection {
         by_name: &HashMap<&str, &InputValues>,
         dynamic: &Dynamic,
         row: usize,
+        json_checks: &HashMap<&str, Vec<&InputValues>>,
+        source_row: usize,
     ) -> Result<()> {
         let pk = &self.schema.fields[self.pk_pos];
-        if !pk.auto_id && !by_name.contains_key(pk.name.as_str()) {
+        let primary = resolved_input(pk, by_name.get(pk.name.as_str()).copied(), row)?;
+        if !pk.auto_id
+            && primary
+                .as_ref()
+                .is_none_or(|(value, index)| value.is_null(*index))
+        {
             return Err(EngineError::schema(format!(
                 "primary key {} missing or None",
                 py_repr(&pk.name)
@@ -2089,6 +2127,12 @@ impl Collection {
                     )));
                 }
             }
+            Some(other) if input_is_null(other, row) => {
+                return Err(EngineError::schema(format!(
+                    "vector field {} missing or None",
+                    py_repr(&vector.name)
+                )));
+            }
             Some(other) => {
                 return Err(EngineError::schema(format!(
                     "vector field {} must be list/tuple, got {}",
@@ -2098,11 +2142,31 @@ impl Collection {
             }
         }
         for (i, field) in self.schema.fields.iter().enumerate() {
+            // 0004 的坏 JSON 拒绝也适用于被覆盖、掩码或默认值替换的值，但不能抢在本行
+            // 主键、向量及前序字段检查之前。Upsert 的合并行只有一行，原始列仍按 source_row 取值。
+            if let Some(previous) = json_checks.get(field.name.as_str()) {
+                for values in previous {
+                    if let InputValues::Json(raw) = values.values() {
+                        parse_json(&field.name, &raw[source_row])?;
+                    }
+                }
+            }
             if field.data_type.is_vector() {
+                continue;
+            }
+            if i == self.pk_pos
+                && pk.auto_id
+                && let Some(values) = by_name.get(field.name.as_str())
+                && input_is_null(values, row)
+            {
                 continue;
             }
             let Some(values) = by_name.get(field.name.as_str()) else {
                 if i == self.pk_pos && pk.auto_id {
+                    continue;
+                }
+                if let Some((value, index)) = resolved_input(field, None, row)? {
+                    check_value(field, &value, index)?;
                     continue;
                 }
                 return Err(EngineError::schema(format!(
@@ -2110,7 +2174,12 @@ impl Collection {
                     py_repr(&field.name)
                 )));
             };
-            check_value(field, values, row)?;
+            let (value, index) = resolved_input(field, Some(values), row)?
+                .ok_or_else(|| EngineError::schema("field resolution lost a supplied value"))?;
+            if i == self.pk_pos && pk.auto_id && value.is_null(index) {
+                continue;
+            }
+            check_value(field, &value, index)?;
         }
         if let Some(msg) = &dynamic.errors[row] {
             return Err(EngineError::schema(msg.clone()));
@@ -2322,15 +2391,31 @@ fn vector_values(column: &ColumnData) -> (usize, &[f32]) {
 }
 
 fn input_pk(values: &InputValues, row: usize) -> Option<Pk> {
-    match values {
+    if values.is_null(row) {
+        return None;
+    }
+    match values.values() {
         InputValues::Int(v) => Some(Pk::Int64(v[row])),
         InputValues::Str(v) => Some(Pk::VarChar(v[row].clone())),
+        InputValues::JsonValues(v) => v[row]
+            .as_i64()
+            .map(Pk::Int64)
+            .or_else(|| v[row].as_str().map(|v| Pk::VarChar(v.to_owned()))),
         _ => None,
     }
 }
 
 fn input_row(values: &InputValues, row: usize) -> InputValues {
     match values {
+        InputValues::Null(_) => InputValues::Null(1),
+        InputValues::JsonValues(v) => InputValues::JsonValues(vec![v[row].clone()]),
+        InputValues::Nullable { values, validity } => {
+            if validity.get(row) {
+                input_row(values, row)
+            } else {
+                InputValues::Null(1)
+            }
+        }
         InputValues::Bool(v) => InputValues::Bool(vec![v[row]]),
         InputValues::Int(v) => InputValues::Int(vec![v[row]]),
         InputValues::Float(v) => InputValues::Float(vec![v[row]]),
@@ -2345,6 +2430,13 @@ fn input_row(values: &InputValues, row: usize) -> InputValues {
 
 fn input_from_column(column: &ColumnData, row: usize) -> InputValues {
     match column {
+        ColumnData::Nullable { values, validity } => {
+            if validity.get(row) {
+                input_from_column(values, row)
+            } else {
+                InputValues::Null(1)
+            }
+        }
         ColumnData::Bool(v) => InputValues::Bool(vec![v[row]]),
         ColumnData::Int8(v) => InputValues::Int(vec![i64::from(v[row])]),
         ColumnData::Int16(v) => InputValues::Int(vec![i64::from(v[row])]),
@@ -2363,6 +2455,10 @@ fn input_from_column(column: &ColumnData, row: usize) -> InputValues {
 
 fn input_from_column_all(column: &ColumnData) -> InputValues {
     match column {
+        ColumnData::Nullable { values, validity } => InputValues::Nullable {
+            values: Box::new(input_from_column_all(values)),
+            validity: validity.clone(),
+        },
         ColumnData::Bool(v) => InputValues::Bool(v.clone()),
         ColumnData::Int8(v) => InputValues::Int(v.iter().map(|x| i64::from(*x)).collect()),
         ColumnData::Int16(v) => InputValues::Int(v.iter().map(|x| i64::from(*x)).collect()),
@@ -2404,6 +2500,18 @@ fn parse_json(field: &str, text: &[u8]) -> Result<Value> {
 /// 不在 schema 中的列作为动态字段时的 JSON 值。
 fn to_json(name: &str, values: &InputValues, row: usize) -> Result<Value> {
     Ok(match values {
+        InputValues::Null(_) => Value::Null,
+        InputValues::JsonValues(v) => v[row].clone(),
+        InputValues::Nullable { values, validity } => {
+            if validity.get(row) {
+                to_json(name, values, row)?
+            } else {
+                if matches!(values.values(), InputValues::Json(_)) {
+                    to_json(name, values, row)?;
+                }
+                Value::Null
+            }
+        }
         InputValues::Bool(v) => Value::Bool(v[row]),
         InputValues::Int(v) => Value::from(v[row]),
         InputValues::Float(v) => json_number(name, v[row])?,
@@ -2432,6 +2540,65 @@ fn json_number(name: &str, v: f64) -> Result<Value> {
 
 /// 3.x `_DTYPE_PYTHON_CHECK` 与 VARCHAR 长度检查。
 fn check_value(field: &FieldSchema, values: &InputValues, row: usize) -> Result<()> {
+    if values.is_null(row) {
+        return if field.nullable {
+            Ok(())
+        } else {
+            Err(EngineError::schema(format!(
+                "field {} is None but not nullable",
+                py_repr(&field.name)
+            )))
+        };
+    }
+    if let InputValues::JsonValues(values) = values {
+        let value = &values[row];
+        let integer = value
+            .as_number()
+            .filter(|n| !n.as_str().contains(['.', 'e', 'E']));
+        let ok = match field.data_type {
+            DataType::Bool => value.is_boolean(),
+            DataType::Int64 => integer.is_some(),
+            DataType::Int8 => integer
+                .and_then(|n| n.as_i64())
+                .is_some_and(|v| i8::try_from(v).is_ok()),
+            DataType::Int16 => integer
+                .and_then(|n| n.as_i64())
+                .is_some_and(|v| i16::try_from(v).is_ok()),
+            DataType::Int32 => integer
+                .and_then(|n| n.as_i64())
+                .is_some_and(|v| i32::try_from(v).is_ok()),
+            DataType::Float | DataType::Double => value.is_number(),
+            DataType::VarChar => {
+                if let Some(text) = value.as_str() {
+                    if let Some(max) = field.max_length
+                        && text.chars().count() as i64 > max
+                    {
+                        return Err(EngineError::schema(format!(
+                            "VARCHAR field {} value length {} exceeds max_length={max}",
+                            py_repr(&field.name),
+                            text.chars().count()
+                        )));
+                    }
+                    true
+                } else {
+                    false
+                }
+            }
+            DataType::Json => true,
+            DataType::FloatVector => false,
+        };
+        return if ok {
+            Ok(())
+        } else {
+            Err(EngineError::schema(format!(
+                "field {} value {} does not match dtype {}",
+                py_repr(&field.name),
+                py_json_repr(value),
+                field.data_type.qualified()
+            )))
+        };
+    }
+    let values = values.values();
     let ok = match (field.data_type, values) {
         (DataType::Bool, InputValues::Bool(_)) => true,
         (DataType::Int8, InputValues::Int(v)) => i8::try_from(v[row]).is_ok(),
@@ -2453,7 +2620,7 @@ fn check_value(field: &FieldSchema, values: &InputValues, row: usize) -> Result<
         }
         (DataType::Json, InputValues::Json(v)) => {
             // JSON 的 null 在 3.x 中即 None。
-            if parse_json(&field.name, &v[row])?.is_null() {
+            if parse_json(&field.name, &v[row])?.is_null() && !field.nullable {
                 return Err(EngineError::schema(format!(
                     "field {} is None but not nullable",
                     py_repr(&field.name)
@@ -2475,8 +2642,132 @@ fn check_value(field: &FieldSchema, values: &InputValues, row: usize) -> Result<
     }
 }
 
+/// 保存可能在 Upsert/default 处理时被替换的原始 JSON，在字段校验阶段再报告错误。
+fn retain_masked_json<'a>(
+    supplied: &HashMap<&'a str, &'a InputValues>,
+    checks: &mut HashMap<&'a str, Vec<&'a InputValues>>,
+) {
+    for (&name, &values) in supplied {
+        if matches!(values, InputValues::Nullable { values, .. } if matches!(values.as_ref(), InputValues::Json(_)))
+        {
+            checks.entry(name).or_default().push(values);
+        }
+    }
+}
+
+/// JSON null 只允许首尾的四种 JSON 空白；不解析普通 JSON，也不把畸形文本视为空值。
+fn json_text_is_null(text: &[u8]) -> bool {
+    let whitespace = |byte: &u8| matches!(byte, b' ' | b'\t' | b'\n' | b'\r');
+    let start = text
+        .iter()
+        .position(|byte| !whitespace(byte))
+        .unwrap_or(text.len());
+    text[start..]
+        .strip_prefix(b"null")
+        .is_some_and(|suffix| suffix.iter().all(whitespace))
+}
+
+fn input_is_null(values: &InputValues, row: usize) -> bool {
+    let semantic = match values.values() {
+        // 存在性探测只识别 JSON null；畸形文本视为非空，由后续字段类型/JSON 校验拒绝。
+        // 这样主键/向量存在性检查不会提前报告 JSON 错误；被掩码替换的值另由 json_checks 检查。
+        InputValues::Json(v) => json_text_is_null(&v[row]),
+        InputValues::JsonValues(v) => v[row].is_null(),
+        InputValues::Null(_) => true,
+        _ => false,
+    };
+    semantic || values.is_null(row)
+}
+
+fn resolved_input<'a>(
+    field: &FieldSchema,
+    values: Option<&'a InputValues>,
+    row: usize,
+) -> Result<Option<(std::borrow::Cow<'a, InputValues>, usize)>> {
+    if let Some(values) = values
+        && !input_is_null(values, row)
+    {
+        return Ok(Some((std::borrow::Cow::Borrowed(values.values()), row)));
+    }
+    if let Some(default) = field.default_value.as_ref().filter(|v| !v.is_null()) {
+        return Ok(Some((
+            std::borrow::Cow::Owned(InputValues::JsonValues(vec![default.clone()])),
+            0,
+        )));
+    }
+    if values.is_some() || field.nullable {
+        return Ok(Some((std::borrow::Cow::Owned(InputValues::Null(1)), 0)));
+    }
+    Ok(None)
+}
+
+fn convert_optional(
+    field: &FieldSchema,
+    values: Option<&InputValues>,
+    n: usize,
+) -> Result<ColumnData> {
+    if let Some(values) = values
+        && !matches!(
+            values,
+            InputValues::Nullable { .. } | InputValues::Null(_) | InputValues::JsonValues(_)
+        )
+    {
+        let contains_null = if let InputValues::Json(raw) = values {
+            raw.iter().any(|text| json_text_is_null(text))
+        } else {
+            false
+        };
+        if !contains_null {
+            return convert_nonnull(field, values);
+        }
+    }
+    let mut column = ColumnData::empty(field);
+    for row in 0..n {
+        let (input, index) = resolved_input(field, values, row)?.ok_or_else(|| {
+            EngineError::schema(format!(
+                "field {} missing and not nullable / no default",
+                py_repr(&field.name)
+            ))
+        })?;
+        let converted = if input.is_null(index) {
+            if !field.nullable {
+                return Err(EngineError::schema(format!(
+                    "field {} is None but not nullable",
+                    py_repr(&field.name)
+                )));
+            }
+            ColumnData::nulls(field, 1)
+        } else if let InputValues::JsonValues(values) = input.as_ref() {
+            let value = &values[index];
+            let concrete = if field.data_type == DataType::Json {
+                // 默认值沿用 0004 已登记的 JSON 顶层标量/字符串规则。
+                InputValues::Json(vec![crate::pyjson::dumps_unicode(value).into_bytes()])
+            } else {
+                match value {
+                    Value::Bool(v) => InputValues::Bool(vec![*v]),
+                    Value::String(v) => InputValues::Str(vec![v.clone()]),
+                    Value::Number(v) if !v.as_str().contains(['.', 'e', 'E']) => {
+                        InputValues::Int(vec![v.as_i64().ok_or_else(|| {
+                            EngineError::invalid("Python int too large to convert to C long")
+                        })?])
+                    }
+                    Value::Number(v) => InputValues::Float(vec![v.as_f64().ok_or_else(|| {
+                        EngineError::invalid("float value cannot be represented")
+                    })?]),
+                    _ => return Err(EngineError::schema("invalid default value type")),
+                }
+            };
+            convert_nonnull(field, &concrete)?
+        } else {
+            convert_nonnull(field, &input_row(&input, index))?
+        };
+        column.push_row(&converted, 0);
+    }
+    Ok(column)
+}
+
 /// 校验通过后按字段类型转换为存储列。
-fn convert(field: &FieldSchema, values: &InputValues) -> Result<ColumnData> {
+fn convert_nonnull(field: &FieldSchema, values: &InputValues) -> Result<ColumnData> {
     let mismatch = || {
         EngineError::schema(format!(
             "field {} values do not match dtype {}",
@@ -2538,6 +2829,28 @@ fn narrow<T: TryFrom<i64>>(v: &[i64]) -> Option<Vec<T>> {
 /// Python `type(value).__name__`。
 fn py_type_name(values: &InputValues, row: usize) -> &'static str {
     match values {
+        InputValues::Null(_) => "NoneType",
+        InputValues::Nullable { values, validity } => {
+            if validity.get(row) {
+                py_type_name(values, row)
+            } else {
+                "NoneType"
+            }
+        }
+        InputValues::JsonValues(v) => match &v[row] {
+            Value::Null => "NoneType",
+            Value::Bool(_) => "bool",
+            Value::String(_) => "str",
+            Value::Array(_) => "list",
+            Value::Object(_) => "dict",
+            Value::Number(n) => {
+                if n.as_str().contains(['.', 'e', 'E']) {
+                    "float"
+                } else {
+                    "int"
+                }
+            }
+        },
         InputValues::Bool(_) => "bool",
         InputValues::Int(_) => "int",
         InputValues::Float(_) => "float",
@@ -2550,7 +2863,9 @@ fn py_type_name(values: &InputValues, row: usize) -> &'static str {
             Ok(Value::Bool(_)) => "bool",
             Ok(Value::Number(n)) if n.is_f64() => "float",
             Ok(Value::Number(_)) => "int",
-            Ok(Value::Null) | Err(_) => "NoneType",
+            Ok(Value::Null) => "NoneType",
+            // 参照的 JSON 解码失败后保留原文本；存在性探测已把它与 null 区分。
+            Err(_) => "str",
         },
     }
 }
@@ -2558,6 +2873,15 @@ fn py_type_name(values: &InputValues, row: usize) -> &'static str {
 /// Python `repr(value)`，用于 3.x 的 `value {value!r} does not match dtype` 信息。
 fn py_value_repr(values: &InputValues, row: usize) -> String {
     match values {
+        InputValues::Null(_) => "None".into(),
+        InputValues::Nullable { values, validity } => {
+            if validity.get(row) {
+                py_value_repr(values, row)
+            } else {
+                "None".into()
+            }
+        }
+        InputValues::JsonValues(v) => py_json_repr(&v[row]),
         InputValues::Bool(v) => if v[row] { "True" } else { "False" }.to_owned(),
         InputValues::Int(v) => v[row].to_string(),
         InputValues::Float(v) => py_float_repr(v[row]),
@@ -2594,6 +2918,47 @@ fn check_loaded(name: &str, state: LoadState, deleted: bool, unusable: bool) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn json_null_probe_matches_parser_and_rejects_non_json_whitespace() {
+        let check = |text: &[u8]| {
+            let expected = serde_json::from_slice::<Value>(text).is_ok_and(|value| value.is_null());
+            assert_eq!(json_text_is_null(text), expected, "{text:?}");
+        };
+        // 覆盖全部字节边界，防止 trim_ascii 扩大 JSON 空白集合或 UTF-8 解码改变语义。
+        for prefix in 0..=u8::MAX {
+            for suffix in 0..=u8::MAX {
+                check(&[prefix, b'n', b'u', b'l', b'l', suffix]);
+            }
+        }
+        for text in [
+            &b"null"[..],
+            b" \t\n\rnull\r\n\t ",
+            b"",
+            b" \t\r\n",
+            b"n ull",
+            b"nu\nll",
+            b"null null",
+            b"null0",
+            b"\x0cnull",
+            b"null\x0b",
+            b"\xef\xbb\xbfnull",
+            b"\xc2\xa0null",
+            b"null\0",
+            b"\"null\"",
+            b"[null]",
+            b"{\"x\":null}",
+            b"false",
+            b"0",
+            b"{}",
+            b"[]",
+            b"NULL",
+            b"nul",
+            b"null\xff",
+        ] {
+            check(text);
+        }
+    }
 
     #[test]
     fn zero_row_source_skips_sidecar_metadata() {

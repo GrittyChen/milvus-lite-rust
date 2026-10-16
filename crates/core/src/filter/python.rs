@@ -388,28 +388,37 @@ fn operand<'a>(op: &'a Operand, row: &DynamicRow<'a>) -> Result<Value<'a>> {
             .meta
             .and_then(|m| m.get(key))
             .map_or(Value::Null, Value::Json),
-        Operand::Column(i) => match &row.columns[*i] {
-            ColumnData::Bool(v) => Value::Bool(v[row.row]),
-            ColumnData::Int8(v) => Value::Int(Cow::Owned(v[row.row].to_string())),
-            ColumnData::Int16(v) => Value::Int(Cow::Owned(v[row.row].to_string())),
-            ColumnData::Int32(v) => Value::Int(Cow::Owned(v[row.row].to_string())),
-            ColumnData::Int64(v) => Value::Int(Cow::Owned(v[row.row].to_string())),
-            ColumnData::Float(v) => Value::Float(f64::from(v[row.row]), false),
-            ColumnData::Double(v) => Value::Float(v[row.row], false),
-            ColumnData::VarChar(v) => {
-                Value::Text(Cow::Owned(v[row.row].chars().map(u32::from).collect()))
+        Operand::Column(i) => {
+            if row.columns[*i].is_null(row.row) {
+                Value::Null
+            } else {
+                match row.columns[*i].values() {
+                    ColumnData::Nullable { .. } => {
+                        return Err(EngineError::Storage("nested nullable column".into()));
+                    }
+                    ColumnData::Bool(v) => Value::Bool(v[row.row]),
+                    ColumnData::Int8(v) => Value::Int(Cow::Owned(v[row.row].to_string())),
+                    ColumnData::Int16(v) => Value::Int(Cow::Owned(v[row.row].to_string())),
+                    ColumnData::Int32(v) => Value::Int(Cow::Owned(v[row.row].to_string())),
+                    ColumnData::Int64(v) => Value::Int(Cow::Owned(v[row.row].to_string())),
+                    ColumnData::Float(v) => Value::Float(f64::from(v[row.row]), false),
+                    ColumnData::Double(v) => Value::Float(v[row.row], false),
+                    ColumnData::VarChar(v) => {
+                        Value::Text(Cow::Owned(v[row.row].chars().map(u32::from).collect()))
+                    }
+                    ColumnData::Json(v) => Value::Text(Cow::Owned(
+                        std::str::from_utf8(&v[row.row])
+                            .map_err(|e| EngineError::Storage(e.to_string()))?
+                            .chars()
+                            .map(u32::from)
+                            .collect(),
+                    )),
+                    ColumnData::FloatVector { dim, values } => {
+                        Value::Vector(&values[row.row * dim..(row.row + 1) * dim])
+                    }
+                }
             }
-            ColumnData::Json(v) => Value::Text(Cow::Owned(
-                std::str::from_utf8(&v[row.row])
-                    .map_err(|e| EngineError::Storage(e.to_string()))?
-                    .chars()
-                    .map(u32::from)
-                    .collect(),
-            )),
-            ColumnData::FloatVector { dim, values } => {
-                Value::Vector(&values[row.row * dim..(row.row + 1) * dim])
-            }
-        },
+        }
     })
 }
 fn membership(value: &Value<'_>, literals: &[Literal]) -> Result<Option<bool>> {

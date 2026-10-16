@@ -105,8 +105,8 @@ impl SchemaFile {
                 max_length: field.max_length,
                 element_type: None,
                 max_capacity: None,
-                nullable: false,
-                default_value: None,
+                nullable: field.nullable,
+                default_value: field.default_value.clone(),
                 enable_analyzer: false,
                 analyzer_params: None,
                 enable_match: false,
@@ -187,11 +187,8 @@ impl SchemaFile {
             .fields
             .iter()
             .map(|field| {
-                if field.nullable
-                    || field
-                        .default_value
-                        .as_ref()
-                        .is_some_and(|value| !value.is_null())
+                if (field.dtype == "float_vector"
+                    && (field.nullable || field.default_value.is_some()))
                     || field.element_type.is_some()
                     || field.max_capacity.is_some()
                     || field.enable_analyzer
@@ -224,6 +221,8 @@ impl SchemaFile {
                     }
                 };
                 Ok(FieldSchema {
+                    nullable: field.nullable,
+                    default_value: field.default_value.clone(),
                     name: field.name.clone(),
                     data_type: dtype,
                     is_primary: field.is_primary,

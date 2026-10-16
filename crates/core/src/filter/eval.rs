@@ -585,7 +585,7 @@ impl Predicate {
                         validate_literal(&Operand::Literal(lit.clone()))?;
                     }
                     let float = if matches!(
-                        columns[*column],
+                        columns[*column].values(),
                         ColumnData::Float(_) | ColumnData::Double(_)
                     ) || values.iter().any(|l| matches!(l, Literal::Float(_)))
                     {
@@ -599,7 +599,7 @@ impl Predicate {
                     // 往返校验，x86_64 则判为截断。这里按截断处理，越界浮点数（包括 float(i64::MAX - 1)）
                     // 不能命中、更不能删除另一个整数；差异见 0006「与 3.x 的差异」。
                     let integer_set = float != 0
-                        && matches!(columns[*column], ColumnData::Int64(_))
+                        && matches!(columns[*column].values(), ColumnData::Int64(_))
                         && values.iter().all(|literal| match literal {
                             Literal::Int(_) => true,
                             Literal::Float(v) => {
@@ -640,6 +640,10 @@ impl Predicate {
                     let column_operand = Operand::Column(*column);
                     for row in 0..live.len {
                         if live.get(row) {
+                            if columns[*column].is_null(row) {
+                                out.set(row, false);
+                                continue;
+                            }
                             let a = value(&column_operand, columns, row, lookup_precision)?;
                             if !set.contains(&a.key()) {
                                 out.set(row, false);
@@ -690,7 +694,7 @@ pub(super) fn operand_precision<C: std::ops::Index<usize, Output = ColumnData> +
 ) -> u8 {
     match op {
         Operand::Literal(Literal::Float(_)) => 64,
-        Operand::Column(i) => match columns[*i] {
+        Operand::Column(i) => match columns[*i].values() {
             ColumnData::Float(_) => 32,
             ColumnData::Double(_) => 64,
             _ => 0,
@@ -712,7 +716,7 @@ pub(super) fn value<'a, C: std::ops::Index<usize, Output = ColumnData> + ?Sized>
         Operand::Literal(Literal::Float(f)) => Scalar::Float(*f),
         Operand::Literal(Literal::String(s)) => Scalar::String(s),
         Operand::Literal(Literal::Bool(b)) => Scalar::Bool(*b),
-        Operand::Column(i) => match &columns[*i] {
+        Operand::Column(i) => match columns[*i].values() {
             ColumnData::Int8(v) => Scalar::Int(i64::from(v[row])),
             ColumnData::Int16(v) => Scalar::Int(i64::from(v[row])),
             ColumnData::Int32(v) => Scalar::Int(i64::from(v[row])),
@@ -750,6 +754,13 @@ fn compare_column(
     live: &SourceBits,
     out: &mut SourceBits,
 ) -> Result<()> {
+    if let ColumnData::Nullable { values, validity } = column {
+        let mut valid = live.clone();
+        valid.intersect(validity.bits());
+        compare_column(values, constant, op, &valid, out)?;
+        out.intersect(&valid);
+        return Ok(());
+    }
     macro_rules! integer {
         ($values:expr) => {{
             let values = $values;
