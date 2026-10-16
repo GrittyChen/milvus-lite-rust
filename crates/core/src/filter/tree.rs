@@ -26,7 +26,11 @@ pub(super) struct Tree {
 pub(super) fn legacy_shape(ast: &Ast, schema: &CollectionSchema) -> bool {
     let field = |id: usize| match &ast.nodes[id].kind {
         Kind::Field(name) => !schema.fields.iter().any(|f| {
-            &f.name == name && matches!(f.data_type, DataType::Json | DataType::FloatVector)
+            &f.name == name
+                && matches!(
+                    f.data_type,
+                    DataType::Json | DataType::Array | DataType::FloatVector
+                )
         }),
         Kind::Meta(_) => true,
         _ => false,
@@ -147,6 +151,7 @@ impl Tree {
                     }
                     match schema.fields.iter().find(|f| &f.name == name) {
                         Some(f) if f.data_type == DataType::Json => "string",
+                        Some(f) if f.data_type == DataType::Array => "dynamic",
                         Some(f) => eval::sem(f.data_type).ok_or_else(|| {
                             parser::diagnostic(
                                 &format!(

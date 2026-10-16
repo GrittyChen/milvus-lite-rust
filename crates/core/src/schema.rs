@@ -16,6 +16,7 @@ pub enum DataType {
     Double,
     VarChar,
     Json,
+    Array,
     FloatVector,
 }
 
@@ -32,6 +33,7 @@ impl DataType {
             Self::Double => "DOUBLE",
             Self::VarChar => "VARCHAR",
             Self::Json => "JSON",
+            Self::Array => "ARRAY",
             Self::FloatVector => "FLOAT_VECTOR",
         }
     }
@@ -58,6 +60,8 @@ pub struct FieldSchema {
     pub dim: Option<i64>,
     /// VARCHAR 的最大字符数；3.x 允许不设，此时不限长度。
     pub max_length: Option<i64>,
+    pub element_type: Option<DataType>,
+    pub max_capacity: Option<i64>,
 }
 
 impl FieldSchema {
@@ -71,6 +75,8 @@ impl FieldSchema {
             default_value: None,
             dim: None,
             max_length: None,
+            element_type: None,
+            max_capacity: None,
         }
     }
 }
@@ -142,6 +148,26 @@ impl CollectionSchema {
                     "vector field {} requires dim > 0, got {dim}",
                     py_repr(&f.name)
                 )));
+            }
+            if f.data_type == DataType::Array {
+                let element = f.element_type.ok_or_else(|| {
+                    EngineError::schema(format!(
+                        "ARRAY field {} requires element_type",
+                        py_repr(&f.name)
+                    ))
+                })?;
+                if matches!(
+                    element,
+                    DataType::Array | DataType::Json | DataType::FloatVector
+                ) {
+                    return Err(EngineError::unsupported(
+                        "ARRAY element type",
+                        format!(
+                            "ARRAY element type {} is not supported in this build of milvus-lite-rust yet",
+                            element.name()
+                        ),
+                    ));
+                }
             }
         }
 

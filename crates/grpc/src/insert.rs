@@ -72,13 +72,34 @@ pub(crate) fn decode(
 fn scalar(name: &str, t: i32, sf: pb::ScalarField) -> Result<InputValues, EngineError> {
     use scalar_field::Data;
     match t {
-        22 => return Err(unsupported("ARRAY values")),
         24 => return Err(unsupported("GEOMETRY values")),
         26 => return Err(unsupported("TIMESTAMPTZ values")),
         _ => {}
     }
     // 槽位与 type 不符时，3.x 读到的是空数组，随后报行数不符。
     Ok(match (t, sf.data) {
+        (22, Some(Data::ArrayData(array))) => InputValues::Array(
+            array
+                .data
+                .into_iter()
+                .map(|row| {
+                    Some(match row.data {
+                        Some(Data::LongData(v)) => InputValues::Int(v.data),
+                        Some(Data::IntData(v)) => {
+                            InputValues::Int(v.data.into_iter().map(i64::from).collect())
+                        }
+                        Some(Data::FloatData(v)) => {
+                            InputValues::Float(v.data.into_iter().map(f64::from).collect())
+                        }
+                        Some(Data::DoubleData(v)) => InputValues::Float(v.data),
+                        Some(Data::StringData(v)) => InputValues::Str(v.data),
+                        Some(Data::BoolData(v)) => InputValues::Bool(v.data),
+                        _ => InputValues::Int(Vec::new()),
+                    })
+                })
+                .collect(),
+        ),
+        (22, _) => InputValues::Array(Vec::new()),
         (1, Some(Data::BoolData(a))) => InputValues::Bool(a.data),
         (1, _) => InputValues::Bool(Vec::new()),
         (2..=4, Some(Data::IntData(a))) => {
@@ -210,6 +231,7 @@ fn check_valid_data(
         }};
     }
     let expanded = match values {
+        InputValues::Array(v) => expand!(Array, v, None),
         InputValues::Bool(v) => expand!(Bool, v, false),
         InputValues::Int(v) => expand!(Int, v, 0),
         InputValues::Float(v) => expand!(Float, v, 0.0),

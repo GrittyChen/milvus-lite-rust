@@ -91,7 +91,7 @@ fn nullable_typed_columns_match_reference_all_routes() {
                     .map(|v| v.as_str().unwrap_or("null").as_bytes().to_vec())
                     .collect(),
             ),
-            DataType::FloatVector => panic!("type"),
+            DataType::FloatVector | DataType::Array => panic!("type outside scalar fixture"),
         }
         .with_validity(&valid);
         let columns = vec![
@@ -261,6 +261,7 @@ fn all_routes_match_reference_tree_corpus() {
                             .map(|v| v.as_f64().unwrap() as f32)
                             .collect(),
                     },
+                    DataType::Array => panic!("ARRAY is covered by its own truth fixture"),
                 }
             })
             .collect();
@@ -330,6 +331,133 @@ fn all_routes_match_reference_tree_corpus() {
                 failures.push(format!(
                     "case {index}: {expr}; backend {actual} expected {expected}"
                 ));
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} divergences:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+}
+
+#[test]
+fn array_columns_match_reference_routes_and_masks() {
+    let fixture: Value =
+        serde_json::from_str(include_str!("../../tests/fixtures/array_v321.json")).unwrap();
+    let mut failures = Vec::new();
+    for (i, case) in fixture["filters"].as_array().unwrap().iter().enumerate() {
+        let dtype = match case["element_type"].as_str().unwrap() {
+            "bool" => DataType::Bool,
+            "int8" => DataType::Int8,
+            "int16" => DataType::Int16,
+            "int32" => DataType::Int32,
+            "int64" => DataType::Int64,
+            "float" => DataType::Float,
+            "double" => DataType::Double,
+            "varchar" => DataType::VarChar,
+            _ => panic!("type"),
+        };
+        let f = FieldSchema {
+            nullable: true,
+            element_type: Some(dtype),
+            ..FieldSchema::new("x", DataType::Array)
+        };
+        let input = crate::data::InputValues::Array(
+            case["values"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| {
+                    v.as_array()
+                        .map(|a| crate::data::InputValues::JsonValues(a.clone()))
+                })
+                .collect(),
+        );
+        let column = crate::data::array::convert(&f, &input).unwrap();
+        let schema = CollectionSchema {
+            fields: vec![
+                FieldSchema {
+                    is_primary: true,
+                    ..FieldSchema::new("id", DataType::Int64)
+                },
+                FieldSchema {
+                    dim: Some(2),
+                    ..FieldSchema::new("vector", DataType::FloatVector)
+                },
+                f,
+                FieldSchema::new("j", DataType::Json),
+            ],
+            enable_dynamic_field: true,
+            properties: vec![],
+        };
+        let columns = vec![
+            ColumnData::Int64(vec![1, 2, 3, 4]),
+            ColumnData::FloatVector {
+                dim: 2,
+                values: vec![1., 0., 1., 0., 1., 0., 1., 0.],
+            },
+            column,
+            ColumnData::Json(
+                [r#"{"k":1}"#, r#"{"k":null}"#, "{}", "null"]
+                    .iter()
+                    .map(|s| s.as_bytes().to_vec())
+                    .collect(),
+            ),
+        ];
+        let meta: Vec<serde_json::Map<String, Value>> =
+            [r#"{"d":1}"#, r#"{"d":null}"#, "{}", r#"{"d":false}"#]
+                .iter()
+                .map(|s| serde_json::from_str(s).unwrap())
+                .collect();
+        let rows: Vec<_> = (0..4)
+            .map(|row| DynamicRow {
+                columns: &columns,
+                meta: Some(&meta[row]),
+                row,
+                sequence: None,
+            })
+            .collect();
+        let expr = case["expression"].as_str().unwrap();
+        let mut phase = "parse";
+        let mut route = None;
+        let result = ParsedFilter::parse(expr).and_then(|p| {
+            phase = "compile";
+            let bound = Predicate::from_parsed(&p, &schema)?;
+            route = Some(if let Some(t) = &bound.tree {
+                t.backend
+            } else if bound.field_names.is_some() {
+                Backend::Hybrid
+            } else {
+                Backend::Arrow
+            });
+            phase = "evaluate";
+            if bound.requires_source_rows() {
+                bound.evaluate_source_rows(&rows)
+            } else {
+                bound.evaluate(&columns, &SourceBits::from_live(&[true; 4]))
+            }
+        });
+        let actual = match result {
+            Ok(m) => serde_json::json!({"mask":(0..4).map(|i|m.get(i)).collect::<Vec<_>>()}),
+            Err(e) => serde_json::json!({"phase":phase,"error":e.to_string()}),
+        };
+        if actual.get("mask") != case.get("mask")
+            || actual.get("phase") != case.get("phase")
+            || actual.get("error") != case.get("error")
+        {
+            failures.push(format!("{i} {expr} expected {case} actual {actual}"));
+        }
+        if let Some(expected) = case["backend"].as_str() {
+            let actual = match route {
+                Some(Backend::Arrow) => "arrow",
+                Some(Backend::Hybrid) => "hybrid",
+                Some(Backend::Python) => "python",
+                None => "none",
+            };
+            if actual != expected {
+                failures.push(format!("{i} route {actual} != {expected}"));
             }
         }
     }

@@ -324,6 +324,12 @@ def test_create_collection_remaining_unsupported(env):
     v = field("v", DataType.FLOAT_VECTOR, dim=2)
     arr = field("a", DataType.ARRAY, max_capacity=4)
     arr.element_type = DataType.INT32
+    assert status_of(create(stub, "c", pk, v, arr)) == (0, 0, "")
+    assert status_of(stub.DropCollection(milvus_pb2.DropCollectionRequest(collection_name="c"))) == (0, 0, "")
+    # 0015 B 已接入八种标量元素；JSON 元素与嵌套 ARRAY 继续明确拒绝。
+    arr.element_type = DataType.JSON
+    unimplemented(create, stub, "c", pk, v, arr)
+    arr.element_type = DataType.ARRAY
     unimplemented(create, stub, "c", pk, v, arr)
     nullable = field("v", DataType.FLOAT_VECTOR, dim=2)
     nullable.nullable = True
@@ -960,7 +966,6 @@ def test_pymilvus_entry_points_remaining_unsupported(env):
         (lambda: client.search("q", [[1, 0]], filter="id + 1 > 0"), "filter expressions: arithmetic, temporal literals, text_match, and geometry predicates are not supported"),
         (lambda: client.search("q", [[1, 0]], ranker=decay), f"rerank and function chains: {feature}"),
         (lambda: client.query_iterator("q", batch_size=2).next(), f"query iterators: {feature}"),
-        (with_field("a", DataType.ARRAY, element_type=DataType.INT64, max_capacity=4), f"ARRAY fields: {feature}"),
     ]
     for call, details in cases:
         with pytest.raises(grpc.RpcError) as info:

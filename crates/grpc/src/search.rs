@@ -90,7 +90,7 @@ pub(crate) fn search(
         results: Some(pb::SearchResultData {
             num_queries: i64::try_from(result.hits.len()).unwrap_or(i64::MAX),
             top_k: parsed.top_k,
-            fields_data: output::fields_data(schema, &result.projection, &rows),
+            fields_data: output::fields_data(schema, &result.projection, &rows)?,
             scores,
             ids: Some(insert::pb_ids(&pks, varchar)),
             topks,

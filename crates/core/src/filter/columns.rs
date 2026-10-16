@@ -129,6 +129,24 @@ fn scalar_compare(a: Scalar<'_>, b: Scalar<'_>, op: Comparison) -> ColumnResult<
         _ => Err(kernel("no matching comparison kernel")),
     }
 }
+fn arrow_type(column: &ColumnData) -> String {
+    match column.values() {
+        ColumnData::Bool(_) => "bool".into(),
+        ColumnData::Int8(_) => "int8".into(),
+        ColumnData::Int16(_) => "int16".into(),
+        ColumnData::Int32(_) => "int32".into(),
+        ColumnData::Int64(_) => "int64".into(),
+        ColumnData::Float(_) => "float".into(),
+        ColumnData::Double(_) => "double".into(),
+        ColumnData::VarChar(_) | ColumnData::Json(_) => "string".into(),
+        ColumnData::Array(array) => format!(
+            "list<{}: {}>",
+            array.element_name,
+            arrow_type(&array.values)
+        ),
+        _ => "null".into(),
+    }
+}
 fn compare(
     a: &Column<'_>,
     b: &Column<'_>,
@@ -139,6 +157,23 @@ fn compare(
         return Err(kernel("no matching comparison kernel for null inputs"));
     }
     if matches!(a.shape, Shape::Complex) || matches!(b.shape, Shape::Complex) {
+        if matches!(a.data.values(), ColumnData::Array(_))
+            || matches!(b.data.values(), ColumnData::Array(_))
+        {
+            let name = match op {
+                Comparison::Equal => "equal",
+                Comparison::NotEqual => "not_equal",
+                Comparison::Less => "less",
+                Comparison::LessEqual => "less_equal",
+                Comparison::Greater => "greater",
+                Comparison::GreaterEqual => "greater_equal",
+            };
+            return Err(kernel(format!(
+                "Function '{name}' has no kernel matching input types ({}, {})",
+                arrow_type(&a.data),
+                arrow_type(&b.data)
+            )));
+        }
         return Err(kernel("no matching comparison kernel"));
     }
     let pair = Pair(&a.data, &b.data);
@@ -184,6 +219,12 @@ fn in_list(
         }
     }
     let Some(converted) = members(column.shape, literals) else {
+        if matches!(column.data.values(), ColumnData::Array(_)) {
+            return Err(kernel(format!(
+                "Function 'is_in' has no kernel matching input types ({})",
+                arrow_type(&column.data)
+            )));
+        }
         return Err(kernel("no matching membership kernel"));
     };
     if column.shape == Shape::Null {

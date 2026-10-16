@@ -433,9 +433,17 @@ fn validate_decoded(schema: &CollectionSchema, decoded: &DecodedData) -> Result<
                 | (DataType::Double, ColumnData::Double(_))
                 | (DataType::VarChar, ColumnData::VarChar(_))
                 | (DataType::Json, ColumnData::Json(_))
+                | (DataType::Array, ColumnData::Array(_))
                 | (DataType::FloatVector, ColumnData::FloatVector { .. })
         );
         if !matches_type || column.len() != n {
+            return Err(MemTableError::Column(field.name.clone()));
+        }
+        if let ColumnData::Array(array) = column.values()
+            && !field
+                .element_type
+                .is_some_and(|element| array.valid(element))
+        {
             return Err(MemTableError::Column(field.name.clone()));
         }
         if let ColumnData::FloatVector { dim, .. } = column

@@ -123,7 +123,7 @@ pub(crate) fn query(
     };
     Ok(svc::QueryResults {
         status: Some(status::success()),
-        fields_data: output::fields_data(schema, &result.projection, &[&result.rows]),
+        fields_data: output::fields_data(schema, &result.projection, &[&result.rows])?,
         collection_name: name.to_owned(),
         output_fields: if req.output_fields.is_empty() {
             Vec::new()

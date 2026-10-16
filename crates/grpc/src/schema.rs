@@ -20,6 +20,7 @@ fn m1_type(t: i32) -> Option<DataType> {
         11 => DataType::Double,
         21 => DataType::VarChar,
         23 => DataType::Json,
+        22 => DataType::Array,
         101 => DataType::FloatVector,
         _ => return None,
     })
@@ -36,6 +37,7 @@ pub(crate) fn milvus_type(t: DataType) -> i32 {
         DataType::Double => 11,
         DataType::VarChar => 21,
         DataType::Json => 23,
+        DataType::Array => 22,
         DataType::FloatVector => 101,
     }
 }
@@ -43,7 +45,6 @@ pub(crate) fn milvus_type(t: DataType) -> i32 {
 /// 3.x 支持、M1 尚不支持的类型（ARRAY、GEOMETRY、TIMESTAMPTZ、稀疏向量）。
 fn unsupported_in_m1(t: i32) -> Option<&'static str> {
     Some(match t {
-        22 => "ARRAY fields",
         24 => "GEOMETRY fields",
         26 => "TIMESTAMPTZ fields",
         104 => "SPARSE_FLOAT_VECTOR fields",
@@ -175,6 +176,19 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<CollectionSchema, EngineError> {
                 ))
             })?);
         }
+        let element_type = if data_type == Some(DataType::Array) {
+            if matches!(f.element_type, 24 | 26 | 104) {
+                note("ARRAY element type");
+            }
+            m1_type(f.element_type)
+        } else {
+            None
+        };
+        let max_capacity = if data_type == Some(DataType::Array) {
+            param("max_capacity").and_then(pyint::int_str)
+        } else {
+            None
+        };
         // 以下属性在 3.x 中按这些条件生效（`_decode_field`），M1 都不支持。
         let flag = |key: &str| param(key).is_some_and(|v| v.to_lowercase() == "true");
         if flag("enable_analyzer") || flag("enable_match") {
@@ -239,6 +253,8 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<CollectionSchema, EngineError> {
                 auto_id: f.auto_id,
                 dim,
                 max_length,
+                element_type,
+                max_capacity,
                 nullable: f.nullable,
                 default_value,
                 ..FieldSchema::new(f.name.clone(), data_type)
@@ -304,12 +320,21 @@ pub(crate) fn encode(
             if let Some(dim) = f.dim.filter(|_| f.data_type == DataType::FloatVector) {
                 type_params.push(kv("dim", dim.to_string()));
             }
-            if let Some(max) = f.max_length.filter(|_| f.data_type == DataType::VarChar) {
+            if f.data_type == DataType::Array
+                && let Some(max) = f.max_capacity
+            {
+                type_params.push(kv("max_capacity", max.to_string()));
+            }
+            if let Some(max) = f
+                .max_length
+                .filter(|_| matches!(f.data_type, DataType::VarChar | DataType::Array))
+            {
                 type_params.push(kv("max_length", max.to_string()));
             }
             Ok(pb::FieldSchema {
                 name: f.name.clone(),
                 data_type: milvus_type(f.data_type),
+                element_type: f.element_type.map_or(0, milvus_type),
                 is_primary_key: f.is_primary,
                 auto_id: f.auto_id,
                 type_params,
@@ -370,7 +395,7 @@ fn encode_default(dtype: DataType, value: &Value) -> Result<Option<pb::ValueFiel
             Value::String(v) => v.clone(),
             other => milvus_lite_core::error::py_json_repr(other),
         }),
-        DataType::Json | DataType::FloatVector => return Ok(None),
+        DataType::Json | DataType::FloatVector | DataType::Array => return Ok(None),
     };
     Ok(Some(pb::ValueField { data: Some(data) }))
 }

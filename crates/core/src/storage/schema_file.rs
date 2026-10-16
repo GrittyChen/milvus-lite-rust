@@ -103,8 +103,8 @@ impl SchemaFile {
                 auto_id: field.auto_id,
                 dim: field.dim,
                 max_length: field.max_length,
-                element_type: None,
-                max_capacity: None,
+                element_type: field.element_type.map(|t| dtype_name(t).to_owned()),
+                max_capacity: field.max_capacity,
                 nullable: field.nullable,
                 default_value: field.default_value.clone(),
                 enable_analyzer: false,
@@ -189,8 +189,8 @@ impl SchemaFile {
             .map(|field| {
                 if (field.dtype == "float_vector"
                     && (field.nullable || field.default_value.is_some()))
-                    || field.element_type.is_some()
-                    || field.max_capacity.is_some()
+                    || (field.dtype != "array"
+                        && (field.element_type.is_some() || field.max_capacity.is_some()))
                     || field.enable_analyzer
                     || field.analyzer_params.is_some()
                     || field.enable_match
@@ -212,6 +212,7 @@ impl SchemaFile {
                     "double" => DataType::Double,
                     "varchar" => DataType::VarChar,
                     "json" => DataType::Json,
+                    "array" => DataType::Array,
                     "float_vector" => DataType::FloatVector,
                     _ => {
                         return Err(SchemaFileError::Unsupported(format!(
@@ -229,6 +230,8 @@ impl SchemaFile {
                     auto_id: field.auto_id,
                     dim: field.dim,
                     max_length: field.max_length,
+                    element_type: field.element_type.as_deref().and_then(core_dtype),
+                    max_capacity: field.max_capacity,
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -267,8 +270,26 @@ fn dtype_name(dtype: DataType) -> &'static str {
         DataType::Double => "double",
         DataType::VarChar => "varchar",
         DataType::Json => "json",
+        DataType::Array => "array",
         DataType::FloatVector => "float_vector",
     }
+}
+
+fn core_dtype(name: &str) -> Option<DataType> {
+    Some(match name {
+        "bool" => DataType::Bool,
+        "int8" => DataType::Int8,
+        "int16" => DataType::Int16,
+        "int32" => DataType::Int32,
+        "int64" => DataType::Int64,
+        "float" => DataType::Float,
+        "double" => DataType::Double,
+        "varchar" => DataType::VarChar,
+        "json" => DataType::Json,
+        "array" => DataType::Array,
+        "float_vector" => DataType::FloatVector,
+        _ => return None,
+    })
 }
 
 fn known_dtype(dtype: &str) -> bool {

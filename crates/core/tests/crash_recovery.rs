@@ -26,7 +26,11 @@ fn nullable_wal_and_manifest_crashes_preserve_nulls_defaults_and_deletes() {
         j.nullable = true;
         let mut flag = FieldSchema::new("flag", DataType::Bool);
         flag.default_value = Some(serde_json::json!(false));
-        s.fields.extend([x, j, flag]);
+        let mut a = FieldSchema::new("a", DataType::Array);
+        a.nullable = true;
+        a.element_type = Some(DataType::Int64);
+        a.max_capacity = Some(4);
+        s.fields.extend([x, j, flag, a]);
         s
     };
     let initial = || {
@@ -44,6 +48,17 @@ fn nullable_wal_and_manifest_crashes_preserve_nulls_defaults_and_deletes() {
                 b"null".to_vec(),
                 br#"{"k":1}"#.to_vec(),
                 b"null".to_vec(),
+            ]),
+        ));
+        b.columns.push((
+            "a".into(),
+            InputValues::Array(vec![
+                None,
+                Some(InputValues::Int(vec![])),
+                Some(InputValues::JsonValues(vec![
+                    serde_json::json!(null),
+                    serde_json::json!(7),
+                ])),
             ]),
         ));
         b
@@ -162,6 +177,14 @@ fn nullable_wal_and_manifest_crashes_preserve_nulls_defaults_and_deletes() {
             assert_eq!(read.count_filtered("x is null").unwrap(), 4);
             assert_eq!(read.count_filtered("j is null").unwrap(), 8);
             assert_eq!(read.count_filtered("flag == false").unwrap(), 12);
+            assert_eq!(read.count_filtered("a is null").unwrap(), 4);
+            assert_eq!(read.count_filtered("array_length(a)==0").unwrap(), 8);
+            assert_eq!(read.count_filtered("array_contains(a,7)").unwrap(), 4);
+            assert_eq!(
+                read.count_filtered("array_length(a)==2 and a[0] is null")
+                    .unwrap(),
+                4
+            );
             db.close();
             continue;
         }
@@ -182,6 +205,27 @@ fn nullable_wal_and_manifest_crashes_preserve_nulls_defaults_and_deletes() {
         );
         assert_eq!(read.count_filtered("j is null").unwrap(), 2, "{stage}");
         assert_eq!(read.count_filtered("flag == false").unwrap(), 3, "{stage}");
+        assert_eq!(
+            read.count_filtered("a is null").unwrap(),
+            if original { 1 } else { 2 },
+            "{stage}"
+        );
+        assert_eq!(
+            read.count_filtered("array_length(a)==0").unwrap(),
+            if original { 2 } else { 3 },
+            "{stage}"
+        );
+        assert_eq!(
+            read.count_filtered("array_contains(a,7)").unwrap(),
+            if original { 1 } else { 0 },
+            "{stage}"
+        );
+        assert_eq!(
+            read.count_filtered("array_length(a)==2 and a[0] is null")
+                .unwrap(),
+            if original { 1 } else { 0 },
+            "{stage}"
+        );
         db.close();
     }
 }

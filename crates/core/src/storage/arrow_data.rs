@@ -4,14 +4,14 @@ use std::sync::Arc;
 
 use arrow_array::{
     Array, ArrayRef, BooleanArray, FixedSizeListArray, Float32Array, Float64Array, Int8Array,
-    Int16Array, Int32Array, Int64Array, RecordBatch, StringArray, UInt64Array,
+    Int16Array, Int32Array, Int64Array, ListArray, RecordBatch, StringArray, UInt64Array,
 };
 use arrow_schema::{DataType as ArrowType, Field, Schema};
 use serde_json::{Map, Value};
 
-use crate::data::{ColumnData, Pk, Validity};
+use crate::data::{ArrayData, ColumnData, Pk, Validity};
 use crate::pyjson;
-use crate::schema::{CollectionSchema, DataType};
+use crate::schema::{CollectionSchema, DataType, FieldSchema};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ArrowDataError {
@@ -359,6 +359,22 @@ fn user_fields(schema: &CollectionSchema) -> Result<Vec<Field>, ArrowDataError> 
                 DataType::Float => ArrowType::Float32,
                 DataType::Double => ArrowType::Float64,
                 DataType::VarChar | DataType::Json => ArrowType::Utf8,
+                DataType::Array => {
+                    let element =
+                        field
+                            .element_type
+                            .ok_or_else(|| ArrowDataError::TypeMismatch {
+                                name: field.name.clone(),
+                            })?;
+                    let child = user_fields(&CollectionSchema {
+                        fields: vec![FieldSchema {
+                            nullable: true,
+                            ..FieldSchema::new("item", element)
+                        }],
+                        ..Default::default()
+                    })?;
+                    ArrowType::List(Arc::new(child[0].clone()))
+                }
                 DataType::FloatVector => {
                     let dim = field
                         .dim
@@ -423,6 +439,7 @@ fn build_batch(
             });
         }
         let array: ArrayRef = match column {
+            ColumnData::Array(array) => encode_array(array, None)?,
             ColumnData::Nullable { values, validity } => {
                 nullable_array(&field.name, values, validity)?
             }
@@ -498,6 +515,7 @@ fn nullable_array(
         };
     }
     Ok(match values {
+        ColumnData::Array(array) => encode_array(array, Some(validity))?,
         ColumnData::Bool(v) => numbers!(BooleanArray, v),
         ColumnData::Int8(v) => numbers!(Int8Array, v),
         ColumnData::Int16(v) => numbers!(Int16Array, v),
@@ -520,6 +538,212 @@ fn nullable_array(
             ))
         }
         _ => return Err(ArrowDataError::TypeMismatch { name: name.into() }),
+    })
+}
+
+fn encode_array(
+    array: &ArrayData,
+    validity: Option<&Validity>,
+) -> Result<ArrayRef, ArrowDataError> {
+    use arrow_array::builder::*;
+    if !array.valid(array.element_type) {
+        return Err(ArrowDataError::TypeMismatch {
+            name: "ARRAY offset overflow".into(),
+        });
+    }
+    macro_rules! list {
+        ($builder:ident, $values:expr, $get:expr) => {{
+            let values = $values;
+            let mut builder = ListBuilder::new($builder::new());
+            for row in 0..array.len() {
+                for i in array.range(row) {
+                    if array.values.is_null(i) {
+                        builder.values().append_null();
+                    } else {
+                        builder.values().append_value(($get)(values, i));
+                    }
+                }
+                builder.append(validity.is_none_or(|v| v.get(row)));
+            }
+            Arc::new(builder.finish()) as ArrayRef
+        }};
+    }
+    Ok(match array.values.values() {
+        ColumnData::Bool(v) => list!(BooleanBuilder, v, |v: &Vec<bool>, i| v[i]),
+        ColumnData::Int8(v) => list!(Int8Builder, v, |v: &Vec<i8>, i| v[i]),
+        ColumnData::Int16(v) => list!(Int16Builder, v, |v: &Vec<i16>, i| v[i]),
+        ColumnData::Int32(v) => list!(Int32Builder, v, |v: &Vec<i32>, i| v[i]),
+        ColumnData::Int64(v) => list!(Int64Builder, v, |v: &Vec<i64>, i| v[i]),
+        ColumnData::Float(v) => list!(Float32Builder, v, |v: &Vec<f32>, i| v[i]),
+        ColumnData::Double(v) => list!(Float64Builder, v, |v: &Vec<f64>, i| v[i]),
+        ColumnData::VarChar(v) => list!(StringBuilder, v, |v: &Vec<String>, i: usize| v[i].clone()),
+        _ => {
+            return Err(ArrowDataError::TypeMismatch {
+                name: "ARRAY child".into(),
+            });
+        }
+    })
+}
+
+fn decode_column(field: &FieldSchema, array: &ArrayRef) -> Result<ColumnData, ArrowDataError> {
+    let n = array.len();
+    if array.null_count() != 0 && !field.nullable {
+        return Err(ArrowDataError::TypeMismatch {
+            name: field.name.clone(),
+        });
+    }
+    let bad = || ArrowDataError::TypeMismatch {
+        name: field.name.clone(),
+    };
+    let values = match field.data_type {
+        DataType::Array => {
+            let list = array.as_any().downcast_ref::<ListArray>().ok_or_else(bad)?;
+            let element_type = field.element_type.ok_or_else(bad)?;
+            let offsets = list
+                .value_offsets()
+                .iter()
+                .map(|&i| usize::try_from(i).map_err(|_| bad()))
+                .collect::<Result<Vec<_>, _>>()?;
+            let start = *offsets.first().ok_or_else(bad)?;
+            let end = *offsets.last().ok_or_else(bad)?;
+            let length = end
+                .checked_sub(start)
+                .filter(|_| end <= list.values().len())
+                .ok_or_else(bad)?;
+            let child = FieldSchema {
+                nullable: true,
+                ..FieldSchema::new("item", element_type)
+            };
+            let values = decode_column(&child, &list.values().slice(start, length))?;
+            let ArrowType::List(item) = array.data_type() else {
+                return Err(bad());
+            };
+            ColumnData::Array(ArrayData {
+                element_type,
+                element_name: item.name().clone(),
+                offsets: offsets.into_iter().map(|i| i - start).collect(),
+                values: Box::new(values),
+            })
+        }
+        DataType::Bool => ColumnData::Bool(
+            array
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .ok_or_else(bad)?
+                .values()
+                .iter()
+                .collect(),
+        ),
+        DataType::Int8 => ColumnData::Int8(
+            array
+                .as_any()
+                .downcast_ref::<Int8Array>()
+                .ok_or_else(bad)?
+                .values()
+                .to_vec(),
+        ),
+        DataType::Int16 => ColumnData::Int16(
+            array
+                .as_any()
+                .downcast_ref::<Int16Array>()
+                .ok_or_else(bad)?
+                .values()
+                .to_vec(),
+        ),
+        DataType::Int32 => ColumnData::Int32(
+            array
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .ok_or_else(bad)?
+                .values()
+                .to_vec(),
+        ),
+        DataType::Int64 => ColumnData::Int64(
+            array
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(bad)?
+                .values()
+                .to_vec(),
+        ),
+        DataType::Float => ColumnData::Float(
+            array
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .ok_or_else(bad)?
+                .values()
+                .to_vec(),
+        ),
+        DataType::Double => ColumnData::Double(
+            array
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .ok_or_else(bad)?
+                .values()
+                .to_vec(),
+        ),
+        DataType::VarChar => {
+            let strings = array
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(bad)?;
+            ColumnData::VarChar(
+                (0..n)
+                    .map(|row| {
+                        if strings.is_null(row) {
+                            String::new()
+                        } else {
+                            strings.value(row).to_owned()
+                        }
+                    })
+                    .collect(),
+            )
+        }
+        DataType::Json => {
+            let strings = array
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(bad)?;
+            ColumnData::Json(
+                (0..n)
+                    .map(|row| {
+                        if strings.is_null(row) {
+                            b"null".to_vec()
+                        } else {
+                            strings.value(row).as_bytes().to_vec()
+                        }
+                    })
+                    .collect(),
+            )
+        }
+        DataType::FloatVector => {
+            let list = array
+                .as_any()
+                .downcast_ref::<FixedSizeListArray>()
+                .ok_or_else(bad)?;
+            let dim = usize::try_from(list.value_length()).map_err(|_| bad())?;
+            if Some(dim as i64) != field.dim {
+                return Err(bad());
+            }
+            // Parquet 读出的 list 子字段名可为 `element`，WAL 中为 `item`；只校验值的类型与维度。
+            let floats = list.values();
+            let floats = floats
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .ok_or_else(bad)?;
+            if floats.null_count() != 0 {
+                return Err(bad());
+            }
+            ColumnData::FloatVector {
+                dim,
+                values: floats.values().to_vec(),
+            }
+        }
+    };
+    Ok(if array.null_count() == 0 {
+        values
+    } else {
+        values.with_validity(&(0..n).map(|row| array.is_valid(row)).collect::<Vec<_>>())
     })
 }
 
@@ -588,135 +812,12 @@ fn decode_batch(
     for (offset, field) in schema.fields.iter().enumerate() {
         require_name(batch, start + offset, &field.name)?;
         let array = batch.column(start + offset);
-        if array.null_count() != 0 && !field.nullable {
-            return Err(ArrowDataError::TypeMismatch {
-                name: field.name.clone(),
-            });
+        let mut column = decode_column(field, array)?;
+        if !has_partition && let ColumnData::Array(array) = column.values_mut() {
+            // PyArrow 15/25 的 Parquet 读取采用 compliant nested type 的子字段名。
+            array.element_name = "element".into();
         }
-        let bad = || ArrowDataError::TypeMismatch {
-            name: field.name.clone(),
-        };
-        let values = match field.data_type {
-            DataType::Bool => ColumnData::Bool(
-                array
-                    .as_any()
-                    .downcast_ref::<BooleanArray>()
-                    .ok_or_else(bad)?
-                    .values()
-                    .iter()
-                    .collect(),
-            ),
-            DataType::Int8 => ColumnData::Int8(
-                array
-                    .as_any()
-                    .downcast_ref::<Int8Array>()
-                    .ok_or_else(bad)?
-                    .values()
-                    .to_vec(),
-            ),
-            DataType::Int16 => ColumnData::Int16(
-                array
-                    .as_any()
-                    .downcast_ref::<Int16Array>()
-                    .ok_or_else(bad)?
-                    .values()
-                    .to_vec(),
-            ),
-            DataType::Int32 => ColumnData::Int32(
-                array
-                    .as_any()
-                    .downcast_ref::<Int32Array>()
-                    .ok_or_else(bad)?
-                    .values()
-                    .to_vec(),
-            ),
-            DataType::Int64 => ColumnData::Int64(
-                array
-                    .as_any()
-                    .downcast_ref::<Int64Array>()
-                    .ok_or_else(bad)?
-                    .values()
-                    .to_vec(),
-            ),
-            DataType::Float => ColumnData::Float(
-                array
-                    .as_any()
-                    .downcast_ref::<Float32Array>()
-                    .ok_or_else(bad)?
-                    .values()
-                    .to_vec(),
-            ),
-            DataType::Double => ColumnData::Double(
-                array
-                    .as_any()
-                    .downcast_ref::<Float64Array>()
-                    .ok_or_else(bad)?
-                    .values()
-                    .to_vec(),
-            ),
-            DataType::VarChar => {
-                let strings = array
-                    .as_any()
-                    .downcast_ref::<StringArray>()
-                    .ok_or_else(bad)?;
-                ColumnData::VarChar(
-                    (0..n)
-                        .map(|row| {
-                            if strings.is_null(row) {
-                                String::new()
-                            } else {
-                                strings.value(row).to_owned()
-                            }
-                        })
-                        .collect(),
-                )
-            }
-            DataType::Json => {
-                let strings = array
-                    .as_any()
-                    .downcast_ref::<StringArray>()
-                    .ok_or_else(bad)?;
-                ColumnData::Json(
-                    (0..n)
-                        .map(|row| {
-                            if strings.is_null(row) {
-                                b"null".to_vec()
-                            } else {
-                                strings.value(row).as_bytes().to_vec()
-                            }
-                        })
-                        .collect(),
-                )
-            }
-            DataType::FloatVector => {
-                let list = array
-                    .as_any()
-                    .downcast_ref::<FixedSizeListArray>()
-                    .ok_or_else(bad)?;
-                let dim = usize::try_from(list.value_length()).map_err(|_| bad())?;
-                if Some(dim as i64) != field.dim {
-                    return Err(bad());
-                }
-                // Parquet 读出的 list 子字段名可为 `element`，WAL 中为 `item`；只校验值的类型与维度。
-                let floats = list.values();
-                let floats = floats
-                    .as_any()
-                    .downcast_ref::<Float32Array>()
-                    .ok_or_else(bad)?;
-                if floats.null_count() != 0 {
-                    return Err(bad());
-                }
-                ColumnData::FloatVector {
-                    dim,
-                    values: floats.values().to_vec(),
-                }
-            }
-        };
-        columns.push(if array.null_count() == 0 {
-            values
-        } else {
-            values.with_validity(&(0..n).map(|row| array.is_valid(row)).collect::<Vec<_>>())
-        });
+        columns.push(column);
     }
     let meta = if schema.enable_dynamic_field {
         require_name(batch, start + schema.fields.len(), "$meta")?;

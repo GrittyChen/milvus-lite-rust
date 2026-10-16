@@ -3,7 +3,7 @@
 //! 没有结果时各列仍然设置对应的槽位。
 
 use milvus_lite_core::{
-    CollectionSchema, ColumnData, DataType, META_FIELD, Pk, Projection, Rows, pyjson,
+    CollectionSchema, ColumnData, DataType, EngineError, META_FIELD, Pk, Projection, Rows, pyjson,
 };
 use serde_json::{Map, Value};
 
@@ -14,7 +14,7 @@ pub(crate) fn fields_data(
     schema: &CollectionSchema,
     projection: &Projection,
     rows: &[&Rows],
-) -> Vec<pb::FieldData> {
+) -> Result<Vec<pb::FieldData>, EngineError> {
     let mut out = Vec::new();
     for (i, field) in schema.fields.iter().enumerate() {
         let column = if field.is_primary {
@@ -24,7 +24,13 @@ pub(crate) fn fields_data(
         } else {
             continue;
         };
-        out.push(field_data(&field.name, field.data_type, field.dim, &column));
+        out.push(field_data(
+            &field.name,
+            field.data_type,
+            field.dim,
+            field.element_type,
+            &column,
+        )?);
     }
     if schema.enable_dynamic_field {
         let json = rows
@@ -42,7 +48,7 @@ pub(crate) fn fields_data(
             ..Default::default()
         });
     }
-    out
+    Ok(out)
 }
 
 /// 3.x 以 `json.dumps` 输出每行的动态字段：显式请求的 key 按请求顺序，否则按 key 排序
@@ -91,8 +97,9 @@ fn field_data(
     name: &str,
     data_type: DataType,
     dim: Option<i64>,
+    element_type: Option<DataType>,
     column: &Column<'_>,
-) -> pb::FieldData {
+) -> Result<pb::FieldData, EngineError> {
     use scalar_field::Data;
     let field = match column {
         Column::Pk(pks) => {
@@ -124,12 +131,12 @@ fn field_data(
                 })
             } else {
                 field_data::Field::Scalars(pb::ScalarField {
-                    data: Some(scalar(data_type, parts)),
+                    data: Some(scalar(data_type, element_type, parts)?),
                 })
             }
         }
     };
-    pb::FieldData {
+    Ok(pb::FieldData {
         r#type: milvus_type(data_type),
         field_name: name.to_owned(),
         field: Some(field),
@@ -141,10 +148,14 @@ fn field_data(
             _ => Vec::new(),
         },
         ..Default::default()
-    }
+    })
 }
 
-fn scalar(data_type: DataType, parts: &[&ColumnData]) -> scalar_field::Data {
+fn scalar(
+    data_type: DataType,
+    element_type: Option<DataType>,
+    parts: &[&ColumnData],
+) -> Result<scalar_field::Data, EngineError> {
     use scalar_field::Data;
     macro_rules! collect {
         ($variant:ident, $conv:expr) => {
@@ -168,7 +179,73 @@ fn scalar(data_type: DataType, parts: &[&ColumnData]) -> scalar_field::Data {
                 .collect()
         };
     }
-    match data_type {
+    Ok(match data_type {
+        DataType::Array => {
+            let element_type = element_type
+                .ok_or_else(|| EngineError::Storage("ARRAY schema lost element_type".into()))?;
+            let mut data = Vec::new();
+            for column in parts {
+                let ColumnData::Array(array) = column.values() else {
+                    return Err(EngineError::Storage(MISMATCH.into()));
+                };
+                for row in 0..array.len() {
+                    let range = if column.is_null(row) {
+                        0..0
+                    } else {
+                        array.range(row)
+                    };
+                    if range.clone().any(|i| array.values.is_null(i)) {
+                        let reason = match element_type {
+                            DataType::Float | DataType::Double => {
+                                "must be real number, not NoneType"
+                            }
+                            DataType::VarChar => "bad argument type for built-in operation",
+                            _ => "'NoneType' object cannot be interpreted as an integer",
+                        };
+                        return Err(EngineError::InvalidArgument(reason.into()));
+                    }
+                    macro_rules! items {
+                        ($values:expr,$map:expr) => {
+                            range.clone().map(|i| ($map)(&$values[i])).collect()
+                        };
+                    }
+                    let row_data = match array.values.values() {
+                        ColumnData::Bool(v) => Data::BoolData(pb::BoolArray {
+                            data: items!(v, |v: &bool| *v),
+                        }),
+                        ColumnData::Int8(v) => Data::IntData(pb::IntArray {
+                            data: items!(v, |v: &i8| i32::from(*v)),
+                        }),
+                        ColumnData::Int16(v) => Data::IntData(pb::IntArray {
+                            data: items!(v, |v: &i16| i32::from(*v)),
+                        }),
+                        ColumnData::Int32(v) => Data::IntData(pb::IntArray {
+                            data: items!(v, |v: &i32| *v),
+                        }),
+                        ColumnData::Int64(v) => Data::LongData(pb::LongArray {
+                            data: items!(v, |v: &i64| *v),
+                        }),
+                        ColumnData::Float(v) => Data::FloatData(pb::FloatArray {
+                            data: items!(v, |v: &f32| *v),
+                        }),
+                        ColumnData::Double(v) => Data::DoubleData(pb::DoubleArray {
+                            data: items!(v, |v: &f64| *v),
+                        }),
+                        ColumnData::VarChar(v) => Data::StringData(pb::StringArray {
+                            data: items!(v, |v: &String| v.clone()),
+                        }),
+                        _ => return Err(EngineError::Storage(MISMATCH.into())),
+                    };
+                    data.push(pb::ScalarField {
+                        data: Some(row_data),
+                    });
+                }
+            }
+            Data::ArrayData(pb::ArrayArray {
+                data,
+                element_type: milvus_type(element_type),
+            })
+        }
         DataType::Bool => Data::BoolData(pb::BoolArray {
             data: collect!(Bool, |v| *v),
         }),
@@ -214,5 +291,5 @@ fn scalar(data_type: DataType, parts: &[&ColumnData]) -> scalar_field::Data {
         }),
         // 向量列在 field_data 中单独处理。
         DataType::FloatVector => Data::FloatData(pb::FloatArray { data: Vec::new() }),
-    }
+    })
 }

@@ -6,6 +6,9 @@ use crate::error::{EngineError, Result, py_repr};
 use crate::schema::{DataType, FieldSchema};
 use crate::storage::visibility::SourceBits;
 
+pub(crate) mod array;
+pub use array::ArrayData;
+
 /// 列空值独立于行的删除有效位；全部有效的列不持有此对象。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Validity(SourceBits);
@@ -43,6 +46,8 @@ pub enum Pk {
 /// 字段类型的检查与转换在引擎里做，与 3.x 的 `validate_record` 一致。
 #[derive(Debug, Clone, PartialEq)]
 pub enum InputValues {
+    /// 每个父行是一个标量元素列；None 是父 null，子列自己的有效位表示元素 null。
+    Array(Vec<Option<InputValues>>),
     Null(usize),
     JsonValues(Vec<Value>),
     Nullable {
@@ -73,6 +78,7 @@ impl InputValues {
 
     pub fn is_null(&self, row: usize) -> bool {
         match self {
+            Self::Array(rows) => rows[row].is_none(),
             Self::Null(_) => true,
             Self::Nullable { validity, .. } => !validity.get(row),
             _ => false,
@@ -81,6 +87,7 @@ impl InputValues {
 
     pub fn len(&self) -> usize {
         match self {
+            Self::Array(rows) => rows.len(),
             Self::Null(n) => *n,
             Self::JsonValues(values) => values.len(),
             Self::Nullable { values, .. } => values.len(),
@@ -165,6 +172,7 @@ impl<V> PkMap<V> {
 /// 按字段类型存储的一列。
 #[derive(Debug, Clone, PartialEq)]
 pub enum ColumnData {
+    Array(ArrayData),
     Nullable {
         values: Box<ColumnData>,
         validity: Validity,
@@ -218,6 +226,7 @@ impl ColumnData {
             DataType::Double => Self::Double(vec![0.0; n]),
             DataType::VarChar => Self::VarChar(vec![String::new(); n]),
             DataType::Json => Self::Json(vec![b"null".to_vec(); n]),
+            DataType::Array => Self::Array(ArrayData::empty_rows(field, n)),
             DataType::FloatVector => unreachable!("nullable vector schema is rejected"),
         };
         values.with_validity(&vec![false; n])
@@ -249,6 +258,7 @@ impl ColumnData {
             DataType::Double => Self::Double(Vec::new()),
             DataType::VarChar => Self::VarChar(Vec::new()),
             DataType::Json => Self::Json(Vec::new()),
+            DataType::Array => Self::Array(ArrayData::empty_rows(field, 0)),
             DataType::FloatVector => Self::FloatVector {
                 dim: field_dim(field),
                 values: Vec::new(),
@@ -258,6 +268,7 @@ impl ColumnData {
 
     pub fn len(&self) -> usize {
         match self {
+            Self::Array(values) => values.len(),
             Self::Nullable { values, .. } => values.len(),
             Self::Bool(v) => v.len(),
             Self::Int8(v) => v.len(),
@@ -287,6 +298,7 @@ impl ColumnData {
             let mut valid: Vec<bool> = (0..self.len()).map(|i| !self.is_null(i)).collect();
             valid.push(!src.is_null(row));
             let empty = match self.values() {
+                Self::Array(values) => Self::Array(values.empty_like()),
                 Self::Bool(_) => Self::Bool(Vec::new()),
                 Self::Int8(_) => Self::Int8(Vec::new()),
                 Self::Int16(_) => Self::Int16(Vec::new()),
@@ -309,6 +321,7 @@ impl ColumnData {
         }
         let src = src.values();
         match (self, src) {
+            (Self::Array(dst), Self::Array(source)) => dst.push_row(source, row),
             (Self::Bool(d), Self::Bool(s)) => d.push(s[row]),
             (Self::Int8(d), Self::Int8(s)) => d.push(s[row]),
             (Self::Int16(d), Self::Int16(s)) => d.push(s[row]),
@@ -337,6 +350,9 @@ impl ColumnData {
         macro_rules! append {
             ($($variant:ident),*) => {
                 match (self, src) {
+                    (Self::Array(dst), Self::Array(source)) => {
+                        for row in 0..source.len() { dst.push_row(source, row); }
+                    }
                     $((Self::$variant(dst), Self::$variant(source)) => dst.extend_from_slice(source),)*
                     (Self::FloatVector { dim, values: dst }, Self::FloatVector { dim: other, values: source }) => {
                         assert_eq!(dim, other, "columns of one field have the same dimension");
@@ -396,6 +412,12 @@ pub fn check_column_len(name: &str, values: &InputValues, n: usize) -> Result<()
         }
         return check_column_len(name, inner, n);
     }
+    if let InputValues::Array(rows) = values {
+        // Rust 引擎入口可直接提供元素有效位；不能只校验 gRPC 能携带的父列掩码。
+        for items in rows.iter().flatten() {
+            check_column_len(name, items, items.len())?;
+        }
+    }
     if let InputValues::FloatVector { dim, values } = values {
         let expected = n.saturating_mul(*dim);
         if *dim == 0 || values.len() != expected {
@@ -420,6 +442,24 @@ pub fn check_column_len(name: &str, values: &InputValues, n: usize) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn array_child_validity_is_checked_before_conversion() {
+        let items = InputValues::Nullable {
+            values: Box::new(InputValues::Int(vec![1, 2])),
+            validity: Validity::from_bools(&[true]),
+        };
+        let input = InputValues::Array(vec![None, Some(items)]);
+        assert_eq!(
+            check_column_len("x", &input, 2).unwrap_err().to_string(),
+            "invalid nullable input for field 'x'"
+        );
+        let items = InputValues::Nullable {
+            values: Box::new(InputValues::Int(vec![1, 2])),
+            validity: Validity::from_bools(&[false, true]),
+        };
+        assert!(check_column_len("x", &InputValues::Array(vec![None, Some(items)]), 2).is_ok());
+    }
 
     #[test]
     fn nullable_gather_append_and_old_clone_keep_word_boundaries() {

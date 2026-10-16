@@ -80,10 +80,12 @@ impl LikePattern {
 
 #[derive(Clone)]
 pub(super) enum Value<'a> {
+    Array(&'a crate::data::ArrayData, usize),
     Null,
     Bool(bool),
     Int(Cow<'a, str>),
     Float(f64, bool),
+    ArrayFloat(f64, &'a ColumnData, usize),
     Text(Cow<'a, [u32]>),
     Json(&'a Json),
     Decoded(Arc<Document>, usize),
@@ -102,10 +104,12 @@ enum Atom<'a> {
 impl Value<'_> {
     fn atom(&self) -> Result<Atom<'_>> {
         Ok(match self {
+            Self::Array(array, row) => Atom::List(array.range(*row).len()),
             Self::Null => Atom::Null,
             Self::Bool(b) => Atom::Bool(*b),
             Self::Int(s) => Atom::Int(s),
             Self::Float(v, nan) => Atom::Float(*v, *nan),
+            Self::ArrayFloat(v, _, _) => Atom::Float(*v, false),
             Self::Text(s) => Atom::Text(Cow::Borrowed(s)),
             Self::Json(value) => match value {
                 Json::Null => Atom::Null,
@@ -143,8 +147,22 @@ impl Value<'_> {
             )),
         }
     }
-    fn list_item(&self, i: usize) -> Option<Self> {
-        match self {
+    fn list_item(&self, i: usize) -> Result<Option<Self>> {
+        Ok(match self {
+            Self::Array(array, row) => {
+                let range = array.range(*row);
+                if i < range.len() {
+                    let index = range.start + i;
+                    Some(match column_value(&array.values, index)? {
+                        Self::Float(value, _) if value.is_nan() => {
+                            Self::ArrayFloat(value, &array.values, index)
+                        }
+                        value => value,
+                    })
+                } else {
+                    None
+                }
+            }
             Self::Json(Json::Array(values)) => values.get(i).map(Self::Json),
             Self::Decoded(doc, id) => {
                 if let JsonNode::List(values) = &doc.nodes[*id] {
@@ -156,7 +174,7 @@ impl Value<'_> {
             Self::Vector(values) => values.get(i).map(|v| Self::Float(f64::from(*v), false)),
             Self::Targets(values) => values.get(i).cloned(),
             _ => None,
-        }
+        })
     }
     fn keys(&self) -> Vec<Vec<u32>> {
         match self {
@@ -270,6 +288,11 @@ fn equal(a: &Value<'_>, b: &Value<'_>, identity: bool) -> Result<bool> {
                     continue;
                 }
                 (Value::Json(a), Value::Json(b)) if std::ptr::eq(*a, *b) => continue,
+                (Value::ArrayFloat(_, ac, ai), Value::ArrayFloat(_, bc, bi))
+                    if ai == bi && std::ptr::eq(*ac, *bc) =>
+                {
+                    continue;
+                }
                 _ => {}
             }
         }
@@ -288,7 +311,7 @@ fn equal(a: &Value<'_>, b: &Value<'_>, identity: bool) -> Result<bool> {
             (Atom::Text(a), Atom::Text(b)) if a == b => {}
             (Atom::List(an), Atom::List(bn)) if an == bn => {
                 for i in (0..an).rev() {
-                    let (Some(av), Some(bv)) = (a.list_item(i), b.list_item(i)) else {
+                    let (Some(av), Some(bv)) = (a.list_item(i)?, b.list_item(i)?) else {
                         return Err(EngineError::Storage("Python list lost element".into()));
                     };
                     work.push((av, bv, true));
@@ -328,7 +351,7 @@ fn ordered(a: &Value<'_>, b: &Value<'_>) -> Result<Ordered> {
             (Atom::List(an), Atom::List(bn)) => {
                 let mut next = None;
                 for i in 0..an.min(bn) {
-                    let (Some(av), Some(bv)) = (a.list_item(i), b.list_item(i)) else {
+                    let (Some(av), Some(bv)) = (a.list_item(i)?, b.list_item(i)?) else {
                         return Err(EngineError::Storage("Python list lost element".into()));
                     };
                     if !equal(&av, &bv, true)? {
@@ -381,6 +404,39 @@ fn from_literal(l: &Literal) -> Result<Value<'_>> {
         _ => return Err(super::eval::unsupported()),
     })
 }
+fn column_value(column: &ColumnData, index: usize) -> Result<Value<'_>> {
+    Ok(if column.is_null(index) {
+        Value::Null
+    } else {
+        match column.values() {
+            ColumnData::Array(array) => Value::Array(array, index),
+            ColumnData::Nullable { .. } => {
+                return Err(EngineError::Storage("nested nullable column".into()));
+            }
+            ColumnData::Bool(v) => Value::Bool(v[index]),
+            ColumnData::Int8(v) => Value::Int(Cow::Owned(v[index].to_string())),
+            ColumnData::Int16(v) => Value::Int(Cow::Owned(v[index].to_string())),
+            ColumnData::Int32(v) => Value::Int(Cow::Owned(v[index].to_string())),
+            ColumnData::Int64(v) => Value::Int(Cow::Owned(v[index].to_string())),
+            ColumnData::Float(v) => Value::Float(f64::from(v[index]), false),
+            ColumnData::Double(v) => Value::Float(v[index], false),
+            ColumnData::VarChar(v) => {
+                Value::Text(Cow::Owned(v[index].chars().map(u32::from).collect()))
+            }
+            ColumnData::Json(v) => Value::Text(Cow::Owned(
+                std::str::from_utf8(&v[index])
+                    .map_err(|e| EngineError::Storage(e.to_string()))?
+                    .chars()
+                    .map(u32::from)
+                    .collect(),
+            )),
+            ColumnData::FloatVector { dim, values } => {
+                Value::Vector(&values[index * dim..(index + 1) * dim])
+            }
+        }
+    })
+}
+
 fn operand<'a>(op: &'a Operand, row: &DynamicRow<'a>) -> Result<Value<'a>> {
     Ok(match op {
         Operand::Literal(l) => return from_literal(l),
@@ -388,37 +444,7 @@ fn operand<'a>(op: &'a Operand, row: &DynamicRow<'a>) -> Result<Value<'a>> {
             .meta
             .and_then(|m| m.get(key))
             .map_or(Value::Null, Value::Json),
-        Operand::Column(i) => {
-            if row.columns[*i].is_null(row.row) {
-                Value::Null
-            } else {
-                match row.columns[*i].values() {
-                    ColumnData::Nullable { .. } => {
-                        return Err(EngineError::Storage("nested nullable column".into()));
-                    }
-                    ColumnData::Bool(v) => Value::Bool(v[row.row]),
-                    ColumnData::Int8(v) => Value::Int(Cow::Owned(v[row.row].to_string())),
-                    ColumnData::Int16(v) => Value::Int(Cow::Owned(v[row.row].to_string())),
-                    ColumnData::Int32(v) => Value::Int(Cow::Owned(v[row.row].to_string())),
-                    ColumnData::Int64(v) => Value::Int(Cow::Owned(v[row.row].to_string())),
-                    ColumnData::Float(v) => Value::Float(f64::from(v[row.row]), false),
-                    ColumnData::Double(v) => Value::Float(v[row.row], false),
-                    ColumnData::VarChar(v) => {
-                        Value::Text(Cow::Owned(v[row.row].chars().map(u32::from).collect()))
-                    }
-                    ColumnData::Json(v) => Value::Text(Cow::Owned(
-                        std::str::from_utf8(&v[row.row])
-                            .map_err(|e| EngineError::Storage(e.to_string()))?
-                            .chars()
-                            .map(u32::from)
-                            .collect(),
-                    )),
-                    ColumnData::FloatVector { dim, values } => {
-                        Value::Vector(&values[row.row * dim..(row.row + 1) * dim])
-                    }
-                }
-            }
-        }
+        Operand::Column(i) => column_value(&row.columns[*i], row.row)?,
     })
 }
 fn membership(value: &Value<'_>, literals: &[Literal]) -> Result<Option<bool>> {
@@ -608,7 +634,7 @@ pub(super) fn evaluate_tree(tree: &Tree, rows: &[DynamicRow<'_>]) -> Result<Sour
                     } else if let Atom::List(len) = target.atom()? {
                         (0..len)
                             .map(|i| {
-                                target.list_item(i).ok_or_else(|| {
+                                target.list_item(i)?.ok_or_else(|| {
                                     EngineError::Storage("Python targets lost element".into())
                                 })
                             })
@@ -623,7 +649,7 @@ pub(super) fn evaluate_tree(tree: &Tree, rows: &[DynamicRow<'_>]) -> Result<Sour
                     for target in targets {
                         let mut found = false;
                         for i in 0..len {
-                            let item = array.list_item(i).ok_or_else(|| {
+                            let item = array.list_item(i)?.ok_or_else(|| {
                                 EngineError::Storage("Python contains lost element".into())
                             })?;
                             if equal(&target, &item, true)? {
@@ -675,11 +701,10 @@ pub(super) fn evaluate_tree(tree: &Tree, rows: &[DynamicRow<'_>]) -> Result<Sour
                                     PathPart::Key(key) => value
                                         .key(&key.chars().map(u32::from).collect::<Vec<_>>())
                                         .unwrap_or(Value::Null),
-                                    PathPart::Index(index) => index
-                                        .parse::<usize>()
-                                        .ok()
-                                        .and_then(|i| value.list_item(i))
-                                        .unwrap_or(Value::Null),
+                                    PathPart::Index(index) => match index.parse::<usize>() {
+                                        Ok(i) => value.list_item(i)?.unwrap_or(Value::Null),
+                                        Err(_) => Value::Null,
+                                    },
                                 };
                             }
                             value

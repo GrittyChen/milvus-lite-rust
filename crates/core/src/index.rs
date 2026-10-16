@@ -225,6 +225,11 @@ pub(crate) fn build_spec(field: &FieldSchema, req: IndexRequest) -> Result<Index
 /// 索引，但 3.x 自身建不成的存量定义要在同一时机以同样的错误拒绝（0002「结论」）。只判定向量字段：
 /// 3.x 的 `create_index` 在标量字段上只接受 INVERTED，写不出别的定义。
 pub(crate) fn unbuildable(spec: &IndexSpec, field: &FieldSchema) -> Option<EngineError> {
+    if field.data_type == DataType::Array && spec.index_type == "INVERTED" {
+        return Some(EngineError::invalid(
+            "scalar index INVERTED does not support field type ARRAY",
+        ));
+    }
     if !field.data_type.is_vector() {
         return None;
     }
@@ -277,8 +282,8 @@ fn validate_scalar_request(data_type: DataType, index_type: &str) -> Result<()> 
             py_repr(index_type)
         )));
     }
-    // INVERTED 支持除 JSON 以外的全部 M1 标量类型（3.x 另支持 TIMESTAMPTZ，M1 没有这个类型）。
-    if data_type == DataType::Json {
+    // 参照的 INVERTED 支持这八种标量类型，JSON / ARRAY 不在其能力表中。
+    if matches!(data_type, DataType::Json | DataType::Array) {
         return Err(EngineError::schema(format!(
             "field type {} does not support scalar index",
             data_type.name()
@@ -290,6 +295,21 @@ fn validate_scalar_request(data_type: DataType, index_type: &str) -> Result<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stored_array_inverted_build_error_is_not_a_schema_validation_error() {
+        let field = FieldSchema::new("x", DataType::Array);
+        let spec = IndexSpec {
+            field_name: "x".into(),
+            index_type: "INVERTED".into(),
+            metric_type: "NONE".into(),
+            params: Map::new(),
+            search_params: Map::new(),
+        };
+        assert!(
+            matches!(unbuildable(&spec, &field), Some(EngineError::InvalidArgument(message)) if message == "scalar index INVERTED does not support field type ARRAY")
+        );
+    }
 
     fn vector() -> FieldSchema {
         FieldSchema {

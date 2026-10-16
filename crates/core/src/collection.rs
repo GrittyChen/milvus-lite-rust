@@ -1550,6 +1550,7 @@ impl Collection {
         let mut pending: HashMap<Pk, (Vec<InputValues>, Map<String, Value>)> = HashMap::new();
         let mut fields: Vec<ColumnData> =
             self.schema.fields.iter().map(ColumnData::empty).collect();
+        let mut array_inputs: HashMap<usize, Vec<Option<InputValues>>> = HashMap::new();
         let mut metas = Vec::with_capacity(n);
         for row in 0..n {
             let candidate = supplied
@@ -1620,6 +1621,16 @@ impl Collection {
             };
             self.validate_row(&row_fields, &row_dynamic, 0, &json_checks, row)?;
             for (i, field) in self.schema.fields.iter().enumerate() {
+                if field.data_type == DataType::Array {
+                    let (input, index) =
+                        resolved_input(field, present[i].then_some(&values[i]), 0)?
+                            .ok_or_else(|| EngineError::schema("validated ARRAY lost field"))?;
+                    let list = crate::data::array::row_input(&input, index)?
+                        .map(std::borrow::Cow::into_owned);
+                    values[i] = InputValues::Array(vec![list.clone()]);
+                    array_inputs.entry(i).or_default().push(list);
+                    continue;
+                }
                 let converted = convert_optional(field, present[i].then_some(&values[i]), 1)?;
                 fields[i].push_row(&converted, 0);
                 values[i] = input_from_column(&converted, 0);
@@ -1627,6 +1638,11 @@ impl Collection {
             let pk = pk_at(&fields[self.pk_pos], row);
             pending.insert(pk, (values, meta.clone()));
             metas.push(meta);
+        }
+        // 与参照一样，全部行的业务检查完成后才做 ARRAY 元素的 Arrow 转换。
+        for (i, rows) in array_inputs {
+            fields[i] =
+                convert_optional(&self.schema.fields[i], Some(&InputValues::Array(rows)), n)?;
         }
         let mut columns: Vec<(String, InputValues)> = self
             .schema
@@ -2170,7 +2186,12 @@ impl Collection {
                     continue;
                 }
                 return Err(EngineError::schema(format!(
-                    "field {} missing and not nullable / no default",
+                    "{} {} missing and not nullable / no default",
+                    if field.data_type == DataType::Array {
+                        "ARRAY field"
+                    } else {
+                        "field"
+                    },
                     py_repr(&field.name)
                 )));
             };
@@ -2407,6 +2428,7 @@ fn input_pk(values: &InputValues, row: usize) -> Option<Pk> {
 
 fn input_row(values: &InputValues, row: usize) -> InputValues {
     match values {
+        InputValues::Array(rows) => InputValues::Array(vec![rows[row].clone()]),
         InputValues::Null(_) => InputValues::Null(1),
         InputValues::JsonValues(v) => InputValues::JsonValues(vec![v[row].clone()]),
         InputValues::Nullable { values, validity } => {
@@ -2428,8 +2450,9 @@ fn input_row(values: &InputValues, row: usize) -> InputValues {
     }
 }
 
-fn input_from_column(column: &ColumnData, row: usize) -> InputValues {
+pub(crate) fn input_from_column(column: &ColumnData, row: usize) -> InputValues {
     match column {
+        ColumnData::Array(array) => InputValues::Array(vec![Some(array.input(row))]),
         ColumnData::Nullable { values, validity } => {
             if validity.get(row) {
                 input_from_column(values, row)
@@ -2453,8 +2476,11 @@ fn input_from_column(column: &ColumnData, row: usize) -> InputValues {
     }
 }
 
-fn input_from_column_all(column: &ColumnData) -> InputValues {
+pub(crate) fn input_from_column_all(column: &ColumnData) -> InputValues {
     match column {
+        ColumnData::Array(array) => {
+            InputValues::Array((0..array.len()).map(|row| Some(array.input(row))).collect())
+        }
         ColumnData::Nullable { values, validity } => InputValues::Nullable {
             values: Box::new(input_from_column_all(values)),
             validity: validity.clone(),
@@ -2500,6 +2526,14 @@ fn parse_json(field: &str, text: &[u8]) -> Result<Value> {
 /// 不在 schema 中的列作为动态字段时的 JSON 值。
 fn to_json(name: &str, values: &InputValues, row: usize) -> Result<Value> {
     Ok(match values {
+        InputValues::Array(rows) => match &rows[row] {
+            None => Value::Null,
+            Some(items) => Value::Array(
+                (0..items.len())
+                    .map(|i| to_json(name, items, i))
+                    .collect::<Result<_>>()?,
+            ),
+        },
         InputValues::Null(_) => Value::Null,
         InputValues::JsonValues(v) => v[row].clone(),
         InputValues::Nullable { values, validity } => {
@@ -2540,6 +2574,34 @@ fn json_number(name: &str, v: f64) -> Result<Value> {
 
 /// 3.x `_DTYPE_PYTHON_CHECK` 与 VARCHAR 长度检查。
 fn check_value(field: &FieldSchema, values: &InputValues, row: usize) -> Result<()> {
+    if field.data_type == DataType::Array {
+        if values.is_null(row) {
+            return if field.nullable {
+                Ok(())
+            } else {
+                Err(EngineError::schema(format!(
+                    "ARRAY field {} missing and not nullable / no default",
+                    py_repr(&field.name)
+                )))
+            };
+        }
+        let len = crate::data::array::row_len(values, row).ok_or_else(|| {
+            EngineError::schema(format!(
+                "ARRAY field {} must be list/tuple, got {}",
+                py_repr(&field.name),
+                py_type_name(values, row)
+            ))
+        })?;
+        if let Some(max) = field.max_capacity
+            && (len as i128) > i128::from(max)
+        {
+            return Err(EngineError::schema(format!(
+                "ARRAY field {} has {len} elements, exceeds max_capacity={max}",
+                py_repr(&field.name)
+            )));
+        }
+        return Ok(());
+    }
     if values.is_null(row) {
         return if field.nullable {
             Ok(())
@@ -2585,6 +2647,7 @@ fn check_value(field: &FieldSchema, values: &InputValues, row: usize) -> Result<
                 }
             }
             DataType::Json => true,
+            DataType::Array => unreachable!("ARRAY has separate outer validation"),
             DataType::FloatVector => false,
         };
         return if ok {
@@ -2712,7 +2775,9 @@ fn convert_optional(
             InputValues::Nullable { .. } | InputValues::Null(_) | InputValues::JsonValues(_)
         )
     {
-        let contains_null = if let InputValues::Json(raw) = values {
+        let contains_null = if let InputValues::Array(rows) = values {
+            rows.iter().any(Option::is_none)
+        } else if let InputValues::Json(raw) = values {
             raw.iter().any(|text| json_text_is_null(text))
         } else {
             false
@@ -2737,6 +2802,8 @@ fn convert_optional(
                 )));
             }
             ColumnData::nulls(field, 1)
+        } else if field.data_type == DataType::Array {
+            crate::data::array::convert(field, &input_row(&input, index))?
         } else if let InputValues::JsonValues(values) = input.as_ref() {
             let value = &values[index];
             let concrete = if field.data_type == DataType::Json {
@@ -2768,6 +2835,9 @@ fn convert_optional(
 
 /// 校验通过后按字段类型转换为存储列。
 fn convert_nonnull(field: &FieldSchema, values: &InputValues) -> Result<ColumnData> {
+    if field.data_type == DataType::Array {
+        return crate::data::array::convert(field, values);
+    }
     let mismatch = || {
         EngineError::schema(format!(
             "field {} values do not match dtype {}",
@@ -2813,7 +2883,7 @@ fn convert_nonnull(field: &FieldSchema, values: &InputValues) -> Result<ColumnDa
 }
 
 /// pyarrow 把整数转成浮点时要求能精确表示（|x| ≤ 2^24 或 2^53），否则报 ArrowInvalid（3.x 中 code 1）。
-fn exact_int(x: i64, limit: i64, precision: &str) -> Result<i64> {
+pub(crate) fn exact_int(x: i64, limit: i64, precision: &str) -> Result<i64> {
     if x.unsigned_abs() > limit.unsigned_abs() {
         return Err(EngineError::invalid(format!(
             "Integer value {x} is outside of the range exactly representable by a IEEE 754 {precision} precision value"
@@ -2827,8 +2897,15 @@ fn narrow<T: TryFrom<i64>>(v: &[i64]) -> Option<Vec<T>> {
 }
 
 /// Python `type(value).__name__`。
-fn py_type_name(values: &InputValues, row: usize) -> &'static str {
+pub(crate) fn py_type_name(values: &InputValues, row: usize) -> &'static str {
     match values {
+        InputValues::Array(rows) => {
+            if rows[row].is_some() {
+                "list"
+            } else {
+                "NoneType"
+            }
+        }
         InputValues::Null(_) => "NoneType",
         InputValues::Nullable { values, validity } => {
             if validity.get(row) {
@@ -2871,8 +2948,18 @@ fn py_type_name(values: &InputValues, row: usize) -> &'static str {
 }
 
 /// Python `repr(value)`，用于 3.x 的 `value {value!r} does not match dtype` 信息。
-fn py_value_repr(values: &InputValues, row: usize) -> String {
+pub(crate) fn py_value_repr(values: &InputValues, row: usize) -> String {
     match values {
+        InputValues::Array(rows) => match &rows[row] {
+            None => "None".into(),
+            Some(items) => format!(
+                "[{}]",
+                (0..items.len())
+                    .map(|i| py_value_repr(items, i))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        },
         InputValues::Null(_) => "None".into(),
         InputValues::Nullable { values, validity } => {
             if validity.get(row) {

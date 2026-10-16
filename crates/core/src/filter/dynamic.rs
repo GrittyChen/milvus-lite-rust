@@ -72,6 +72,7 @@ pub(super) fn source_columns(
         }
         // 仅物化表达式引用的标量列，向量、JSON 与整个 meta 对象仍借用原快照。
         let mut column = match first.columns[i].values() {
+            ColumnData::Array(array) => ColumnData::Array(array.empty_like()),
             ColumnData::Int8(_) => ColumnData::Int8(Vec::new()),
             ColumnData::Int16(_) => ColumnData::Int16(Vec::new()),
             ColumnData::Int32(_) => ColumnData::Int32(Vec::new()),

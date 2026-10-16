@@ -203,6 +203,139 @@ fn read_wal_matrix(root: &Path) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+fn array_directory(root: &Path, state: &str) -> Result<(), Box<dyn Error>> {
+    use milvus_lite_core::{Compute, DataDir, Db, InputValues, InsertBatch};
+    let db = Db::new(
+        DataDir::open(root)?,
+        Compute::new(std::num::NonZeroUsize::MIN)?,
+    )?;
+    if state == "inspect" {
+        let handle = db.collection("", "c")?;
+        handle.write().load()?;
+        let read = handle.read().read_snapshot();
+        let rows = read.query("", &["*".into()], None, 0)?.rows;
+        let mut result = Vec::new();
+        for row in 0..rows.pks.len() {
+            let mut object = serde_json::Map::new();
+            object.insert(
+                "id".into(),
+                match &rows.pks[row] {
+                    Pk::Int64(v) => serde_json::json!(v),
+                    _ => return Err(io::Error::other("primary type").into()),
+                },
+            );
+            for (name, col) in &rows.fields {
+                if let ColumnData::Array(a) = col.values() {
+                    let value = if col.is_null(row) {
+                        serde_json::Value::Null
+                    } else {
+                        serde_json::Value::Array(
+                            a.range(row)
+                                .map(|i| {
+                                    if a.values.is_null(i) {
+                                        return serde_json::Value::Null;
+                                    }
+                                    match a.values.values() {
+                                        ColumnData::Bool(v) => serde_json::json!(v[i]),
+                                        ColumnData::Int8(v) => serde_json::json!(v[i]),
+                                        ColumnData::Int16(v) => serde_json::json!(v[i]),
+                                        ColumnData::Int32(v) => serde_json::json!(v[i]),
+                                        ColumnData::Int64(v) => serde_json::json!(v[i]),
+                                        ColumnData::Float(v) => serde_json::json!(v[i]),
+                                        ColumnData::Double(v) => serde_json::json!(v[i]),
+                                        ColumnData::VarChar(v) => serde_json::json!(v[i]),
+                                        _ => unreachable!(),
+                                    }
+                                })
+                                .collect(),
+                        )
+                    };
+                    object.insert(name.clone(), value);
+                }
+            }
+            result.push(object);
+        }
+        println!("{}", serde_json::to_string(&result)?);
+        db.close();
+        return Ok(());
+    }
+    let mut s = schema();
+    for (name, dt) in [
+        ("b", DataType::Bool),
+        ("i8", DataType::Int8),
+        ("i16", DataType::Int16),
+        ("i32", DataType::Int32),
+        ("i64", DataType::Int64),
+        ("f", DataType::Float),
+        ("d", DataType::Double),
+        ("s", DataType::VarChar),
+    ] {
+        let mut f = FieldSchema::new(name, DataType::Array);
+        f.element_type = Some(dt);
+        f.max_capacity = Some(4);
+        f.nullable = true;
+        s.fields.push(f);
+    }
+    let mut default = FieldSchema::new("default", DataType::Array);
+    default.element_type = Some(DataType::Int64);
+    default.default_value = Some(serde_json::json!([]));
+    s.fields.push(default);
+    db.create_collection("", "c", s)?;
+    for part in 0..if state == "compacted" { 4 } else { 1 } {
+        let mut columns = vec![
+            (
+                "id".into(),
+                InputValues::Int(vec![part * 3 + 1, part * 3 + 2, part * 3 + 3]),
+            ),
+            (
+                "vector".into(),
+                InputValues::FloatVector {
+                    dim: 2,
+                    values: vec![1., 0., 1., 0., 1., 0.],
+                },
+            ),
+        ];
+        for (name, value) in [
+            ("b", serde_json::json!(true)),
+            ("i8", serde_json::json!(7)),
+            ("i16", serde_json::json!(7)),
+            ("i32", serde_json::json!(7)),
+            ("i64", serde_json::json!(7)),
+            ("f", serde_json::json!(1.5)),
+            ("d", serde_json::json!(1.5)),
+            ("s", serde_json::json!("abc")),
+        ] {
+            columns.push((
+                name.into(),
+                InputValues::Array(vec![
+                    None,
+                    Some(InputValues::Int(vec![])),
+                    Some(InputValues::JsonValues(vec![
+                        serde_json::Value::Null,
+                        value,
+                    ])),
+                ]),
+            ));
+        }
+        db.insert(
+            "",
+            "c",
+            InsertBatch {
+                num_rows: 3,
+                columns,
+            },
+        )?;
+        if state != "wal" {
+            db.flush_collection("", "c")?;
+        }
+    }
+    if state == "wal" {
+        std::process::exit(0);
+    }
+    db.close();
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     let mut args = std::env::args().skip(1);
     let operation = args
@@ -216,6 +349,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     let root = Path::new(&root);
     match operation.as_str() {
+        "write-array-wal" => array_directory(root, "wal"),
+        "write-array-flushed" => array_directory(root, "flushed"),
+        "write-array-compacted" => array_directory(root, "compacted"),
+        "inspect-array" => array_directory(root, "inspect"),
         "write-wal" => write(root, false),
         "write-flushed" => write(root, true),
         "inspect" => inspect(root),
