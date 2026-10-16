@@ -184,7 +184,7 @@ M1 证明了整条链路可行，但数据只在内存中，不发布（[0004](0
        - `and` 与括号；
        - 所有 RPC（Query、Search、Delete、`count(*)`）中顶层的 `<主键> in [...]`；
        - 空 expr 的 Query（含 limit / offset）。
-     - query iterator 仍返回 UNIMPLEMENTED，保留 M1 按 `iterator` 键拒绝的检查：pymilvus 的 query_iterator 发出的 `<主键> > x` 加 limit 正好落在 S1 内，而 3.x 见到这个键就改为按主键排序（[servicer.py:442](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/milvus_lite/adapter/grpc/servicer.py#L442)）；忽略它，分页结果会静默出错。
+     - query iterator 仍返回 UNIMPLEMENTED，保留 M1 按 `iterator` 键拒绝的检查（该历史范围由 [0016](0016-query-iteration-and-range-search.md) 切片 A 接续，当前源码支持状态见其验收记录）：pymilvus 的 query_iterator 发出的 `<主键> > x` 加 limit 正好落在 S1 内，而 3.x 见到这个键就改为按主键排序（[servicer.py:442](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/milvus_lite/adapter/grpc/servicer.py#L442)）；忽略它，分页结果会静默出错。
      - 字面量写在左边、`&&` 等写法：凡能归约为上述构造的都属于 S1，由过滤一步的实现按 3.x 的解析结果确定。
      - **解析**：对 3.x 的全部语法完整实现，语法错误与原文一致。
      - **语义检查**：只对 S1 求值的构造完整实现。其余构造解析成功后返回 UNIMPLEMENTED，即使 3.x 会对它报 code 6；这沿用 0004「同时含不支持的功能与其他错误时」的先后规则。这一条界定了上面工作量估计的范围。
@@ -320,6 +320,7 @@ M1 证明了整条链路可行，但数据只在内存中，不发布（[0004](0
 ### 三、数据目录的兼容
 
 14. **本实现不支持或无法安全处理的内容。** **建议按 collection 做 fail-closed**。
+    - **后续范围修订**：[0015](0015-nullable-defaults-and-array.md) 的切片 A 已支持既有标量的 nullable 与默认值，B 接入八种标量元素的 ARRAY；这些已支持属性不再单独导致拒绝打开。下列条件保留 M2 当时的范围记录，nullable 向量及其余尚未接入能力仍按当前 schema 支持矩阵拒绝。
     - **判定条件**，满足任一条即 fail-closed：
       - schema 属于 M1 的 CreateCollection 会拒绝的：M1 范围之外的字段类型、nullable 或默认值、function、多个向量字段、partition key、`enable_analyzer` / `enable_match` / `analyzer_params`、properties 中的 `timezone`；
       - manifest 中有 `_default` 以外的分区，或 WAL 中出现 manifest 没有的分区。delta WAL 中的 `_all` 表示跨分区删除，不算分区：pymilvus 不指定分区的 delete，3.x 在 WAL 中就写 `_all`（实测）；data WAL 中不应出现 `_all`；

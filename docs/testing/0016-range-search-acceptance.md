@@ -100,7 +100,7 @@ V1 另覆盖三种度量、INT64 / 非 ASCII VARCHAR、空集合、并列分数�
 
 Linux / Intel Mac 最终候选矩阵未执行；本机 arm64 结果不能补齐它们。分区、group_by、rerank、稀疏向量、真实 ANN、服务端 V2 / MVCC 继续范围外；V1 还受有限候选窗与 SDK 探测上限约束，不能承诺任意批量/数据下完整遍历。
 
-源清单、两代官方环境、wheel/sdist、所有失败和成功日志、1100 项捕获及 --verify、阈值原始探针、反证和四方性能保存在仓库外 mlr-0016-range；三组统计运行身份 range-b2 / range-b2-upstream / range-b2-probe。变更未提交，未切版本、打 tag 或发布；最终候选仍按 0013 重建验收。
+源清单、两代官方环境、wheel/sdist、所有失败和成功日志、1100 项捕获及 --verify、阈值原始探针、反证和四方性能保存在仓库外 mlr-0016-range；三组统计运行身份 range-b2 / range-b2-upstream / range-b2-probe。冻结验收时变更未提交、未切版本、打 tag 或发布；收口后按切片作本地提交，不推送，最终候选仍按 0013 重建验收。
 
 
 ## 独立评审收口

@@ -85,7 +85,7 @@
 
 正式性能脚本 SHA256 为 `0dbe73b3b0b715b2daa56b3291236efdd164cfa2d8fa9deb882b4c4db302fb56`，三轮结果位于 performance-v2；中断的首版非 ASCII 运行保留在 performance。
 
-原始日志、环境冻结、源清单、wheel/sdist、B3 反证及物理目录保存在仓库外 mlr-0016-query；三组统计保存在既有调查工作区，运行身份 query-a-original-v2 / query-a-upstream / query-a-probe。失败环境和测试草稿日志同样保留，不用于替代最终成功记录。变更未提交，未切版本、打 tag 或发布；本记录已由负责人独立评审通过，进入 range search。
+原始日志、环境冻结、源清单、wheel/sdist、B3 反证及物理目录保存在仓库外 mlr-0016-query；三组统计保存在既有调查工作区，运行身份 query-a-original-v2 / query-a-upstream / query-a-probe。失败环境和测试草稿日志同样保留，不用于替代最终成功记录。冻结验收时变更未提交、未切版本、打 tag 或发布；本片与后续 range search 均已独立评审收口，现按切片作本地提交，不推送。
 
 
 ## 负责人独立评审

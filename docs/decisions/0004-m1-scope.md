@@ -82,7 +82,7 @@ M1 的对外行为与 3.x 有阶段性差异，本文按 [AGENTS.md](../../AGENT
 
 下列功能都返回明确错误，绝不静默成功（不变量 15）。这些功能 3.x 都支持，M1 如果忽略相应参数，就会在不自知的情况下返回与 3.x 不同的结果，所以同样报错。错误形式与 3.x 的 `_unimplemented`（[servicer.py:1563](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/milvus_lite/adapter/grpc/servicer.py#L1563)）相同：gRPC 状态码 `UNIMPLEMENTED`，details 写成 `MilvusLite does not support <功能>: <说明>`，说明中注明当前阶段尚未实现。gRPC 状态非 OK 时响应体会被丢弃，3.x 在响应体里另放的 `Status` 客户端看不到（实测 pymilvus 只得到状态码与 details），因此不必复现。pymilvus 收到 `UNIMPLEMENTED` 时不重试。
 
-- **过滤**：M2 支持 [0006 第 1 项](0006-m2-scope.md#决策项)的 S1；其余过滤构造、`text_match`、JSON / 动态字段、数组与几何谓词仍不求值。query iterator 仍不支持，即使表达式落在 S1 内也显式拒绝。
+- **过滤**：M2 支持 [0006 第 1 项](0006-m2-scope.md#决策项)的 S1；其余过滤构造、`text_match`、JSON / 动态字段、数组与几何谓词仍不求值。query iterator 仍不支持，即使表达式落在 S1 内也显式拒绝。（该历史范围由 [0016](0016-query-iteration-and-range-search.md) 切片 A 接续，当前源码支持状态见其验收记录。）
 - **分区**：partition 相关 RPC；在检索、查询与写入中指定 `_default` 以外的分区；partition key。
 - **多数据库与别名**：`CreateDatabase` 等数据库 RPC，以及 alias。
 - **schema**：
@@ -91,7 +91,7 @@ M1 的对外行为与 3.x 有阶段性差异，本文按 [AGENTS.md](../../AGENT
   - 修改 schema 与 collection properties；
   - properties 中的 `timezone`，以及 Search 与 Query 请求中非空的 `timezone`：它们只作用于 TIMESTAMPTZ 字段。
 - **检索**：`HybridSearch`、range search（`params` 中的 `radius` / `range_filter`）、`group_by`、rerank。
-  - search iterator 没有专门的请求：pymilvus 先按 v2 探测，服务端不支持时退回 v1，而 v1 的第一批是普通检索，之后各批才带 range search 与过滤表达式。3.x 的 Search 同样忽略 `iterator` 等参数，所以只需要第一批时（`limit` 不超过 `batch_size`）结果与 3.x 相同，需要后续批次时返回 `UNIMPLEMENTED`。
+  - search iterator 没有专门的请求：pymilvus 先按 v2 探测，服务端不支持时退回 v1，而 v1 的第一批是普通检索，之后各批才带 range search 与过滤表达式。3.x 的 Search 同样忽略 `iterator` 等参数，所以只需要第一批时（`limit` 不超过 `batch_size`）结果与 3.x 相同，需要后续批次时返回 `UNIMPLEMENTED`（这一历史范围由 [0016 B](0016-query-iteration-and-range-search.md#b冻结合同) 接续）。
 - **其他**：snapshot、compaction 相关 RPC；CLI 与 `milvus-lite dump`。其余未列出的 RPC 一律返回 `UNIMPLEMENTED`。
 
 ## 阶段性差异（登记）
@@ -169,7 +169,7 @@ M1 的对外行为与 3.x 有阶段性差异，本文按 [AGENTS.md](../../AGENT
 - **M1 的非 ASCII 主键识别限制已随 M2 完整解析注销。** 当前词法与 Unicode 版本边界以 [0006](0006-m2-scope.md#与-3x-的差异)及 [0007](0007-m2-storage-engine.md#s1-过滤的当前实现与验收范围)为准，不再通过 M1 的局部范围识别器分派。
 
 - **同时含 M1 不支持的功能与其他错误时，报错的先后不保证与 3.x 相同。** 3.x 翻译阶段对 M1 支持的参数所做的检查，以及 load 状态检查，先于 `UNIMPLEMENTED` 报告；写入时一列不支持不影响其后各列的解码错误先报出。3.x 对 M1 不支持的功能自身参数的校验不复现，这类请求报 `UNIMPLEMENTED`：例如 nullable 主键 3.x 报 code 6；rerank 函数的参数有误（如 boost 函数带了 `input_field_names`、未知的 reranker）3.x 报 code 6；M1 曾不解析过滤表达式；M2 完整解析语法并对齐语法错误，范围外构造的语义错误仍返回 UNIMPLEMENTED。pymilvus 对含单引号、反斜杠、换行或回车的 VARCHAR 主键调用 `get` 时就会拼出语法错误的表达式（例如 `id in ['b'c']`）。影响：同时触发两类错误的请求。
-- **按 Python `int()` / `float()` 解析的参数，只对齐合法输入与常见错误。** 涉及 search_params 的 `topk`、`offset`、`round_decimal`、`group_size`、`radius`、`range_filter`，以及 type_params 的 `dim`、`max_length`。整数、截断取整的浮点数、布尔，以及带空白、正负号或下划线的数字字符串，结果与 3.x 相同；非数字字符串、null、列表与对象的错误码与信息相同。NaN 与 Infinity（Python 的 `json.loads` 接受、serde_json 不接受）、非 ASCII 数字与超出 int64 的值，错误信息或结果可能不同，超出 int64 时按饱和处理。pymilvus 只发送整数，这些输入只能由手写请求构造。
+- **按 Python `int()` / `float()` 解析的参数，只对齐合法输入与常见错误。** 涉及 search_params 的 `topk`、`offset`、`round_decimal`、`group_size`、`radius`、`range_filter`，以及 type_params 的 `dim`、`max_length`。整数、截断取整的浮点数、布尔，以及带空白、正负号或下划线的数字字符串，结果与 3.x 相同；非数字字符串、null、列表与对象的错误码与信息相同。NaN 与 Infinity（Python 的 `json.loads` 接受、serde_json 不接受）、非 ASCII 数字与超出 int64 的值，错误信息或结果可能不同，超出 int64 时按饱和处理。pymilvus 只发送整数，这些输入只能由手写请求构造。0016 B 对范围参数的 JSON 数字溢出按 3.x 恢复转换，已对齐的子集和阈值数值边界见 [0016](0016-query-iteration-and-range-search.md#b冻结合同)。
 - **只能由手写请求构造的其他输入。**
 
   | 输入 | 3.x | 本实现 |
@@ -196,3 +196,5 @@ M1 只在本机（macOS）验收。Linux 与 Windows 的 CI 与 wheel 构建单�
 后续索引定义与 DropIndex 的范围及差异统一见 [0014 切片 A](0014-index-definitions-and-filter-expressions.md#切片-a索引定义与-dropindex)；本文保留当时的验收范围。
 
 后续过滤表达式的扩展范围、参照缺陷与路线差异见 [0014 切片 B](0014-index-definitions-and-filter-expressions.md#切片-b过滤表达式)。
+
+后续范围修订：[0015](0015-nullable-defaults-and-array.md) 的 B 已接入八种标量元素 ARRAY（包括解码后进入动态字段的数组）；上文 ARRAY 的 UNIMPLEMENTED 是 M1 当时的边界，当前范围以 0015 为准。JSON 元素、嵌套 ARRAY 和其它未接入类型仍明确拒绝。
