@@ -1,0 +1,8211 @@
+{
+  "reference": "43d1257774e629bc9f66873977ab7c320d5bf5a7",
+  "cases": {
+    "engine": {
+      "duplicate/active": {
+        "all": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "new",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "new",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "new"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "empty": {
+          "query": {
+            "ok": true,
+            "value": []
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "new",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              []
+            ]
+          }
+        },
+        "p1": {
+          "query": {
+            "ok": true,
+            "value": []
+          },
+          "get": {
+            "ok": true,
+            "value": []
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              []
+            ]
+          }
+        },
+        "p2": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "new",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "new",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "new"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "union": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "new",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "new",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "new"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "duplicate": {
+          "query": {
+            "ok": true,
+            "value": []
+          },
+          "get": {
+            "ok": true,
+            "value": []
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              []
+            ]
+          }
+        },
+        "unknown": {
+          "query": {
+            "ok": true,
+            "value": []
+          },
+          "get": {
+            "ok": true,
+            "value": []
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              []
+            ]
+          }
+        },
+        "mixed_unknown": {
+          "query": {
+            "ok": true,
+            "value": []
+          },
+          "get": {
+            "ok": true,
+            "value": []
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              []
+            ]
+          }
+        },
+        "stats": {
+          "_default": {
+            "ok": true,
+            "value": 0
+          },
+          "p1": {
+            "ok": true,
+            "value": 0
+          },
+          "p2": {
+            "ok": true,
+            "value": 1
+          },
+          "missing": {
+            "ok": false,
+            "type": "PartitionNotFoundError",
+            "code": null,
+            "reason": "missing"
+          }
+        },
+        "total": 1
+      },
+      "duplicate/active/after-flush": {
+        "all": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "new",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "new",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "new"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "empty": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "new",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "new",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "new"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "p1": {
+          "query": {
+            "ok": true,
+            "value": []
+          },
+          "get": {
+            "ok": true,
+            "value": []
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              []
+            ]
+          }
+        },
+        "p2": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "new",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "new",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "new"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "union": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "new",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "new",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "new"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "duplicate": {
+          "query": {
+            "ok": true,
+            "value": []
+          },
+          "get": {
+            "ok": true,
+            "value": []
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              []
+            ]
+          }
+        },
+        "unknown": {
+          "query": {
+            "ok": true,
+            "value": []
+          },
+          "get": {
+            "ok": true,
+            "value": []
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              []
+            ]
+          }
+        },
+        "mixed_unknown": {
+          "query": {
+            "ok": true,
+            "value": []
+          },
+          "get": {
+            "ok": true,
+            "value": []
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              []
+            ]
+          }
+        },
+        "stats": {
+          "_default": {
+            "ok": true,
+            "value": 0
+          },
+          "p1": {
+            "ok": true,
+            "value": 0
+          },
+          "p2": {
+            "ok": true,
+            "value": 1
+          },
+          "missing": {
+            "ok": false,
+            "type": "PartitionNotFoundError",
+            "code": null,
+            "reason": "missing"
+          }
+        },
+        "total": 1
+      },
+      "duplicate/active/reopen": {
+        "all": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "new",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "new",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "new"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "empty": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "new",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "new",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "new"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "p1": {
+          "query": {
+            "ok": true,
+            "value": []
+          },
+          "get": {
+            "ok": true,
+            "value": []
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              []
+            ]
+          }
+        },
+        "p2": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "new",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "new",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "new"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "union": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "new",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "new",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "new"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "duplicate": {
+          "query": {
+            "ok": true,
+            "value": []
+          },
+          "get": {
+            "ok": true,
+            "value": []
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              []
+            ]
+          }
+        },
+        "unknown": {
+          "query": {
+            "ok": true,
+            "value": []
+          },
+          "get": {
+            "ok": true,
+            "value": []
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              []
+            ]
+          }
+        },
+        "mixed_unknown": {
+          "query": {
+            "ok": true,
+            "value": []
+          },
+          "get": {
+            "ok": true,
+            "value": []
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              []
+            ]
+          }
+        },
+        "stats": {
+          "_default": {
+            "ok": true,
+            "value": 0
+          },
+          "p1": {
+            "ok": true,
+            "value": 0
+          },
+          "p2": {
+            "ok": true,
+            "value": 1
+          },
+          "missing": {
+            "ok": false,
+            "type": "PartitionNotFoundError",
+            "code": null,
+            "reason": "missing"
+          }
+        },
+        "total": 1
+      },
+      "duplicate/old-segment": {
+        "all": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "new",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "new",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "new"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "empty": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "old",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "new",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "old"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "p1": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "old",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "old",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "old"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "p2": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "new",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "new",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "new"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "union": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "new",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "new",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "new"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "duplicate": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "old",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "old",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "old"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "unknown": {
+          "query": {
+            "ok": true,
+            "value": []
+          },
+          "get": {
+            "ok": true,
+            "value": []
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              []
+            ]
+          }
+        },
+        "mixed_unknown": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "old",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "old",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "old"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "stats": {
+          "_default": {
+            "ok": true,
+            "value": 0
+          },
+          "p1": {
+            "ok": true,
+            "value": 1
+          },
+          "p2": {
+            "ok": true,
+            "value": 1
+          },
+          "missing": {
+            "ok": false,
+            "type": "PartitionNotFoundError",
+            "code": null,
+            "reason": "missing"
+          }
+        },
+        "total": 1
+      },
+      "duplicate/old-segment/after-flush": {
+        "all": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "new",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "new",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "new"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "empty": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "new",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "new",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "new"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "p1": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "old",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "old",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "old"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "p2": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "new",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "new",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "new"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "union": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "new",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "new",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "new"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "duplicate": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "old",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "old",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "old"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "unknown": {
+          "query": {
+            "ok": true,
+            "value": []
+          },
+          "get": {
+            "ok": true,
+            "value": []
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              []
+            ]
+          }
+        },
+        "mixed_unknown": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "old",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "old",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "old"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "stats": {
+          "_default": {
+            "ok": true,
+            "value": 0
+          },
+          "p1": {
+            "ok": true,
+            "value": 1
+          },
+          "p2": {
+            "ok": true,
+            "value": 1
+          },
+          "missing": {
+            "ok": false,
+            "type": "PartitionNotFoundError",
+            "code": null,
+            "reason": "missing"
+          }
+        },
+        "total": 1
+      },
+      "duplicate/old-segment/reopen": {
+        "all": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "new",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "new",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "new"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "empty": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "new",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "new",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "new"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "p1": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "old",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "old",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "old"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "p2": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "new",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "new",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "new"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "union": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "new",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "new",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "new"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "duplicate": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "old",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "old",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "old"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "unknown": {
+          "query": {
+            "ok": true,
+            "value": []
+          },
+          "get": {
+            "ok": true,
+            "value": []
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              []
+            ]
+          }
+        },
+        "mixed_unknown": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "old",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "old",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "old"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "stats": {
+          "_default": {
+            "ok": true,
+            "value": 0
+          },
+          "p1": {
+            "ok": true,
+            "value": 1
+          },
+          "p2": {
+            "ok": true,
+            "value": 1
+          },
+          "missing": {
+            "ok": false,
+            "type": "PartitionNotFoundError",
+            "code": null,
+            "reason": "missing"
+          }
+        },
+        "total": 1
+      },
+      "duplicate/both-segment": {
+        "all": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "new",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "new",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "new"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "empty": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "new",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "new",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "new"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "p1": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "old",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "old",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "old"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "p2": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "new",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "new",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "new"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "union": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "new",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "new",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "new"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "duplicate": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "old",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "old",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "old"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "unknown": {
+          "query": {
+            "ok": true,
+            "value": []
+          },
+          "get": {
+            "ok": true,
+            "value": []
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              []
+            ]
+          }
+        },
+        "mixed_unknown": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "old",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "old",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "old"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "stats": {
+          "_default": {
+            "ok": true,
+            "value": 0
+          },
+          "p1": {
+            "ok": true,
+            "value": 1
+          },
+          "p2": {
+            "ok": true,
+            "value": 1
+          },
+          "missing": {
+            "ok": false,
+            "type": "PartitionNotFoundError",
+            "code": null,
+            "reason": "missing"
+          }
+        },
+        "total": 1
+      },
+      "duplicate/both-segment/after-flush": {
+        "all": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "new",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "new",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "new"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "empty": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "new",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "new",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "new"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "p1": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "old",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "old",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "old"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "p2": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "new",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "new",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "new"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "union": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "new",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "new",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "new"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "duplicate": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "old",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "old",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "old"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "unknown": {
+          "query": {
+            "ok": true,
+            "value": []
+          },
+          "get": {
+            "ok": true,
+            "value": []
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              []
+            ]
+          }
+        },
+        "mixed_unknown": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "old",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "old",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "old"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "stats": {
+          "_default": {
+            "ok": true,
+            "value": 0
+          },
+          "p1": {
+            "ok": true,
+            "value": 1
+          },
+          "p2": {
+            "ok": true,
+            "value": 1
+          },
+          "missing": {
+            "ok": false,
+            "type": "PartitionNotFoundError",
+            "code": null,
+            "reason": "missing"
+          }
+        },
+        "total": 1
+      },
+      "duplicate/both-segment/reopen": {
+        "all": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "new",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "new",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "new"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "empty": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "new",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "new",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "new"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "p1": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "old",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "old",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "old"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "p2": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "new",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "new",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "new"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "union": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "new",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "new",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "new"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "duplicate": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "old",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "old",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "old"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "unknown": {
+          "query": {
+            "ok": true,
+            "value": []
+          },
+          "get": {
+            "ok": true,
+            "value": []
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              []
+            ]
+          }
+        },
+        "mixed_unknown": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "old",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "old",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "old"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "stats": {
+          "_default": {
+            "ok": true,
+            "value": 0
+          },
+          "p1": {
+            "ok": true,
+            "value": 1
+          },
+          "p2": {
+            "ok": true,
+            "value": 1
+          },
+          "missing": {
+            "ok": false,
+            "type": "PartitionNotFoundError",
+            "code": null,
+            "reason": "missing"
+          }
+        },
+        "total": 1
+      },
+      "duplicate/wal": {
+        "all": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "new",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "new",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "new"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "empty": {
+          "query": {
+            "ok": true,
+            "value": []
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "new",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              []
+            ]
+          }
+        },
+        "p1": {
+          "query": {
+            "ok": true,
+            "value": []
+          },
+          "get": {
+            "ok": true,
+            "value": []
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              []
+            ]
+          }
+        },
+        "p2": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "new",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "new",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "new"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "union": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "new",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "new",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "new"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "duplicate": {
+          "query": {
+            "ok": true,
+            "value": []
+          },
+          "get": {
+            "ok": true,
+            "value": []
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              []
+            ]
+          }
+        },
+        "unknown": {
+          "query": {
+            "ok": true,
+            "value": []
+          },
+          "get": {
+            "ok": true,
+            "value": []
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              []
+            ]
+          }
+        },
+        "mixed_unknown": {
+          "query": {
+            "ok": true,
+            "value": []
+          },
+          "get": {
+            "ok": true,
+            "value": []
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              []
+            ]
+          }
+        },
+        "stats": {
+          "_default": {
+            "ok": true,
+            "value": 0
+          },
+          "p1": {
+            "ok": true,
+            "value": 0
+          },
+          "p2": {
+            "ok": true,
+            "value": 1
+          },
+          "missing": {
+            "ok": false,
+            "type": "PartitionNotFoundError",
+            "code": null,
+            "reason": "missing"
+          }
+        },
+        "total": 1
+      },
+      "duplicate/wal/after-flush": {
+        "all": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "new",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "new",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "new"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "empty": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "new",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "new",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "new"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "p1": {
+          "query": {
+            "ok": true,
+            "value": []
+          },
+          "get": {
+            "ok": true,
+            "value": []
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              []
+            ]
+          }
+        },
+        "p2": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "new",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "new",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "new"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "union": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "new",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "new",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "new"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "duplicate": {
+          "query": {
+            "ok": true,
+            "value": []
+          },
+          "get": {
+            "ok": true,
+            "value": []
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              []
+            ]
+          }
+        },
+        "unknown": {
+          "query": {
+            "ok": true,
+            "value": []
+          },
+          "get": {
+            "ok": true,
+            "value": []
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              []
+            ]
+          }
+        },
+        "mixed_unknown": {
+          "query": {
+            "ok": true,
+            "value": []
+          },
+          "get": {
+            "ok": true,
+            "value": []
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              []
+            ]
+          }
+        },
+        "stats": {
+          "_default": {
+            "ok": true,
+            "value": 0
+          },
+          "p1": {
+            "ok": true,
+            "value": 0
+          },
+          "p2": {
+            "ok": true,
+            "value": 1
+          },
+          "missing": {
+            "ok": false,
+            "type": "PartitionNotFoundError",
+            "code": null,
+            "reason": "missing"
+          }
+        },
+        "total": 1
+      },
+      "duplicate/wal/reopen": {
+        "all": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "new",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "new",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "new"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "empty": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "new",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "new",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "new"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "p1": {
+          "query": {
+            "ok": true,
+            "value": []
+          },
+          "get": {
+            "ok": true,
+            "value": []
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              []
+            ]
+          }
+        },
+        "p2": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "new",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "new",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "new"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "union": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "new",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "new",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "new"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "duplicate": {
+          "query": {
+            "ok": true,
+            "value": []
+          },
+          "get": {
+            "ok": true,
+            "value": []
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              []
+            ]
+          }
+        },
+        "unknown": {
+          "query": {
+            "ok": true,
+            "value": []
+          },
+          "get": {
+            "ok": true,
+            "value": []
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              []
+            ]
+          }
+        },
+        "mixed_unknown": {
+          "query": {
+            "ok": true,
+            "value": []
+          },
+          "get": {
+            "ok": true,
+            "value": []
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              []
+            ]
+          }
+        },
+        "stats": {
+          "_default": {
+            "ok": true,
+            "value": 0
+          },
+          "p1": {
+            "ok": true,
+            "value": 0
+          },
+          "p2": {
+            "ok": true,
+            "value": 1
+          },
+          "missing": {
+            "ok": false,
+            "type": "PartitionNotFoundError",
+            "code": null,
+            "reason": "missing"
+          }
+        },
+        "total": 1
+      },
+      "duplicate/old-segment-wal": {
+        "all": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "new",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "new",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "new"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "empty": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "old",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "new",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "old"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "p1": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "old",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "old",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "old"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "p2": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "new",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "new",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "new"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "union": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "new",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "new",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "new"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "duplicate": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "old",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "old",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "old"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "unknown": {
+          "query": {
+            "ok": true,
+            "value": []
+          },
+          "get": {
+            "ok": true,
+            "value": []
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              []
+            ]
+          }
+        },
+        "mixed_unknown": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "old",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "old",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "old"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "stats": {
+          "_default": {
+            "ok": true,
+            "value": 0
+          },
+          "p1": {
+            "ok": true,
+            "value": 1
+          },
+          "p2": {
+            "ok": true,
+            "value": 1
+          },
+          "missing": {
+            "ok": false,
+            "type": "PartitionNotFoundError",
+            "code": null,
+            "reason": "missing"
+          }
+        },
+        "total": 1
+      },
+      "duplicate/old-segment-wal/after-flush": {
+        "all": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "new",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "new",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "new"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "empty": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "new",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "new",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "new"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "p1": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "old",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "old",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "old"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "p2": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "new",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "new",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "new"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "union": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "new",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "new",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "new"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "duplicate": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "old",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "old",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "old"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "unknown": {
+          "query": {
+            "ok": true,
+            "value": []
+          },
+          "get": {
+            "ok": true,
+            "value": []
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              []
+            ]
+          }
+        },
+        "mixed_unknown": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "old",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "old",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "old"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "stats": {
+          "_default": {
+            "ok": true,
+            "value": 0
+          },
+          "p1": {
+            "ok": true,
+            "value": 1
+          },
+          "p2": {
+            "ok": true,
+            "value": 1
+          },
+          "missing": {
+            "ok": false,
+            "type": "PartitionNotFoundError",
+            "code": null,
+            "reason": "missing"
+          }
+        },
+        "total": 1
+      },
+      "duplicate/old-segment-wal/reopen": {
+        "all": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "new",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "new",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "new"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "empty": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "new",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "new",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "new"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "p1": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "old",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "old",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "old"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "p2": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "new",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "new",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "new"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "union": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "new",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "new",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "new"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "duplicate": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "old",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "old",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "old"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "unknown": {
+          "query": {
+            "ok": true,
+            "value": []
+          },
+          "get": {
+            "ok": true,
+            "value": []
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              []
+            ]
+          }
+        },
+        "mixed_unknown": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "old",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "old",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "old"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "stats": {
+          "_default": {
+            "ok": true,
+            "value": 0
+          },
+          "p1": {
+            "ok": true,
+            "value": 1
+          },
+          "p2": {
+            "ok": true,
+            "value": 1
+          },
+          "missing": {
+            "ok": false,
+            "type": "PartitionNotFoundError",
+            "code": null,
+            "reason": "missing"
+          }
+        },
+        "total": 1
+      },
+      "duplicate/compacted": {
+        "all": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "new",
+                "x": 0,
+                "a": null
+              },
+              {
+                "id": 10,
+                "tag": "extra",
+                "x": 0,
+                "a": null
+              },
+              {
+                "id": 11,
+                "tag": "extra",
+                "x": 0,
+                "a": null
+              },
+              {
+                "id": 12,
+                "tag": "extra",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "new",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "new"
+                  }
+                },
+                {
+                  "id": 10,
+                  "distance": 100.0,
+                  "entity": {
+                    "tag": "extra"
+                  }
+                },
+                {
+                  "id": 11,
+                  "distance": 121.0,
+                  "entity": {
+                    "tag": "extra"
+                  }
+                },
+                {
+                  "id": 12,
+                  "distance": 144.0,
+                  "entity": {
+                    "tag": "extra"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "empty": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "new",
+                "x": 0,
+                "a": null
+              },
+              {
+                "id": 10,
+                "tag": "extra",
+                "x": 0,
+                "a": null
+              },
+              {
+                "id": 11,
+                "tag": "extra",
+                "x": 0,
+                "a": null
+              },
+              {
+                "id": 12,
+                "tag": "extra",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "new",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "new"
+                  }
+                },
+                {
+                  "id": 10,
+                  "distance": 100.0,
+                  "entity": {
+                    "tag": "extra"
+                  }
+                },
+                {
+                  "id": 11,
+                  "distance": 121.0,
+                  "entity": {
+                    "tag": "extra"
+                  }
+                },
+                {
+                  "id": 12,
+                  "distance": 144.0,
+                  "entity": {
+                    "tag": "extra"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "p1": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "old",
+                "x": 0,
+                "a": null
+              },
+              {
+                "id": 10,
+                "tag": "extra",
+                "x": 0,
+                "a": null
+              },
+              {
+                "id": 11,
+                "tag": "extra",
+                "x": 0,
+                "a": null
+              },
+              {
+                "id": 12,
+                "tag": "extra",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "old",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "old"
+                  }
+                },
+                {
+                  "id": 10,
+                  "distance": 100.0,
+                  "entity": {
+                    "tag": "extra"
+                  }
+                },
+                {
+                  "id": 11,
+                  "distance": 121.0,
+                  "entity": {
+                    "tag": "extra"
+                  }
+                },
+                {
+                  "id": 12,
+                  "distance": 144.0,
+                  "entity": {
+                    "tag": "extra"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "p2": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "new",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "new",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "new"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "union": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "new",
+                "x": 0,
+                "a": null
+              },
+              {
+                "id": 10,
+                "tag": "extra",
+                "x": 0,
+                "a": null
+              },
+              {
+                "id": 11,
+                "tag": "extra",
+                "x": 0,
+                "a": null
+              },
+              {
+                "id": 12,
+                "tag": "extra",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "new",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "new"
+                  }
+                },
+                {
+                  "id": 10,
+                  "distance": 100.0,
+                  "entity": {
+                    "tag": "extra"
+                  }
+                },
+                {
+                  "id": 11,
+                  "distance": 121.0,
+                  "entity": {
+                    "tag": "extra"
+                  }
+                },
+                {
+                  "id": 12,
+                  "distance": 144.0,
+                  "entity": {
+                    "tag": "extra"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "duplicate": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "old",
+                "x": 0,
+                "a": null
+              },
+              {
+                "id": 10,
+                "tag": "extra",
+                "x": 0,
+                "a": null
+              },
+              {
+                "id": 11,
+                "tag": "extra",
+                "x": 0,
+                "a": null
+              },
+              {
+                "id": 12,
+                "tag": "extra",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "old",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "old"
+                  }
+                },
+                {
+                  "id": 10,
+                  "distance": 100.0,
+                  "entity": {
+                    "tag": "extra"
+                  }
+                },
+                {
+                  "id": 11,
+                  "distance": 121.0,
+                  "entity": {
+                    "tag": "extra"
+                  }
+                },
+                {
+                  "id": 12,
+                  "distance": 144.0,
+                  "entity": {
+                    "tag": "extra"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "unknown": {
+          "query": {
+            "ok": true,
+            "value": []
+          },
+          "get": {
+            "ok": true,
+            "value": []
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              []
+            ]
+          }
+        },
+        "mixed_unknown": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "old",
+                "x": 0,
+                "a": null
+              },
+              {
+                "id": 10,
+                "tag": "extra",
+                "x": 0,
+                "a": null
+              },
+              {
+                "id": 11,
+                "tag": "extra",
+                "x": 0,
+                "a": null
+              },
+              {
+                "id": 12,
+                "tag": "extra",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "old",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "old"
+                  }
+                },
+                {
+                  "id": 10,
+                  "distance": 100.0,
+                  "entity": {
+                    "tag": "extra"
+                  }
+                },
+                {
+                  "id": 11,
+                  "distance": 121.0,
+                  "entity": {
+                    "tag": "extra"
+                  }
+                },
+                {
+                  "id": 12,
+                  "distance": 144.0,
+                  "entity": {
+                    "tag": "extra"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "stats": {
+          "_default": {
+            "ok": true,
+            "value": 0
+          },
+          "p1": {
+            "ok": true,
+            "value": 4
+          },
+          "p2": {
+            "ok": true,
+            "value": 1
+          },
+          "missing": {
+            "ok": false,
+            "type": "PartitionNotFoundError",
+            "code": null,
+            "reason": "missing"
+          }
+        },
+        "total": 4
+      },
+      "duplicate/compacted/after-flush": {
+        "all": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "new",
+                "x": 0,
+                "a": null
+              },
+              {
+                "id": 10,
+                "tag": "extra",
+                "x": 0,
+                "a": null
+              },
+              {
+                "id": 11,
+                "tag": "extra",
+                "x": 0,
+                "a": null
+              },
+              {
+                "id": 12,
+                "tag": "extra",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "new",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "new"
+                  }
+                },
+                {
+                  "id": 10,
+                  "distance": 100.0,
+                  "entity": {
+                    "tag": "extra"
+                  }
+                },
+                {
+                  "id": 11,
+                  "distance": 121.0,
+                  "entity": {
+                    "tag": "extra"
+                  }
+                },
+                {
+                  "id": 12,
+                  "distance": 144.0,
+                  "entity": {
+                    "tag": "extra"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "empty": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "new",
+                "x": 0,
+                "a": null
+              },
+              {
+                "id": 10,
+                "tag": "extra",
+                "x": 0,
+                "a": null
+              },
+              {
+                "id": 11,
+                "tag": "extra",
+                "x": 0,
+                "a": null
+              },
+              {
+                "id": 12,
+                "tag": "extra",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "new",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "new"
+                  }
+                },
+                {
+                  "id": 10,
+                  "distance": 100.0,
+                  "entity": {
+                    "tag": "extra"
+                  }
+                },
+                {
+                  "id": 11,
+                  "distance": 121.0,
+                  "entity": {
+                    "tag": "extra"
+                  }
+                },
+                {
+                  "id": 12,
+                  "distance": 144.0,
+                  "entity": {
+                    "tag": "extra"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "p1": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "old",
+                "x": 0,
+                "a": null
+              },
+              {
+                "id": 10,
+                "tag": "extra",
+                "x": 0,
+                "a": null
+              },
+              {
+                "id": 11,
+                "tag": "extra",
+                "x": 0,
+                "a": null
+              },
+              {
+                "id": 12,
+                "tag": "extra",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "old",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "old"
+                  }
+                },
+                {
+                  "id": 10,
+                  "distance": 100.0,
+                  "entity": {
+                    "tag": "extra"
+                  }
+                },
+                {
+                  "id": 11,
+                  "distance": 121.0,
+                  "entity": {
+                    "tag": "extra"
+                  }
+                },
+                {
+                  "id": 12,
+                  "distance": 144.0,
+                  "entity": {
+                    "tag": "extra"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "p2": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "new",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "new",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "new"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "union": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "new",
+                "x": 0,
+                "a": null
+              },
+              {
+                "id": 10,
+                "tag": "extra",
+                "x": 0,
+                "a": null
+              },
+              {
+                "id": 11,
+                "tag": "extra",
+                "x": 0,
+                "a": null
+              },
+              {
+                "id": 12,
+                "tag": "extra",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "new",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "new"
+                  }
+                },
+                {
+                  "id": 10,
+                  "distance": 100.0,
+                  "entity": {
+                    "tag": "extra"
+                  }
+                },
+                {
+                  "id": 11,
+                  "distance": 121.0,
+                  "entity": {
+                    "tag": "extra"
+                  }
+                },
+                {
+                  "id": 12,
+                  "distance": 144.0,
+                  "entity": {
+                    "tag": "extra"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "duplicate": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "old",
+                "x": 0,
+                "a": null
+              },
+              {
+                "id": 10,
+                "tag": "extra",
+                "x": 0,
+                "a": null
+              },
+              {
+                "id": 11,
+                "tag": "extra",
+                "x": 0,
+                "a": null
+              },
+              {
+                "id": 12,
+                "tag": "extra",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "old",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "old"
+                  }
+                },
+                {
+                  "id": 10,
+                  "distance": 100.0,
+                  "entity": {
+                    "tag": "extra"
+                  }
+                },
+                {
+                  "id": 11,
+                  "distance": 121.0,
+                  "entity": {
+                    "tag": "extra"
+                  }
+                },
+                {
+                  "id": 12,
+                  "distance": 144.0,
+                  "entity": {
+                    "tag": "extra"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "unknown": {
+          "query": {
+            "ok": true,
+            "value": []
+          },
+          "get": {
+            "ok": true,
+            "value": []
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              []
+            ]
+          }
+        },
+        "mixed_unknown": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "old",
+                "x": 0,
+                "a": null
+              },
+              {
+                "id": 10,
+                "tag": "extra",
+                "x": 0,
+                "a": null
+              },
+              {
+                "id": 11,
+                "tag": "extra",
+                "x": 0,
+                "a": null
+              },
+              {
+                "id": 12,
+                "tag": "extra",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "old",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "old"
+                  }
+                },
+                {
+                  "id": 10,
+                  "distance": 100.0,
+                  "entity": {
+                    "tag": "extra"
+                  }
+                },
+                {
+                  "id": 11,
+                  "distance": 121.0,
+                  "entity": {
+                    "tag": "extra"
+                  }
+                },
+                {
+                  "id": 12,
+                  "distance": 144.0,
+                  "entity": {
+                    "tag": "extra"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "stats": {
+          "_default": {
+            "ok": true,
+            "value": 0
+          },
+          "p1": {
+            "ok": true,
+            "value": 4
+          },
+          "p2": {
+            "ok": true,
+            "value": 1
+          },
+          "missing": {
+            "ok": false,
+            "type": "PartitionNotFoundError",
+            "code": null,
+            "reason": "missing"
+          }
+        },
+        "total": 4
+      },
+      "duplicate/compacted/reopen": {
+        "all": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 10,
+                "tag": "extra",
+                "x": 0,
+                "a": null
+              },
+              {
+                "id": 11,
+                "tag": "extra",
+                "x": 0,
+                "a": null
+              },
+              {
+                "id": 12,
+                "tag": "extra",
+                "x": 0,
+                "a": null
+              },
+              {
+                "id": 1,
+                "tag": "new",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "new",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "new"
+                  }
+                },
+                {
+                  "id": 10,
+                  "distance": 100.0,
+                  "entity": {
+                    "tag": "extra"
+                  }
+                },
+                {
+                  "id": 11,
+                  "distance": 121.0,
+                  "entity": {
+                    "tag": "extra"
+                  }
+                },
+                {
+                  "id": 12,
+                  "distance": 144.0,
+                  "entity": {
+                    "tag": "extra"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "empty": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 10,
+                "tag": "extra",
+                "x": 0,
+                "a": null
+              },
+              {
+                "id": 11,
+                "tag": "extra",
+                "x": 0,
+                "a": null
+              },
+              {
+                "id": 12,
+                "tag": "extra",
+                "x": 0,
+                "a": null
+              },
+              {
+                "id": 1,
+                "tag": "new",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "new",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "new"
+                  }
+                },
+                {
+                  "id": 10,
+                  "distance": 100.0,
+                  "entity": {
+                    "tag": "extra"
+                  }
+                },
+                {
+                  "id": 11,
+                  "distance": 121.0,
+                  "entity": {
+                    "tag": "extra"
+                  }
+                },
+                {
+                  "id": 12,
+                  "distance": 144.0,
+                  "entity": {
+                    "tag": "extra"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "p1": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "old",
+                "x": 0,
+                "a": null
+              },
+              {
+                "id": 10,
+                "tag": "extra",
+                "x": 0,
+                "a": null
+              },
+              {
+                "id": 11,
+                "tag": "extra",
+                "x": 0,
+                "a": null
+              },
+              {
+                "id": 12,
+                "tag": "extra",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "old",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "old"
+                  }
+                },
+                {
+                  "id": 10,
+                  "distance": 100.0,
+                  "entity": {
+                    "tag": "extra"
+                  }
+                },
+                {
+                  "id": 11,
+                  "distance": 121.0,
+                  "entity": {
+                    "tag": "extra"
+                  }
+                },
+                {
+                  "id": 12,
+                  "distance": 144.0,
+                  "entity": {
+                    "tag": "extra"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "p2": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "new",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "new",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "new"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "union": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 10,
+                "tag": "extra",
+                "x": 0,
+                "a": null
+              },
+              {
+                "id": 11,
+                "tag": "extra",
+                "x": 0,
+                "a": null
+              },
+              {
+                "id": 12,
+                "tag": "extra",
+                "x": 0,
+                "a": null
+              },
+              {
+                "id": 1,
+                "tag": "new",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "new",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "new"
+                  }
+                },
+                {
+                  "id": 10,
+                  "distance": 100.0,
+                  "entity": {
+                    "tag": "extra"
+                  }
+                },
+                {
+                  "id": 11,
+                  "distance": 121.0,
+                  "entity": {
+                    "tag": "extra"
+                  }
+                },
+                {
+                  "id": 12,
+                  "distance": 144.0,
+                  "entity": {
+                    "tag": "extra"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "duplicate": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "old",
+                "x": 0,
+                "a": null
+              },
+              {
+                "id": 10,
+                "tag": "extra",
+                "x": 0,
+                "a": null
+              },
+              {
+                "id": 11,
+                "tag": "extra",
+                "x": 0,
+                "a": null
+              },
+              {
+                "id": 12,
+                "tag": "extra",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "old",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "old"
+                  }
+                },
+                {
+                  "id": 10,
+                  "distance": 100.0,
+                  "entity": {
+                    "tag": "extra"
+                  }
+                },
+                {
+                  "id": 11,
+                  "distance": 121.0,
+                  "entity": {
+                    "tag": "extra"
+                  }
+                },
+                {
+                  "id": 12,
+                  "distance": 144.0,
+                  "entity": {
+                    "tag": "extra"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "unknown": {
+          "query": {
+            "ok": true,
+            "value": []
+          },
+          "get": {
+            "ok": true,
+            "value": []
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              []
+            ]
+          }
+        },
+        "mixed_unknown": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "old",
+                "x": 0,
+                "a": null
+              },
+              {
+                "id": 10,
+                "tag": "extra",
+                "x": 0,
+                "a": null
+              },
+              {
+                "id": 11,
+                "tag": "extra",
+                "x": 0,
+                "a": null
+              },
+              {
+                "id": 12,
+                "tag": "extra",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "old",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "old"
+                  }
+                },
+                {
+                  "id": 10,
+                  "distance": 100.0,
+                  "entity": {
+                    "tag": "extra"
+                  }
+                },
+                {
+                  "id": 11,
+                  "distance": 121.0,
+                  "entity": {
+                    "tag": "extra"
+                  }
+                },
+                {
+                  "id": 12,
+                  "distance": 144.0,
+                  "entity": {
+                    "tag": "extra"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "stats": {
+          "_default": {
+            "ok": true,
+            "value": 0
+          },
+          "p1": {
+            "ok": true,
+            "value": 4
+          },
+          "p2": {
+            "ok": true,
+            "value": 1
+          },
+          "missing": {
+            "ok": false,
+            "type": "PartitionNotFoundError",
+            "code": null,
+            "reason": "missing"
+          }
+        },
+        "total": 4
+      },
+      "wrong-partition-delete/active": {
+        "delete_count": 1,
+        "before_flush": {
+          "all": {
+            "query": {
+              "ok": true,
+              "value": []
+            },
+            "get": {
+              "ok": true,
+              "value": []
+            },
+            "search": {
+              "ok": true,
+              "value": [
+                []
+              ]
+            }
+          },
+          "empty": {
+            "query": {
+              "ok": true,
+              "value": []
+            },
+            "get": {
+              "ok": true,
+              "value": []
+            },
+            "search": {
+              "ok": true,
+              "value": [
+                []
+              ]
+            }
+          },
+          "p1": {
+            "query": {
+              "ok": true,
+              "value": []
+            },
+            "get": {
+              "ok": true,
+              "value": []
+            },
+            "search": {
+              "ok": true,
+              "value": [
+                []
+              ]
+            }
+          },
+          "p2": {
+            "query": {
+              "ok": true,
+              "value": []
+            },
+            "get": {
+              "ok": true,
+              "value": []
+            },
+            "search": {
+              "ok": true,
+              "value": [
+                []
+              ]
+            }
+          },
+          "union": {
+            "query": {
+              "ok": true,
+              "value": []
+            },
+            "get": {
+              "ok": true,
+              "value": []
+            },
+            "search": {
+              "ok": true,
+              "value": [
+                []
+              ]
+            }
+          },
+          "duplicate": {
+            "query": {
+              "ok": true,
+              "value": []
+            },
+            "get": {
+              "ok": true,
+              "value": []
+            },
+            "search": {
+              "ok": true,
+              "value": [
+                []
+              ]
+            }
+          },
+          "unknown": {
+            "query": {
+              "ok": true,
+              "value": []
+            },
+            "get": {
+              "ok": true,
+              "value": []
+            },
+            "search": {
+              "ok": true,
+              "value": [
+                []
+              ]
+            }
+          },
+          "mixed_unknown": {
+            "query": {
+              "ok": true,
+              "value": []
+            },
+            "get": {
+              "ok": true,
+              "value": []
+            },
+            "search": {
+              "ok": true,
+              "value": [
+                []
+              ]
+            }
+          },
+          "stats": {
+            "_default": {
+              "ok": true,
+              "value": 0
+            },
+            "p1": {
+              "ok": true,
+              "value": 0
+            },
+            "p2": {
+              "ok": true,
+              "value": 0
+            },
+            "missing": {
+              "ok": false,
+              "type": "PartitionNotFoundError",
+              "code": null,
+              "reason": "missing"
+            }
+          },
+          "total": 0
+        },
+        "after_flush": {
+          "all": {
+            "query": {
+              "ok": true,
+              "value": []
+            },
+            "get": {
+              "ok": true,
+              "value": []
+            },
+            "search": {
+              "ok": true,
+              "value": [
+                []
+              ]
+            }
+          },
+          "empty": {
+            "query": {
+              "ok": true,
+              "value": []
+            },
+            "get": {
+              "ok": true,
+              "value": []
+            },
+            "search": {
+              "ok": true,
+              "value": [
+                []
+              ]
+            }
+          },
+          "p1": {
+            "query": {
+              "ok": true,
+              "value": []
+            },
+            "get": {
+              "ok": true,
+              "value": []
+            },
+            "search": {
+              "ok": true,
+              "value": [
+                []
+              ]
+            }
+          },
+          "p2": {
+            "query": {
+              "ok": true,
+              "value": []
+            },
+            "get": {
+              "ok": true,
+              "value": []
+            },
+            "search": {
+              "ok": true,
+              "value": [
+                []
+              ]
+            }
+          },
+          "union": {
+            "query": {
+              "ok": true,
+              "value": []
+            },
+            "get": {
+              "ok": true,
+              "value": []
+            },
+            "search": {
+              "ok": true,
+              "value": [
+                []
+              ]
+            }
+          },
+          "duplicate": {
+            "query": {
+              "ok": true,
+              "value": []
+            },
+            "get": {
+              "ok": true,
+              "value": []
+            },
+            "search": {
+              "ok": true,
+              "value": [
+                []
+              ]
+            }
+          },
+          "unknown": {
+            "query": {
+              "ok": true,
+              "value": []
+            },
+            "get": {
+              "ok": true,
+              "value": []
+            },
+            "search": {
+              "ok": true,
+              "value": [
+                []
+              ]
+            }
+          },
+          "mixed_unknown": {
+            "query": {
+              "ok": true,
+              "value": []
+            },
+            "get": {
+              "ok": true,
+              "value": []
+            },
+            "search": {
+              "ok": true,
+              "value": [
+                []
+              ]
+            }
+          },
+          "stats": {
+            "_default": {
+              "ok": true,
+              "value": 0
+            },
+            "p1": {
+              "ok": true,
+              "value": 0
+            },
+            "p2": {
+              "ok": true,
+              "value": 0
+            },
+            "missing": {
+              "ok": false,
+              "type": "PartitionNotFoundError",
+              "code": null,
+              "reason": "missing"
+            }
+          },
+          "total": 0
+        },
+        "after_drop": {
+          "all": {
+            "query": {
+              "ok": true,
+              "value": []
+            },
+            "get": {
+              "ok": true,
+              "value": []
+            },
+            "search": {
+              "ok": true,
+              "value": [
+                []
+              ]
+            }
+          },
+          "empty": {
+            "query": {
+              "ok": true,
+              "value": []
+            },
+            "get": {
+              "ok": true,
+              "value": []
+            },
+            "search": {
+              "ok": true,
+              "value": [
+                []
+              ]
+            }
+          },
+          "p1": {
+            "query": {
+              "ok": true,
+              "value": []
+            },
+            "get": {
+              "ok": true,
+              "value": []
+            },
+            "search": {
+              "ok": true,
+              "value": [
+                []
+              ]
+            }
+          },
+          "p2": {
+            "query": {
+              "ok": true,
+              "value": []
+            },
+            "get": {
+              "ok": true,
+              "value": []
+            },
+            "search": {
+              "ok": true,
+              "value": [
+                []
+              ]
+            }
+          },
+          "union": {
+            "query": {
+              "ok": true,
+              "value": []
+            },
+            "get": {
+              "ok": true,
+              "value": []
+            },
+            "search": {
+              "ok": true,
+              "value": [
+                []
+              ]
+            }
+          },
+          "duplicate": {
+            "query": {
+              "ok": true,
+              "value": []
+            },
+            "get": {
+              "ok": true,
+              "value": []
+            },
+            "search": {
+              "ok": true,
+              "value": [
+                []
+              ]
+            }
+          },
+          "unknown": {
+            "query": {
+              "ok": true,
+              "value": []
+            },
+            "get": {
+              "ok": true,
+              "value": []
+            },
+            "search": {
+              "ok": true,
+              "value": [
+                []
+              ]
+            }
+          },
+          "mixed_unknown": {
+            "query": {
+              "ok": true,
+              "value": []
+            },
+            "get": {
+              "ok": true,
+              "value": []
+            },
+            "search": {
+              "ok": true,
+              "value": [
+                []
+              ]
+            }
+          },
+          "stats": {
+            "_default": {
+              "ok": true,
+              "value": 0
+            },
+            "p1": {
+              "ok": false,
+              "type": "PartitionNotFoundError",
+              "code": null,
+              "reason": "p1"
+            },
+            "p2": {
+              "ok": true,
+              "value": 0
+            },
+            "missing": {
+              "ok": false,
+              "type": "PartitionNotFoundError",
+              "code": null,
+              "reason": "missing"
+            }
+          },
+          "total": 0
+        },
+        "reopen": {
+          "all": {
+            "query": {
+              "ok": true,
+              "value": []
+            },
+            "get": {
+              "ok": true,
+              "value": []
+            },
+            "search": {
+              "ok": true,
+              "value": [
+                []
+              ]
+            }
+          },
+          "empty": {
+            "query": {
+              "ok": true,
+              "value": []
+            },
+            "get": {
+              "ok": true,
+              "value": []
+            },
+            "search": {
+              "ok": true,
+              "value": [
+                []
+              ]
+            }
+          },
+          "p1": {
+            "query": {
+              "ok": true,
+              "value": []
+            },
+            "get": {
+              "ok": true,
+              "value": []
+            },
+            "search": {
+              "ok": true,
+              "value": [
+                []
+              ]
+            }
+          },
+          "p2": {
+            "query": {
+              "ok": true,
+              "value": []
+            },
+            "get": {
+              "ok": true,
+              "value": []
+            },
+            "search": {
+              "ok": true,
+              "value": [
+                []
+              ]
+            }
+          },
+          "union": {
+            "query": {
+              "ok": true,
+              "value": []
+            },
+            "get": {
+              "ok": true,
+              "value": []
+            },
+            "search": {
+              "ok": true,
+              "value": [
+                []
+              ]
+            }
+          },
+          "duplicate": {
+            "query": {
+              "ok": true,
+              "value": []
+            },
+            "get": {
+              "ok": true,
+              "value": []
+            },
+            "search": {
+              "ok": true,
+              "value": [
+                []
+              ]
+            }
+          },
+          "unknown": {
+            "query": {
+              "ok": true,
+              "value": []
+            },
+            "get": {
+              "ok": true,
+              "value": []
+            },
+            "search": {
+              "ok": true,
+              "value": [
+                []
+              ]
+            }
+          },
+          "mixed_unknown": {
+            "query": {
+              "ok": true,
+              "value": []
+            },
+            "get": {
+              "ok": true,
+              "value": []
+            },
+            "search": {
+              "ok": true,
+              "value": [
+                []
+              ]
+            }
+          },
+          "stats": {
+            "_default": {
+              "ok": true,
+              "value": 0
+            },
+            "p1": {
+              "ok": false,
+              "type": "PartitionNotFoundError",
+              "code": null,
+              "reason": "p1"
+            },
+            "p2": {
+              "ok": true,
+              "value": 0
+            },
+            "missing": {
+              "ok": false,
+              "type": "PartitionNotFoundError",
+              "code": null,
+              "reason": "missing"
+            }
+          },
+          "total": 0
+        }
+      },
+      "wrong-partition-delete/segment": {
+        "delete_count": 1,
+        "before_flush": {
+          "all": {
+            "query": {
+              "ok": true,
+              "value": []
+            },
+            "get": {
+              "ok": true,
+              "value": []
+            },
+            "search": {
+              "ok": true,
+              "value": [
+                []
+              ]
+            }
+          },
+          "empty": {
+            "query": {
+              "ok": true,
+              "value": []
+            },
+            "get": {
+              "ok": true,
+              "value": []
+            },
+            "search": {
+              "ok": true,
+              "value": [
+                []
+              ]
+            }
+          },
+          "p1": {
+            "query": {
+              "ok": true,
+              "value": []
+            },
+            "get": {
+              "ok": true,
+              "value": []
+            },
+            "search": {
+              "ok": true,
+              "value": [
+                []
+              ]
+            }
+          },
+          "p2": {
+            "query": {
+              "ok": true,
+              "value": []
+            },
+            "get": {
+              "ok": true,
+              "value": []
+            },
+            "search": {
+              "ok": true,
+              "value": [
+                []
+              ]
+            }
+          },
+          "union": {
+            "query": {
+              "ok": true,
+              "value": []
+            },
+            "get": {
+              "ok": true,
+              "value": []
+            },
+            "search": {
+              "ok": true,
+              "value": [
+                []
+              ]
+            }
+          },
+          "duplicate": {
+            "query": {
+              "ok": true,
+              "value": []
+            },
+            "get": {
+              "ok": true,
+              "value": []
+            },
+            "search": {
+              "ok": true,
+              "value": [
+                []
+              ]
+            }
+          },
+          "unknown": {
+            "query": {
+              "ok": true,
+              "value": []
+            },
+            "get": {
+              "ok": true,
+              "value": []
+            },
+            "search": {
+              "ok": true,
+              "value": [
+                []
+              ]
+            }
+          },
+          "mixed_unknown": {
+            "query": {
+              "ok": true,
+              "value": []
+            },
+            "get": {
+              "ok": true,
+              "value": []
+            },
+            "search": {
+              "ok": true,
+              "value": [
+                []
+              ]
+            }
+          },
+          "stats": {
+            "_default": {
+              "ok": true,
+              "value": 0
+            },
+            "p1": {
+              "ok": true,
+              "value": 0
+            },
+            "p2": {
+              "ok": true,
+              "value": 0
+            },
+            "missing": {
+              "ok": false,
+              "type": "PartitionNotFoundError",
+              "code": null,
+              "reason": "missing"
+            }
+          },
+          "total": 0
+        },
+        "after_flush": {
+          "all": {
+            "query": {
+              "ok": true,
+              "value": []
+            },
+            "get": {
+              "ok": true,
+              "value": []
+            },
+            "search": {
+              "ok": true,
+              "value": [
+                []
+              ]
+            }
+          },
+          "empty": {
+            "query": {
+              "ok": true,
+              "value": []
+            },
+            "get": {
+              "ok": true,
+              "value": []
+            },
+            "search": {
+              "ok": true,
+              "value": [
+                []
+              ]
+            }
+          },
+          "p1": {
+            "query": {
+              "ok": true,
+              "value": []
+            },
+            "get": {
+              "ok": true,
+              "value": []
+            },
+            "search": {
+              "ok": true,
+              "value": [
+                []
+              ]
+            }
+          },
+          "p2": {
+            "query": {
+              "ok": true,
+              "value": []
+            },
+            "get": {
+              "ok": true,
+              "value": []
+            },
+            "search": {
+              "ok": true,
+              "value": [
+                []
+              ]
+            }
+          },
+          "union": {
+            "query": {
+              "ok": true,
+              "value": []
+            },
+            "get": {
+              "ok": true,
+              "value": []
+            },
+            "search": {
+              "ok": true,
+              "value": [
+                []
+              ]
+            }
+          },
+          "duplicate": {
+            "query": {
+              "ok": true,
+              "value": []
+            },
+            "get": {
+              "ok": true,
+              "value": []
+            },
+            "search": {
+              "ok": true,
+              "value": [
+                []
+              ]
+            }
+          },
+          "unknown": {
+            "query": {
+              "ok": true,
+              "value": []
+            },
+            "get": {
+              "ok": true,
+              "value": []
+            },
+            "search": {
+              "ok": true,
+              "value": [
+                []
+              ]
+            }
+          },
+          "mixed_unknown": {
+            "query": {
+              "ok": true,
+              "value": []
+            },
+            "get": {
+              "ok": true,
+              "value": []
+            },
+            "search": {
+              "ok": true,
+              "value": [
+                []
+              ]
+            }
+          },
+          "stats": {
+            "_default": {
+              "ok": true,
+              "value": 0
+            },
+            "p1": {
+              "ok": true,
+              "value": 0
+            },
+            "p2": {
+              "ok": true,
+              "value": 0
+            },
+            "missing": {
+              "ok": false,
+              "type": "PartitionNotFoundError",
+              "code": null,
+              "reason": "missing"
+            }
+          },
+          "total": 0
+        },
+        "after_drop": {
+          "all": {
+            "query": {
+              "ok": true,
+              "value": []
+            },
+            "get": {
+              "ok": true,
+              "value": []
+            },
+            "search": {
+              "ok": true,
+              "value": [
+                []
+              ]
+            }
+          },
+          "empty": {
+            "query": {
+              "ok": true,
+              "value": []
+            },
+            "get": {
+              "ok": true,
+              "value": []
+            },
+            "search": {
+              "ok": true,
+              "value": [
+                []
+              ]
+            }
+          },
+          "p1": {
+            "query": {
+              "ok": true,
+              "value": []
+            },
+            "get": {
+              "ok": true,
+              "value": []
+            },
+            "search": {
+              "ok": true,
+              "value": [
+                []
+              ]
+            }
+          },
+          "p2": {
+            "query": {
+              "ok": true,
+              "value": []
+            },
+            "get": {
+              "ok": true,
+              "value": []
+            },
+            "search": {
+              "ok": true,
+              "value": [
+                []
+              ]
+            }
+          },
+          "union": {
+            "query": {
+              "ok": true,
+              "value": []
+            },
+            "get": {
+              "ok": true,
+              "value": []
+            },
+            "search": {
+              "ok": true,
+              "value": [
+                []
+              ]
+            }
+          },
+          "duplicate": {
+            "query": {
+              "ok": true,
+              "value": []
+            },
+            "get": {
+              "ok": true,
+              "value": []
+            },
+            "search": {
+              "ok": true,
+              "value": [
+                []
+              ]
+            }
+          },
+          "unknown": {
+            "query": {
+              "ok": true,
+              "value": []
+            },
+            "get": {
+              "ok": true,
+              "value": []
+            },
+            "search": {
+              "ok": true,
+              "value": [
+                []
+              ]
+            }
+          },
+          "mixed_unknown": {
+            "query": {
+              "ok": true,
+              "value": []
+            },
+            "get": {
+              "ok": true,
+              "value": []
+            },
+            "search": {
+              "ok": true,
+              "value": [
+                []
+              ]
+            }
+          },
+          "stats": {
+            "_default": {
+              "ok": true,
+              "value": 0
+            },
+            "p1": {
+              "ok": false,
+              "type": "PartitionNotFoundError",
+              "code": null,
+              "reason": "p1"
+            },
+            "p2": {
+              "ok": true,
+              "value": 0
+            },
+            "missing": {
+              "ok": false,
+              "type": "PartitionNotFoundError",
+              "code": null,
+              "reason": "missing"
+            }
+          },
+          "total": 0
+        },
+        "reopen": {
+          "all": {
+            "query": {
+              "ok": true,
+              "value": [
+                {
+                  "id": 2,
+                  "tag": "only-p2",
+                  "x": 0,
+                  "a": null
+                }
+              ]
+            },
+            "get": {
+              "ok": true,
+              "value": [
+                {
+                  "tag": "only-p2",
+                  "id": 2
+                }
+              ]
+            },
+            "search": {
+              "ok": true,
+              "value": [
+                [
+                  {
+                    "id": 2,
+                    "distance": 4.0,
+                    "entity": {
+                      "tag": "only-p2"
+                    }
+                  }
+                ]
+              ]
+            }
+          },
+          "empty": {
+            "query": {
+              "ok": true,
+              "value": [
+                {
+                  "id": 2,
+                  "tag": "only-p2",
+                  "x": 0,
+                  "a": null
+                }
+              ]
+            },
+            "get": {
+              "ok": true,
+              "value": [
+                {
+                  "tag": "only-p2",
+                  "id": 2
+                }
+              ]
+            },
+            "search": {
+              "ok": true,
+              "value": [
+                [
+                  {
+                    "id": 2,
+                    "distance": 4.0,
+                    "entity": {
+                      "tag": "only-p2"
+                    }
+                  }
+                ]
+              ]
+            }
+          },
+          "p1": {
+            "query": {
+              "ok": true,
+              "value": []
+            },
+            "get": {
+              "ok": true,
+              "value": []
+            },
+            "search": {
+              "ok": true,
+              "value": [
+                []
+              ]
+            }
+          },
+          "p2": {
+            "query": {
+              "ok": true,
+              "value": [
+                {
+                  "id": 2,
+                  "tag": "only-p2",
+                  "x": 0,
+                  "a": null
+                }
+              ]
+            },
+            "get": {
+              "ok": true,
+              "value": [
+                {
+                  "tag": "only-p2",
+                  "id": 2
+                }
+              ]
+            },
+            "search": {
+              "ok": true,
+              "value": [
+                [
+                  {
+                    "id": 2,
+                    "distance": 4.0,
+                    "entity": {
+                      "tag": "only-p2"
+                    }
+                  }
+                ]
+              ]
+            }
+          },
+          "union": {
+            "query": {
+              "ok": true,
+              "value": [
+                {
+                  "id": 2,
+                  "tag": "only-p2",
+                  "x": 0,
+                  "a": null
+                }
+              ]
+            },
+            "get": {
+              "ok": true,
+              "value": [
+                {
+                  "tag": "only-p2",
+                  "id": 2
+                }
+              ]
+            },
+            "search": {
+              "ok": true,
+              "value": [
+                [
+                  {
+                    "id": 2,
+                    "distance": 4.0,
+                    "entity": {
+                      "tag": "only-p2"
+                    }
+                  }
+                ]
+              ]
+            }
+          },
+          "duplicate": {
+            "query": {
+              "ok": true,
+              "value": []
+            },
+            "get": {
+              "ok": true,
+              "value": []
+            },
+            "search": {
+              "ok": true,
+              "value": [
+                []
+              ]
+            }
+          },
+          "unknown": {
+            "query": {
+              "ok": true,
+              "value": []
+            },
+            "get": {
+              "ok": true,
+              "value": []
+            },
+            "search": {
+              "ok": true,
+              "value": [
+                []
+              ]
+            }
+          },
+          "mixed_unknown": {
+            "query": {
+              "ok": true,
+              "value": []
+            },
+            "get": {
+              "ok": true,
+              "value": []
+            },
+            "search": {
+              "ok": true,
+              "value": [
+                []
+              ]
+            }
+          },
+          "stats": {
+            "_default": {
+              "ok": true,
+              "value": 0
+            },
+            "p1": {
+              "ok": false,
+              "type": "PartitionNotFoundError",
+              "code": null,
+              "reason": "p1"
+            },
+            "p2": {
+              "ok": true,
+              "value": 1
+            },
+            "missing": {
+              "ok": false,
+              "type": "PartitionNotFoundError",
+              "code": null,
+              "reason": "missing"
+            }
+          },
+          "total": 1
+        }
+      },
+      "drop-latest/before": {
+        "all": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "new",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "new",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "new"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "empty": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "new",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "new",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "new"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "p1": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "old",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "old",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "old"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "p2": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "new",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "new",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "new"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "union": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "new",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "new",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "new"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "duplicate": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "old",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "old",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "old"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "unknown": {
+          "query": {
+            "ok": true,
+            "value": []
+          },
+          "get": {
+            "ok": true,
+            "value": []
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              []
+            ]
+          }
+        },
+        "mixed_unknown": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "old",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "old",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "old"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "stats": {
+          "_default": {
+            "ok": true,
+            "value": 0
+          },
+          "p1": {
+            "ok": true,
+            "value": 1
+          },
+          "p2": {
+            "ok": true,
+            "value": 1
+          },
+          "missing": {
+            "ok": false,
+            "type": "PartitionNotFoundError",
+            "code": null,
+            "reason": "missing"
+          }
+        },
+        "total": 1
+      },
+      "drop-latest/after": {
+        "all": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "old",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "old",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "old"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "empty": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "old",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "old",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "old"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "p1": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "old",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "old",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "old"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "p2": {
+          "query": {
+            "ok": true,
+            "value": []
+          },
+          "get": {
+            "ok": true,
+            "value": []
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              []
+            ]
+          }
+        },
+        "union": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "old",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "old",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "old"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "duplicate": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "old",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "old",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "old"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "unknown": {
+          "query": {
+            "ok": true,
+            "value": []
+          },
+          "get": {
+            "ok": true,
+            "value": []
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              []
+            ]
+          }
+        },
+        "mixed_unknown": {
+          "query": {
+            "ok": true,
+            "value": [
+              {
+                "id": 1,
+                "tag": "old",
+                "x": 0,
+                "a": null
+              }
+            ]
+          },
+          "get": {
+            "ok": true,
+            "value": [
+              {
+                "tag": "old",
+                "id": 1
+              }
+            ]
+          },
+          "search": {
+            "ok": true,
+            "value": [
+              [
+                {
+                  "id": 1,
+                  "distance": 1.0,
+                  "entity": {
+                    "tag": "old"
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        "stats": {
+          "_default": {
+            "ok": true,
+            "value": 0
+          },
+          "p1": {
+            "ok": true,
+            "value": 1
+          },
+          "p2": {
+            "ok": false,
+            "type": "PartitionNotFoundError",
+            "code": null,
+            "reason": "p2"
+          },
+          "missing": {
+            "ok": false,
+            "type": "PartitionNotFoundError",
+            "code": null,
+            "reason": "missing"
+          }
+        },
+        "total": 1
+      },
+      "drop-side-effect/missing": {
+        "result": {
+          "ok": false,
+          "type": "PartitionNotFoundError",
+          "code": null,
+          "reason": "missing"
+        },
+        "files_changed": false,
+        "data_files": {
+          "_default": [],
+          "p1": [],
+          "p2": []
+        },
+        "current_seq": 0,
+        "next_seq_changed": false
+      },
+      "drop-side-effect/_default": {
+        "result": {
+          "ok": false,
+          "type": "DefaultPartitionError",
+          "code": null,
+          "reason": "cannot remove default partition '_default'"
+        },
+        "files_changed": true,
+        "data_files": {
+          "_default": [
+            "data/data_000001_000001.parquet"
+          ],
+          "p1": [],
+          "p2": []
+        },
+        "current_seq": 1,
+        "next_seq_changed": false
+      },
+      "drop-side-effect/p1": {
+        "result": {
+          "ok": true,
+          "value": null
+        },
+        "files_changed": true,
+        "data_files": {
+          "_default": [
+            "data/data_000001_000001.parquet"
+          ],
+          "p2": []
+        },
+        "current_seq": 1,
+        "next_seq_changed": false
+      },
+      "snapshot/drop-recreate": {
+        "protected": true,
+        "restored": [
+          {
+            "id": 1,
+            "tag": "pinned",
+            "a": [
+              null,
+              7
+            ]
+          }
+        ],
+        "current": [
+          {
+            "id": 2,
+            "tag": "new",
+            "a": null
+          }
+        ]
+      }
+    },
+    "paths": {
+      "empty": {
+        "name": "",
+        "result": {
+          "ok": true,
+          "value": null
+        },
+        "registered_after": true,
+        "partitions_before": [
+          "_default",
+          "p1",
+          "p2"
+        ],
+        "close": {
+          "ok": true,
+          "value": null
+        }
+      },
+      "dot": {
+        "name": ".",
+        "result": {
+          "ok": true,
+          "value": null
+        },
+        "registered_after": true,
+        "partitions_before": [
+          "_default",
+          "p1",
+          "p2"
+        ],
+        "close": {
+          "ok": true,
+          "value": null
+        }
+      },
+      "dotdot": {
+        "name": "..",
+        "result": {
+          "ok": true,
+          "value": null
+        },
+        "registered_after": true,
+        "partitions_before": [
+          "_default",
+          "p1",
+          "p2"
+        ],
+        "close": {
+          "ok": true,
+          "value": null
+        }
+      },
+      "relative": {
+        "name": "../escape",
+        "result": {
+          "ok": true,
+          "value": null
+        },
+        "registered_after": true,
+        "partitions_before": [
+          "_default",
+          "p1",
+          "p2"
+        ],
+        "close": {
+          "ok": true,
+          "value": null
+        }
+      },
+      "absolute": {
+        "name": "<work>/absolute-target",
+        "result": {
+          "ok": true,
+          "value": null
+        },
+        "registered_after": true,
+        "partitions_before": [
+          "_default",
+          "p1",
+          "p2"
+        ],
+        "parquet_outside_collection": [
+          "absolute-target/data/data_000001_000001.parquet"
+        ],
+        "close": {
+          "ok": true,
+          "value": null
+        }
+      },
+      "slash": {
+        "name": "nested/name",
+        "result": {
+          "ok": true,
+          "value": null
+        },
+        "registered_after": true,
+        "partitions_before": [
+          "_default",
+          "p1",
+          "p2"
+        ],
+        "close": {
+          "ok": true,
+          "value": null
+        }
+      },
+      "backslash": {
+        "name": "back\\slash",
+        "result": {
+          "ok": true,
+          "value": null
+        },
+        "registered_after": true,
+        "partitions_before": [
+          "_default",
+          "p1",
+          "p2"
+        ],
+        "close": {
+          "ok": true,
+          "value": null
+        }
+      },
+      "null": {
+        "name": "bad\u0000name",
+        "result": {
+          "ok": false,
+          "type": "ValueError",
+          "code": null,
+          "reason": "mkdir: embedded null character in path"
+        },
+        "registered_after": true,
+        "partitions_before": [
+          "_default",
+          "p1",
+          "p2"
+        ],
+        "close": {
+          "ok": true,
+          "value": null
+        }
+      },
+      "unicode": {
+        "name": "\u5206\u533a",
+        "result": {
+          "ok": true,
+          "value": null
+        },
+        "registered_after": true,
+        "partitions_before": [
+          "_default",
+          "p1",
+          "p2"
+        ],
+        "close": {
+          "ok": true,
+          "value": null
+        }
+      },
+      "sentinel": {
+        "name": "_all",
+        "result": {
+          "ok": true,
+          "value": null
+        },
+        "registered_after": true,
+        "partitions_before": [
+          "_default",
+          "p1",
+          "p2"
+        ],
+        "close": {
+          "ok": true,
+          "value": null
+        }
+      },
+      "case-alias": {
+        "same_directory": true,
+        "remaining_referenced_files_exist": false,
+        "live": [
+          {
+            "id": 1,
+            "tag": "lower"
+          }
+        ],
+        "reopen": {
+          "ok": true,
+          "value": []
+        }
+      }
+    },
+    "key": {
+      "routing": {
+        "ids": [
+          1,
+          2,
+          3,
+          4,
+          5,
+          6
+        ],
+        "partitions": [
+          "_default",
+          "_pk_0",
+          "_pk_1",
+          "_pk_10",
+          "_pk_11",
+          "_pk_12",
+          "_pk_13",
+          "_pk_14",
+          "_pk_15",
+          "_pk_2",
+          "_pk_3",
+          "_pk_4",
+          "_pk_5",
+          "_pk_6",
+          "_pk_7",
+          "_pk_8",
+          "_pk_9"
+        ],
+        "rows": [
+          {
+            "_seq": 1,
+            "_partition": "_pk_10",
+            "id": 1,
+            "vector": [
+              0.0,
+              0.0
+            ],
+            "tag": "0",
+            "x": 0,
+            "a": null,
+            "tenant": 0,
+            "$meta": null
+          },
+          {
+            "_seq": 2,
+            "_partition": "_pk_10",
+            "id": 6,
+            "vector": [
+              0.0,
+              0.0
+            ],
+            "tag": "5",
+            "x": 0,
+            "a": null,
+            "tenant": 0,
+            "$meta": null
+          },
+          {
+            "_seq": 3,
+            "_partition": "_pk_11",
+            "id": 2,
+            "vector": [
+              0.0,
+              0.0
+            ],
+            "tag": "1",
+            "x": 0,
+            "a": null,
+            "tenant": 1,
+            "$meta": null
+          },
+          {
+            "_seq": 4,
+            "_partition": "_pk_8",
+            "id": 3,
+            "vector": [
+              0.0,
+              0.0
+            ],
+            "tag": "2",
+            "x": 0,
+            "a": null,
+            "tenant": -1,
+            "$meta": null
+          },
+          {
+            "_seq": 5,
+            "_partition": "_pk_6",
+            "id": 4,
+            "vector": [
+              0.0,
+              0.0
+            ],
+            "tag": "3",
+            "x": 0,
+            "a": null,
+            "tenant": 42,
+            "$meta": null
+          },
+          {
+            "_seq": 6,
+            "_partition": "_pk_4",
+            "id": 5,
+            "vector": [
+              0.0,
+              0.0
+            ],
+            "tag": "4",
+            "x": 0,
+            "a": null,
+            "tenant": null,
+            "$meta": null
+          }
+        ],
+        "manual_create": {
+          "ok": false,
+          "type": "SchemaValidationError",
+          "code": null,
+          "reason": "cannot create manual partitions when partition key is set (partition_key field: 'tenant')"
+        },
+        "manual_drop": {
+          "ok": false,
+          "type": "SchemaValidationError",
+          "code": null,
+          "reason": "cannot drop partitions when partition key is set (partition_key field: 'tenant')"
+        }
+      },
+      "auto-id-interrupted": {
+        "wal_rows": [
+          {
+            "_seq": 1,
+            "_partition": "_pk_10",
+            "id": 1,
+            "vector": [
+              0.0,
+              0.0
+            ],
+            "tag": "0",
+            "x": 0,
+            "a": null,
+            "tenant": 0,
+            "$meta": null
+          },
+          {
+            "_seq": 2,
+            "_partition": "_pk_10",
+            "id": 3,
+            "vector": [
+              0.0,
+              0.0
+            ],
+            "tag": "2",
+            "x": 0,
+            "a": null,
+            "tenant": 0,
+            "$meta": null
+          },
+          {
+            "_seq": 3,
+            "_partition": "_pk_10",
+            "id": 5,
+            "vector": [
+              0.0,
+              0.0
+            ],
+            "tag": "4",
+            "x": 0,
+            "a": null,
+            "tenant": 0,
+            "$meta": null
+          }
+        ],
+        "rows_before": [
+          {
+            "id": 1,
+            "tag": "0"
+          },
+          {
+            "id": 3,
+            "tag": "2"
+          },
+          {
+            "id": 5,
+            "tag": "4"
+          }
+        ],
+        "inserted": [
+          4,
+          5,
+          6
+        ],
+        "rows_after": [
+          {
+            "id": 1,
+            "tag": "0"
+          },
+          {
+            "id": 3,
+            "tag": "2"
+          },
+          {
+            "id": 5,
+            "tag": "after"
+          },
+          {
+            "id": 4,
+            "tag": "after"
+          },
+          {
+            "id": 6,
+            "tag": "after"
+          }
+        ],
+        "expected_count_without_overwrite": 6,
+        "actual_count": 5
+      }
+    },
+    "rpc": {
+      "c/CreatePartition/p1": {
+        "code": 1,
+        "error_code": 1,
+        "reason": "p1"
+      },
+      "c/HasPartition/p1": {
+        "code": 0,
+        "error_code": 0,
+        "reason": "",
+        "value": true
+      },
+      "c/GetPartitionStatistics/p1": {
+        "code": 0,
+        "error_code": 0,
+        "reason": "",
+        "stats": {
+          "row_count": "1"
+        }
+      },
+      "c/HasPartition/missing": {
+        "code": 0,
+        "error_code": 0,
+        "reason": "",
+        "value": false
+      },
+      "c/GetPartitionStatistics/missing": {
+        "code": 200,
+        "error_code": 200,
+        "reason": "missing",
+        "stats": {}
+      },
+      "c/DropPartition/missing": {
+        "code": 200,
+        "error_code": 200,
+        "reason": "missing"
+      },
+      "c/CreatePartition/_default": {
+        "code": 1,
+        "error_code": 1,
+        "reason": "_default"
+      },
+      "c/HasPartition/_default": {
+        "code": 0,
+        "error_code": 0,
+        "reason": "",
+        "value": true
+      },
+      "c/GetPartitionStatistics/_default": {
+        "code": 0,
+        "error_code": 0,
+        "reason": "",
+        "stats": {
+          "row_count": "0"
+        }
+      },
+      "c/DropPartition/_default": {
+        "code": 6,
+        "error_code": 6,
+        "reason": "cannot remove default partition '_default'"
+      },
+      "missing/CreatePartition/p1": {
+        "code": 100,
+        "error_code": 4,
+        "reason": "collection 'missing' does not exist"
+      },
+      "missing/HasPartition/p1": {
+        "code": 100,
+        "error_code": 4,
+        "reason": "collection 'missing' does not exist",
+        "value": false
+      },
+      "missing/GetPartitionStatistics/p1": {
+        "code": 100,
+        "error_code": 4,
+        "reason": "collection 'missing' does not exist",
+        "stats": {}
+      },
+      "missing/CreatePartition/missing": {
+        "code": 100,
+        "error_code": 4,
+        "reason": "collection 'missing' does not exist"
+      },
+      "missing/HasPartition/missing": {
+        "code": 100,
+        "error_code": 4,
+        "reason": "collection 'missing' does not exist",
+        "value": false
+      },
+      "missing/GetPartitionStatistics/missing": {
+        "code": 100,
+        "error_code": 4,
+        "reason": "collection 'missing' does not exist",
+        "stats": {}
+      },
+      "missing/DropPartition/missing": {
+        "code": 100,
+        "error_code": 4,
+        "reason": "collection 'missing' does not exist"
+      },
+      "missing/CreatePartition/_default": {
+        "code": 100,
+        "error_code": 4,
+        "reason": "collection 'missing' does not exist"
+      },
+      "missing/HasPartition/_default": {
+        "code": 100,
+        "error_code": 4,
+        "reason": "collection 'missing' does not exist",
+        "value": false
+      },
+      "missing/GetPartitionStatistics/_default": {
+        "code": 100,
+        "error_code": 4,
+        "reason": "collection 'missing' does not exist",
+        "stats": {}
+      },
+      "missing/DropPartition/_default": {
+        "code": 100,
+        "error_code": 4,
+        "reason": "collection 'missing' does not exist"
+      },
+      "create/new": {
+        "code": 0,
+        "error_code": 0,
+        "reason": ""
+      },
+      "drop/new": {
+        "code": 0,
+        "error_code": 0,
+        "reason": ""
+      },
+      "show/[]": {
+        "code": 0,
+        "error_code": 0,
+        "reason": "",
+        "partitions": [
+          "_default",
+          "p1",
+          "p2"
+        ],
+        "percentages": [
+          100,
+          100,
+          100
+        ]
+      },
+      "count//[]": [
+        {
+          "count(*)": 2
+        }
+      ],
+      "count/id >= 0/[]": [
+        {
+          "count(*)": 2
+        }
+      ],
+      "query/[]": [
+        {
+          "id": 1,
+          "tag": "new"
+        },
+        {
+          "id": 2,
+          "tag": "second"
+        }
+      ],
+      "get/[]": [
+        {
+          "id": 1,
+          "tag": "new"
+        }
+      ],
+      "show/[\"p2\", \"p1\"]": {
+        "code": 0,
+        "error_code": 0,
+        "reason": "",
+        "partitions": [
+          "p1",
+          "p2"
+        ],
+        "percentages": [
+          100,
+          100
+        ]
+      },
+      "count//[\"p2\", \"p1\"]": [
+        {
+          "count(*)": 2
+        }
+      ],
+      "count/id >= 0/[\"p2\", \"p1\"]": [
+        {
+          "count(*)": 2
+        }
+      ],
+      "query/[\"p2\", \"p1\"]": [
+        {
+          "id": 1,
+          "tag": "new"
+        },
+        {
+          "id": 2,
+          "tag": "second"
+        }
+      ],
+      "get/[\"p2\", \"p1\"]": [
+        {
+          "id": 1,
+          "tag": "new"
+        }
+      ],
+      "show/[\"missing\"]": {
+        "code": 0,
+        "error_code": 0,
+        "reason": "",
+        "partitions": [],
+        "percentages": []
+      },
+      "count//[\"missing\"]": [
+        {
+          "count(*)": 2
+        }
+      ],
+      "count/id >= 0/[\"missing\"]": [
+        {
+          "count(*)": 0
+        }
+      ],
+      "query/[\"missing\"]": [],
+      "get/[\"missing\"]": [],
+      "show/[\"p1\", \"p1\"]": {
+        "code": 0,
+        "error_code": 0,
+        "reason": "",
+        "partitions": [
+          "p1"
+        ],
+        "percentages": [
+          100
+        ]
+      },
+      "count//[\"p1\", \"p1\"]": [
+        {
+          "count(*)": 2
+        }
+      ],
+      "count/id >= 0/[\"p1\", \"p1\"]": [
+        {
+          "count(*)": 1
+        }
+      ],
+      "query/[\"p1\", \"p1\"]": [
+        {
+          "id": 1,
+          "tag": "old"
+        }
+      ],
+      "get/[\"p1\", \"p1\"]": [
+        {
+          "id": 1,
+          "tag": "old"
+        }
+      ],
+      "LoadPartitions": {
+        "grpc": "UNIMPLEMENTED",
+        "details": "MilvusLite does not support LoadPartitions: partition-level load is not supported; use load_collection instead"
+      },
+      "ReleasePartitions": {
+        "grpc": "UNIMPLEMENTED",
+        "details": "MilvusLite does not support ReleasePartitions: partition-level release is not supported; use release_collection instead"
+      },
+      "released/show": {
+        "code": 0,
+        "error_code": 0,
+        "reason": "",
+        "partitions": [
+          "_default",
+          "p1",
+          "p2"
+        ],
+        "percentages": [
+          0,
+          0,
+          0
+        ]
+      },
+      "released/count-empty": {
+        "ok": true,
+        "value": [
+          {
+            "count(*)": 2
+          }
+        ]
+      },
+      "released/count-expr": {
+        "ok": false,
+        "type": "MilvusException",
+        "code": 101,
+        "reason": "<MilvusException: (code=101, message=Collection 'c' is in state 'released'; call load() before search/get/query)>"
+      },
+      "released/partition-stats": {
+        "code": 0,
+        "error_code": 0,
+        "reason": "",
+        "stats": {
+          "row_count": "1"
+        }
+      }
+    }
+  }
+}
