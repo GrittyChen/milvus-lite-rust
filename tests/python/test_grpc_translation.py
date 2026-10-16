@@ -737,14 +737,17 @@ def test_search_m1_unsupported(env):
     basic(stub)
     seed(stub)
     unimplemented(stub.Search, search_req(dsl="id + 1 > 0"))
-    unimplemented(stub.Search, search_req(params={"params": '{"radius": 1.0}'}))
+    response = stub.Search(search_req(params={"metric_type": '"L2"', "params": '{"radius": 6, "range_filter": 1}'}))
+    assert status_of(response)[0] == 0
+    assert list(response.results.ids.int_id.data) == [1, 2]
     unimplemented(stub.Search, search_req(params={"group_by_field": "t"}))
     unimplemented(stub.Search, search_req(partition_names=["p"]))
     unimplemented(stub.Search, search_req(params={"timezone": "UTC"}))
     # Python 的 json.loads 能解析、serde_json 不能解析的 params：其中可能有 range search 的参数，
     # 不能像解析失败那样忽略（0004「决策」）。
-    for extra in ["NaN", "Infinity", "-Infinity", "1e999", '"\\ud800"']:
+    for extra in ["NaN", "Infinity", "-Infinity", '"\\ud800"']:
         unimplemented(stub.Search, search_req(params={"params": '{"radius": 2.5, "x": ' + extra + '}'}))
+    assert status_of(stub.Search(search_req(params={"params": '{"radius": 2.5, "x": 1e999}'})))[0] == 0
 
 
 def test_search_result_encoding(env):
@@ -984,17 +987,17 @@ def test_pymilvus_entry_points_remaining_unsupported(env):
     finally:
         iterator.close()
 
-    # search_iterator 的第一批是普通检索（3.x 同样忽略 iterator 参数），结果与 3.x 相同；
-    # 之后各批要用 range search 与过滤表达式，返回 UNIMPLEMENTED。
+    # V1 后续批次经范围检索和主键排除续读；V2 仍按参照回退客户端 V1。
     it = client.search_iterator("q", data=[[1.0, 0.0]], batch_size=10, limit=3)
     assert [h["id"] for h in it.next()] == [0, 1, 2]
     assert len(it.next()) == 0
+    it.close()
     it = client.search_iterator("q", data=[[1.0, 0.0]], batch_size=10, limit=25)
     assert [h["id"] for h in it.next()] == list(range(10))
-    with pytest.raises(grpc.RpcError) as info:
-        it.next()
-    assert info.value.code() == grpc.StatusCode.UNIMPLEMENTED
-    assert info.value.details().startswith(f"MilvusLite does not support range search: {feature}")
+    assert [h["id"] for h in it.next()] == list(range(10, 20))
+    assert [h["id"] for h in it.next()] == list(range(20, 25))
+    assert len(it.next()) == 0
+    it.close()
 
 
 @pytest.mark.parametrize(

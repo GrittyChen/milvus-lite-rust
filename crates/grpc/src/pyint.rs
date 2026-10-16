@@ -216,7 +216,8 @@ fn strip_number(s: &str) -> Option<String> {
 pub(crate) fn float(v: &Value) -> Result<f64, PyError> {
     match v {
         Value::Bool(b) => Ok(if *b { 1.0 } else { 0.0 }),
-        Value::Number(n) => Ok(n.as_f64().unwrap_or(f64::NAN)),
+        // arbitrary_precision 保留了溢出数字文本；JSON 指数溢出是 infinity，整数转浮点溢出则报错。
+        Value::Number(_) => proto_float(v),
         Value::String(s) => float_str(s).ok_or_else(|| {
             PyError::Value(format!("could not convert string to float: {}", py_repr(s)))
         }),

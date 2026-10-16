@@ -1,10 +1,11 @@
 # 0016 Query iterator 与 range search
 
-- 状态：切片 A 已独立评审通过并收口；随后推进切片 B，分区继续延后冻结设计
+- 状态：切片 A、B 均经独立评审通过并收口；分区继续延后冻结设计
 - 日期：2026-10-16
 - 参照：milvus-lite v3.2.1 / `43d1257774e629bc9f66873977ab7c320d5bf5a7`；pymilvus 2.6.17 / 3.0.2
 - 前置：[0014](0014-index-definitions-and-filter-expressions.md)、[0015](0015-nullable-defaults-and-array.md)
 - A 实现证据：[验收记录](../testing/0016-query-iterator-acceptance.md)；负责人独立评审通过（2026-10-16）
+- B 实现证据：[验收记录](../testing/0016-range-search-acceptance.md)；独立评审通过并收口（2026-10-16）
 - 调查：[分区调查](../testing/0016-partition-investigation.md)；工具：[compatibility_audit](../../tests/compatibility_audit/README.md)
 
 ## 依据与切片
@@ -41,7 +42,27 @@ gRPC 只选择引擎读取路线；解析仍在状态锁外，排序、物化与
 
 性能分别测普通读取相对 B3 的回归、较大匹配集的 iterator 首批/完整分页；顺序轮换，逐次校验结果。只评估回归和资源边界；不据此作相对 2.5.1 / 3.x 的加速声明。平台证据分层沿用 0013。
 
+## B：冻结合同
 
-## 下一切片
+当前源码调查显示，3.x 在 range search 时先取有限近邻窗口（至少 `5 × (topk + offset)`），再以公开、尚未舍入的距离过滤；L2 为 `range_filter <= distance < radius`，IP/COSINE 为 `radius < score <= range_filter`。它不是全量范围扫描。以下实测冻结了阈值、缺失/空参数、offset 与客户端 V1 分页；V2 服务端 iterator 继续范围外。
 
-按已确认顺序推进 range search；先冻结候选窗口、公共距离阈值和客户端 V1 真值，再独立实施与验收。
+参照源码及真实服务的 15 组生命周期、1100 项结果在两条 SDK 下逐项相同，冻结为 [range fixture](../../tests/compatibility_audit/fixtures/range_v321.json)。采用以下边界：
+
+1. radius / range_filter 优先取 params 对象中的非 null 值，再回退顶层最后一个同名键；两者均缺失/null 时沿用普通检索，不扩展候选窗。布尔、数值和数值字符串按 Python float 转换。JSON 指数溢出为 infinity，巨大整数转 float 报 code 1；复用 0015 已实现的数字转换。非严格 JSON 容器及其它 0004 已登记的参数差异仍按原范围拒绝或保留，不在本片引入通用 Python JSON 解析器。
+2. 普通过滤和去重完成后，取得最近 `5 × (topk + offset)` 个候选，再做范围判断、截断至 topk + offset，最后跳过正 offset。候选窗不为正时为空。负 topk / 正 offset 也必须保留真实候选窗是否为空，不能因无输出而改变数据过滤的错误优先级。原有非 range 路径保持原样。
+3. 公共距离在 float64 中比较：L2 是内部 float32 开方距离转 float64 后平方，COSINE 是 1 减内部 float32 距离，IP 是内部距离取负。不能拿原始平方距离、余弦相似度或响应中舍入后的 float32 代替。NaN 作为任一有效边界时没有匹配；数据 NaN 也不能通过有效的范围比较。
+4. 上述窗口是参照可观察行为，保留。例如 L2 位置 1..32，topk=1、range_filter=36 时先取最近 5 条后全部被排除，返回空；topk=2 时取最近 10 条，再返回 6、7。不能在扫描阶段提前丢弃范围外点，从而把它变成全量范围检索。
+5. 保持 placeholder → topk → radius → range_filter → group_size → offset → round_decimal 的解码错误顺序；解码失败先于 load，成功解码后 released 仍报 101。过滤路线、度量/维度检查与投影沿用引擎既有顺序，范围判断在排序后、物化和响应舍入前。覆盖多查询的 topks、分数、nullable / ARRAY / 动态字段输出，失败不得返回部分字段。
+6. search_iterator 只接通参照真实支持的客户端 V1；V2 探测沿用不返回 V2 结果字段后的客户端回退。不添加服务端 token、游标、MVCC 或跨 RPC 状态。V1 的 batch=1 宽度归零后取 0.05，最多约 21 次线性探测，可能跨不过较大的距离间隙而提前结束；已在两条 SDK 的真实 3.x 上复现（本例 L2 返回 2/32，batch=7 返回 32/32）。这属于既有客户端算法限制，本片不修改 SDK，不承诺任意数据与批量下 V1 都会遍历全部记录。
+
+实施复用现有 TopK、计算池及读快照：扩展全局候选数，合并后在候选向量上原地保留范围内条目，再物化最终行。引擎新增与协议无关的 SearchRange 输入，普通 SearchRequest 和已有调用方保持兼容。无新锁、module、依赖、存储格式或写入协议。
+
+验收除上述真值与差分外，包含多批计算任务、旧快照、NaN、有限窗反证、两条 SDK 全套、Arrow 15/25 互通、既有故障注入与固定三组统计。性能对照普通 Search 的 A 基线回归，并补充范围检索、客户端 V1 与官方实现的同机结果；每轮校验，平台证据仍按 0013 分层。分区、group_by、rerank/function chain、稀疏向量及真实 ANN 不随本片展开。
+
+### 阈值附近的数值差异（负责人确认）
+
+128 维、seed 1927 的实测中，同一行的 Rust 公共距离为 `90.59801781004353`，3.x 为 `90.59799965532966`；radius 为 `90.5980087326866` 时，命中数量为 19 / 20。这是 SIMD 与 NumPy 求和顺序产生的既有分数误差向范围判断传播，差值 `1.82e-5` 在 0004 的 L2 预算约 `9.06e-4` 内；仅允许分数误差和 topk 截断换位的旧合同未明确授权阈值成员数量差异，因此单独确认后登记。
+
+实现负责人决定沿用既有误差预算，不要求逐位模拟依赖平台 BLAS 的求和，不给服务端范围比较添加 epsilon。对有限分数和有限阈值：以 3.x 的未舍入公共距离 d、相应行的 0004 误差预算 t 为准，只有 `|d - threshold| <= t` 的行允许两端范围资格不同；带外的资格必须一致。半径的开闭比较符、每端按自身未舍入距离严格判断、候选窗和结果上限仍必须正确；这不允许任意漏行，也不扩大分数误差。有限候选窗截断处的并列/近邻换位仍按 0004 原规则。
+
+影响：阈值来自精确浮点值或落在误差带内的 range search，及依赖这些阈值的客户端 V1，可能有成员/数量差异；普通 Query 与标量过滤不受影响。固定 [边界输入](../../tests/compatibility_audit/fixtures/range_boundary_v321.json) 和独立差分用例分别检查两端自身的严格比较，再逐项限制成员差集只能落入原预算；非边界的 1100 项矩阵继续严格比较主键、状态和输出，不因此放宽。

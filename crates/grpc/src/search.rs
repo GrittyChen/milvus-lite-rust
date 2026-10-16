@@ -5,7 +5,9 @@
 use std::collections::HashMap;
 
 use milvus_lite_core::error::py_json_repr;
-use milvus_lite_core::{Compute, EngineError, Metric, QueryVectors, ReadSnapshot, SearchRequest};
+use milvus_lite_core::{
+    Compute, EngineError, Metric, QueryVectors, ReadSnapshot, SearchRange, SearchRequest,
+};
 use prost::Message;
 use serde_json::Value;
 
@@ -29,6 +31,7 @@ pub(crate) struct Parsed {
     anns_field: Option<String>,
     offset: i64,
     round_decimal: i64,
+    range: Option<SearchRange>,
     unsupported: Option<&'static str>,
     expr: String,
 }
@@ -47,9 +50,13 @@ pub(crate) fn search(
     // 3.x 在没有 group_by / range / rerank 的路径上取前 topk + offset 个结果，offset 为正时再跳过 offset 个；
     // 二者之和不为正时结果为空。
     let end = parsed.top_k.saturating_add(parsed.offset).max(0);
-    let skip = parsed.offset.max(0);
+    let mut skip = parsed.offset.max(0);
+    // 负 topk 加正 offset 时结果必为空，但范围候选窗仍须按真实 end 决定是否求值过滤。
+    if parsed.range.is_some() && end < skip {
+        skip = end;
+    }
     let limit = usize::try_from(end.saturating_sub(skip).max(0)).unwrap_or(usize::MAX);
-    let result = c.search_filtered(
+    let result = c.search_filtered_with_range(
         SearchRequest {
             anns_field: parsed.anns_field,
             vectors: parsed.vectors,
@@ -60,6 +67,7 @@ pub(crate) fn search(
         },
         compute,
         &parsed.expr,
+        parsed.range,
     )?;
 
     let schema = c.schema();
@@ -169,14 +177,20 @@ pub(crate) fn parse(req: &svc::SearchRequest) -> Result<Parsed, EngineError> {
         Some(Value::Object(m)) => Some(m),
         _ => None,
     };
-    for key in ["radius", "range_filter"] {
+    let mut range = SearchRange::default();
+    for (key, target) in [
+        ("radius", &mut range.radius),
+        ("range_filter", &mut range.range_filter),
+    ] {
         let value = inner
             .and_then(|m| m.get(key))
             .filter(|v| !v.is_null())
             .or_else(|| raw.get(key).filter(|v| !v.is_null()));
         if let Some(v) = value {
-            pyint::float(v).map_err(|e| EngineError::InvalidArgument(e.message().to_owned()))?;
-            note("range search");
+            *target = Some(
+                pyint::float(v)
+                    .map_err(|e| EngineError::InvalidArgument(e.message().to_owned()))?,
+            );
         }
     }
     if let Some(Value::String(s)) = raw.get("group_by_field")
@@ -223,6 +237,7 @@ pub(crate) fn parse(req: &svc::SearchRequest) -> Result<Parsed, EngineError> {
         anns_field,
         offset,
         round_decimal,
+        range: (range.radius.is_some() || range.range_filter.is_some()).then_some(range),
         unsupported: unsupported_feature,
         expr: req.dsl.clone(),
     })

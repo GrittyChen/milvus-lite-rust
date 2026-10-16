@@ -22,7 +22,7 @@ pub mod schema;
 pub mod storage;
 
 pub use collection::{
-    Collection, GetSnapshot, Hits, LoadState, QueryResult, QueryVectors, ReadSnapshot,
+    Collection, GetSnapshot, Hits, LoadState, QueryResult, QueryVectors, ReadSnapshot, SearchRange,
     SearchRequest, SearchResult,
 };
 pub use compute::{Compute, ComputeError};

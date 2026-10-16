@@ -48,6 +48,24 @@ pub struct SearchRequest {
     pub output_fields: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct SearchRange {
+    pub radius: Option<f64>,
+    pub range_filter: Option<f64>,
+}
+
+impl SearchRange {
+    fn contains(self, metric: Metric, score: f32) -> bool {
+        // 3.x 先将内部 float32 距离转换为公共 float64，再比较范围；响应舍入在此之后。
+        let value = metric.public_f64(score);
+        if metric.higher_is_better() {
+            self.radius.is_none_or(|r| value > r) && self.range_filter.is_none_or(|r| value <= r)
+        } else {
+            self.radius.is_none_or(|r| value < r) && self.range_filter.is_none_or(|r| value >= r)
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Hits {
     /// 与 `rows` 逐行对应的对外分数。
@@ -128,8 +146,18 @@ impl ReadSnapshot {
         compute: &Compute,
         expr: &str,
     ) -> Result<SearchResult> {
+        self.search_filtered_with_range(req, compute, expr, None)
+    }
+
+    pub fn search_filtered_with_range(
+        &self,
+        req: SearchRequest,
+        compute: &Compute,
+        expr: &str,
+        range: Option<SearchRange>,
+    ) -> Result<SearchResult> {
         let rows_per_block = (BLOCK_ELEMS / field_dim(&self.schema.fields[self.vector_pos])).max(1);
-        self.search_filtered_in_blocks(req, compute, rows_per_block, expr)
+        self.search_filtered_in_blocks(req, compute, rows_per_block, expr, range)
     }
 
     fn search_in_blocks(
@@ -138,7 +166,7 @@ impl ReadSnapshot {
         compute: &Compute,
         rows_per_block: usize,
     ) -> Result<SearchResult> {
-        self.search_filtered_in_blocks(req, compute, rows_per_block, "")
+        self.search_filtered_in_blocks(req, compute, rows_per_block, "", None)
     }
 
     fn search_filtered_in_blocks(
@@ -147,6 +175,7 @@ impl ReadSnapshot {
         compute: &Compute,
         rows_per_block: usize,
         expr: &str,
+        range: Option<SearchRange>,
     ) -> Result<SearchResult> {
         let projection = Projection::new(&self.schema, &req.output_fields, ApiKind::Search);
         // 3.x：没有查询向量时在一切检查之前返回空结果。
@@ -181,7 +210,14 @@ impl ReadSnapshot {
         } else {
             Some(crate::filter::Predicate::compile(expr, &self.schema)?)
         };
-        let take = req.limit.saturating_add(req.offset);
+        let range = range.filter(|r| r.radius.is_some() || r.range_filter.is_some());
+        let end = req.limit.saturating_add(req.offset);
+        // 3.x 只在有限近邻窗口内做范围过滤，不能在扫描时提前筛掉范围外候选。
+        let take = if range.is_some() {
+            end.saturating_mul(5)
+        } else {
+            end
+        };
         // 3.x 编译过滤后才处理 topk<=0，但此时不会进入数据求值或数值转换。
         let chunks = if take > 0 {
             self.filtered_chunks_compiled(predicate.as_ref())?
@@ -240,7 +276,11 @@ impl ReadSnapshot {
         let hits = tops
             .into_iter()
             .map(|top| {
-                let ranked = top.finish();
+                let mut ranked = top.finish();
+                if let Some(range) = range {
+                    ranked.retain(|(score, _)| range.contains(metric, *score));
+                    ranked.truncate(end);
+                }
                 let kept = ranked.get(req.offset..).unwrap_or(&[]);
                 let refs: Vec<RowRef> = kept.iter().map(|(_, r)| r.at).collect();
                 Hits {
@@ -3032,6 +3072,38 @@ fn check_loaded(name: &str, state: LoadState, deleted: bool, unusable: bool) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn active_range_rejects_nan_scores_and_nan_bounds() {
+        for metric in [Metric::L2, Metric::Ip, Metric::Cosine] {
+            for range in [
+                SearchRange {
+                    radius: Some(10.),
+                    range_filter: None,
+                },
+                SearchRange {
+                    radius: None,
+                    range_filter: Some(10.),
+                },
+            ] {
+                assert!(!range.contains(metric, f32::NAN));
+            }
+            assert!(
+                !SearchRange {
+                    radius: Some(f64::NAN),
+                    range_filter: None
+                }
+                .contains(metric, 1.)
+            );
+            assert!(
+                !SearchRange {
+                    radius: None,
+                    range_filter: Some(f64::NAN)
+                }
+                .contains(metric, 1.)
+            );
+        }
+    }
 
     #[test]
     fn json_null_probe_matches_parser_and_rejects_non_json_whitespace() {
