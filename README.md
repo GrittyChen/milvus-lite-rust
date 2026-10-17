@@ -78,12 +78,12 @@ finally:
 
 本候选在已发布 rc3 的基础上增加标量 nullable / 默认值、八种标量元素 ARRAY、Query iterator 和 range search / search iterator V1；范围与验收依据见源码树中的 0015、0016 决策。
 
-`0.2.0rc1` 的范围包括基本 CRUD、Upsert/Delete、Flush/关闭重开、FLAT 的 L2/IP/COSINE、标量与动态字段比较、and/or/not、in/not in、LIKE、is null/exists、JSON 与动态字段路径、json_contains/array_contains 系列及 array_length、后台 compaction 与 tombstone 回收，以及下述新增能力。过滤按官方 3.x 的整条表达式路线执行，各路线对缺失值、短路和类型错误的处理不同；范围与参照缺陷见 0014。算术运算、text_match、几何与时间谓词、分区、alias/rename、BM25/function chain、稀疏向量、服务端 iterator V2 等范围外能力保持明确的 UNIMPLEMENTED，不静默忽略条件。官方 3.x 数据互通仍受类型、索引与已登记历史目录限制约束，不宣称兼容它的全部功能。
+`0.2.0rc1` 的范围包括基本 CRUD、Upsert/Delete、Flush/关闭重开、FLAT 的 L2/IP/COSINE、标量与动态字段比较、and/or/not、in/not in、LIKE、is null/exists、JSON 与动态字段路径、json_contains/array_contains 系列及 array_length、后台 compaction 与 tombstone 回收，以及下述新增能力。过滤按官方 3.x 的整条表达式路线执行，各路线对缺失值、短路和类型错误的处理不同；范围与参照缺陷见 0014。算术运算、text_match、几何与时间谓词、分区、alias/rename、BM25/function chain、稀疏向量等范围外能力保持明确的 UNIMPLEMENTED，不静默忽略条件。官方 3.x 数据互通仍受类型、索引与已登记历史目录限制约束，不宣称兼容它的全部功能。
 
 - nullable / 默认值支持 BOOL、INT8/16/32/64、FLOAT/DOUBLE、VARCHAR、JSON；主键与向量的 nullable 仍不支持。
 - ARRAY 支持 BOOL、INT8/16/32/64、FLOAT/DOUBLE、VARCHAR 元素及父列 null；不支持嵌套、JSON 或向量元素。存量数组中的元素 null 可保留，但经 Query/Search 投影时报错，与参照实现一致。
 - Query iterator 按 INT64 / VARCHAR 主键排序，每个请求取得独立快照；不提供跨请求的一致性快照。
-- range search 沿用 3.x 的有限候选窗口，不是全量范围扫描；阈值附近可能出现已登记浮点误差范围内的成员差异。Search iterator 仅支持 SDK 的 V1 路线，其探测算法在部分批量和数据分布下可能提前结束，不保证任意场景都遍历全部数据。
+- range search 沿用 3.x 的有限候选窗口，不是全量范围扫描；阈值附近可能出现已登记浮点误差范围内的成员差异。服务端不实现 Search iterator V2，会忽略 V2 探测参数并返回不含 V2 结果字段的普通 Search 结果；SDK 据此自动回退 V1，与官方 3.x 一致。V1 的探测算法在部分批量和数据分布下可能提前结束，不保证任意场景都遍历全部数据。
 
 新能力沿用 3.x 的 schema.json、Arrow WAL 和 Parquet 编码，不增加私有格式。已发布 rc1–rc3 不支持新增的 schema 属性，回退时会明确拒绝相应 collection；升级与回退的具体范围见源码树中的 0015 验收记录。
 
