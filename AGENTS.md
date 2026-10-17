@@ -64,6 +64,7 @@
 | 标量 nullable、默认值与 ARRAY；向量 nullable 延后、真值矩阵与前后兼容（A、B 均评审通过并收口；新功能进入 0.2.0 开发线） | [0015](docs/decisions/0015-nullable-defaults-and-array.md)、[调查记录](docs/testing/0015-schema-investigation.md)、[A 验收](docs/testing/0015-scalar-nullable-acceptance.md)、[修复记录](docs/testing/0015-scalar-nullable-review-fixes.md)、[JSON 写入专项](docs/testing/0015-json-write-regression.md)、[B 验收](docs/testing/0015-array-acceptance.md) |
 | Query iterator / range search（A、B 均已独立评审收口）、分区调查结论及冻结边界 | [0016](docs/decisions/0016-query-iteration-and-range-search.md) |
 | 0015／0016 冻结提交的跨平台开发验收、平台证据边界与 SDK 临时端口复用的缓存隔离 | [跨平台验收](docs/testing/0015-0016-cross-platform-acceptance.md) |
+| 0.2.0rc1 候选范围、版本冻结与发行说明草案（最终产物验收后再决定 tag／发布） | [0013](docs/decisions/0013-first-release-platform-and-packaging.md#首发候选矩阵)、[发行说明](docs/releases/0.2.0rc1.md) |
 | 性能基线怎么测 / 口径 / 注意事项 | [benchmarks/baseline/README.md](benchmarks/baseline/README.md) |
 | 代码审查 / 修复复审（冻结合同、完整调用链、同类全域清扫、分级与证据门槛、二三阶影响矩阵） | [code-review-rules](.agents/skills/code-review-rules/SKILL.md)（Claude Code 经 `.claude/skills` 软链读取同一份） |
 

@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/core", "crates/grpc", "crates/py"]
 
 [workspace.package]
-version = "0.1.0-rc.3"
+version = "0.2.0-rc.1"
 edition = "2024"
 # File::try_lock 自 1.89 起稳定，LOCK 的 flock 语义依赖它。
 rust-version = "1.89"
