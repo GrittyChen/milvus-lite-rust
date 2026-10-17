@@ -4,6 +4,8 @@
 
 本记录保留测试隔离提交时的证据。后续产品已改为排空后显式解锁，消除下面描述的正常关闭继承窗口；当前行为以 [0003](../decisions/0003-in-process-server-lifecycle.md#fork) 与 [显式解锁验收](explicit-unlock.md) 为准，完整用例守卫继续保留。
 
+2026-10-17 的两条 Python SDK 线端口复用与 schema 缓存隔离另见[跨平台验收记录](0015-0016-cross-platform-acceptance.md#本轮发现两条-sdk-的跨用例-schema-缓存污染)；它由 [pytest 函数级隔离](../../tests/conftest.py)处理，与本文的 Rust 进程内锁守卫是两个独立边界。
+
 ## 问题与边界
 
 复审方以单线程、默认并行、排除派生子进程用例三组对照定位了偶发 Locked：同一测试二进制中的其他线程派生子进程，可能在 exec 关闭 CLOEXEC 描述符之前保留已关闭数据库的 flock 引用，干扰关闭后的立即重开。已通过六次基线运行不能排除这个短窗口。

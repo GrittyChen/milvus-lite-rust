@@ -63,6 +63,7 @@
 | rc2 之后的索引定义、DropIndex 与过滤表达式切片；删除意图和实施验收矩阵 | [0014](docs/decisions/0014-index-definitions-and-filter-expressions.md) |
 | 标量 nullable、默认值与 ARRAY；向量 nullable 延后、真值矩阵与前后兼容（A、B 均评审通过并收口；新功能进入 0.2.0 开发线） | [0015](docs/decisions/0015-nullable-defaults-and-array.md)、[调查记录](docs/testing/0015-schema-investigation.md)、[A 验收](docs/testing/0015-scalar-nullable-acceptance.md)、[修复记录](docs/testing/0015-scalar-nullable-review-fixes.md)、[JSON 写入专项](docs/testing/0015-json-write-regression.md)、[B 验收](docs/testing/0015-array-acceptance.md) |
 | Query iterator / range search（A、B 均已独立评审收口）、分区调查结论及冻结边界 | [0016](docs/decisions/0016-query-iteration-and-range-search.md) |
+| 0015／0016 冻结提交的跨平台开发验收、平台证据边界与 SDK 临时端口复用的缓存隔离 | [跨平台验收](docs/testing/0015-0016-cross-platform-acceptance.md) |
 | 性能基线怎么测 / 口径 / 注意事项 | [benchmarks/baseline/README.md](benchmarks/baseline/README.md) |
 | 代码审查 / 修复复审（冻结合同、完整调用链、同类全域清扫、分级与证据门槛、二三阶影响矩阵） | [code-review-rules](.agents/skills/code-review-rules/SKILL.md)（Claude Code 经 `.claude/skills` 软链读取同一份） |
 
@@ -191,6 +192,7 @@ cd <work_dir> && MILVUS_LITE_3X_PYTHON=<3.x 的 venv>/bin/python v26/bin/python 
 | Query iterator 首批、全量分页及普通读取回归 | 环境、轮换与命令见 [专项 README](benchmarks/query-iterator/README.md) |
 | JSON 写入回归专项（预序列化 raw RPC / SDK 端到端，逐批校验） | 环境、轮换与命令见 [benchmarks/json-write/README.md](benchmarks/json-write/README.md) |
 | Linux 容器的 LOCK 与 strace 验收 | 环境、非 root 执行与命令见 [tests/platform/README.md](tests/platform/README.md) |
+| 已安装产物的 nullable／ARRAY／iterator／range 联合冒烟 | `<installed-wheel-python> tests/platform/feature_smoke.py --repo <source-root> --work-dir <new-outside-directory>`；见 [平台流程](tests/platform/README.md) |
 
 参照实现侧（生成真值时用，在 [references/milvus-lite/](references/milvus-lite/) 内执行）：
 

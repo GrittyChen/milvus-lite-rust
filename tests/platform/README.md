@@ -2,6 +2,14 @@
 
 范围来自 [0006 第 7/19 项与验收](../../docs/decisions/0006-m2-scope.md#验收)：容器内执行 Rust 默认与故障注入测试、真实 pymilvus 入口、两实现的 LOCK 互斥，以及 Linux strace 的同步/提交/删除顺序。Windows 与真实断电另行验证，不从本记录推断。
 
+0015／0016 的跨平台开发验收见[独立记录](../../docs/testing/0015-0016-cross-platform-acceptance.md)。安装 wheel 后，可在两条 SDK 环境中运行四个切片的联合冒烟：
+
+```bash
+<installed-wheel-python> tests/platform/feature_smoke.py --repo <source-root> --work-dir <new-outside-directory>
+```
+
+探针覆盖标量 null／默认值、ARRAY、Query iterator 的主键顺序、范围检索和 SearchIterator V1，分别在活跃写入、正常关闭重开、显式 Flush、再次重开后核对结果；输出解释器、SDK、原生库与探针哈希。它不代替差分、故障注入或 WAL 崩溃恢复矩阵。Intel Mac 使用 Rosetta 时须在记录中注明，不能写成原生 Intel 通过。
+
 ## 环境与执行
 
 使用 ARM64 Linux 容器时，源码从 `git archive` 复制到容器自己的文件系统；数据、临时目录和构建产物同样位于容器内部，不使用宿主 macOS 的 bind mount。以非 root 用户执行测试，权限位造成的 EACCES 才有效。容器需要 Rust、Python 开发环境、maturin、pytest、pymilvus 和 strace；参考环境安装 `milvus-lite==3.2.1`，Rust 环境不能安装官方 `milvus-lite`。
