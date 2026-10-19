@@ -31,6 +31,7 @@ pub enum MemTableError {
 
 #[derive(Debug, Clone, Copy)]
 struct Entry {
+    partition: u32,
     batch: usize,
     row: usize,
     global_row: usize,
@@ -40,6 +41,7 @@ struct Entry {
 
 #[derive(Debug, Clone, Copy)]
 struct Tombstone {
+    target: Option<u32>,
     seq: u64,
     position: u64,
 }
@@ -50,6 +52,15 @@ pub struct Materialized {
     pub delta: Option<RecordBatch>,
     /// 原 source 行号 → data Parquet 行号；发布时转换有效位图与主键引用。
     pub mapping: Vec<Option<usize>>,
+}
+
+pub struct PartitionBatch {
+    pub data: Option<RecordBatch>,
+    pub delta: Option<RecordBatch>,
+}
+pub struct MaterializedPartitions {
+    pub batches: std::collections::BTreeMap<u32, PartitionBatch>,
+    pub mapping: Vec<Option<(u32, usize)>>,
 }
 
 #[derive(Debug)]
@@ -72,6 +83,17 @@ pub struct FrozenMemTable {
 }
 
 impl FrozenMemTable {
+    pub fn materialize_partitions(
+        &self,
+        schema: &CollectionSchema,
+        known: &[u32],
+    ) -> Result<MaterializedPartitions, MemTableError> {
+        self.memtable
+            .materialize_partitions(schema, &self.live_at_freeze, known)
+    }
+    pub(crate) fn position(&self, pk: &Pk, row: usize) -> Option<u64> {
+        self.memtable.position(pk, row)
+    }
     pub(crate) fn delete_entries(&self) -> impl Iterator<Item = (&Pk, u64)> {
         self.memtable
             .tombstones
@@ -98,6 +120,11 @@ impl FrozenMemTable {
 }
 
 impl MemTable {
+    pub(crate) fn delete_entries(&self) -> impl Iterator<Item = (&Pk, u64)> {
+        self.tombstones
+            .iter()
+            .map(|(pk, tombstone)| (pk, tombstone.seq))
+    }
     pub(crate) fn has_legacy_operations(&self, committed: u64) -> bool {
         self.batches
             .iter()
@@ -161,7 +188,28 @@ impl MemTable {
         decoded: DecodedData,
         visibility: &mut Visibility,
     ) -> Result<(), MemTableError> {
+        self.apply_partition_data(schema, decoded, visibility, &[0])
+    }
+
+    pub fn apply_partition_data(
+        &mut self,
+        schema: &CollectionSchema,
+        decoded: DecodedData,
+        visibility: &mut Visibility,
+        partitions: &[u32],
+    ) -> Result<(), MemTableError> {
         let n = decoded.seqs.len();
+        if partitions.len() != 1 && partitions.len() != n {
+            return Err(MemTableError::Column("partition count".into()));
+        }
+        if !visibility.is_partitioned()
+            && let Some(&part) = partitions.iter().find(|&&part| part != 0)
+        {
+            return Err(
+                crate::storage::visibility::VisibilityError::PartitionModeRequired(part).into(),
+            );
+        }
+        visibility.check_active_source(self.source)?;
         validate_decoded(schema, &decoded)?;
         self.next_position
             .checked_add(u64::try_from(n).map_err(|_| MemTableError::PositionExhausted)?)
@@ -202,11 +250,13 @@ impl MemTable {
                 position
             };
             self.tombstones.remove(&pk);
-            visibility.apply_row(pk.clone(), seq, self.source, global_row)?;
+            let partition = partitions[if partitions.len() == 1 { 0 } else { row }];
+            visibility.apply_partition_row(pk.clone(), seq, self.source, global_row, partition)?;
             self.max_seq = self.max_seq.max(seq);
             self.active.insert(
                 pk,
                 Entry {
+                    partition,
                     batch: batch_index,
                     row,
                     global_row,
@@ -269,8 +319,26 @@ impl MemTable {
         seq: u64,
         visibility: &mut Visibility,
     ) -> Result<(), MemTableError> {
+        self.apply_partition_delete(pks, seq, None, visibility)
+    }
+
+    pub fn apply_partition_delete(
+        &mut self,
+        pks: &[Pk],
+        seq: u64,
+        target: Option<u32>,
+        visibility: &mut Visibility,
+    ) -> Result<(), MemTableError> {
         if pks.is_empty() {
             return Ok(());
+        }
+        visibility.check_active_source(self.source)?;
+        if !visibility.is_partitioned()
+            && let Some(part) = target.filter(|part| *part != 0)
+        {
+            return Err(
+                crate::storage::visibility::VisibilityError::PartitionModeRequired(part).into(),
+            );
         }
         self.next_tombstone_position
             .checked_add(u64::try_from(pks.len()).map_err(|_| MemTableError::PositionExhausted)?)
@@ -295,10 +363,16 @@ impl MemTable {
                 position
             };
             self.active.remove(pk);
-            visibility.apply_delete(pk.clone(), seq)?;
+            visibility.apply_local_delete(self.source, pk.clone(), seq)?;
             self.max_seq = self.max_seq.max(seq);
-            self.tombstones
-                .insert(pk.clone(), Tombstone { seq, position });
+            self.tombstones.insert(
+                pk.clone(),
+                Tombstone {
+                    seq,
+                    position,
+                    target,
+                },
+            );
         }
         Ok(())
     }
@@ -309,6 +383,16 @@ impl MemTable {
         schema: &CollectionSchema,
         live_at_freeze: &VisibilitySnapshot,
     ) -> Result<Materialized, MemTableError> {
+        if self.active.values().any(|entry| entry.partition != 0)
+            || self
+                .tombstones
+                .values()
+                .any(|entry| entry.target.is_some_and(|part| part != 0))
+        {
+            return Err(MemTableError::Column(
+                "non-default partitions require partition materialization".into(),
+            ));
+        }
         let mut active: Vec<_> = self.active.values().collect();
         active.sort_by_key(|entry| entry.position);
         let mut columns: Vec<ColumnData> = schema.fields.iter().map(ColumnData::empty).collect();
@@ -353,7 +437,7 @@ impl MemTable {
             )?)
         };
         let mut tombstones: Vec<_> = self.tombstones.iter().collect();
-        tombstones.sort_by_key(|(_, tombstone)| tombstone.position);
+        tombstones.sort_by_key(|(_, tombstone)| (tombstone.target.is_none(), tombstone.position));
         let delta = if tombstones.is_empty() {
             None
         } else {
@@ -372,6 +456,112 @@ impl MemTable {
             delta,
             mapping,
         })
+    }
+
+    fn materialize_partitions(
+        &self,
+        schema: &CollectionSchema,
+        live: &VisibilitySnapshot,
+        known: &[u32],
+    ) -> Result<MaterializedPartitions, MemTableError> {
+        if !known.contains(&0)
+            || known
+                .iter()
+                .copied()
+                .collect::<std::collections::HashSet<_>>()
+                .len()
+                != known.len()
+        {
+            return Err(MemTableError::Column("invalid frozen partition set".into()));
+        }
+        let mut groups = std::collections::BTreeMap::<u32, Vec<&Entry>>::new();
+        for entry in self.active.values() {
+            match live.is_live(self.source, entry.global_row) {
+                Some(true) => groups.entry(entry.partition).or_default().push(entry),
+                Some(false) => {}
+                None => {
+                    return Err(MemTableError::MissingFrozenRow {
+                        source_id: self.source,
+                        row: entry.global_row,
+                    });
+                }
+            }
+        }
+        let mut mapping = vec![None; self.physical_rows];
+        let mut batches = std::collections::BTreeMap::new();
+        for (partition, mut entries) in groups {
+            if !known.contains(&partition) {
+                return Err(MemTableError::Column("unknown frozen partition".into()));
+            }
+            entries.sort_by_key(|entry| entry.position);
+            let mut columns: Vec<_> = schema.fields.iter().map(ColumnData::empty).collect();
+            let mut seqs = Vec::with_capacity(entries.len());
+            let mut metas = schema.enable_dynamic_field.then(Vec::new);
+            for entry in entries {
+                let batch = &self.batches[entry.batch];
+                let target = seqs.len();
+                seqs.push(entry.seq);
+                mapping[entry.global_row] = Some((partition, target));
+                for (dst, src) in columns.iter_mut().zip(&batch.columns) {
+                    dst.push_row(src, entry.row);
+                }
+                if let Some(metas) = &mut metas {
+                    metas.push(
+                        batch
+                            .meta
+                            .as_ref()
+                            .and_then(|values| values.get(entry.row))
+                            .ok_or(MemTableError::Meta)?
+                            .clone(),
+                    );
+                }
+            }
+            batches.insert(
+                partition,
+                PartitionBatch {
+                    data: Some(arrow_data::data_batch(
+                        schema,
+                        &seqs,
+                        &columns,
+                        metas.as_deref(),
+                    )?),
+                    delta: None,
+                },
+            );
+        }
+        let mut all = Vec::new();
+        let mut explicit = std::collections::BTreeMap::<u32, Vec<(&Pk, &Tombstone)>>::new();
+        for (pk, entry) in &self.tombstones {
+            if let Some(partition) = entry.target {
+                if !known.contains(&partition) {
+                    return Err(MemTableError::Column("unknown delete partition".into()));
+                }
+                explicit.entry(partition).or_default().push((pk, entry));
+            } else {
+                all.push((pk, entry));
+            }
+        }
+        all.sort_by_key(|(_, entry)| entry.position);
+        // 3.x 先输出显式目标，再追加 _all；不能按全局 tombstone 位次混排两组。
+        for &partition in known {
+            let mut entries = explicit.remove(&partition).unwrap_or_default();
+            entries.sort_by_key(|(_, entry)| entry.position);
+            entries.extend(all.iter().copied());
+            if entries.is_empty() {
+                continue;
+            }
+            let pks: Vec<_> = entries.iter().map(|(pk, _)| (*pk).clone()).collect();
+            let seqs: Vec<_> = entries.iter().map(|(_, entry)| entry.seq).collect();
+            let delta = arrow_data::delta_batch(schema, &pks, &seqs)?;
+            batches
+                .entry(partition)
+                .or_insert(PartitionBatch {
+                    data: None,
+                    delta: None,
+                })
+                .delta = Some(delta);
+        }
+        Ok(MaterializedPartitions { batches, mapping })
     }
 }
 
@@ -484,6 +674,7 @@ mod tests {
         mem.active.insert(
             Pk::Int64(2),
             Entry {
+                partition: 0,
                 batch: 1,
                 row: 0,
                 global_row: 1,

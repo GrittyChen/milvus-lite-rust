@@ -54,6 +54,8 @@ pub(crate) fn from_engine(
     let (code, error_code) = match e {
         EngineError::CollectionNotFound(_) => (100, 4),
         EngineError::CollectionAlreadyExists(_) => (1, 1),
+        EngineError::PartitionNotFound(_) => (200, 200),
+        EngineError::PartitionAlreadyExists(_) => (1, 1),
         EngineError::SchemaValidation(_) | EngineError::DatabaseNotFound(_) => (6, 6),
         EngineError::CollectionNotLoaded(_) => (101, 101),
         EngineError::IndexAlreadyExists(_) => (35, 35),
@@ -92,6 +94,9 @@ reply_with_status_field!(
     crate::pb::service::DescribeCollectionResponse,
     crate::pb::service::ShowCollectionsResponse,
     crate::pb::service::GetCollectionStatisticsResponse,
+    crate::pb::service::BoolResponse,
+    crate::pb::service::ShowPartitionsResponse,
+    crate::pb::service::GetPartitionStatisticsResponse,
     crate::pb::service::DescribeIndexResponse,
     crate::pb::service::GetLoadingProgressResponse,
     crate::pb::service::GetLoadStateResponse,

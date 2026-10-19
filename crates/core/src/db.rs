@@ -22,6 +22,21 @@ use crate::index::IndexRequest;
 use crate::schema::CollectionSchema;
 use crate::storage::{fs_commit, recovery, runtime, schema_file::SchemaFile};
 
+#[cfg(feature = "fault-injection")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PartitionPausePoint {
+    Checked,
+    Flushed,
+    BeforeReplace,
+    Published,
+}
+#[cfg(feature = "fault-injection")]
+type PartitionPause = (
+    PartitionPausePoint,
+    std::sync::mpsc::Sender<()>,
+    std::sync::mpsc::Receiver<()>,
+);
+
 /// 每个 collection 一把读写锁：写入互斥、读取并发，仍是「单 collection 单写者」（不变量 7）。
 pub type CollectionHandle = Arc<RwLock<Collection, 5>>;
 
@@ -310,6 +325,8 @@ pub struct Db {
     maintenance: Arc<crate::maintenance::Maintenance>,
     namespace_waiters: AtomicUsize,
     shutdown_failed: AtomicBool,
+    #[cfg(feature = "fault-injection")]
+    partition_pause: Mutex<Option<PartitionPause>>,
 }
 
 /// 关闭闸门（0003「进程退出」第 2、3 步）：关闭后不再接受新任务，在途任务全部结束后才释放 LOCK，
@@ -384,6 +401,8 @@ impl Db {
             maintenance: crate::maintenance::Maintenance::new(),
             namespace_waiters: AtomicUsize::new(0),
             shutdown_failed: AtomicBool::new(false),
+            #[cfg(feature = "fault-injection")]
+            partition_pause: Mutex::new(None),
         });
         db.maintenance.start(Arc::downgrade(&db))?;
         Ok(db)
@@ -1007,17 +1026,351 @@ impl Db {
             .map(|outcome| outcome.pks)
     }
 
+    #[cfg(feature = "fault-injection")]
+    pub fn pause_partition_once(
+        &self,
+        point: PartitionPausePoint,
+        entered: std::sync::mpsc::Sender<()>,
+        resume: std::sync::mpsc::Receiver<()>,
+    ) {
+        *self.partition_pause.lock() = Some((point, entered, resume));
+    }
+
+    #[cfg(feature = "fault-injection")]
+    fn partition_pause(&self, point: PartitionPausePoint) -> Result<()> {
+        let pause = {
+            let mut slot = self.partition_pause.lock();
+            if slot.as_ref().is_some_and(|(wanted, _, _)| *wanted == point) {
+                slot.take()
+            } else {
+                None
+            }
+        };
+        if let Some((_, entered, resume)) = pause {
+            entered.send(()).map_err(storage)?;
+            resume
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .map_err(storage)?;
+        }
+        Ok(())
+    }
+
+    pub fn create_partition(&self, database: &str, name: &str, partition: &str) -> Result<()> {
+        require_database(database)?;
+        let _intent = NamespaceIntent::new(&self.namespace_waiters);
+        let blocked = self.write_gate.write();
+        if *blocked {
+            return Err(storage(
+                "database writes are blocked after an unconfirmed directory change",
+            ));
+        }
+        let _namespace = self.namespace.lock();
+        let handle = checked_read_handle(self.collection_inner(name)?)?;
+        {
+            let collection = handle.read();
+            let p = collection
+                .persistent()
+                .ok_or_else(|| storage("persistent state missing"))?;
+            if p.manifest.partitions.contains_key(partition) {
+                return Err(EngineError::PartitionAlreadyExists(partition.to_owned()));
+            }
+        }
+        if !crate::storage::partition_paths::valid_name(partition) {
+            return Err(EngineError::schema(format!(
+                "invalid partition name: {}",
+                crate::error::py_repr(partition)
+            )));
+        }
+        #[cfg(feature = "fault-injection")]
+        self.partition_pause(PartitionPausePoint::Checked)?;
+        if handle.read().persistent().is_some_and(|p| p.needs_retry()) {
+            self.flush_handle(&handle, false)?;
+        }
+        #[cfg(feature = "fault-injection")]
+        self.partition_pause(PartitionPausePoint::Flushed)?;
+        let lock = handle
+            .read()
+            .persistent()
+            .ok_or_else(|| storage("persistent state missing"))?
+            .flush_lock();
+        let _flush = lock.lock();
+        self.check_partition_index_intent(&handle)?;
+        self.cleanup_partition_files(&handle)?;
+        let (dir, candidate, registry, pins, inherited) = {
+            let mut collection = handle.write();
+            state_change(&mut collection, |collection| {
+                collection.enable_partition_visibility()
+            })?;
+            let p = collection
+                .persistent()
+                .ok_or_else(|| storage("persistent state missing"))?;
+            let mut candidate = p.manifest.clone();
+            candidate
+                .partitions
+                .insert(partition.to_owned(), Default::default());
+            candidate.partition_order.push(partition.to_owned());
+            candidate.version = candidate
+                .version
+                .checked_add(1)
+                .ok_or_else(|| storage("manifest version space exhausted"))?;
+            let mut registry = p.partitions.clone();
+            registry.add(partition).map_err(storage)?;
+            (
+                p.dir.clone(),
+                candidate,
+                registry,
+                p.pinned_files.clone(),
+                p.inherited_synced(),
+            )
+        };
+        let original = handle
+            .read()
+            .persistent()
+            .ok_or_else(|| storage("persistent state missing"))?
+            .manifest
+            .clone();
+        crate::storage::partition_paths::prepare(&dir, &original, &pins, partition)
+            .map_err(storage)?;
+        if !inherited {
+            crate::storage::flush::sync_inherited(&dir, &original).map_err(storage)?;
+            handle
+                .write()
+                .persistent_mut()
+                .ok_or_else(|| storage("persistent state missing"))?
+                .mark_inherited_synced();
+        }
+        let mut prepared = fs_commit::prepare_manifest(&dir, &candidate).map_err(storage)?;
+        #[cfg(feature = "fault-injection")]
+        self.partition_pause(PartitionPausePoint::BeforeReplace)?;
+        handle
+            .read()
+            .persistent()
+            .ok_or_else(|| storage("persistent state missing"))?
+            .validate_partition_commit()
+            .map_err(storage)?;
+        // 独占许可及 flush 锁覆盖提交；磁盘 rename/fsync 不挡住读取旧快照。
+        let committed = prepared.replace();
+        let mut collection = handle.write();
+        let result = state_change(&mut collection, |collection| {
+            collection
+                .persistent_mut()
+                .ok_or_else(|| storage("persistent state missing"))?
+                .publish_partition_manifest(candidate, registry, committed)
+                .map_err(storage)
+        });
+        drop(collection);
+        #[cfg(feature = "fault-injection")]
+        self.partition_pause(PartitionPausePoint::Published)?;
+        result
+    }
+
+    pub fn drop_partition(&self, database: &str, name: &str, partition: &str) -> Result<()> {
+        require_database(database)?;
+        let _intent = NamespaceIntent::new(&self.namespace_waiters);
+        let blocked = self.write_gate.write();
+        if *blocked {
+            return Err(storage(
+                "database writes are blocked after an unconfirmed directory change",
+            ));
+        }
+        let _namespace = self.namespace.lock();
+        let handle = checked_read_handle(self.collection_inner(name)?)?;
+        if !handle
+            .read()
+            .persistent()
+            .is_some_and(|p| p.manifest.partitions.contains_key(partition))
+        {
+            return Err(EngineError::PartitionNotFound(partition.into()));
+        }
+        #[cfg(feature = "fault-injection")]
+        self.partition_pause(PartitionPausePoint::Checked)?;
+        // 参照在拒绝默认分区删除之前也会 Flush 待写数据。
+        self.flush_handle(&handle, true)?;
+        if partition == "_default" {
+            return Err(EngineError::schema(
+                "cannot remove default partition '_default'",
+            ));
+        }
+        let recovered_wal = {
+            let mut collection = handle.write();
+            let retained = collection
+                .persistent()
+                .ok_or_else(|| storage("persistent state missing"))?
+                .retained_old_wal();
+            if retained {
+                // 恢复可滤掉全部已提交行；移除分区前仍须发布空恢复代并排空旧 WAL。
+                state_change(&mut collection, |collection| {
+                    collection
+                        .persistent_mut()
+                        .ok_or_else(|| storage("persistent state missing"))?
+                        .freeze_active(true)
+                        .map_err(storage)
+                })?;
+            }
+            retained
+        };
+        if recovered_wal {
+            self.flush_handle(&handle, false)?;
+        }
+        #[cfg(feature = "fault-injection")]
+        self.partition_pause(PartitionPausePoint::Flushed)?;
+        let lock = handle
+            .read()
+            .persistent()
+            .ok_or_else(|| storage("persistent state missing"))?
+            .flush_lock();
+        let _flush = lock.lock();
+        self.check_partition_index_intent(&handle)?;
+        let (dir, old, pins, mut registry, id, inherited) = {
+            let c = handle.read();
+            let p = c
+                .persistent()
+                .ok_or_else(|| storage("persistent state missing"))?;
+            (
+                p.dir.clone(),
+                p.manifest.clone(),
+                p.pinned_files.clone(),
+                p.partitions.clone(),
+                p.partitions
+                    .id(partition)
+                    .ok_or_else(|| storage("partition identifier missing"))?,
+                p.inherited_synced(),
+            )
+        };
+        crate::storage::partition_paths::validate(&dir, &old, &pins, None).map_err(storage)?;
+        if !inherited {
+            crate::storage::flush::sync_inherited(&dir, &old).map_err(storage)?;
+        }
+        let candidate = crate::storage::partition_drop::prepare(&dir, &old, &pins, partition)
+            .map_err(storage)?;
+        registry.remove(partition).map_err(storage)?;
+        let mut prepared = fs_commit::prepare_manifest(&dir, &candidate).map_err(storage)?;
+        #[cfg(feature = "fault-injection")]
+        self.partition_pause(PartitionPausePoint::BeforeReplace)?;
+        handle
+            .read()
+            .persistent()
+            .ok_or_else(|| storage("persistent state missing"))?
+            .validate_partition_commit()
+            .map_err(storage)?;
+        // 独占许可及 flush 锁覆盖提交；磁盘 rename/fsync 不挡住读取旧快照。
+        let committed = prepared.replace();
+        let mut c = handle.write();
+        let publication = state_change(&mut c, |c| {
+            let p = c
+                .persistent_mut()
+                .ok_or_else(|| storage("persistent state missing"))?;
+            let result = p
+                .publish_partition_manifest(candidate, registry, committed)
+                .map_err(storage);
+            // replace 后的 fsync 错误已发布新 manifest，必须同步内存而非保留旧分区。
+            if !p.manifest.partitions.contains_key(partition)
+                && let Err(error) = c.publish_partition_drop(partition, id)
+            {
+                c.persistent_mut()
+                    .ok_or_else(|| storage("persistent state missing"))?
+                    .poison();
+                return Err(error);
+            }
+            result
+        });
+        drop(c);
+        #[cfg(feature = "fault-injection")]
+        self.partition_pause(PartitionPausePoint::Published)?;
+
+        publication?;
+        self.cleanup_partition_files(&handle)?;
+        Ok(())
+    }
+
+    fn cleanup_partition_files(&self, handle: &CollectionHandle) -> Result<()> {
+        let state = {
+            let c = handle.read();
+            let p = c
+                .persistent()
+                .ok_or_else(|| storage("persistent state missing"))?;
+            if !p.partition_cleanup || p.retry_manifest() || p.poisoned() {
+                return Ok(());
+            }
+            (p.dir.clone(), p.manifest.clone(), p.pinned_files.clone())
+        };
+        let warnings =
+            recovery::cleanup_unreferenced(&state.0, &state.1, &state.2).map_err(recovery_error)?;
+        let complete = warnings.is_empty();
+        for warning in warnings {
+            eprintln!("{warning}");
+        }
+        handle
+            .write()
+            .persistent_mut()
+            .ok_or_else(|| storage("persistent state missing"))?
+            .partition_cleanup = !complete;
+        Ok(())
+    }
+
+    // 调用者持有命名空间许可及 flush 锁；索引删除意图必须先完成或封锁后续文件清理。
+    fn check_partition_index_intent(&self, handle: &CollectionHandle) -> Result<()> {
+        let (dir, mut intent) = {
+            let c = handle.read();
+            let p = c
+                .persistent()
+                .ok_or_else(|| storage("persistent state missing"))?;
+            (p.dir.clone(), p.index_intent.clone())
+        };
+        let result = intent.check(&dir).map_err(EngineError::invalid);
+        handle
+            .write()
+            .persistent_mut()
+            .ok_or_else(|| storage("persistent state missing"))?
+            .index_intent = intent;
+        result
+    }
+
+    pub fn has_partition(&self, database: &str, name: &str, partition: &str) -> Result<bool> {
+        let handle = self.collection(database, name)?;
+        let collection = handle.read();
+        Ok(collection
+            .persistent()
+            .map_or(partition == "_default", |p| {
+                p.manifest.partitions.contains_key(partition)
+            }))
+    }
+
+    pub fn list_partitions(&self, database: &str, name: &str) -> Result<(Vec<String>, LoadState)> {
+        let handle = self.collection(database, name)?;
+        let collection = handle.read();
+        let names = collection.persistent().map_or_else(
+            || vec!["_default".into()],
+            |p| p.manifest.partitions.keys().cloned().collect(),
+        );
+        Ok((names, collection.load_state()))
+    }
+
     pub fn insert_with_pk_type(
         &self,
         database: &str,
         name: &str,
         batch: InsertBatch,
     ) -> Result<InsertOutcome> {
+        self.insert_partition_with_pk_type(database, name, batch, "_default")
+    }
+
+    pub fn insert_partition_with_pk_type(
+        &self,
+        database: &str,
+        name: &str,
+        batch: InsertBatch,
+        partition: &str,
+    ) -> Result<InsertOutcome> {
         self.mutate(database, name, |collection| {
             let varchar = collection.schema().fields.iter().any(|field| {
                 field.is_primary && field.data_type == crate::schema::DataType::VarChar
             });
-            let pks = collection.insert_from_db(batch)?;
+            let pks = if matches!(partition, "" | "_default") {
+                collection.insert_from_db(batch)?
+            } else {
+                collection.insert_partition_from_db(batch, partition)?
+            };
             Ok(InsertOutcome { pks, varchar })
         })
     }
@@ -1032,11 +1385,21 @@ impl Db {
         name: &str,
         batch: InsertBatch,
     ) -> Result<InsertOutcome> {
+        self.upsert_partition_with_pk_type(database, name, batch, "_default")
+    }
+
+    pub fn upsert_partition_with_pk_type(
+        &self,
+        database: &str,
+        name: &str,
+        batch: InsertBatch,
+        partition: &str,
+    ) -> Result<InsertOutcome> {
         self.mutate(database, name, |collection| {
             let varchar = collection.schema().fields.iter().any(|field| {
                 field.is_primary && field.data_type == crate::schema::DataType::VarChar
             });
-            let pks = collection.upsert_from_db(batch)?;
+            let pks = collection.upsert_partition_from_db(batch, partition)?;
             Ok(InsertOutcome { pks, varchar })
         })
     }
@@ -1071,7 +1434,11 @@ impl Db {
                 self.flush_handle(&handle, false)?;
                 continue;
             }
-            break collection.read_snapshot();
+            break if partition.is_empty() {
+                collection.read_snapshot()
+            } else {
+                collection.read_named_snapshot(&[partition.into()])?
+            };
         };
         let pk = snapshot
             .schema()
@@ -1084,13 +1451,10 @@ impl Db {
         let literals = parsed.primary_keys(&pk.name);
         if let Some(literals) = literals {
             return self.mutate_handle(&handle, name, |collection| {
-                if !literals.is_empty() && !matches!(partition, "" | "_default") {
-                    return Err(EngineError::unsupported(
-                        "partitions other than '_default'",
-                        "",
-                    ));
-                }
-                Ok((collection.delete_literals_from_db(&literals)?, varchar))
+                Ok((
+                    collection.delete_partition_literals_from_db(&literals, partition)?,
+                    varchar,
+                ))
             });
         }
         let pks = snapshot.query_for_delete(&parsed)?;
@@ -1100,15 +1464,9 @@ impl Db {
                 pause();
             }
         });
-        if !pks.is_empty() && !matches!(partition, "" | "_default") {
-            return Err(EngineError::unsupported(
-                "partitions other than '_default'",
-                "",
-            ));
-        }
         // 与 3.x 的 query → delete 相同：之后写入的同主键新版本也会被删除；不升级共享许可。
         self.mutate_handle(&handle, name, |collection| {
-            collection.delete_from_db(&pks)?;
+            collection.delete_partition_from_db(&pks, partition)?;
             Ok((pks, varchar))
         })
     }
@@ -1429,6 +1787,7 @@ impl Db {
                 })?;
             }
         }
+        self.cleanup_partition_files(handle)?;
         loop {
             let (work, manifest, dir, schema, sync_inherited_files) = {
                 let collection = handle.read();
@@ -1462,14 +1821,23 @@ impl Db {
                     );
                     let mut collection = handle.write();
                     state_change(&mut collection, |collection| {
-                        collection.publish_generation(
-                            &work,
-                            outcome.manifest,
-                            &outcome.mapping,
-                            outcome.data,
-                            outcome.norms,
-                            retry_manifest,
-                        )?;
+                        if let Some(partitioned) = outcome.partitioned {
+                            collection.publish_partitioned_generation(
+                                &work,
+                                outcome.manifest,
+                                partitioned,
+                                retry_manifest,
+                            )?;
+                        } else {
+                            collection.publish_generation(
+                                &work,
+                                outcome.manifest,
+                                &outcome.mapping,
+                                outcome.data,
+                                outcome.norms,
+                                retry_manifest,
+                            )?;
+                        }
                         #[cfg(feature = "fault-injection")]
                         state_panic(StatePanicPoint::Publish);
                         Ok(())
@@ -1687,12 +2055,12 @@ impl Db {
                 .persistent_mut()
                 .ok_or_else(|| storage("persistent state missing"))?
                 .compaction_cleanup
-                .extend(
-                    prepared
-                        .outputs
-                        .iter()
-                        .filter_map(|output| output.relative.as_ref().map(PathBuf::from)),
-                );
+                .extend(prepared.outputs.iter().filter_map(|output| {
+                    output
+                        .relative
+                        .as_ref()
+                        .map(|name| PathBuf::from(&prepared.partition).join(name))
+                }));
         }
         let (candidate, threshold, obsolete, durability_error) = submission?;
         #[cfg(feature = "fault-injection")]
@@ -1785,6 +2153,7 @@ impl Db {
             crate::storage::flush::cleanup_wal(&dir.join("wal"), limit).map_err(storage)?;
         }
         self.cleanup_compaction_files(handle)?;
+        self.cleanup_partition_files(handle)?;
         Ok(true)
     }
 
@@ -1797,18 +2166,25 @@ impl Db {
             if p.retry_manifest() || p.poisoned() {
                 return Ok(());
             }
-            let current = &p.manifest.partitions["_default"];
             let obsolete: Vec<_> = p
                 .compaction_cleanup
                 .iter()
                 .filter(|path| {
-                    path.to_str().is_some_and(|name| {
-                        !current
-                            .data_files
-                            .iter()
-                            .chain(&current.delta_files)
-                            .any(|f| f == name)
-                    })
+                    let mut parts = path.components();
+                    let Some(std::path::Component::Normal(name)) = parts.next() else {
+                        return true;
+                    };
+                    let relative = parts.as_path().to_str();
+                    !name
+                        .to_str()
+                        .and_then(|name| p.manifest.partitions.get(name))
+                        .is_some_and(|files| {
+                            files
+                                .data_files
+                                .iter()
+                                .chain(&files.delta_files)
+                                .any(|f| Some(f.as_str()) == relative)
+                        })
                 })
                 .cloned()
                 .collect();
@@ -2135,9 +2511,6 @@ fn unopened_load_state(dir: &std::path::Path) -> LoadState {
         Ok(manifest) => manifest,
         Err(_) => return LoadState::Released,
     };
-    if manifest.partitions.len() != 1 || !manifest.partitions.contains_key("_default") {
-        return LoadState::Released;
-    }
     if manifest.index_specs.is_empty() {
         LoadState::Loaded
     } else {
@@ -2260,6 +2633,429 @@ mod tests {
     use crate::schema::{DataType, FieldSchema};
 
     #[test]
+    fn named_partition_writes_flush_and_reopen_preserve_both_reinsert_delete_branches() {
+        for committed in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let db = test_db(root.path());
+            db.create_collection("", "c", basic_schema()).unwrap();
+            for name in ["p1", "p2"] {
+                db.create_partition("", "c", name).unwrap();
+            }
+            let batch = |value| InsertBatch {
+                num_rows: 1,
+                columns: vec![
+                    ("id".into(), InputValues::Int(vec![1])),
+                    (
+                        "v".into(),
+                        InputValues::FloatVector {
+                            dim: 2,
+                            values: vec![value, 0.],
+                        },
+                    ),
+                ],
+            };
+            let insert = |part: &str, value| {
+                db.insert_partition_with_pk_type("", "c", batch(value), part)
+                    .unwrap()
+            };
+            insert("p1", 1.);
+            insert("p2", 2.);
+            let handle = db.collection("", "c").unwrap();
+            let count = |part: &str| {
+                let c = handle.read();
+                let ids = c.resolve_partitions(&[part.into()]).unwrap();
+                c.read_partition_snapshot(ids.as_deref())
+                    .unwrap()
+                    .count_filtered("")
+                    .unwrap()
+            };
+            assert_eq!(count("p1"), 0);
+            db.flush_collection("", "c").unwrap();
+            insert("p1", 3.);
+            db.flush_collection("", "c").unwrap();
+            assert_eq!(count("p1"), 1);
+            assert_eq!(count("p2"), 1);
+            assert_eq!(handle.read().count(), 1);
+            db.delete("", "c", &[Pk::Int64(1)]).unwrap();
+            if committed {
+                db.flush_collection("", "c").unwrap();
+            }
+            insert("p2", 4.);
+            assert_eq!(count("p1"), usize::from(!committed));
+            db.close();
+            drop(handle);
+            drop(db);
+            let reopened = test_db(root.path());
+            let handle = reopened.collection("", "c").unwrap();
+            let c = handle.read();
+            let ids = c.resolve_partitions(&["p1".into()]).unwrap();
+            assert_eq!(
+                c.read_partition_snapshot(ids.as_deref())
+                    .unwrap()
+                    .count_filtered("")
+                    .unwrap(),
+                usize::from(!committed)
+            );
+            assert_eq!(
+                c.get(&[Pk::Int64(1)], &["v".into()]).unwrap().rows.fields[0].1,
+                crate::ColumnData::FloatVector {
+                    dim: 2,
+                    values: vec![4., 0.]
+                }
+            );
+            drop(c);
+            reopened.close();
+        }
+    }
+
+    #[test]
+    fn partition_namespace_waits_for_an_existing_shared_write_permit() {
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+        for drop_partition in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let db = test_db(root.path());
+            db.create_collection("", "c", basic_schema()).unwrap();
+            db.create_partition("", "c", "p").unwrap();
+            let (entered_tx, entered_rx) = mpsc::channel();
+            let (resume_tx, resume_rx) = mpsc::channel();
+            let writer_db = Arc::clone(&db);
+            let writer = std::thread::spawn(move || {
+                let _task = writer_db.enter().unwrap();
+                writer_db
+                    .mutate("", "c", |_| {
+                        entered_tx.send(()).unwrap();
+                        resume_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                        Ok(())
+                    })
+                    .unwrap();
+            });
+            entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            let worker_db = Arc::clone(&db);
+            let (done_tx, done_rx) = mpsc::channel();
+            let namespace = std::thread::spawn(move || {
+                let _task = worker_db.enter().unwrap();
+                let result = if drop_partition {
+                    worker_db.drop_partition("", "c", "p")
+                } else {
+                    worker_db.create_partition("", "c", "q")
+                };
+                done_tx.send(result).unwrap();
+            });
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while db.namespace_waiters.load(Ordering::Acquire) == 0 {
+                assert!(
+                    Instant::now() < deadline,
+                    "namespace operation did not enter"
+                );
+                std::thread::yield_now();
+            }
+            // 已观测到命名空间请求，旧写者仍持共享许可，不能在其退出前完成变更。
+            assert!(matches!(done_rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+            resume_tx.send(()).unwrap();
+            writer.join().unwrap();
+            done_rx
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap()
+                .unwrap();
+            namespace.join().unwrap();
+            db.close();
+        }
+    }
+
+    #[test]
+    fn first_partition_activation_keeps_preexisting_frozen_default_generations_correct() {
+        let put = |db: &Db, part: &str, id, value| {
+            db.insert_partition_with_pk_type(
+                "",
+                "c",
+                InsertBatch {
+                    num_rows: 1,
+                    columns: vec![
+                        ("id".into(), InputValues::Int(vec![id])),
+                        (
+                            "v".into(),
+                            InputValues::FloatVector {
+                                dim: 2,
+                                values: vec![value, 0.],
+                            },
+                        ),
+                    ],
+                },
+                part,
+            )
+            .unwrap();
+        };
+        let count = |db: &Db, part: &str| {
+            db.collection("", "c")
+                .unwrap()
+                .read()
+                .count_partition(part)
+                .unwrap()
+        };
+        for frozen_delete in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let db = test_db(root.path());
+            db.create_collection("", "c", basic_schema()).unwrap();
+            put(&db, "_default", 1, 1.);
+            let handle = db.collection("", "c").unwrap();
+            handle
+                .write()
+                .persistent_mut()
+                .unwrap()
+                .freeze_active(false)
+                .unwrap();
+            if frozen_delete {
+                db.delete("", "c", &[Pk::Int64(1)]).unwrap();
+                handle
+                    .write()
+                    .persistent_mut()
+                    .unwrap()
+                    .freeze_active(false)
+                    .unwrap();
+            }
+            let old = handle.read().read_snapshot();
+            db.create_partition("", "c", "p").unwrap();
+            put(&db, "p", 1, 2.);
+            db.flush_collection("", "c").unwrap();
+            assert_eq!(count(&db, "_default"), usize::from(!frozen_delete));
+            assert_eq!(count(&db, "p"), 1);
+            assert_eq!(old.count_filtered("").unwrap(), usize::from(!frozen_delete));
+            db.close();
+            std::mem::drop(handle);
+            std::mem::drop(db);
+            let db = test_db(root.path());
+            assert_eq!(count(&db, "_default"), usize::from(!frozen_delete));
+            assert_eq!(count(&db, "p"), 1);
+            db.close();
+        }
+    }
+
+    #[test]
+    fn partition_drop_unknown_has_no_flush_and_default_flushes_before_rejection() {
+        let root = tempfile::tempdir().unwrap();
+        let db = test_db(root.path());
+        db.create_collection("", "c", basic_schema()).unwrap();
+        db.insert(
+            "",
+            "c",
+            InsertBatch {
+                num_rows: 1,
+                columns: vec![
+                    ("id".into(), InputValues::Int(vec![1])),
+                    (
+                        "v".into(),
+                        InputValues::FloatVector {
+                            dim: 2,
+                            values: vec![1., 0.],
+                        },
+                    ),
+                ],
+            },
+        )
+        .unwrap();
+        let collection = root.path().join("collections/c");
+        let wal_bytes = || {
+            fs::read_dir(collection.join("wal"))
+                .unwrap()
+                .map(|entry| {
+                    let path = entry.unwrap().path();
+                    (
+                        path.file_name().unwrap().to_os_string(),
+                        fs::read(path).unwrap(),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>()
+        };
+        let manifest_bytes = || match fs::read(collection.join("manifest.json")) {
+            Ok(bytes) => Some(bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => panic!("cannot inspect manifest: {error}"),
+        };
+        let before = manifest_bytes();
+        let wal_before = wal_bytes();
+        assert!(matches!(
+            db.drop_partition("", "c", "missing"),
+            Err(EngineError::PartitionNotFound(_))
+        ));
+        assert_eq!(manifest_bytes(), before);
+        assert_eq!(wal_bytes(), wal_before);
+        assert!(
+            matches!(db.drop_partition("","c","_default"),Err(EngineError::SchemaValidation(reason)) if reason=="cannot remove default partition '_default'")
+        );
+        let manifest =
+            crate::storage::manifest::Manifest::read(&collection.join("manifest.json")).unwrap();
+        assert_eq!(manifest.current_seq, 1);
+        assert_eq!(manifest.partitions["_default"].data_files.len(), 1);
+        assert!(wal_bytes().is_empty());
+        db.close();
+        drop(db);
+        let db = test_db(root.path());
+        assert_eq!(db.collection("", "c").unwrap().read().count(), 1);
+        db.close();
+    }
+
+    #[test]
+    fn partition_creation_registers_only_safe_prepared_directories_and_rejects_unowned_files() {
+        let root = tempfile::tempdir().unwrap();
+        let db = test_db(root.path());
+        db.create_collection("", "c", basic_schema()).unwrap();
+        db.create_partition("", "c", "p1").unwrap();
+        assert!(db.has_partition("", "c", "p1").unwrap());
+        assert_eq!(db.list_partitions("", "c").unwrap().0, ["_default", "p1"]);
+        assert!(matches!(
+            db.create_partition("", "c", "p1"),
+            Err(EngineError::PartitionAlreadyExists(_))
+        ));
+        for name in ["", ".", "..", "_all", "../escape", "a/b", "a\\b", "a\0b"] {
+            assert!(matches!(
+                db.create_partition("", "c", name),
+                Err(EngineError::SchemaValidation(_))
+            ));
+            assert!(!db.has_partition("", "c", name).unwrap());
+        }
+        let occupied = root.path().join("collections/c/partitions/occupied");
+        fs::create_dir_all(&occupied).unwrap();
+        fs::write(occupied.join("canary"), b"owned").unwrap();
+        assert!(db.create_partition("", "c", "occupied").is_err());
+        assert!(!db.has_partition("", "c", "occupied").unwrap());
+        assert_eq!(fs::read(occupied.join("canary")).unwrap(), b"owned");
+        db.close();
+    }
+
+    #[test]
+    fn partition_visibility_activation_keeps_real_columns_writes_flush_and_reopen_consistent() {
+        let root = tempfile::tempdir().unwrap();
+        let db = test_db(root.path());
+        db.create_collection("", "c", basic_schema()).unwrap();
+        let batch = |id, value| InsertBatch {
+            num_rows: 1,
+            columns: vec![
+                ("id".into(), InputValues::Int(vec![id])),
+                (
+                    "v".into(),
+                    InputValues::FloatVector {
+                        dim: 2,
+                        values: vec![value, 0.],
+                    },
+                ),
+            ],
+        };
+        db.insert("", "c", batch(1, 1.)).unwrap();
+        db.flush_collection("", "c").unwrap();
+        db.delete("", "c", &[Pk::Int64(1)]).unwrap();
+        db.insert("", "c", batch(1, 3.)).unwrap();
+        let handle = db.collection("", "c").unwrap();
+        handle.write().enable_partition_visibility().unwrap();
+        let old = handle.read().read_partition_snapshot(Some(&[0])).unwrap();
+        assert_eq!(
+            old.query("", &["v".into()], None, 0).unwrap().rows.fields[0].1,
+            crate::ColumnData::FloatVector {
+                dim: 2,
+                values: vec![3., 0.]
+            }
+        );
+        assert_eq!(
+            handle
+                .read()
+                .read_partition_snapshot(Some(&[1]))
+                .unwrap()
+                .count_filtered("")
+                .unwrap(),
+            0
+        );
+        db.insert("", "c", batch(2, 2.)).unwrap();
+        assert_eq!(old.count_filtered("").unwrap(), 1);
+        db.flush_collection("", "c").unwrap();
+        assert_eq!(
+            handle
+                .read()
+                .read_partition_snapshot(None)
+                .unwrap()
+                .count_filtered("")
+                .unwrap(),
+            2
+        );
+        db.delete("", "c", &[Pk::Int64(1)]).unwrap();
+        db.flush_collection("", "c").unwrap();
+        db.insert("", "c", batch(1, 5.)).unwrap();
+        db.flush_collection("", "c").unwrap();
+        assert_eq!(handle.read().count(), 2);
+        db.close();
+        drop(handle);
+        drop(db);
+        let reopened = test_db(root.path());
+        let handle = reopened.collection("", "c").unwrap();
+        assert_eq!(handle.read().count(), 2);
+        assert_eq!(
+            handle
+                .read()
+                .get(&[Pk::Int64(1)], &["v".into()])
+                .unwrap()
+                .rows
+                .fields[0]
+                .1,
+            crate::ColumnData::FloatVector {
+                dim: 2,
+                values: vec![5., 0.]
+            }
+        );
+        reopened.close();
+    }
+
+    #[test]
+    fn failed_or_panicking_partition_index_transfer_blocks_service_and_preserves_wal() {
+        for panic in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let db = test_db(root.path());
+            db.create_collection("", "c", basic_schema()).unwrap();
+            db.insert(
+                "",
+                "c",
+                InsertBatch {
+                    num_rows: 1,
+                    columns: vec![
+                        ("id".into(), InputValues::Int(vec![1])),
+                        (
+                            "v".into(),
+                            InputValues::FloatVector {
+                                dim: 2,
+                                values: vec![1., 0.],
+                            },
+                        ),
+                    ],
+                },
+            )
+            .unwrap();
+            let handle = db.collection("", "c").unwrap();
+            let mut collection = handle.write();
+            let persistent = collection.persistent_mut().unwrap();
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                persistent.rebuild_partition_visibility(|_, _| {
+                    if panic {
+                        panic!("controlled partition index transfer panic");
+                    }
+                    Err("controlled partition index transfer error".into())
+                })
+            }));
+            if panic {
+                assert!(outcome.is_err());
+            } else {
+                assert!(outcome.unwrap().is_err());
+            }
+            assert!(persistent.poisoned());
+            drop(collection);
+            assert!(db.collection("", "c").is_err());
+            db.close();
+            drop(handle);
+            drop(db);
+            let reopened = test_db(root.path());
+            assert_eq!(reopened.collection("", "c").unwrap().read().count(), 1);
+            reopened.close();
+        }
+    }
+
+    #[test]
     fn compaction_cleanup_does_not_delete_a_path_now_referenced_by_flush() {
         let root = tempfile::tempdir().unwrap();
         let db = test_db(root.path());
@@ -2290,7 +3086,9 @@ mod tests {
             let mut collection = handle.write();
             let persistent = collection.persistent_mut().unwrap();
             let relative = persistent.manifest.partitions["_default"].data_files[0].clone();
-            persistent.compaction_cleanup.push(PathBuf::from(&relative));
+            persistent
+                .compaction_cleanup
+                .push(PathBuf::from("_default").join(&relative));
             persistent.dir.join("partitions/_default").join(relative)
         };
         let before = fs::read(&path).unwrap();

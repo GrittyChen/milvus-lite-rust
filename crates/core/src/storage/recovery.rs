@@ -86,6 +86,7 @@ pub enum RecoveryError {
 
 #[derive(Debug)]
 pub struct RecoveredSegment {
+    pub partition: String,
     pub source: SourceId,
     pub relative_path: String,
     pub batches: Vec<DecodedData>,
@@ -96,6 +97,7 @@ pub struct RecoveredCollection {
     pub schema_file: SchemaFile,
     pub schema: CollectionSchema,
     pub manifest: Manifest,
+    pub(crate) partitions: super::partition_paths::Registry,
     pub segments: Vec<RecoveredSegment>,
     pub pinned_files: PinnedFiles,
     pub active_memtable: MemTable,
@@ -113,60 +115,134 @@ pub(crate) fn cleanup_unreferenced(
     manifest: &Manifest,
     pinned: &PinnedFiles,
 ) -> Result<Vec<String>, RecoveryError> {
-    let partition = collection_dir.join("partitions/_default");
-    // 最终子目录即使是真目录，其父级也可能是指向库外的符号链接。
-    for dir in [collection_dir.join("partitions"), partition.clone()] {
-        match fs::symlink_metadata(&dir) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(source) => return Err(RecoveryError::Cleanup { path: dir, source }),
-            Ok(meta) if !meta.file_type().is_dir() => {
+    super::partition_paths::validate(collection_dir, manifest, pinned, None)
+        .map_err(RecoveryError::Unsupported)?;
+    let root = collection_dir.join("partitions");
+    let mut names: BTreeSet<String> = manifest.partitions.keys().cloned().collect();
+    for pins in [&pinned.data, &pinned.delta, &pinned.index] {
+        names.extend(pins.iter().map(|(part, _)| part.clone()));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let mut identities = HashSet::new();
+        for name in &names {
+            match fs::symlink_metadata(root.join(name)) {
+                Ok(meta) => {
+                    identities.insert((meta.dev(), meta.ino()));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(source) => {
+                    return Err(RecoveryError::Cleanup {
+                        path: root.join(name),
+                        source,
+                    });
+                }
+            }
+        }
+        for entry in entries(&root)? {
+            let kind = entry.file_type().map_err(|source| RecoveryError::Cleanup {
+                path: entry.path(),
+                source,
+            })?;
+            if kind.is_symlink() {
                 return Err(RecoveryError::Unsupported(format!(
-                    "orphan scan path {dir:?} is not a directory"
+                    "partition scan entry is a symbolic link: {:?}",
+                    entry.path()
                 )));
             }
-            Ok(_) => {}
+            if !kind.is_dir() {
+                continue;
+            }
+            let meta = entry.metadata().map_err(|source| RecoveryError::Cleanup {
+                path: entry.path(),
+                source,
+            })?;
+            if identities.contains(&(meta.dev(), meta.ino())) {
+                continue;
+            }
+            if let Some(name) = entry.file_name().to_str()
+                && super::partition_paths::valid_name(name)
+            {
+                names.insert(name.to_owned());
+            }
         }
     }
-    let files = &manifest.partitions["_default"];
-    let data_refs: HashSet<PathBuf> = files
-        .data_files
-        .iter()
-        .chain(
-            pinned
-                .data
-                .iter()
-                .filter(|(p, _)| p == "_default")
-                .map(|(_, f)| f),
-        )
-        .map(PathBuf::from)
-        .collect();
-    let delta_refs: HashSet<PathBuf> = files
-        .delta_files
-        .iter()
-        .chain(
-            pinned
-                .delta
-                .iter()
-                .filter(|(p, _)| p == "_default")
-                .map(|(_, f)| f),
-        )
-        .map(PathBuf::from)
-        .collect();
-    let index_refs: HashSet<PathBuf> = pinned
-        .index
-        .iter()
-        .filter(|(p, _)| p == "_default")
-        .map(|(_, f)| PathBuf::from(f))
-        .collect();
-    let valid_stems: HashSet<&str> = data_refs
-        .iter()
-        .filter_map(|path| path.file_stem().and_then(|stem| stem.to_str()))
-        .collect();
     let mut remove = Vec::new();
-    for (kind, refs) in [("data", &data_refs), ("delta", &delta_refs)] {
-        for entry in entries(&partition.join(kind))? {
-            let relative = PathBuf::from(kind).join(entry.file_name());
-            if !refs.contains(&relative)
+    let mut orphan_dirs = Vec::new();
+    for name in names {
+        let partition = root.join(&name);
+        let empty = super::manifest::PartitionFiles::default();
+        let files = manifest.partitions.get(&name).unwrap_or(&empty);
+        let data_refs: HashSet<PathBuf> = files
+            .data_files
+            .iter()
+            .chain(
+                pinned
+                    .data
+                    .iter()
+                    .filter(|(part, _)| part == &name)
+                    .map(|(_, file)| file),
+            )
+            .map(PathBuf::from)
+            .collect();
+        let delta_refs: HashSet<PathBuf> = files
+            .delta_files
+            .iter()
+            .chain(
+                pinned
+                    .delta
+                    .iter()
+                    .filter(|(part, _)| part == &name)
+                    .map(|(_, file)| file),
+            )
+            .map(PathBuf::from)
+            .collect();
+        let index_refs: HashSet<PathBuf> = pinned
+            .index
+            .iter()
+            .filter(|(part, _)| part == &name)
+            .map(|(_, file)| PathBuf::from(file))
+            .collect();
+        let stems: HashSet<&str> = data_refs
+            .iter()
+            .filter_map(|path| path.file_stem().and_then(|stem| stem.to_str()))
+            .collect();
+        for (kind, refs) in [("data", &data_refs), ("delta", &delta_refs)] {
+            for entry in entries(&partition.join(kind))? {
+                let relative = PathBuf::from(kind).join(entry.file_name());
+                // 未登记目录没有可证明的整体所有权，只回收符合存储命名规则的输出；
+                // Create 曾拒绝的不可信残留不能被另一个分区的 Drop 顺带删掉。
+                if !manifest.partitions.contains_key(&name)
+                    && !entry.file_name().to_str().is_some_and(|file| {
+                        file.starts_with(&format!("{kind}_"))
+                            && relative
+                                .to_str()
+                                .is_some_and(|path| super::compaction::sequence_range(path).is_ok())
+                    })
+                {
+                    continue;
+                }
+                if !refs.contains(&relative)
+                    && !entry
+                        .file_type()
+                        .map_err(|source| RecoveryError::Cleanup {
+                            path: entry.path(),
+                            source,
+                        })?
+                        .is_dir()
+                {
+                    remove.push(entry.path());
+                }
+            }
+        }
+        for entry in entries(&partition.join("indexes"))? {
+            let name = entry.file_name();
+            let Some(stem) = name.to_str().and_then(sidecar_source_stem) else {
+                continue;
+            };
+            if !stems.contains(stem)
+                && !index_refs.contains(&PathBuf::from("indexes").join(name))
                 && !entry
                     .file_type()
                     .map_err(|source| RecoveryError::Cleanup {
@@ -178,24 +254,12 @@ pub(crate) fn cleanup_unreferenced(
                 remove.push(entry.path());
             }
         }
-    }
-    for entry in entries(&partition.join("indexes"))? {
-        let name = entry.file_name();
-        let Some(source_stem) = name.to_str().and_then(sidecar_source_stem) else {
-            continue;
-        };
-        let relative = PathBuf::from("indexes").join(&name);
-        if !valid_stems.contains(source_stem)
-            && !index_refs.contains(&relative)
-            && !entry
-                .file_type()
-                .map_err(|source| RecoveryError::Cleanup {
-                    path: entry.path(),
-                    source,
-                })?
-                .is_dir()
+        if !manifest.partitions.contains_key(&name)
+            && ![&pinned.data, &pinned.delta, &pinned.index]
+                .into_iter()
+                .any(|pins| pins.iter().any(|(part, _)| part == &name))
         {
-            remove.push(entry.path());
+            orphan_dirs.push(partition);
         }
     }
     remove.sort();
@@ -211,9 +275,36 @@ pub(crate) fn cleanup_unreferenced(
             warnings.push(format!("cannot remove orphan {path:?}: {error}"));
             continue;
         }
-        changed_dirs.insert(path.parent().unwrap_or(&partition).to_path_buf());
+        changed_dirs.insert(path.parent().unwrap_or(&root).to_path_buf());
+    }
+    for partition in orphan_dirs {
+        for dir in [
+            partition.join("data"),
+            partition.join("delta"),
+            partition.join("indexes"),
+            partition.clone(),
+        ] {
+            match fs::remove_dir(&dir) {
+                Ok(()) => {
+                    if let Some(parent) = dir.parent() {
+                        changed_dirs.insert(parent.to_path_buf());
+                    }
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
+                    ) => {}
+                Err(error) => warnings.push(format!(
+                    "cannot remove orphan partition directory {dir:?}: {error}"
+                )),
+            }
+        }
     }
     for dir in changed_dirs {
+        if orphan_directory_missing(&dir)? {
+            continue;
+        }
         #[cfg(feature = "fault-injection")]
         let synced =
             orphan_cleanup_fault(OrphanCleanupFault::Sync).and_then(|()| fs_commit::sync_dir(&dir));
@@ -226,6 +317,20 @@ pub(crate) fn cleanup_unreferenced(
         }
     }
     Ok(warnings)
+}
+
+fn orphan_directory_missing(path: &Path) -> Result<bool, RecoveryError> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_dir() => Ok(false),
+        Ok(_) => Err(RecoveryError::Unsupported(format!(
+            "cleanup directory is not real: {path:?}"
+        ))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(source) => Err(RecoveryError::Cleanup {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
 }
 
 fn entries(dir: &Path) -> Result<Vec<fs::DirEntry>, RecoveryError> {
@@ -263,15 +368,43 @@ fn sidecar_source_stem(name: &str) -> Option<&str> {
 }
 
 enum WalOperation {
-    Data(DecodedData),
-    Delete(DecodedDelta),
+    Data(DecodedData, arrow_data::PartitionLabels),
+    Delete(DecodedDelta, arrow_data::PartitionLabels),
+}
+
+fn validate_wal_labels(
+    labels: &arrow_data::PartitionLabels,
+    rows: usize,
+    all: bool,
+) -> Result<(), RecoveryError> {
+    let check = |name: &str| {
+        if (all && name == "_all") || super::partition_paths::valid_name(name) {
+            Ok(())
+        } else {
+            Err(RecoveryError::Unsupported(format!(
+                "unsafe WAL partition name {name:?}"
+            )))
+        }
+    };
+    match labels {
+        arrow_data::PartitionLabels::Uniform(name) => check(name),
+        _ => {
+            for row in 0..rows {
+                check(labels.value(row).ok_or_else(|| {
+                    RecoveryError::Unsupported("WAL partition value missing".into())
+                })?)?;
+            }
+            Ok(())
+        }
+    }
 }
 
 fn filter_committed_rows(
     schema: &CollectionSchema,
     batch: DecodedData,
     committed: &Visibility,
-) -> Result<DecodedData, RecoveryError> {
+) -> Result<(DecodedData, Vec<usize>), RecoveryError> {
+    let mut selected = Vec::new();
     let mut seqs = Vec::new();
     let mut columns = schema
         .fields
@@ -287,6 +420,7 @@ fn filter_committed_rows(
         if seg_max.is_some_and(|old| seq <= old) || delta_max.is_some_and(|deleted| seq < deleted) {
             continue;
         }
+        selected.push(row);
         seqs.push(seq);
         for (dst, src) in columns.iter_mut().zip(&batch.columns) {
             dst.push_row(src, row);
@@ -300,11 +434,14 @@ fn filter_committed_rows(
             meta.push(value.clone());
         }
     }
-    Ok(DecodedData {
-        seqs,
-        columns,
-        meta,
-    })
+    Ok((
+        DecodedData {
+            seqs,
+            columns,
+            meta,
+        },
+        selected,
+    ))
 }
 
 /// 不做孤儿清理；任何读取或判定失败时，目录保持原样。
@@ -345,66 +482,82 @@ pub fn load_committed(collection_dir: &Path) -> Result<RecoveredCollection, Reco
             });
         }
     };
-    if manifest.partitions.len() != 1 || !manifest.partitions.contains_key("_default") {
-        return Err(RecoveryError::Unsupported(
-            "non-default partitions".to_owned(),
-        ));
-    }
     let pinned_files = snapshot::load_pins(collection_dir)?;
-    let files = &manifest.partitions["_default"];
-    let partition_dir = collection_dir.join("partitions").join("_default");
-    let mut visibility = Visibility::default();
+    super::partition_paths::validate(collection_dir, &manifest, &pinned_files, None)
+        .map_err(RecoveryError::Unsupported)?;
+    let partitions = super::partition_paths::Registry::from_manifest(&manifest)
+        .map_err(RecoveryError::Unsupported)?;
+    let mut visibility = if manifest.partitions.len() > 1 {
+        Visibility::new_partitioned()
+    } else {
+        Visibility::default()
+    };
     let mut committed_max_seq = 0_u64;
-    let mut segments = Vec::with_capacity(files.data_files.len());
-    for (index, relative_path) in files.data_files.iter().enumerate() {
-        let path = partition_dir.join(relative_path);
-        regular_file(&path)?;
-        let batches = parquet_file::read_all(&path)?;
-        if !batches.iter().any(|batch| batch.num_rows() > 0) {
-            return Err(RecoveryError::EmptyReferencedFile { path, kind: "data" });
-        }
-        let decoded = batches
-            .iter()
-            .map(|batch| arrow_data::decode_data_batch(&schema, batch))
-            .collect::<Result<Vec<_>, _>>()?;
-        let source = SourceId(index as u64 + 1);
-        let row_count = decoded.iter().try_fold(0_usize, |rows, batch| {
-            rows.checked_add(batch.seqs.len()).ok_or_else(|| {
-                RecoveryError::Unsupported(format!("row count overflows in {path:?}"))
-            })
+    let mut segments = Vec::new();
+    for name in &manifest.partition_order {
+        let files = manifest.partitions.get(name).ok_or_else(|| {
+            RecoveryError::Unsupported("partition order references missing partition".into())
         })?;
-        visibility.add_source(source, row_count)?;
-        let mut global_row = 0;
-        for batch in &decoded {
-            for row in 0..batch.seqs.len() {
-                let pk = pk_at(&schema, &batch.columns, row)?;
-                committed_max_seq = committed_max_seq.max(batch.seqs[row]);
-                visibility.apply_row(pk, batch.seqs[row], source, global_row)?;
-                global_row += 1;
+        let partition_dir = collection_dir.join("partitions").join(name);
+        let partition = partitions
+            .id(name)
+            .ok_or_else(|| RecoveryError::Unsupported("partition identifier missing".into()))?;
+        for relative_path in &files.data_files {
+            let path = partition_dir.join(relative_path);
+            regular_file(&path)?;
+            let batches = parquet_file::read_all(&path)?;
+            if !batches.iter().any(|batch| batch.num_rows() > 0) {
+                return Err(RecoveryError::EmptyReferencedFile { path, kind: "data" });
             }
-        }
-        segments.push(RecoveredSegment {
-            source,
-            relative_path: relative_path.clone(),
-            batches: decoded,
-        });
-    }
-    // 数据与 delta 各自可能乱序；位图与主键索引只比较 `_seq`，不依赖文件处理顺序。
-    for relative_path in &files.delta_files {
-        let path = partition_dir.join(relative_path);
-        regular_file(&path)?;
-        let batches = parquet_file::read_all(&path)?;
-        if !batches.iter().any(|batch| batch.num_rows() > 0) {
-            return Err(RecoveryError::EmptyReferencedFile {
-                path,
-                kind: "delta",
+            let decoded = batches
+                .iter()
+                .map(|batch| arrow_data::decode_data_batch(&schema, batch))
+                .collect::<Result<Vec<_>, _>>()?;
+            let source = SourceId(segments.len() as u64 + 1);
+            let row_count = decoded.iter().try_fold(0_usize, |rows, batch| {
+                rows.checked_add(batch.seqs.len()).ok_or_else(|| {
+                    RecoveryError::Unsupported(format!("row count overflows in {path:?}"))
+                })
+            })?;
+            visibility.add_partition_source(source, row_count, partition)?;
+            let mut global_row = 0;
+            for batch in &decoded {
+                for row in 0..batch.seqs.len() {
+                    let pk = pk_at(&schema, &batch.columns, row)?;
+                    committed_max_seq = committed_max_seq.max(batch.seqs[row]);
+                    visibility.apply_partition_row(
+                        pk,
+                        batch.seqs[row],
+                        source,
+                        global_row,
+                        partition,
+                    )?;
+                    global_row += 1;
+                }
+            }
+            segments.push(RecoveredSegment {
+                source,
+                partition: name.clone(),
+                relative_path: relative_path.clone(),
+                batches: decoded,
             });
         }
-        for batch in &batches {
-            let DecodedDelta { pks, seqs } = arrow_data::decode_delta_batch(&schema, batch)?;
-            for (pk, seq) in pks.into_iter().zip(seqs) {
-                committed_max_seq = committed_max_seq.max(seq);
-                visibility.apply_delete(pk, seq)?;
+        for relative_path in &files.delta_files {
+            let path = partition_dir.join(relative_path);
+            regular_file(&path)?;
+            let batches = parquet_file::read_all(&path)?;
+            if !batches.iter().any(|batch| batch.num_rows() > 0) {
+                return Err(RecoveryError::EmptyReferencedFile {
+                    path,
+                    kind: "delta",
+                });
+            }
+            for batch in &batches {
+                let DecodedDelta { pks, seqs } = arrow_data::decode_delta_batch(&schema, batch)?;
+                for (pk, seq) in pks.into_iter().zip(seqs) {
+                    committed_max_seq = committed_max_seq.max(seq);
+                    visibility.apply_delete(pk, seq)?;
+                }
             }
         }
     }
@@ -435,10 +588,12 @@ pub fn load_committed(collection_dir: &Path) -> Result<RecoveredCollection, Reco
                     wal_warnings.push(format!("{path:?}: {reason}"));
                 }
                 for batch in recovered.batches {
-                    let decoded = arrow_data::decode_wal_data_batch(&schema, &batch)?;
+                    let (decoded, labels) =
+                        arrow_data::decode_partitioned_wal_data(&schema, &batch)?;
+                    validate_wal_labels(&labels, decoded.seqs.len(), false)?;
                     retained_old_wal |= decoded.seqs.iter().any(|seq| *seq <= manifest.current_seq);
                     if let Some(&first_seq) = decoded.seqs.first() {
-                        operations.push((first_seq, WalOperation::Data(decoded)));
+                        operations.push((first_seq, WalOperation::Data(decoded, labels)));
                     }
                 }
             }
@@ -449,10 +604,12 @@ pub fn load_committed(collection_dir: &Path) -> Result<RecoveredCollection, Reco
                     wal_warnings.push(format!("{path:?}: {reason}"));
                 }
                 for batch in recovered.batches {
-                    let decoded = arrow_data::decode_wal_delta_batch(&schema, &batch)?;
+                    let (decoded, labels) =
+                        arrow_data::decode_partitioned_wal_delta(&schema, &batch)?;
+                    validate_wal_labels(&labels, decoded.seqs.len(), true)?;
                     retained_old_wal |= decoded.seqs.iter().any(|seq| *seq <= manifest.current_seq);
                     if let Some(&first_seq) = decoded.seqs.first() {
-                        operations.push((first_seq, WalOperation::Delete(decoded)));
+                        operations.push((first_seq, WalOperation::Delete(decoded, labels)));
                     }
                 }
             }
@@ -460,19 +617,68 @@ pub fn load_committed(collection_dir: &Path) -> Result<RecoveredCollection, Reco
             operations.sort_by_key(|(first_seq, _)| *first_seq);
             for (_, operation) in operations {
                 match operation {
-                    WalOperation::Data(decoded) => {
-                        let filtered = filter_committed_rows(&schema, decoded, &committed)?;
+                    WalOperation::Data(decoded, labels) => {
+                        let (filtered, selected) =
+                            filter_committed_rows(&schema, decoded, &committed)?;
                         if !filtered.seqs.is_empty() {
-                            active_memtable.apply_data(&schema, filtered, &mut visibility)?;
+                            let ids = match &labels {
+                                arrow_data::PartitionLabels::Uniform(name) => {
+                                    vec![partitions.id(name).ok_or_else(|| {
+                                        RecoveryError::Unsupported(format!(
+                                            "WAL partition {name:?} is not registered"
+                                        ))
+                                    })?]
+                                }
+                                _ => selected
+                                    .iter()
+                                    .map(|&row| {
+                                        let name = labels.value(row).ok_or_else(|| {
+                                            RecoveryError::Unsupported(
+                                                "WAL partition value missing".into(),
+                                            )
+                                        })?;
+                                        partitions.id(name).ok_or_else(|| {
+                                            RecoveryError::Unsupported(format!(
+                                                "WAL partition {name:?} is not registered"
+                                            ))
+                                        })
+                                    })
+                                    .collect::<Result<Vec<_>, _>>()?,
+                            };
+                            active_memtable.apply_partition_data(
+                                &schema,
+                                filtered,
+                                &mut visibility,
+                                &ids,
+                            )?;
                         }
                     }
-                    WalOperation::Delete(delta) => {
-                        for (pk, seq) in delta.pks.into_iter().zip(delta.seqs) {
+                    WalOperation::Delete(delta, labels) => {
+                        for (row, (pk, seq)) in delta.pks.into_iter().zip(delta.seqs).enumerate() {
                             let seg_max =
                                 committed.latest_data(&pk).map(|loc| loc.seq).unwrap_or(0);
                             let delta_max = committed.latest_delete(&pk).unwrap_or(0);
                             if seq > seg_max.max(delta_max) {
-                                active_memtable.apply_delete(&[pk], seq, &mut visibility)?;
+                                let name = labels.value(row).ok_or_else(|| {
+                                    RecoveryError::Unsupported(
+                                        "WAL delete partition value missing".into(),
+                                    )
+                                })?;
+                                let target = if name == "_all" {
+                                    None
+                                } else {
+                                    Some(partitions.id(name).ok_or_else(|| {
+                                        RecoveryError::Unsupported(format!(
+                                            "WAL delete partition {name:?} is not registered"
+                                        ))
+                                    })?)
+                                };
+                                active_memtable.apply_partition_delete(
+                                    &[pk],
+                                    seq,
+                                    target,
+                                    &mut visibility,
+                                )?;
                             }
                         }
                     }
@@ -490,6 +696,7 @@ pub fn load_committed(collection_dir: &Path) -> Result<RecoveredCollection, Reco
         .ok_or_else(|| RecoveryError::Unsupported("WAL number space exhausted".to_owned()))?
         .max(manifest.active_wal_number.unwrap_or(1));
     Ok(RecoveredCollection {
+        partitions,
         schema_file,
         schema,
         manifest,

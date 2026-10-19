@@ -24,8 +24,30 @@ pub(crate) fn preflight(
     change: &IndexChange,
 ) -> Result<Vec<PathBuf>, String> {
     check_root(dir)?;
+    let pins = snapshot::load_pins(dir).map_err(|e| e.to_string())?;
+    super::partition_paths::validate(dir, manifest, &pins, None)?;
+    let mut partitions: std::collections::BTreeSet<_> =
+        manifest.partitions.keys().cloned().collect();
+    // snapshot 只钉住数据、没有钉住后来生成的索引时，已 Drop 的分区仍须参与侧车清理。
+    for paths in [&pins.data, &pins.delta, &pins.index] {
+        partitions.extend(paths.iter().map(|(name, _)| name.clone()));
+    }
+    let mut files = Vec::new();
+    for partition in partitions {
+        files.extend(preflight_partition(dir, manifest, change, &partition)?);
+    }
+    Ok(files)
+}
+
+fn preflight_partition(
+    dir: &Path,
+    manifest: &Manifest,
+    change: &IndexChange,
+    partition: &str,
+) -> Result<Vec<PathBuf>, String> {
+    check_root(dir)?;
     let mut path = dir.to_owned();
-    for part in ["partitions", "_default", "indexes"] {
+    for part in ["partitions", partition, "indexes"] {
         path.push(part);
         match fs::symlink_metadata(&path) {
             Ok(meta) if meta.file_type().is_dir() => {
@@ -43,11 +65,13 @@ pub(crate) fn preflight(
     let snapshots = snapshot::index_snapshots(dir).map_err(|e| e.to_string())?;
     let pinned: HashSet<_> = snapshots
         .iter()
-        .flat_map(|s| s.index_files.get("_default").into_iter().flatten())
+        .flat_map(|s| s.index_files.get(partition).into_iter().flatten())
         .collect();
-    let stems: HashSet<_> = manifest.partitions["_default"]
-        .data_files
-        .iter()
+    let stems: HashSet<_> = manifest
+        .partitions
+        .get(partition)
+        .into_iter()
+        .flat_map(|files| &files.data_files)
         .filter_map(|name| Path::new(name).file_stem().and_then(|s| s.to_str()))
         .collect();
     let mut entries = fs::read_dir(&path)
@@ -89,7 +113,7 @@ pub(crate) fn preflight(
                 for snap in &snapshots {
                     if !snap
                         .index_files
-                        .get("_default")
+                        .get(partition)
                         .is_some_and(|refs| refs.contains(&relative))
                     {
                         continue;

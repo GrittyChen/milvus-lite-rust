@@ -28,8 +28,14 @@ pub use collection::{
 pub use compute::{Compute, ComputeError};
 pub use data::{ColumnData, InputValues, InsertBatch, META_FIELD, Pk, Rows};
 pub use data_dir::{DataDir, DataDirError};
+#[cfg(feature = "fault-injection")]
+pub use db::PartitionPausePoint;
 pub use db::{CollectionHandle, DEFAULT_DATABASE, Db, InFlight};
 pub use error::{EngineError, Result};
 pub use index::{IndexRequest, IndexSpec, Metric};
 pub use projection::{ApiKind, Projection};
 pub use schema::{CollectionSchema, DataType, FieldSchema};
+#[cfg(feature = "fault-injection")]
+pub use storage::partition_drop::{
+    CopyFault as PartitionCopyFault, inject_copy_fault_once as inject_partition_copy_fault_once,
+};

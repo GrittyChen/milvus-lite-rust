@@ -6,6 +6,10 @@ use crate::data_dir::DataDirError;
 
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
+    #[error("{0}")]
+    PartitionNotFound(String),
+    #[error("{0}")]
+    PartitionAlreadyExists(String),
     /// 3.x `CollectionNotFoundError`。
     #[error("collection {} does not exist", py_repr(.0))]
     CollectionNotFound(String),

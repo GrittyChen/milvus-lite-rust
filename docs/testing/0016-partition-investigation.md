@@ -4,6 +4,8 @@
 - 日期：2026-10-16；调查对象为只读参照 v3.2.1 / `43d1257774e629bc9f66873977ab7c320d5bf5a7`
 - Rust 基线：0015 B3，原生库 SHA256 `283da7afb42a0c9be412f1c3eaba049186e05fd15ed93a09b337d47f7507e7b8`
 - 结论：先按 [0016](../decisions/0016-query-iteration-and-range-search.md) 做 Query iterator，再做 range search；分区需独立确认缺陷处理和存储设计。本轮没有加入分区产品能力
+- 2026-10-17 补充：[0017 原始 RPC / Linux 文件系统补测](0017-partition-design-investigation.md) 已重验本调查真值，并补足下文当时未跑的 raw gRPC 危险名称；[分区设计草案](../decisions/0017-partitions.md) 仍待单独评审。以下保留原调查的时间与证据边界
+- 2026-10-18：0017 设计阶段及原调查工具已独立评审通过；新增 [可见性组件对照](0017-visibility-component.md) 单独验收，不代表产品分区已实现
 
 ## 收益估算
 

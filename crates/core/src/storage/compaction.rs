@@ -28,6 +28,7 @@ static TEMP_NUMBER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone)]
 pub(crate) struct Input {
+    pub partition: String,
     pub relative: String,
     pub source: SourceId,
     pub rank: usize,
@@ -56,6 +57,7 @@ pub(crate) struct Output {
 
 #[derive(Debug)]
 pub(crate) struct Prepared {
+    pub partition: String,
     pub inputs: Vec<Input>,
     pub mapping: Vec<Vec<Option<Target>>>,
     pub outputs: Vec<Output>,
@@ -107,12 +109,32 @@ fn cap(candidates: &[usize], counts: &[usize]) -> Vec<usize> {
 }
 
 pub(crate) fn select(dir: &Path, inputs: Vec<Input>) -> Result<Vec<Input>> {
+    let mut groups = std::collections::BTreeMap::<String, Vec<Input>>::new();
+    for input in inputs {
+        groups
+            .entry(input.partition.clone())
+            .or_default()
+            .push(input);
+    }
+    for inputs in groups.into_values() {
+        let selected = select_partition(dir, inputs)?;
+        if !selected.is_empty() {
+            return Ok(selected);
+        }
+    }
+    Ok(Vec::new())
+}
+
+fn select_partition(dir: &Path, inputs: Vec<Input>) -> Result<Vec<Input>> {
     if inputs.len() < 4 {
         return Ok(Vec::new());
     }
     let mut buckets: [Vec<usize>; 4] = std::array::from_fn(|_| Vec::new());
     for (index, input) in inputs.iter().enumerate() {
-        let path = dir.join("partitions/_default").join(&input.relative);
+        let path = dir
+            .join("partitions")
+            .join(&input.partition)
+            .join(&input.relative);
         let meta = fs::symlink_metadata(&path).map_err(storage)?;
         if !meta.file_type().is_file() {
             return Err(storage("compaction input is not a regular file"));
@@ -203,6 +225,14 @@ pub(crate) fn prepare(
     deletes: &HashMap<Pk, u64>,
     cancelled: impl Fn() -> bool,
 ) -> Result<Prepared> {
+    let partition = inputs
+        .first()
+        .ok_or_else(|| storage("no compaction inputs"))?
+        .partition
+        .clone();
+    if inputs.iter().any(|input| input.partition != partition) {
+        return Err(storage("compaction inputs span partitions"));
+    }
     let pk_pos = schema
         .primary_position()
         .ok_or_else(|| storage("compaction schema has no primary key"))?;
@@ -238,6 +268,7 @@ pub(crate) fn prepare(
     retained.sort_by_key(|r| (r.0, inputs[r.1].rank, r.4));
     let input_rows = inputs.iter().map(Input::rows).sum();
     let mut prepared = Prepared {
+        partition: partition.clone(),
         mapping: inputs
             .iter()
             .map(|input| vec![None; input.rows()])
@@ -287,11 +318,15 @@ pub(crate) fn prepare(
         }
         let batch = arrow_data::data_batch(schema, &data.seqs, &data.columns, data.meta.as_deref())
             .map_err(storage)?;
-        let temp = dir.join("partitions/_default/data").join(format!(
-            ".compaction-{}-{}.tmp",
-            std::process::id(),
-            TEMP_NUMBER.fetch_add(1, Ordering::Relaxed)
-        ));
+        let temp = dir
+            .join("partitions")
+            .join(&partition)
+            .join("data")
+            .join(format!(
+                ".compaction-{}-{}.tmp",
+                std::process::id(),
+                TEMP_NUMBER.fetch_add(1, Ordering::Relaxed)
+            ));
         // write_new 在返回前完成 Parquet 收尾和文件 fsync；提交锁只负责目录与 manifest。
         prepared.outputs.push(Output {
             data,
@@ -326,7 +361,7 @@ pub(crate) fn sequence_range(relative: &str) -> Result<(u64, u64)> {
 }
 
 pub(crate) fn promote(dir: &Path, prepared: &mut Prepared, pins: &PinnedFiles) -> Result<()> {
-    let partition = dir.join("partitions/_default");
+    let partition = dir.join("partitions").join(&prepared.partition);
     for output in &mut prepared.outputs {
         let min = *output
             .data
@@ -348,7 +383,9 @@ pub(crate) fn promote(dir: &Path, prepared: &mut Prepared, pins: &PinnedFiles) -
                 Err(error) => return Err(storage(error)),
             };
             if !exists
-                && !pins.data.contains(&("_default".into(), relative.clone()))
+                && !pins
+                    .data
+                    .contains(&(prepared.partition.clone(), relative.clone()))
                 && !super::flush::has_index_sidecar(
                     &partition.join("data"),
                     path.file_stem()
@@ -389,7 +426,7 @@ pub(crate) fn candidate(
         .ok_or_else(|| storage("manifest version exhausted"))?;
     let files = next
         .partitions
-        .get_mut("_default")
+        .get_mut(&prepared.partition)
         .ok_or_else(|| storage("default partition missing"))?;
     for input in &prepared.inputs {
         if !files.data_files.contains(&input.relative) {
@@ -402,8 +439,12 @@ pub(crate) fn candidate(
             .inputs
             .iter()
             .any(|input| input.relative == *relative);
-        if remove && !pins.data.contains(&("_default".into(), relative.clone())) {
-            obsolete.push(PathBuf::from(relative));
+        if remove
+            && !pins
+                .data
+                .contains(&(prepared.partition.clone(), relative.clone()))
+        {
+            obsolete.push(PathBuf::from(&prepared.partition).join(relative));
         }
         !remove
     });
@@ -415,25 +456,28 @@ pub(crate) fn candidate(
                 .ok_or_else(|| storage("compaction output has no final name"))?,
         );
     }
-    let threshold = files
-        .data_files
-        .iter()
+    let threshold = next
+        .partitions
+        .values()
+        .flat_map(|files| &files.data_files)
         .map(|name| sequence_range(name).map(|range| range.0))
         .collect::<Result<Vec<_>>>()?
         .into_iter()
         .min();
-    let mut delta = Vec::new();
-    for relative in &files.delta_files {
-        let max = sequence_range(relative)?.1;
-        if threshold.is_none_or(|t| max < t)
-            && !pins.delta.contains(&("_default".into(), relative.clone()))
-        {
-            obsolete.push(PathBuf::from(relative));
-        } else {
-            delta.push(relative.clone());
+    for (name, files) in &mut next.partitions {
+        let mut delta = Vec::new();
+        for relative in &files.delta_files {
+            let max = sequence_range(relative)?.1;
+            if threshold.is_none_or(|t| max < t)
+                && !pins.delta.contains(&(name.clone(), relative.clone()))
+            {
+                obsolete.push(PathBuf::from(name).join(relative));
+            } else {
+                delta.push(relative.clone());
+            }
         }
+        files.delta_files = delta;
     }
-    files.delta_files = delta;
     Ok((next, threshold, obsolete))
 }
 
@@ -443,43 +487,97 @@ pub(crate) fn cleanup(
     pins: &PinnedFiles,
     cancelled: impl Fn() -> bool,
 ) -> Result<bool> {
-    let partition = dir.join("partitions/_default");
-    let mut paths: Vec<_> = obsolete.iter().map(|p| partition.join(p)).collect();
-    let index_dir = partition.join("indexes");
-    match fs::symlink_metadata(&index_dir) {
-        Ok(meta) if meta.file_type().is_dir() => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(storage(error)),
-        Ok(_) => {
-            return Err(storage(
-                "compaction index cleanup path is not a regular directory",
-            ));
+    // 清理路径相对 partitions/，必须包含分区名，防止不同分区同名文件混淆。
+    let mut groups = std::collections::BTreeMap::<String, Vec<PathBuf>>::new();
+    for path in obsolete {
+        let mut components = path.components();
+        let Some(std::path::Component::Normal(name)) = components.next() else {
+            return Err(storage("invalid obsolete partition path"));
+        };
+        let name = name
+            .to_str()
+            .ok_or_else(|| storage("invalid partition name"))?;
+        if !super::partition_paths::valid_name(name) {
+            return Err(storage("unsafe partition name"));
         }
+        let relative = components.as_path();
+        if !super::manifest::safe_relative_path(
+            relative
+                .to_str()
+                .ok_or_else(|| storage("invalid obsolete file"))?,
+        ) {
+            return Err(storage("invalid obsolete file"));
+        }
+        groups
+            .entry(name.into())
+            .or_default()
+            .push(relative.to_owned());
     }
-    match fs::read_dir(&index_dir) {
-        Ok(entries) => {
-            for entry in entries {
-                let path = entry.map_err(storage)?.path();
-                let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
-                    continue;
-                };
-                if !name.ends_with(".idx") && !name.ends_with(".sidx") {
-                    continue;
-                }
-                if obsolete.iter().filter(|p| p.starts_with("data")).any(|p| {
-                    p.file_stem()
-                        .and_then(|s| s.to_str())
-                        .is_some_and(|stem| name.starts_with(&format!("{stem}.")))
-                }) && !pins
-                    .index
-                    .contains(&("_default".into(), format!("indexes/{name}")))
-                {
-                    paths.push(path);
+    let mut paths = Vec::new();
+    for (name, obsolete) in groups {
+        let partition = dir.join("partitions").join(&name);
+        let index_dir = partition.join("indexes");
+        // 第一项删除前验证完整目录链，不能跟随链接清理外部文件。
+        for path in [dir.join("partitions"), partition.clone(), index_dir.clone()] {
+            match fs::symlink_metadata(&path) {
+                Ok(meta) if meta.file_type().is_dir() => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(storage(error)),
+                Ok(_) => {
+                    return Err(storage(
+                        "compaction cleanup directory is not a regular directory",
+                    ));
                 }
             }
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(storage(error)),
+        for path in &obsolete {
+            let kind = path
+                .parent()
+                .ok_or_else(|| storage("obsolete file parent missing"))?;
+            match fs::symlink_metadata(partition.join(kind)) {
+                Ok(meta) if meta.file_type().is_dir() => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(storage(error)),
+                Ok(_) => {
+                    return Err(storage(
+                        "compaction cleanup parent is not a regular directory",
+                    ));
+                }
+            }
+            let relative = path
+                .to_str()
+                .ok_or_else(|| storage("invalid obsolete file"))?;
+            if !pins.data.contains(&(name.clone(), relative.into()))
+                && !pins.delta.contains(&(name.clone(), relative.into()))
+            {
+                paths.push(partition.join(path));
+            }
+        }
+        match fs::read_dir(&index_dir) {
+            Ok(entries) => {
+                for entry in entries {
+                    let path = entry.map_err(storage)?.path();
+                    let Some(file) = path.file_name().and_then(|s| s.to_str()) else {
+                        continue;
+                    };
+                    if !file.ends_with(".idx") && !file.ends_with(".sidx") {
+                        continue;
+                    }
+                    if obsolete.iter().filter(|p| p.starts_with("data")).any(|p| {
+                        p.file_stem()
+                            .and_then(|s| s.to_str())
+                            .is_some_and(|stem| file.starts_with(&format!("{stem}.")))
+                    }) && !pins
+                        .index
+                        .contains(&(name.clone(), format!("indexes/{file}")))
+                    {
+                        paths.push(path);
+                    }
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(storage(error)),
+        }
     }
     // 先验证完整集合，类型损坏不触发前半段的破坏性清理。
     for path in &paths {
@@ -521,6 +619,7 @@ mod tests {
         let first = root.path().join("partitions/_default/data/.first.tmp");
         fs::write(&first, b"owned file").unwrap();
         let mut prepared = Prepared {
+            partition: "_default".into(),
             inputs: Vec::new(),
             mapping: Vec::new(),
             input_rows: 2,

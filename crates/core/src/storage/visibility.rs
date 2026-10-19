@@ -5,6 +5,8 @@ use std::sync::Arc;
 
 use crate::data::{Pk, PkMap};
 
+pub mod partitions;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SourceId(pub u64);
 
@@ -129,24 +131,63 @@ impl SourceBits {
             *word &= other;
         }
     }
+
+    pub(crate) fn slice(&self, start: usize, len: usize) -> Option<Self> {
+        if start.checked_add(len)? > self.len {
+            return None;
+        }
+        if start == 0 && len == self.len {
+            return Some(self.clone());
+        }
+        let mut result = Self::new(len);
+        let shift = start % 64;
+        for (index, target) in Arc::make_mut(&mut result.bits).iter_mut().enumerate() {
+            let word = start / 64 + index;
+            *target = self.bits[word] >> shift;
+            if shift != 0 {
+                // 最末字可能没有高侧邻居；不存在的部分仅为有效范围之外的填充位。
+                *target |= self
+                    .bits
+                    .get(word + 1)
+                    .map_or(0, |word| *word << (64 - shift));
+            }
+        }
+        if !len.is_multiple_of(64)
+            && let Some(last) = Arc::make_mut(&mut result.bits).last_mut()
+        {
+            *last &= (1 << (len % 64)) - 1;
+        }
+        Some(result)
+    }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct VisibilitySnapshot {
     sources: BTreeMap<SourceId, SourceBits>,
+    // 单分区零结果省略位图，但仍区分已知源的无效行与未知/越界位置。
+    empty_sources: BTreeMap<SourceId, usize>,
     pub source_order: Vec<SourceId>,
     pub live_count: usize,
 }
 
 impl VisibilitySnapshot {
+    pub(crate) fn source_bits(&self, source: SourceId) -> Option<&SourceBits> {
+        self.sources.get(&source)
+    }
     pub fn is_live(&self, source: SourceId, row: usize) -> Option<bool> {
-        let bits = self.sources.get(&source)?;
-        (row < bits.len).then(|| bits.get(row))
+        if let Some(bits) = self.sources.get(&source) {
+            return (row < bits.len).then(|| bits.get(row));
+        }
+        (row < *self.empty_sources.get(&source)?).then_some(false)
     }
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum VisibilityError {
+    #[error("partition {0} requires partition visibility")]
+    PartitionModeRequired(u32),
+    #[error(transparent)]
+    Partition(#[from] partitions::PartitionVisibilityError),
     #[error("source {0:?} already exists")]
     DuplicateSource(SourceId),
     #[error("source {0:?} does not exist")]
@@ -175,6 +216,7 @@ pub enum VisibilityError {
 
 #[derive(Debug, Default, Clone)]
 pub struct Visibility {
+    partitions: Option<Box<partitions::PartitionVisibility>>,
     sources: BTreeMap<SourceId, SourceBits>,
     source_order: Vec<SourceId>,
     /// 最新的数据行；即使已被 tombstone 隐藏，仍保留它的 `_seq` 以处理乱序回放。
@@ -185,12 +227,179 @@ pub struct Visibility {
 }
 
 impl Visibility {
+    pub(crate) fn new_partitioned() -> Self {
+        Self {
+            partitions: Some(Box::default()),
+            ..Self::default()
+        }
+    }
+    pub(crate) fn add_partition_source(
+        &mut self,
+        id: SourceId,
+        rows: usize,
+        partition: u32,
+    ) -> Result<(), VisibilityError> {
+        if let Some(parts) = self.partitions.as_mut() {
+            return parts
+                .register_source(id, rows, partitions::SourceKind::Immutable(partition))
+                .map_err(Into::into);
+        }
+        if partition != 0 {
+            return Err(VisibilityError::PartitionModeRequired(partition));
+        }
+        self.add_source(id, rows)
+    }
+    pub(crate) fn replace_partition_source(
+        &mut self,
+        old: SourceId,
+        inputs: Vec<(Pk, usize, Option<RowLocation>)>,
+        outputs: &[(SourceId, usize, partitions::SourceKind)],
+        order: &[SourceId],
+    ) -> Result<(), VisibilityError> {
+        let parts = self
+            .partitions
+            .as_mut()
+            .ok_or(VisibilityError::PartitionModeRequired(0))?;
+        parts.commit_deletes(old)?;
+        parts.replace_sources(
+            &[partitions::SourceReplacement {
+                source: old,
+                rows: inputs,
+            }],
+            outputs,
+            order,
+            partitions::Removal::Replace,
+        )?;
+        Ok(())
+    }
+    pub(crate) fn check_active_source(&self, source: SourceId) -> Result<(), VisibilityError> {
+        if let Some(parts) = &self.partitions {
+            parts.check_active(source)?;
+        }
+        Ok(())
+    }
+    pub(crate) fn release_version_index_for_rebuild(&mut self) -> PkMap<RowLocation> {
+        let mut index = std::mem::take(&mut self.latest_data);
+        index.clear();
+        self.latest_delete = HashMap::new();
+        index
+    }
+    pub fn is_partitioned(&self) -> bool {
+        self.partitions.is_some()
+    }
+
+    pub(crate) fn enable_partitions(&mut self, partitions: partitions::PartitionVisibility) {
+        self.sources.clear();
+        self.source_order.clear();
+        self.latest_data = PkMap::default();
+        self.latest_delete = HashMap::new();
+        self.live_count = 0;
+        self.partitions = Some(Box::new(partitions));
+    }
+
+    pub fn selected_snapshot(
+        &self,
+        selected: Option<&[partitions::PartitionId]>,
+    ) -> VisibilitySnapshot {
+        if let Some(parts) = &self.partitions {
+            return parts.snapshot(selected);
+        }
+        let mut snapshot = self.snapshot();
+        if selected.is_some_and(|parts| !parts.contains(&0)) {
+            snapshot.empty_sources = snapshot
+                .sources
+                .iter()
+                .map(|(id, bits)| (*id, bits.len))
+                .collect();
+            snapshot.sources.clear();
+            snapshot.live_count = 0;
+        }
+        snapshot
+    }
+
+    pub(crate) fn freeze_source(&mut self, source: SourceId) -> Result<(), VisibilityError> {
+        if let Some(parts) = self.partitions.as_mut() {
+            parts.freeze(source)?;
+        }
+        Ok(())
+    }
+
+    pub fn apply_local_delete(
+        &mut self,
+        source: SourceId,
+        pk: Pk,
+        seq: u64,
+    ) -> Result<(), VisibilityError> {
+        if let Some(parts) = self.partitions.as_mut() {
+            return parts.delete(source, pk, seq).map_err(Into::into);
+        }
+        self.apply_delete(pk, seq)
+    }
+
+    pub fn apply_partition_row(
+        &mut self,
+        pk: Pk,
+        seq: u64,
+        source: SourceId,
+        row: usize,
+        partition: partitions::PartitionId,
+    ) -> Result<(), VisibilityError> {
+        if let Some(parts) = self.partitions.as_mut() {
+            return parts
+                .insert(
+                    pk,
+                    partitions::PartitionRow {
+                        partition,
+                        location: RowLocation { source, row, seq },
+                    },
+                )
+                .map_err(Into::into);
+        }
+        if partition != 0 {
+            return Err(VisibilityError::PartitionModeRequired(partition));
+        }
+        self.apply_row(pk, seq, source, row)
+    }
+
     pub(crate) fn source_order(&self) -> &[SourceId] {
+        if let Some(parts) = &self.partitions {
+            return &parts.global.source_order;
+        }
         &self.source_order
     }
 
     pub(crate) fn delete_snapshot(&self) -> HashMap<Pk, u64> {
+        if let Some(parts) = &self.partitions {
+            return parts.delete_snapshot();
+        }
         self.latest_delete.clone()
+    }
+
+    pub(crate) fn drop_partition_sources(
+        &mut self,
+        partition: u32,
+        inputs: &[partitions::SourceReplacement],
+    ) -> Result<(), String> {
+        let parts = self
+            .partitions
+            .as_mut()
+            .ok_or("partition visibility missing")?;
+        let removed: HashSet<_> = inputs.iter().map(|input| input.source).collect();
+        let order: Vec<_> = parts
+            .global
+            .source_order
+            .iter()
+            .copied()
+            .filter(|id| !removed.contains(id))
+            .collect();
+        parts
+            .replace_sources(
+                inputs,
+                &[],
+                &order,
+                partitions::Removal::DropPartition(partition),
+            )
+            .map_err(|e| e.to_string())
     }
 
     pub(crate) fn compacted(
@@ -199,6 +408,40 @@ impl Visibility {
         outputs: &[(SourceId, usize)],
         order: Vec<SourceId>,
     ) -> Result<(), String> {
+        if let Some(parts) = &mut self.partitions {
+            let partition = inputs
+                .first()
+                .and_then(|(id, _)| parts.source_partition(*id))
+                .ok_or("compaction partition missing")?;
+            let sources: Vec<_> = inputs
+                .iter()
+                .map(|(source, rows)| partitions::SourceReplacement {
+                    source: *source,
+                    rows: rows
+                        .iter()
+                        .enumerate()
+                        .map(|(row, input)| {
+                            (
+                                input.pk.clone(),
+                                row,
+                                input.target.map(|(source, row)| RowLocation {
+                                    source,
+                                    row,
+                                    seq: input.seq,
+                                }),
+                            )
+                        })
+                        .collect(),
+                })
+                .collect();
+            let outputs: Vec<_> = outputs
+                .iter()
+                .map(|&(source, rows)| (source, rows, partitions::SourceKind::Immutable(partition)))
+                .collect();
+            return parts
+                .replace_sources(&sources, &outputs, &order, partitions::Removal::Replace)
+                .map_err(|error| error.to_string());
+        }
         let removed: HashSet<_> = inputs.iter().map(|(id, _)| *id).collect();
         if removed.len() != inputs.len() {
             return Err("duplicate compaction source".into());
@@ -284,12 +527,35 @@ impl Visibility {
         Ok(())
     }
 
-    pub(crate) fn gc_deletes(&mut self, threshold: Option<u64>, committed: u64) {
+    pub(crate) fn gc_deletes(
+        &mut self,
+        threshold: Option<u64>,
+        committed: u64,
+    ) -> Result<(), String> {
+        if let Some(parts) = self.partitions.as_mut() {
+            return parts
+                .gc_committed_before(threshold)
+                .map_err(|error| error.to_string());
+        }
         self.latest_delete
             .retain(|_, seq| *seq > committed || threshold.is_some_and(|t| *seq >= t));
+        Ok(())
     }
 
     pub fn add_source(&mut self, id: SourceId, rows: usize) -> Result<(), VisibilityError> {
+        if let Some(parts) = self.partitions.as_mut() {
+            return parts
+                .register_source(
+                    id,
+                    rows,
+                    if rows == 0 {
+                        partitions::SourceKind::Active
+                    } else {
+                        partitions::SourceKind::Immutable(0)
+                    },
+                )
+                .map_err(Into::into);
+        }
         if self.sources.contains_key(&id) {
             return Err(VisibilityError::DuplicateSource(id));
         }
@@ -299,6 +565,9 @@ impl Visibility {
     }
 
     pub fn extend_source(&mut self, id: SourceId, new_len: usize) -> Result<(), VisibilityError> {
+        if let Some(parts) = self.partitions.as_mut() {
+            return parts.extend_source(id, new_len).map_err(Into::into);
+        }
         let bits = self.source_mut(id)?;
         if new_len < bits.len {
             return Err(VisibilityError::SourceShrink {
@@ -314,31 +583,61 @@ impl Visibility {
 
     /// 数据源的物理行数，包括已被删除隐藏的行。
     pub(crate) fn source_len(&self, id: SourceId) -> Option<usize> {
+        if let Some(parts) = &self.partitions {
+            return parts.global.sources.get(&id).map(|bits| bits.len);
+        }
         self.sources.get(&id).map(|bits| bits.len)
     }
 
     pub fn snapshot(&self) -> VisibilitySnapshot {
+        if let Some(parts) = &self.partitions {
+            return parts.snapshot(None);
+        }
         VisibilitySnapshot {
             sources: self.sources.clone(),
+            empty_sources: BTreeMap::new(),
             source_order: self.source_order.clone(),
             live_count: self.live_count,
         }
     }
 
+    pub(crate) fn visible_data(&self, pk: &Pk, selected: Option<&[u32]>) -> Option<RowLocation> {
+        if let Some(parts) = &self.partitions {
+            return parts.visible_data(pk, selected);
+        }
+        if selected.is_some_and(|ids| !ids.contains(&0)) {
+            return None;
+        }
+        let at = self.latest_data(pk)?;
+        self.is_live(at.source, at.row)?.then_some(at)
+    }
+
     pub fn latest_data(&self, pk: &Pk) -> Option<RowLocation> {
+        if let Some(parts) = &self.partitions {
+            return parts.latest_data(pk);
+        }
         self.latest_data.get(pk).copied()
     }
 
     pub fn latest_delete(&self, pk: &Pk) -> Option<u64> {
+        if let Some(parts) = &self.partitions {
+            return parts.latest_delete(pk);
+        }
         self.latest_delete.get(pk).copied()
     }
 
     pub fn is_live(&self, source: SourceId, row: usize) -> Option<bool> {
+        if let Some(parts) = &self.partitions {
+            return parts.global.is_live(source, row);
+        }
         let bits = self.sources.get(&source)?;
         (row < bits.len).then(|| bits.get(row))
     }
 
     pub fn live_count(&self) -> usize {
+        if let Some(parts) = &self.partitions {
+            return parts.global.live_count;
+        }
         self.live_count
     }
 
@@ -352,6 +651,53 @@ impl Visibility {
         mapping: &[Option<usize>],
         rows: &[(Pk, usize)],
     ) -> Result<(), VisibilityError> {
+        if let Some(parts) = self.partitions.as_mut() {
+            if mapping.len() != parts.global.sources.get(&old).map_or(0, |bits| bits.len) {
+                return Err(VisibilityError::MappingLength {
+                    source_id: old,
+                    actual: mapping.len(),
+                    expected: parts.global.sources.get(&old).map_or(0, |bits| bits.len),
+                });
+            }
+            let mut source_rows = Vec::with_capacity(rows.len());
+            for (pk, row) in rows {
+                let target = if let Some(target) = mapping.get(*row).copied().flatten() {
+                    let seq = parts.source_row_seq(pk, old, *row).ok_or(
+                        VisibilityError::MissingLiveRow {
+                            source_id: old,
+                            row: *row,
+                        },
+                    )?;
+                    Some(RowLocation {
+                        source: new,
+                        row: target,
+                        seq,
+                    })
+                } else {
+                    None
+                };
+                source_rows.push((pk.clone(), *row, target));
+            }
+            let inputs = [partitions::SourceReplacement {
+                source: old,
+                rows: source_rows,
+            }];
+            let order: Vec<_> = parts
+                .global
+                .source_order
+                .iter()
+                .map(|&id| if id == old { new } else { id })
+                .collect();
+            parts.commit_deletes(old)?;
+            return parts
+                .replace_sources(
+                    &inputs,
+                    &[(new, new_rows, partitions::SourceKind::Immutable(0))],
+                    &order,
+                    partitions::Removal::Replace,
+                )
+                .map_err(Into::into);
+        }
         if self.sources.contains_key(&new) {
             return Err(VisibilityError::DuplicateSource(new));
         }
@@ -427,6 +773,17 @@ impl Visibility {
         source: SourceId,
         row: usize,
     ) -> Result<(), VisibilityError> {
+        if let Some(parts) = self.partitions.as_mut() {
+            return parts
+                .insert(
+                    pk,
+                    partitions::PartitionRow {
+                        partition: 0,
+                        location: RowLocation { source, row, seq },
+                    },
+                )
+                .map_err(Into::into);
+        }
         self.check_row(source, row)?;
         if let Some(old) = self.latest_data.get(&pk)
             && (old.seq > seq || (old.seq == seq && !self.before(source, row, *old)))
@@ -452,6 +809,9 @@ impl Visibility {
     /// 已提交 delta 与数据行同 seq 时数据可见（3.x DeltaIndex.is_deleted 用严格大于）；
     /// 同一 MemTable 内的平局由 MemTable 先按操作顺序拦截。
     pub fn apply_delete(&mut self, pk: Pk, seq: u64) -> Result<(), VisibilityError> {
+        if let Some(parts) = self.partitions.as_mut() {
+            return parts.committed_delete(pk, seq).map_err(Into::into);
+        }
         if self.latest_delete.get(&pk).is_some_and(|old| *old >= seq) {
             return Ok(());
         }
@@ -503,6 +863,31 @@ impl Visibility {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bit_slices_match_physical_ranges_across_word_and_tail_boundaries() {
+        let live: Vec<_> = (0..257).map(|i| i % 7 == 0 || i % 11 == 3).collect();
+        let bits = SourceBits::from_live(&live);
+        for start in 0..=live.len() {
+            for len in [0, 1, 2, 63, 64, 65, 127, 128, 129, 257] {
+                if start + len > live.len() {
+                    assert!(bits.slice(start, len).is_none());
+                    continue;
+                }
+                let sliced = bits.slice(start, len).unwrap();
+                assert_eq!(sliced.len, len);
+                assert_eq!(
+                    sliced.live_rows().collect::<Vec<_>>(),
+                    live[start..start + len]
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(row, &yes)| yes.then_some(row))
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
+        assert!(bits.slice(usize::MAX, 1).is_none());
+    }
 
     #[test]
     fn invalid_known_row_rejects_before_changing_visibility_or_primary_locations() {

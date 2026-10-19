@@ -161,6 +161,7 @@
 - `field_names`、`files` 是非空字符串列表；文件必须是 `partitions/_default/indexes/<侧车文件名>` 形式的合法相对路径，不允许绝对路径或 `..`。标记只记录本次操作，不按它的路径重放删除。`boot_id` 为规范化 UUID 字符串或 null，`boot_source` 为 `linux-kernel-procfs`、`darwin-kern-bootsessionuuid` 或 null；两者须同时有效或同时为 null。`auto_recovery` 为布尔值。只有有效来源、有效 UUID 与可信的缓存边界同时成立，才写 true；否则写 false。null 是明确的未知，不是字段缺失，不用随机 UUID 或空串代替。
 - **Linux 来源**：打开 `/proc/sys/kernel/random/boot_id`，检查 `/proc/self/mountinfo` 排除该文件的单文件覆盖挂载，并对同一 fd 做 `fstatfs`；只有真实 procfs（`PROC_SUPER_MAGIC`）中的合法 UUID 才记为可信来源。普通文件、tmpfs / FUSE 覆盖、读取或检查失败均记为未知。不能以「在容器里」判断可信与否；systemd-nspawn 会用普通文件覆盖此路径，每次容器启动换值。[Linux 定义](https://github.com/torvalds/linux/blob/master/include/uapi/linux/magic.h)、[nspawn 实现](https://github.com/systemd/systemd/blob/main/src/nspawn/nspawn.c)
 - **macOS 来源**：`sysctlbyname("kern.bootsessionuuid")`，读取失败或不是合法 UUID 时记为未知。Linux 与 macOS 来源不能互相比较以证明重启。
+- 0014 的默认分区范围在 [0017](0017-partitions.md#文件与提交协议) 扩展为全部分区：意图路径及缓存边界使用本次实际文件集合，不再要求无关的默认分区索引目录存在。启动来源、文件系统白名单及封锁协议不变。
 - **缓存边界**：自动恢复限于由服务所在内核管理的本地文件系统。本切片保守识别 Linux ext4、XFS、Btrfs，以及 macOS APFS、HFS；collection 与 indexes 所在文件系统都须符合。overlayfs 一律记为不可信，不解析或探测其 upperdir。网络、FUSE、9p、virtiofs 或无法识别的类型同样记为不可信。不可信只关闭自动恢复，不妨碍正常完成删除；删除未确认时按下文人工恢复。虚拟机内的本地文件系统按虚拟机内核判断，共享到宿主机的目录不据虚拟机重启自动解除。
 - 这是独立的持久化安全状态，不能从当前目录扫描重建。同步 0002 时须同时更新格式、互通范围，以及约束 1 中「额外状态可重建」的表述，为本标记明确列出例外。
 

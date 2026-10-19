@@ -127,6 +127,38 @@ partition_truth 的 kind 另有 paths、key、rpc，分别使用不同的外部�
 
 固定 62 条分区样本用 `--selection partitions`；`--mode partition-key` 只移除客户端 is_partition_key 属性。可加 `MLR_AUDIT_PARTITION_TRACE=1` 记录 setup/call/teardown 的分区 API，不记录数据、不更改返回值或异常。反事实结果仍只用于诊断，不能计入兼容性通过数。
 
+## 0017 分区边界补测
+
+[设计草案](../../docs/decisions/0017-partitions.md) 与 [调查记录](../../docs/testing/0017-partition-design-investigation.md) 使用两个新工具。解释器须 CPython 3.12，并安装本地固定参照及依赖；Arrow 15/25 的固定环境准备见 [互通 README](../storage_interop/README.md)。SDK 分别固定 2.6.17 / 3.0.2；不同时安装 Rust 包。脚本和解释器实际导入的参照源码须与 `--reference` 指向同一 checkout，HEAD 为 `43d1257`。源代码只读；数据、日志与输出均在新的仓库外目录。
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 "$AUDIT_REF_PYTHON" tests/compatibility_audit/partition_boundaries.py \
+  --reference "$AUDIT_REF" --work-dir "$AUDIT_WORK/partition-boundaries" \
+  --verify tests/compatibility_audit/fixtures/partition_boundaries_v321.json \
+  --variant mac-alias
+
+PYTHONDONTWRITEBYTECODE=1 "$AUDIT_REF_PYTHON" tests/compatibility_audit/partition_drop_anchor.py \
+  --reference "$AUDIT_REF" --work-dir "$AUDIT_WORK/partition-anchor"
+```
+
+boundary 的 `mac-alias` 变体对应本轮 macOS 大小写及 NFC/NFD 均别名的卷，`linux-distinct` 对应本轮 Linux 两对均独立的卷。Linux 使用后者，数据必须在真实 Linux 文件系统/命名卷，不以宿主 macOS 绑定目录代替。变体还保留两平台超长名字的 errno 差异，因此不能只按操作系统名称推断其它卷也会通过；与两份事实均不同时应保留失败并调查，不自动选另一个或覆盖 fixture。Arrow 15/25、两条 SDK 分目录执行；--verify 只比较现有事实，不改 fixture。
+
+每次 17 组，包含服务端路径穿越、物理别名、符号链接、建目录失败的登记残留及重开前后顺序。每组自己的可丢弃根目录是所有解析路径的硬边界；工具有意允许越出自己创建的 collection，才能观测参照缺陷，但不接受用户已有目录。根路径归一化与 `..` 删除枚举错误的唯一归一化见调查记录；raw 错误仍留在各项日志。异常退出、超时或 fixture 不同都直接失败，无重试。工具不会联网、pip 或进入默认 pytest。
+
+anchor 创建自己的种子，再复制为 control/anchor 两支：一支真实 Drop，另一支仅转存数据副本中的既有 delta 并同次保存 manifest，实际移除旧分区目录，再由真实 3.x 读取和合并。固定断言控制组复活、转存组不复活，合并后数据文件数确为 1。这是编码原型，没有实现产品的碰撞、故障注入或并发协议，不替代未来 Rust 分区验收。
+
+## 分区可见性组件真值
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 "$AUDIT_REF_PYTHON" tests/compatibility_audit/partition_visibility_truth.py \
+  --reference "$AUDIT_REF" --work-dir "$AUDIT_WORK/partition-visibility" \
+  --verify tests/compatibility_audit/fixtures/partition_visibility_v321.json
+```
+
+环境及新目录要求与上节相同，Arrow 15/25、SDK 2.6.17/3.0.2 分目录执行；--verify 不覆盖 fixture。14 条 INT64/VARCHAR 直接引擎轨迹的 170 个状态包含完整 segment 候选、活跃主键位置、活跃/已提交删除及独立 Query 期望；另有两条原始 gRPC 删除后重插轨迹。特别固定 Delete 未 Flush 会被重插移除、已 Flush 的删除继续保留这两支，不扩展 key 路由。
+
+直接引擎 [] 的混合源差异保留为 direct_empty_diagnostic；adapter 实际把空 repeated 参数转为 None，所以组件对照参数为 None 或非空列表，不把内部差异搬成公开行为。数据和诊断均由 --verify 严格核对，没有因模型失败而覆盖期望；该输入边界及初次失败见 [组件记录](../../docs/testing/0017-visibility-component.md)。Rust 模型的构建、1870 次读取与 1716 次旧快照对照、资源诊断见 [组件 README](../../benchmarks/partition-visibility/README.md)。组件证明不等于产品分区、WAL 或整库 RSS 验收。
+
 
 ## Range search 真值
 
@@ -137,3 +169,30 @@ PYTHONDONTWRITEBYTECODE=1 "$AUDIT_REF_PYTHON" tests/compatibility_audit/range_tr
 ```
 
 分别使用 2.6.17 / 3.0.2 的参照环境，解释器、参照 checkout 为绝对路径；不修改参照或覆盖已有目录。15 组数据集覆盖活跃、混合、segment、重开和实际 compaction，包含 raw RPC 与 V1 页序、字段及错误原文。数据、输入矩阵与成功/失败断言固定，`--verify` 不覆盖 fixture。范围窗及 V1 的既有终止限制见 0016；不能把双方共同的早停当作完整遍历证明。
+
+## 0017 产品边界与回退
+
+以下只在待验收的 Rust 环境运行，不调用参照的危险路径；路径均由调用者设置为实际的仓库外新目录。
+
+```bash
+"$AUDIT_RUST_PYTHON" tests/compatibility_audit/partition_product_boundaries.py \
+  --work-dir "$AUDIT_WORK/product-boundaries"
+"$AUDIT_RUST_PYTHON" tests/compatibility_audit/partition_rollback.py seed \
+  --state wal --work-dir "$AUDIT_WORK/partition-wal.db"
+"$AUDIT_OLD_PYTHON" tests/compatibility_audit/partition_rollback.py check \
+  --seed "$AUDIT_WORK/partition-wal.db" --work-dir "$AUDIT_WORK/partition-old-reader"
+```
+
+产品边界分别在两条 SDK、macOS 别名卷和 Linux 命名卷执行：记录实际目录身份、危险名和链接拒绝、超长名失败不登记、拒绝前后哈希不变，以及损坏 collection 不影响同库健康 collection。不能只凭操作系统名推断大小写或 Unicode 别名行为。解释器必须加载 Rust；该工具没有参照真值替换功能。
+
+回退的旧解释器安装已发布 0.2.0rc1；对 `wal`、`segment` 两种状态各生成原生种子并复制后检查。非默认分区被明确拒绝且文件不变；同库健康 collection 仍可读取；最后一个非默认分区 Drop 后仅剩默认分区的目录可读，转存的全局删除继续生效。它不替代 0015 的 rc1–rc3 类型回退矩阵。
+
+分区与 V1 search iterator 的额外交叉对照在两条 SDK 分别执行：
+
+```bash
+MILVUS_LITE_3X_PYTHON="$AUDIT_REF_PYTHON" "$AUDIT_RUST_PYTHON" \
+  tests/compatibility_audit/partition_search_iteration.py \
+  --work-dir "$AUDIT_WORK/partition-search-iteration"
+```
+
+固定两种主键、混合及重开、全部/单/组合/未知选择及范围开关，40 项逐页对照；严格核对完整条数和主键，再沿用 0004 分数误差预算。记录实际客户端迭代器类型，未知分区必须为空页；SDK 的空初始页诊断保留在日志，不当作服务端失败。此工具同样不进入默认 pytest、不覆盖已有目录。

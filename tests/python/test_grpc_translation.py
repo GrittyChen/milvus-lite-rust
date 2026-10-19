@@ -418,8 +418,8 @@ def test_insert_default_partition_and_all_valid_data(env):
 def test_insert_m1_unsupported(env):
     _, stub, _ = env
     basic(stub)
-    unimplemented(insert, stub, "c", long_fd("id", [1]), vec_fd("v", [[1, 0]]), str_fd("t", ["a"]),
-                  partition_name="p")
+    r = insert(stub, "c", long_fd("id", [1]), vec_fd("v", [[1, 0]]), str_fd("t", ["a"]), partition_name="p")
+    assert status_of(r) == (200, 200, "p")
     t = str_fd("t", [])
     t.valid_data.append(False)
     r = insert(stub, "c", long_fd("id", [3]), vec_fd("v", [[1, 0]]), t)
@@ -741,7 +741,8 @@ def test_search_m1_unsupported(env):
     assert status_of(response)[0] == 0
     assert list(response.results.ids.int_id.data) == [1, 2]
     unimplemented(stub.Search, search_req(params={"group_by_field": "t"}))
-    unimplemented(stub.Search, search_req(partition_names=["p"]))
+    empty = stub.Search(search_req(partition_names=["p"]))
+    assert status_of(empty)[0] == 0 and not empty.results.ids.int_id.data
     unimplemented(stub.Search, search_req(params={"timezone": "UTC"}))
     # Python 的 json.loads 能解析、serde_json 不能解析的 params：其中可能有 range search 的参数，
     # 不能像解析失败那样忽略（0004「决策」）。
@@ -819,7 +820,8 @@ def test_query_m1_unsupported(env):
     assert list(response.fields_data[0].scalars.long_data.data) == [1]
     unimplemented(stub.Query, query_req(expr="id + 1 > 0"))
     unimplemented(stub.Query, query_req(expr="ISO '2025-01-01T00:00:00Z' == ISO '2025-01-01T00:00:00Z'"))
-    unimplemented(stub.Query, query_req(expr="id in [1]", partition_names=["p"]))
+    empty = stub.Query(query_req(expr="id in [1]", partition_names=["p"]))
+    assert status_of(empty)[0] == 0 and not empty.fields_data[0].scalars.long_data.data
     timezone = [common_pb2.KeyValuePair(key="timezone", value="UTC")]
     unimplemented(stub.Query, query_req(expr="id in [1]", query_params=timezone))
 
@@ -951,8 +953,6 @@ def test_pymilvus_entry_points_remaining_unsupported(env):
     decay = Function(name="r", function_type=FunctionType.RERANK, input_field_names=["id"],
                      params={"reranker": "decay", "function": "gauss", "origin": 0, "scale": 1})
     cases = [
-        (lambda: client.create_partition("q", "p"), f"CreatePartition: {rpc}"),
-        (lambda: client.list_partitions("q"), f"ShowPartitions: {rpc}"),
         (with_field("k", DataType.INT64, is_partition_key=True), f"partition key: {feature}"),
         (lambda: client.create_database("d"), f"CreateDatabase: {rpc}"),
         (lambda: client.list_databases(), f"ListDatabases: {rpc}"),

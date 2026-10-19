@@ -219,9 +219,6 @@ pub(crate) fn parse(req: &svc::SearchRequest) -> Result<Parsed, EngineError> {
         }
     };
 
-    if req.partition_names.iter().any(|p| p != "_default") {
-        note("partitions other than '_default'");
-    }
     if req
         .function_score
         .as_ref()

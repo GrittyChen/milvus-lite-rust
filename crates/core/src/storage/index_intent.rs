@@ -88,10 +88,13 @@ pub(crate) fn valid_uuid(value: &str) -> bool {
 }
 
 fn valid_sidecar_path(path: &str) -> bool {
-    let prefix = "partitions/_default/indexes/";
-    path.strip_prefix(prefix).is_some_and(|name| {
-        !name.contains(['/', '\\', ':']) && crate::index::parse_sidecar_name(name).is_some()
-    })
+    let parts: Vec<_> = path.split('/').collect();
+    parts.len() == 4
+        && parts[0] == "partitions"
+        && super::partition_paths::valid_name(parts[1])
+        && parts[2] == "indexes"
+        && !parts[3].contains(['\\', ':'])
+        && crate::index::parse_sidecar_name(parts[3]).is_some()
 }
 
 fn read_marker(dir: &Path) -> Result<Option<Vec<u8>>, String> {
@@ -142,7 +145,7 @@ impl IntentState {
                 return Err(reason);
             }
         };
-        let current = boot_context(dir);
+        let current = boot_context(dir, marker.files.iter().map(|path| dir.join(path)));
         if marker.auto_recovery
             && current.local
             && marker.boot_source == current.boot_source
@@ -168,7 +171,7 @@ impl IntentState {
         fields: Vec<String>,
         files: &[PathBuf],
     ) -> Result<(), String> {
-        let context = boot_context(dir);
+        let context = boot_context(dir, files.iter().cloned());
         let marker = Marker {
             format_version: 1,
             operation: operation.to_owned(),
@@ -239,7 +242,14 @@ impl IntentState {
             _ => return Err("index deletion intent has not been persisted".to_owned()),
         };
         *self = Self::Unconfirmed(blocked(dir, "index deletion durability is unconfirmed"));
-        let index_dir = dir.join("partitions/_default/indexes");
+        let directories: std::collections::BTreeSet<_> = files
+            .iter()
+            .map(|path| {
+                path.parent()
+                    .map(Path::to_owned)
+                    .ok_or_else(|| "index path has no parent".to_owned())
+            })
+            .collect::<Result<_, _>>()?;
         guarded(|| {
             #[cfg(feature = "fault-injection")]
             {
@@ -250,7 +260,9 @@ impl IntentState {
             }
             #[cfg(feature = "fault-injection")]
             fault(IndexPoint::CapabilitySync).map_err(|e| e.to_string())?;
-            fs_commit::sync_dir(&index_dir).map_err(|e| e.to_string())?;
+            for index_dir in &directories {
+                fs_commit::sync_dir(index_dir).map_err(|e| e.to_string())?;
+            }
             // 删除位次只用于隔离构建中的逐文件故障注入。
             #[cfg_attr(
                 not(feature = "fault-injection"),
@@ -272,7 +284,9 @@ impl IntentState {
             fault(IndexPoint::AfterLastDelete).map_err(|e| e.to_string())?;
             #[cfg(feature = "fault-injection")]
             fault(IndexPoint::DeleteSync).map_err(|e| e.to_string())?;
-            fs_commit::sync_dir(&index_dir).map_err(|e| e.to_string())?;
+            for index_dir in &directories {
+                fs_commit::sync_dir(index_dir).map_err(|e| e.to_string())?;
+            }
             *self = Self::CleanupPending(bytes);
             Ok(())
         })
@@ -349,12 +363,14 @@ pub(crate) fn guarded<T>(f: impl FnOnce() -> Result<T, String>) -> Result<T, Str
     }
 }
 
-fn boot_context(dir: &Path) -> BootContext {
+fn boot_context(dir: &Path, mut files: impl Iterator<Item = PathBuf>) -> BootContext {
     #[cfg(feature = "fault-injection")]
     if let Some(context) = BOOT_OVERRIDE.with(|s| s.borrow().clone()) {
         return context;
     }
-    index_platform::boot_context(dir)
+    let mut context = index_platform::boot_context(dir);
+    context.local &= files.all(|path| path.parent().is_some_and(index_platform::local_fs));
+    context
 }
 
 #[cfg(feature = "fault-injection")]
@@ -428,5 +444,58 @@ pub(crate) fn fault(point: IndexPoint) -> io::Result<()> {
         ))),
         Some(FaultKind::Panic) => panic!("injected index panic: {point:?}"),
         Some(FaultKind::Exit) => std::process::exit(86),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn real_boot_scope_uses_only_collection_and_involved_index_directories() {
+        for extra_default in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let dir = root.path();
+            let index = dir.join("partitions/p/indexes");
+            fs::create_dir_all(&index).unwrap();
+            let sidecar = index.join("data_1_1.v.hnsw.idx");
+            fs::write(&sidecar, b"reference sidecar").unwrap();
+            if extra_default {
+                fs::create_dir_all(dir.join("partitions/_default/indexes")).unwrap();
+            }
+            let real = index_platform::boot_context(dir);
+            let local = index_platform::local_fs(dir) && index_platform::local_fs(&index);
+            let context = boot_context(dir, [sidecar.clone()].into_iter());
+            assert_eq!(context.local, local);
+            assert_eq!(context.boot_id, real.boot_id);
+            assert_eq!(context.boot_source, real.boot_source);
+            assert!(
+                !boot_context(
+                    dir,
+                    [dir.join("partitions/missing/indexes/x.idx")].into_iter()
+                )
+                .local
+            );
+            assert!(!boot_context(&dir.join("missing"), [sidecar.clone()].into_iter()).local);
+            let mut state = IntentState::Clear;
+            state
+                .persist(dir, "drop_index", vec!["v".into()], &[sidecar])
+                .unwrap();
+            let mut marker = Marker::parse(&fs::read(dir.join(INTENT_FILE)).unwrap()).unwrap();
+            assert_eq!(marker.auto_recovery, local && context.boot_id.is_some());
+            assert!(IntentState::Clear.check(dir).is_err());
+            if context.boot_id.is_some() {
+                marker.boot_id = Some(
+                    if context.boot_id.as_deref() == Some("11111111-1111-4111-8111-111111111111") {
+                        "22222222-2222-4222-8222-222222222222"
+                    } else {
+                        "11111111-1111-4111-8111-111111111111"
+                    }
+                    .into(),
+                );
+                fs::write(dir.join(INTENT_FILE), serde_json::to_vec(&marker).unwrap()).unwrap();
+                assert_eq!(IntentState::Clear.check(dir).is_ok(), local);
+                assert_eq!(dir.join(INTENT_FILE).exists(), !local);
+            }
+        }
     }
 }

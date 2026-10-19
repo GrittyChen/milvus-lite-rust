@@ -133,6 +133,35 @@ pub(crate) fn flush_generation_with_inherited_sync(
     delta: Option<&RecordBatch>,
     sync_inherited_files: bool,
 ) -> Result<Manifest, FlushError> {
+    let plan = [PartitionFlush {
+        name: "_default",
+        data,
+        delta,
+    }];
+    flush_partitions_generation(
+        collection_dir,
+        old_manifest,
+        generation,
+        frozen_max_seq,
+        &plan,
+        sync_inherited_files,
+    )
+}
+
+pub(crate) struct PartitionFlush<'a> {
+    pub name: &'a str,
+    pub data: Option<&'a RecordBatch>,
+    pub delta: Option<&'a RecordBatch>,
+}
+
+pub(crate) fn flush_partitions_generation(
+    collection_dir: &Path,
+    old_manifest: &Manifest,
+    generation: u64,
+    frozen_max_seq: u64,
+    plans: &[PartitionFlush<'_>],
+    sync_inherited_files: bool,
+) -> Result<Manifest, FlushError> {
     let mut committed = None;
     let mut cleanup_started = false;
     // 锁外任何一步 unwind 都必须按实际提交点分类，日志或第三方写入器也不能绕过发布。
@@ -142,27 +171,39 @@ pub(crate) fn flush_generation_with_inherited_sync(
         let next_wal = generation
             .checked_add(1)
             .ok_or_else(|| FlushError::before(collection_dir, "WAL number space exhausted"))?;
-        let data_range = data
-            .filter(|batch| batch.num_rows() > 0)
-            .map(|batch| seq_range(batch, "_seq"))
-            .transpose()?;
-        let delta_range = delta
-            .filter(|batch| batch.num_rows() > 0)
-            .map(|batch| seq_range(batch, "_seq"))
-            .transpose()?;
-        if data_range.is_some_and(|(_, max)| max > frozen_max_seq)
-            || delta_range.is_some_and(|(_, max)| max > frozen_max_seq)
-        {
-            return Err(FlushError::before(
-                collection_dir,
-                "frozen max_seq is below a row written by this generation",
-            ));
+        let mut ranges = Vec::new();
+        for plan in plans {
+            if !super::partition_paths::valid_name(plan.name)
+                || !old_manifest.partitions.contains_key(plan.name)
+            {
+                return Err(FlushError::before(
+                    collection_dir,
+                    "flush partition is not registered",
+                ));
+            }
+            let data_range = plan
+                .data
+                .filter(|batch| batch.num_rows() > 0)
+                .map(|batch| seq_range(batch, "_seq"))
+                .transpose()?;
+            let delta_range = plan
+                .delta
+                .filter(|batch| batch.num_rows() > 0)
+                .map(|batch| seq_range(batch, "_seq"))
+                .transpose()?;
+            if data_range.is_some_and(|(_, max)| max > frozen_max_seq)
+                || delta_range.is_some_and(|(_, max)| max > frozen_max_seq)
+            {
+                return Err(FlushError::before(
+                    collection_dir,
+                    "frozen max_seq is below a row written by this generation",
+                ));
+            }
+            ranges.push((data_range, delta_range));
         }
-        let partition = collection_dir.join("partitions/_default");
-        let data_dir = partition.join("data");
-        let delta_dir = partition.join("delta");
-        if (data.is_some_and(|batch| batch.num_rows() > 0)
-            || delta.is_some_and(|batch| batch.num_rows() > 0))
+        if ranges
+            .iter()
+            .any(|(data, delta)| data.is_some() || delta.is_some())
             && collect_wal(&collection_dir.join("wal"), generation)
                 .map_err(|error| FlushError::before(collection_dir, error))?
                 .is_empty()
@@ -172,43 +213,62 @@ pub(crate) fn flush_generation_with_inherited_sync(
                 "nonempty flush has no WAL for recovery",
             ));
         }
-        fs_commit::create_dir_synced(&data_dir)
-            .map_err(|error| FlushError::before(&data_dir, error))?;
-        fs_commit::create_dir_synced(&delta_dir)
-            .map_err(|error| FlushError::before(&delta_dir, error))?;
+        for plan in plans {
+            let root = collection_dir.join("partitions").join(plan.name);
+            for kind in ["data", "delta"] {
+                let dir = root.join(kind);
+                fs_commit::create_dir_synced(&dir)
+                    .map_err(|error| FlushError::before(&dir, error))?;
+            }
+        }
         let pinned = snapshot::load_pins(collection_dir)
             .map_err(|error| FlushError::before(collection_dir, error))?;
         if sync_inherited_files {
             sync_inherited(collection_dir, old_manifest)?;
         }
         let mut candidate = old_manifest.clone();
-        let files = candidate
-            .partitions
-            .get_mut("_default")
-            .ok_or_else(|| FlushError::before(collection_dir, "default partition missing"))?;
-        if let (Some(batch), Some((min, max))) = (data, data_range) {
-            let name = output_name(&data_dir, "data", min, max, &files.data_files, &pinned.data)?;
-            let path = data_dir.join(&name);
-            parquet_file::write_new(&path, batch)
-                .map_err(|error| FlushError::before(&path, error))?;
-            files.data_files.push(format!("data/{name}"));
+        for (plan, (data_range, delta_range)) in plans.iter().zip(ranges) {
+            let partition = collection_dir.join("partitions").join(plan.name);
+            let data_dir = partition.join("data");
+            let delta_dir = partition.join("delta");
+            let files = candidate
+                .partitions
+                .get_mut(plan.name)
+                .ok_or_else(|| FlushError::before(collection_dir, "flush partition missing"))?;
+            if let (Some(batch), Some((min, max))) = (plan.data, data_range) {
+                let name = output_name(
+                    &data_dir,
+                    "data",
+                    min,
+                    max,
+                    &files.data_files,
+                    &pinned.data,
+                    plan.name,
+                )?;
+                let path = data_dir.join(&name);
+                parquet_file::write_new(&path, batch)
+                    .map_err(|error| FlushError::before(&path, error))?;
+                files.data_files.push(format!("data/{name}"));
+            }
+            if let (Some(batch), Some((min, max))) = (plan.delta, delta_range) {
+                let name = output_name(
+                    &delta_dir,
+                    "delta",
+                    min,
+                    max,
+                    &files.delta_files,
+                    &pinned.delta,
+                    plan.name,
+                )?;
+                let path = delta_dir.join(&name);
+                parquet_file::write_new(&path, batch)
+                    .map_err(|error| FlushError::before(&path, error))?;
+                files.delta_files.push(format!("delta/{name}"));
+            }
+            fs_commit::sync_dir(&data_dir).map_err(|error| FlushError::before(&data_dir, error))?;
+            fs_commit::sync_dir(&delta_dir)
+                .map_err(|error| FlushError::before(&delta_dir, error))?;
         }
-        if let (Some(batch), Some((min, max))) = (delta, delta_range) {
-            let name = output_name(
-                &delta_dir,
-                "delta",
-                min,
-                max,
-                &files.delta_files,
-                &pinned.delta,
-            )?;
-            let path = delta_dir.join(&name);
-            parquet_file::write_new(&path, batch)
-                .map_err(|error| FlushError::before(&path, error))?;
-            files.delta_files.push(format!("delta/{name}"));
-        }
-        fs_commit::sync_dir(&data_dir).map_err(|error| FlushError::before(&data_dir, error))?;
-        fs_commit::sync_dir(&delta_dir).map_err(|error| FlushError::before(&delta_dir, error))?;
         candidate.current_seq = old_manifest.current_seq.max(frozen_max_seq);
         candidate.active_wal_number = Some(next_wal);
         candidate.version = candidate.version.checked_add(1).ok_or_else(|| {
@@ -259,20 +319,22 @@ pub(crate) fn flush_generation_with_inherited_sync(
     })
 }
 
-fn output_name(
+pub(crate) fn output_name(
     dir: &Path,
     prefix: &str,
     seq_min: u64,
     seq_max: u64,
     referenced: &[String],
     pinned: &std::collections::HashSet<(String, String)>,
+    partition_name: &str,
 ) -> Result<String, FlushError> {
     let mut upper = seq_max;
     loop {
         let name = format!("{prefix}_{seq_min:06}_{upper:06}.parquet");
         let relative = format!("{prefix}/{name}");
         let path = dir.join(&name);
-        if referenced.contains(&relative) || pinned.contains(&("_default".to_owned(), relative)) {
+        if referenced.contains(&relative) || pinned.contains(&(partition_name.to_owned(), relative))
+        {
             upper = upper
                 .checked_add(1)
                 .ok_or_else(|| FlushError::before(&path, "segment filename sequence exhausted"))?;
@@ -368,26 +430,32 @@ fn seq_range(batch: &RecordBatch, name: &str) -> Result<(u64, u64), FlushError> 
 pub(crate) fn sync_inherited(collection_dir: &Path, manifest: &Manifest) -> Result<(), FlushError> {
     #[cfg(feature = "fault-injection")]
     INHERITED_SYNC_CALLS.with(|count| count.set(count.get() + 1));
-    let partition = collection_dir.join("partitions/_default");
-    let files = manifest
-        .partitions
-        .get("_default")
-        .ok_or_else(|| FlushError::before(collection_dir, "default partition missing"))?;
-    for relative in files.data_files.iter().chain(&files.delta_files) {
-        if !crate::storage::manifest::safe_relative_path(relative) {
-            return Err(FlushError::before(
-                collection_dir,
-                format!("unsafe manifest path {relative:?}"),
-            ));
+    super::partition_paths::validate(
+        collection_dir,
+        manifest,
+        &snapshot::PinnedFiles::default(),
+        None,
+    )
+    .map_err(|error| FlushError::before(collection_dir, error))?;
+    for (name, files) in &manifest.partitions {
+        let partition = collection_dir.join("partitions").join(name);
+        for relative in files.data_files.iter().chain(&files.delta_files) {
+            if !crate::storage::manifest::safe_relative_path(relative) {
+                return Err(FlushError::before(
+                    collection_dir,
+                    format!("unsafe manifest path {relative:?}"),
+                ));
+            }
+            let path = partition.join(relative);
+            let meta =
+                fs::symlink_metadata(&path).map_err(|error| FlushError::before(&path, error))?;
+            if !meta.file_type().is_file() {
+                return Err(FlushError::before(&path, "referenced file is not regular"));
+            }
+            File::open(&path)
+                .and_then(|file| fs_commit::sync_file(&file, &path))
+                .map_err(|error| FlushError::before(&path, error))?;
         }
-        let path = partition.join(relative);
-        let meta = fs::symlink_metadata(&path).map_err(|error| FlushError::before(&path, error))?;
-        if !meta.file_type().is_file() {
-            return Err(FlushError::before(&path, "referenced file is not regular"));
-        }
-        File::open(&path)
-            .and_then(|file| fs_commit::sync_file(&file, &path))
-            .map_err(|error| FlushError::before(&path, error))?;
     }
     let schema = collection_dir.join("schema.json");
     let meta = fs::symlink_metadata(&schema).map_err(|error| FlushError::before(&schema, error))?;
@@ -416,14 +484,22 @@ pub(crate) fn sync_inherited(collection_dir: &Path, manifest: &Manifest) -> Resu
     }
     // 3.x 按文件种类懒建目录：只插入时 delta 可不存在，不能让 data 引用
     // 把未使用的 delta 目录变成必需项。存在的路径仍确认类型并同步，真实 I/O 不跳过。
-    let has_data = !files.data_files.is_empty();
-    let has_delta = !files.delta_files.is_empty();
-    for (dir, required) in [
-        (collection_dir.join("partitions"), has_data || has_delta),
-        (partition.clone(), has_data || has_delta),
-        (partition.join("data"), has_data),
-        (partition.join("delta"), has_delta),
-    ] {
+    let required = manifest
+        .partitions
+        .values()
+        .any(|files| !files.data_files.is_empty() || !files.delta_files.is_empty());
+    let mut inherited = vec![(collection_dir.join("partitions"), required)];
+    for (name, files) in &manifest.partitions {
+        let partition = collection_dir.join("partitions").join(name);
+        let has_data = !files.data_files.is_empty();
+        let has_delta = !files.delta_files.is_empty();
+        inherited.extend([
+            (partition.clone(), has_data || has_delta),
+            (partition.join("data"), has_data),
+            (partition.join("delta"), has_delta),
+        ]);
+    }
+    for (dir, required) in inherited {
         match fs::symlink_metadata(&dir) {
             Ok(meta) if meta.file_type().is_dir() => {}
             Ok(_) => {
@@ -690,9 +766,17 @@ mod tests {
         );
         fs::remove_dir(partition.join("data")).unwrap();
         fs::write(partition.join("data"), b"not a directory").unwrap();
+        begin_fs_trace();
         let error = sync_inherited(&collection, &Manifest::default()).unwrap_err();
         assert_eq!(error.phase, CommitPhase::BeforeReplace);
-        assert_eq!(error.path, partition.join("data"));
+        assert_eq!(error.path, collection);
+        assert!(
+            error
+                .reason
+                .contains(&format!("{:?}", partition.join("data")))
+        );
+        // 0017 的完整目录预检先于任何文件或目录同步，仍须明确指出损坏的子路径。
+        assert!(finish_fs_trace().is_empty());
     }
     #[test]
     fn flush_data_and_delete_then_recover() {
@@ -796,7 +880,7 @@ mod tests {
             "_default".to_owned(),
             "data/data_000001_000001.parquet".to_owned(),
         ));
-        let new_name = output_name(&data_dir, "data", 1, 1, &[], &pins).unwrap();
+        let new_name = output_name(&data_dir, "data", 1, 1, &[], &pins, "_default").unwrap();
         assert_eq!(new_name, "data_000001_000002.parquet");
         assert_eq!(fs::read(old).unwrap(), b"pinned");
     }
@@ -808,7 +892,7 @@ mod tests {
         fs::create_dir_all(&data_dir).unwrap();
         let orphan = data_dir.join("data_000001_000001.parquet");
         fs::write(&orphan, b"orphan").unwrap();
-        let name = output_name(&data_dir, "data", 1, 1, &[], &HashSet::new()).unwrap();
+        let name = output_name(&data_dir, "data", 1, 1, &[], &HashSet::new(), "_default").unwrap();
         assert_eq!(name, "data_000001_000001.parquet");
         assert!(!orphan.exists());
     }
@@ -827,7 +911,7 @@ mod tests {
             b"old index",
         )
         .unwrap();
-        let name = output_name(&data_dir, "data", 1, 1, &[], &HashSet::new()).unwrap();
+        let name = output_name(&data_dir, "data", 1, 1, &[], &HashSet::new(), "_default").unwrap();
         assert_eq!(name, "data_000001_000002.parquet");
         assert_eq!(fs::read(orphan).unwrap(), b"old data");
     }

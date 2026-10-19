@@ -60,6 +60,50 @@ pub struct DecodedDelta {
     pub seqs: Vec<u64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PartitionLabels {
+    Uniform(String),
+    Rows(Vec<String>),
+}
+
+impl PartitionLabels {
+    pub fn value(&self, row: usize) -> Option<&str> {
+        match self {
+            Self::Uniform(value) => Some(value),
+            Self::Rows(values) => values.get(row).map(String::as_str),
+        }
+    }
+}
+
+fn partition_labels(batch: &RecordBatch, column: usize) -> Result<PartitionLabels, ArrowDataError> {
+    let values = batch
+        .column(column)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| ArrowDataError::TypeMismatch {
+            name: "_partition".into(),
+        })?;
+    if values.null_count() != 0 {
+        return Err(ArrowDataError::TypeMismatch {
+            name: "_partition".into(),
+        });
+    }
+    let first = if values.is_empty() {
+        "_default"
+    } else {
+        values.value(0)
+    };
+    Ok(if (0..values.len()).all(|row| values.value(row) == first) {
+        PartitionLabels::Uniform(first.to_owned())
+    } else {
+        PartitionLabels::Rows(
+            (0..values.len())
+                .map(|row| values.value(row).to_owned())
+                .collect(),
+        )
+    })
+}
+
 fn json_strings(name: &str, values: &[Vec<u8>]) -> Result<Vec<String>, ArrowDataError> {
     values
         .iter()
@@ -249,20 +293,31 @@ pub fn decode_delta_batch(
     schema: &CollectionSchema,
     batch: &RecordBatch,
 ) -> Result<DecodedDelta, ArrowDataError> {
-    decode_delta(schema, batch, false)
+    decode_delta(schema, batch, false, false)
 }
 
 pub fn decode_wal_delta_batch(
     schema: &CollectionSchema,
     batch: &RecordBatch,
 ) -> Result<DecodedDelta, ArrowDataError> {
-    decode_delta(schema, batch, true)
+    decode_delta(schema, batch, true, false)
+}
+
+pub fn decode_partitioned_wal_delta(
+    schema: &CollectionSchema,
+    batch: &RecordBatch,
+) -> Result<(DecodedDelta, PartitionLabels), ArrowDataError> {
+    Ok((
+        decode_delta(schema, batch, true, true)?,
+        partition_labels(batch, 2)?,
+    ))
 }
 
 fn decode_delta(
     schema: &CollectionSchema,
     batch: &RecordBatch,
     has_partition: bool,
+    any_partition: bool,
 ) -> Result<DecodedDelta, ArrowDataError> {
     if batch.num_columns() != 2 + usize::from(has_partition) {
         return Err(ArrowDataError::ColumnCount);
@@ -332,7 +387,8 @@ fn decode_delta(
                 name: "_partition".to_owned(),
             })?;
         if parts.null_count() != 0
-            || (0..parts.len()).any(|i| !matches!(parts.value(i), "_default" | "_all"))
+            || (!any_partition
+                && (0..parts.len()).any(|i| !matches!(parts.value(i), "_default" | "_all")))
         {
             return Err(ArrowDataError::TypeMismatch {
                 name: "_partition".to_owned(),
@@ -751,20 +807,31 @@ pub fn decode_data_batch(
     schema: &CollectionSchema,
     batch: &RecordBatch,
 ) -> Result<DecodedData, ArrowDataError> {
-    decode_batch(schema, batch, false)
+    decode_batch(schema, batch, false, false)
 }
 
 pub fn decode_wal_data_batch(
     schema: &CollectionSchema,
     batch: &RecordBatch,
 ) -> Result<DecodedData, ArrowDataError> {
-    decode_batch(schema, batch, true)
+    decode_batch(schema, batch, true, false)
+}
+
+pub fn decode_partitioned_wal_data(
+    schema: &CollectionSchema,
+    batch: &RecordBatch,
+) -> Result<(DecodedData, PartitionLabels), ArrowDataError> {
+    Ok((
+        decode_batch(schema, batch, true, true)?,
+        partition_labels(batch, 1)?,
+    ))
 }
 
 fn decode_batch(
     schema: &CollectionSchema,
     batch: &RecordBatch,
     has_partition: bool,
+    any_partition: bool,
 ) -> Result<DecodedData, ArrowDataError> {
     let n = batch.num_rows();
     let expected = 1
@@ -799,7 +866,9 @@ fn decode_batch(
             .ok_or_else(|| ArrowDataError::TypeMismatch {
                 name: "_partition".to_owned(),
             })?;
-        if partitions.null_count() != 0 || (0..n).any(|row| partitions.value(row) != "_default") {
+        if partitions.null_count() != 0
+            || (!any_partition && (0..n).any(|row| partitions.value(row) != "_default"))
+        {
             return Err(ArrowDataError::TypeMismatch {
                 name: "_partition".to_owned(),
             });

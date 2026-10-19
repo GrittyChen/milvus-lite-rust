@@ -53,6 +53,8 @@ pub struct Manifest {
     pub active_wal_number: Option<u64>,
     #[serde(default)]
     pub partitions: BTreeMap<String, PartitionFiles>,
+    #[serde(skip)]
+    pub partition_order: Vec<String>,
     #[serde(default)]
     pub index_specs: BTreeMap<String, IndexSpec>,
 }
@@ -68,6 +70,7 @@ impl Default for Manifest {
             schema_version: 1,
             active_wal_number: None,
             partitions,
+            partition_order: vec![DEFAULT_PARTITION.to_owned()],
             index_specs: BTreeMap::new(),
         }
     }
@@ -91,6 +94,18 @@ impl Manifest {
     pub fn parse(bytes: &[u8]) -> Result<Self, ManifestError> {
         let mut manifest: Self = serde_json::from_slice(bytes)
             .map_err(|source| ManifestError::Invalid(source.to_string()))?;
+        let raw: Value = serde_json::from_slice(bytes).map_err(ManifestError::Encode)?;
+        manifest.partition_order = raw
+            .get("partitions")
+            .and_then(Value::as_object)
+            .map_or_else(Vec::new, |parts| parts.keys().cloned().collect());
+        if !manifest
+            .partition_order
+            .iter()
+            .any(|part| part == DEFAULT_PARTITION)
+        {
+            manifest.partition_order.push(DEFAULT_PARTITION.to_owned());
+        }
         if manifest.manifest_format_version != MANIFEST_FORMAT_VERSION {
             return Err(ManifestError::Invalid(format!(
                 "unsupported manifest_format_version {}",
@@ -157,6 +172,20 @@ pub(crate) fn safe_relative_path(path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn partition_order_is_runtime_only_and_reopen_follows_saved_json_order() {
+        let raw = br#"{"partitions":{"z":{},"_default":{},"a":{}}}"#;
+        let manifest = Manifest::parse(raw).unwrap();
+        assert_eq!(manifest.partition_order, ["z", "_default", "a"]);
+        let bytes = manifest.to_bytes().unwrap();
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(value.get("partition_order").is_none());
+        assert_eq!(
+            Manifest::parse(&bytes).unwrap().partition_order,
+            ["_default", "a", "z"]
+        );
+    }
 
     #[test]
     fn default_matches_3x_shape() {

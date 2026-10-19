@@ -7,6 +7,7 @@
 - A 实现证据：[验收记录](../testing/0016-query-iterator-acceptance.md)；负责人独立评审通过（2026-10-16）
 - B 实现证据：[验收记录](../testing/0016-range-search-acceptance.md)；独立评审通过并收口（2026-10-16）
 - 调查：[分区调查](../testing/0016-partition-investigation.md)；工具：[compatibility_audit](../../tests/compatibility_audit/README.md)
+- 后续分区：[0017 设计草案](0017-partitions.md) 与 [补测](../testing/0017-partition-design-investigation.md)，待单独评审，不属于本决策 A/B 的已收口范围
 
 ## 依据与切片
 

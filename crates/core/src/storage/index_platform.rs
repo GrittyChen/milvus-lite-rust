@@ -98,7 +98,8 @@ pub(crate) fn boot_context(dir: &Path) -> BootContext {
     BootContext {
         boot_id,
         boot_source,
-        local: local_fs(dir) && local_fs(&dir.join("partitions/_default/indexes")),
+        // 索引目录由意图的实际文件集合补充，不能假定默认分区已经物化。
+        local: local_fs(dir),
     }
 }
 
@@ -140,7 +141,7 @@ fn fs_type(file: &File) -> io::Result<libc::c_long> {
     Ok(unsafe { stat.assume_init() }.f_type)
 }
 #[cfg(target_os = "linux")]
-fn local_fs(path: &Path) -> bool {
+pub(crate) fn local_fs(path: &Path) -> bool {
     match File::open(path).and_then(|f| fs_type(&f)) {
         Ok(kind) => matches!(
             (kind as u64) & 0xffff_ffff,
@@ -182,7 +183,7 @@ fn read_epoch() -> io::Result<(Option<String>, Option<BootSource>)> {
     Ok((Some(text), Some(BootSource::DarwinKernBootsessionuuid)))
 }
 #[cfg(target_os = "macos")]
-fn local_fs(path: &Path) -> bool {
+pub(crate) fn local_fs(path: &Path) -> bool {
     let file = match File::open(path) {
         Ok(f) => f,
         Err(_) => return false,
@@ -207,6 +208,6 @@ fn read_epoch() -> io::Result<(Option<String>, Option<BootSource>)> {
     Ok((None, None))
 }
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn local_fs(_: &Path) -> bool {
+pub(crate) fn local_fs(_: &Path) -> bool {
     false
 }

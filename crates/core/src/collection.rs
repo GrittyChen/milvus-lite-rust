@@ -664,6 +664,107 @@ impl Collection {
         self.persistent.as_mut()
     }
 
+    /// 首次启用分区时从既有列重建位置索引；状态锁内失败会封锁实例，磁盘格式不变。
+    pub fn enable_partition_visibility(&mut self) -> Result<()> {
+        use crate::storage::visibility::partitions::{PartitionRow, SourceKind};
+        let chunks = &self.chunks;
+        let pk_pos = self.pk_pos;
+        let pk_type = self.schema.fields[pk_pos].data_type;
+        let count = self.pk_index.len();
+        let p = self.persistent.as_mut().ok_or_else(|| {
+            EngineError::Storage("partition visibility requires persistence".into())
+        })?;
+        if p.visibility.is_partitioned() {
+            return Ok(());
+        }
+        if p.manifest.partitions.len() != 1 || !p.manifest.partitions.contains_key("_default") {
+            return Err(EngineError::Storage(
+                "partition activation requires default-only source metadata".into(),
+            ));
+        }
+        p.rebuild_partition_visibility(|p, mut visibility| {
+            let frozen: HashMap<_, _> = p
+                .pending_generations()
+                .map(|generation| (generation.table.source(), &generation.table))
+                .collect();
+            visibility.reserve(pk_type, count);
+            for &source in p.visibility.source_order() {
+                let len = p
+                    .visibility
+                    .source_len(source)
+                    .ok_or("source length missing at partition activation")?;
+                let kind = if source == p.active.source {
+                    SourceKind::Active
+                } else if frozen.contains_key(&source) {
+                    SourceKind::Frozen
+                } else {
+                    SourceKind::Immutable(0)
+                };
+                visibility
+                    .register_source(source, len, kind)
+                    .map_err(|error| error.to_string())?;
+            }
+            for chunk in chunks.values() {
+                for row in 0..chunk.live.len {
+                    let pk = pk_at(&chunk.columns[pk_pos], row);
+                    let physical = chunk.row_start + row;
+                    let eligible = if chunk.source == p.active.source {
+                        p.active.position(&pk, physical).is_some()
+                    } else if let Some(table) = frozen.get(&chunk.source) {
+                        table.position(&pk, physical).is_some()
+                    } else {
+                        true
+                    };
+                    if eligible {
+                        visibility
+                            .load_candidate(
+                                pk,
+                                PartitionRow {
+                                    partition: 0,
+                                    location: crate::storage::visibility::RowLocation {
+                                        source: chunk.source,
+                                        row: physical,
+                                        seq: chunk.seqs[row],
+                                    },
+                                },
+                            )
+                            .map_err(|error| error.to_string())?;
+                    }
+                }
+            }
+            for (pk, &seq) in &p.committed_deletes {
+                visibility
+                    .committed_delete(pk.clone(), seq)
+                    .map_err(|error| error.to_string())?;
+            }
+            for (pk, seq) in p.active.delete_entries() {
+                visibility
+                    .load_pending_delete(p.active.source, pk.clone(), seq)
+                    .map_err(|error| error.to_string())?;
+            }
+            for (&source, table) in &frozen {
+                for (pk, seq) in table.delete_entries() {
+                    visibility
+                        .load_pending_delete(source, pk.clone(), seq)
+                        .map_err(|error| error.to_string())?;
+                }
+            }
+            let snapshot = visibility.snapshot(None);
+            if snapshot.live_count != count
+                || chunks.values().any(|chunk| {
+                    (0..chunk.live.len).any(|row| {
+                        snapshot.is_live(chunk.source, chunk.row_start + row)
+                            != Some(chunk.live.get(row))
+                    })
+                })
+            {
+                return Err("partition activation changes global visibility".into());
+            }
+            Ok(visibility)
+        })
+        .map_err(EngineError::Storage)
+    }
+
     pub(crate) fn mark_deleted(&mut self, deleted: bool) {
         self.deleted = deleted;
     }
@@ -683,7 +784,7 @@ impl Collection {
         let data_sources = recovered
             .segments
             .iter()
-            .map(|s| (s.relative_path.clone(), s.source))
+            .map(|s| ((s.partition.clone(), s.relative_path.clone()), s.source))
             .collect();
         // 活行数已由恢复确定；一次预留避免建表时同时保留扩容前后的两张哈希表。
         collection.pk_index.reserve(
@@ -1049,6 +1150,277 @@ impl Collection {
         Ok(())
     }
 
+    pub(crate) fn publish_partitioned_generation(
+        &mut self,
+        generation: &Arc<crate::storage::runtime::FrozenGeneration>,
+        manifest: crate::storage::manifest::Manifest,
+        mut publication: crate::storage::runtime::PartitionFlushOutcome,
+        retry: bool,
+    ) -> Result<()> {
+        let old = generation.table.source();
+        let ids: Vec<_> = self
+            .chunks
+            .iter()
+            .filter(|(_, chunk)| chunk.source == old)
+            .map(|(&id, _)| id)
+            .collect();
+        let p = self
+            .persistent
+            .as_ref()
+            .ok_or_else(|| EngineError::Storage("persistent state missing".into()))?;
+        let ordered: Vec<_> = manifest
+            .partition_order
+            .iter()
+            .filter_map(|name| p.partitions.id(name))
+            .collect();
+        publication
+            .data
+            .sort_by_key(|data| ordered.iter().position(|id| *id == data.id));
+        let prepared = (|| -> Result<_> {
+            if publication
+                .data
+                .iter()
+                .any(|data| data.data.seqs.is_empty())
+            {
+                return Err(EngineError::Storage(
+                    "published partition data is empty".into(),
+                ));
+            }
+            if publication
+                .data
+                .iter()
+                .any(|data| !ordered.contains(&data.id))
+            {
+                return Err(EngineError::Storage(
+                    "published partition is not registered".into(),
+                ));
+            }
+            let mut seen: Vec<_> = publication
+                .data
+                .iter()
+                .map(|data| vec![false; data.data.seqs.len()])
+                .collect();
+            let mut orders: Vec<_> = publication
+                .data
+                .iter()
+                .map(|data| vec![0; data.data.seqs.len()])
+                .collect();
+            let mut rows = Vec::with_capacity(publication.mapping.len());
+            let mut offset = 0;
+            for &id in &ids {
+                let chunk = &self.chunks[&id];
+                if chunk.row_start != offset {
+                    return Err(EngineError::Storage(
+                        "frozen partition blocks are not contiguous".into(),
+                    ));
+                }
+                for row in 0..chunk.live.len {
+                    let physical = offset + row;
+                    let pk = pk_at(&chunk.columns[self.pk_pos], row);
+                    rows.push((pk.clone(), physical, chunk.seqs[row]));
+                    let target = publication.mapping.get(physical).ok_or_else(|| {
+                        EngineError::Storage("frozen partition mapping missing".into())
+                    })?;
+                    if let Some((part, target)) = target {
+                        let index = publication
+                            .data
+                            .iter()
+                            .position(|data| data.id == *part)
+                            .ok_or_else(|| {
+                                EngineError::Storage("published partition data missing".into())
+                            })?;
+                        let data = &publication.data[index];
+                        if *target >= data.data.seqs.len()
+                            || seen[index][*target]
+                            || data.norms.len() != data.data.seqs.len()
+                            || data.data.seqs[*target] != chunk.seqs[row]
+                            || pk_at(&data.data.columns[self.pk_pos], *target) != pk
+                        {
+                            return Err(EngineError::Storage(
+                                "published partition data differs from frozen row".into(),
+                            ));
+                        }
+                        seen[index][*target] = true;
+                        orders[index][*target] = chunk.orders[row];
+                        if chunk.live.get(row)
+                            && self
+                                .pk_index
+                                .get(&pk)
+                                .is_none_or(|at| at.chunk != id || at.row != row)
+                        {
+                            return Err(EngineError::Storage(
+                                "frozen partition primary reference differs".into(),
+                            ));
+                        }
+                    } else if chunk.live.get(row) {
+                        return Err(EngineError::Storage(
+                            "partition publication omits a global live row".into(),
+                        ));
+                    }
+                }
+                offset += chunk.live.len;
+            }
+            if offset != publication.mapping.len()
+                || seen.iter().any(|bits| bits.iter().any(|live| !*live))
+            {
+                return Err(EngineError::Storage(
+                    "partition publication mapping is incomplete".into(),
+                ));
+            }
+            self.next_chunk
+                .checked_add(publication.data.len())
+                .ok_or_else(|| EngineError::Storage("read chunk ID space exhausted".into()))?;
+            Ok((rows, orders))
+        })();
+        let (rows, orders) = match prepared {
+            Ok(value) => value,
+            Err(error) => {
+                if let Some(p) = self.persistent.as_mut() {
+                    p.poison();
+                }
+                return Err(error);
+            }
+        };
+        let p = self
+            .persistent
+            .as_mut()
+            .ok_or_else(|| EngineError::Storage("persistent state missing".into()))?;
+        let targets = match p.publish_partitioned(generation, manifest, &publication, &rows, retry)
+        {
+            Ok(value) => value,
+            Err(error) => {
+                p.poison();
+                return Err(EngineError::Storage(error));
+            }
+        };
+        let snapshot = p.visibility.snapshot();
+        let built = (|| -> Result<_> {
+            let mut built = Vec::new();
+            for (offset, (data, orders)) in publication.data.into_iter().zip(orders).enumerate() {
+                let source = targets
+                    .iter()
+                    .find(|(id, _)| *id == data.id)
+                    .map(|(_, source)| *source)
+                    .ok_or_else(|| {
+                        EngineError::Storage("published partition source missing".into())
+                    })?;
+                let live = snapshot.source_bits(source).cloned().ok_or_else(|| {
+                    EngineError::Storage("published partition bitmap missing".into())
+                })?;
+                let id = self.next_chunk + offset;
+                built.push((
+                    id,
+                    Chunk {
+                        data: Arc::new(ChunkData {
+                            columns: data.data.columns,
+                            meta: data.data.meta,
+                            seqs: data.data.seqs,
+                            norms: data.norms,
+                            orders,
+                        }),
+                        live,
+                        source,
+                        row_start: 0,
+                        source_rank: 0,
+                        generation: 0,
+                    },
+                ));
+            }
+            Ok(built)
+        })();
+        let built = match built {
+            Ok(value) => value,
+            Err(error) => {
+                if let Some(p) = self.persistent.as_mut() {
+                    p.poison();
+                }
+                return Err(error);
+            }
+        };
+        for id in ids {
+            self.chunks.remove(&id);
+        }
+        self.next_chunk += built.len();
+        for (id, chunk) in built {
+            for row in chunk.live.live_rows() {
+                self.pk_index.insert(
+                    pk_at(&chunk.columns[self.pk_pos], row),
+                    RowRef {
+                        chunk: id,
+                        row,
+                        order: chunk.orders[row],
+                    },
+                );
+            }
+            self.chunks.insert(id, chunk);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn publish_partition_drop(&mut self, name: &str, partition: u32) -> Result<()> {
+        use crate::storage::visibility::partitions::SourceReplacement;
+        let p = self
+            .persistent
+            .as_mut()
+            .ok_or_else(|| EngineError::Storage("persistent state missing".into()))?;
+        let sources: std::collections::HashSet<_> = p
+            .data_sources
+            .iter()
+            .filter(|((part, _), _)| part == name)
+            .map(|(_, source)| *source)
+            .collect();
+        let mut inputs = Vec::new();
+        for &source in &sources {
+            let mut rows = Vec::new();
+            for chunk in self.chunks.values().filter(|c| c.source == source) {
+                if chunk.row_start != rows.len() {
+                    return Err(EngineError::Storage(
+                        "drop source blocks are not contiguous".into(),
+                    ));
+                }
+                for row in 0..chunk.seqs.len() {
+                    rows.push((
+                        crate::storage::compaction::primary(chunk, self.pk_pos, row)?,
+                        chunk.row_start + row,
+                        None,
+                    ));
+                }
+            }
+            inputs.push(SourceReplacement { source, rows });
+        }
+        p.visibility
+            .drop_partition_sources(partition, &inputs)
+            .map_err(EngineError::Storage)?;
+        p.data_sources.retain(|(part, _), _| part != name);
+        p.partition_cleanup = true;
+        self.chunks
+            .retain(|_, chunk| !sources.contains(&chunk.source));
+        let visible = p.visibility.snapshot();
+        self.pk_index.clear();
+        for (&id, chunk) in &mut self.chunks {
+            let bits = visible
+                .source_bits(chunk.source)
+                .ok_or_else(|| EngineError::Storage("drop source bitmap missing".into()))?;
+            chunk.live = bits
+                .slice(chunk.row_start, chunk.seqs.len())
+                .ok_or_else(|| EngineError::Storage("drop source rows missing".into()))?;
+            for row in 0..chunk.seqs.len() {
+                if chunk.live.get(row) {
+                    let pk = crate::storage::compaction::primary(chunk, self.pk_pos, row)?;
+                    self.pk_index.insert(
+                        pk,
+                        RowRef {
+                            chunk: id,
+                            row,
+                            order: chunk.orders[row],
+                        },
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn compaction_view(&self) -> Result<Option<crate::storage::compaction::View>> {
         use crate::storage::compaction::{Input, View};
         let p = self
@@ -1058,29 +1430,34 @@ impl Collection {
         if self.deleted || !p.can_compact().map_err(EngineError::Storage)? {
             return Ok(None);
         }
-        let inputs = p.manifest.partitions["_default"]
-            .data_files
-            .iter()
-            .enumerate()
-            .map(|(rank, relative)| {
+        let mut inputs = Vec::new();
+        for (partition, files) in &p.manifest.partitions {
+            for relative in &files.data_files {
                 let source = *p
                     .data_sources
-                    .get(relative)
+                    .get(&(partition.clone(), relative.clone()))
                     .ok_or_else(|| EngineError::Storage("manifest read source missing".into()))?;
+                let rank = p
+                    .visibility
+                    .source_order()
+                    .iter()
+                    .position(|id| *id == source)
+                    .ok_or_else(|| EngineError::Storage("manifest source rank missing".into()))?;
                 let chunks = self
                     .chunks
                     .values()
                     .filter(|c| c.source == source)
                     .cloned()
                     .collect();
-                Ok(Input {
+                inputs.push(Input {
+                    partition: partition.clone(),
                     relative: relative.clone(),
                     source,
                     rank,
                     chunks,
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
+                });
+            }
+        }
         Ok(Some(View {
             dir: p.dir.clone(),
             schema: self.schema.clone(),
@@ -1371,8 +1748,8 @@ impl Collection {
         let Some(p) = &self.persistent else {
             return Ok(false);
         };
-        let dir = p.dir.join("partitions/_default/indexes");
-        for (file, source) in &p.data_sources {
+        for ((partition, file), source) in &p.data_sources {
+            let dir = p.dir.join("partitions").join(partition).join("indexes");
             let rows = p
                 .visibility
                 .source_len(*source)
@@ -1590,7 +1967,19 @@ impl Collection {
         self.insert_inner(batch)
     }
 
-    pub(crate) fn upsert_from_db(&mut self, batch: InsertBatch) -> Result<Vec<Pk>> {
+    pub(crate) fn insert_partition_from_db(
+        &mut self,
+        batch: InsertBatch,
+        partition: &str,
+    ) -> Result<Vec<Pk>> {
+        self.insert_partition_inner(batch, partition)
+    }
+
+    pub(crate) fn upsert_partition_from_db(
+        &mut self,
+        batch: InsertBatch,
+        partition: &str,
+    ) -> Result<Vec<Pk>> {
         if self.deleted {
             return Err(EngineError::CollectionNotFound(self.name.clone()));
         }
@@ -1707,6 +2096,7 @@ impl Collection {
             metas.push(meta);
         }
         // 与参照一样，全部行的业务检查完成后才做 ARRAY 元素的 Arrow 转换。
+        self.resolve_write_partition(partition)?;
         for (i, rows) in array_inputs {
             fields[i] =
                 convert_optional(&self.schema.fields[i], Some(&InputValues::Array(rows)), n)?;
@@ -1730,33 +2120,50 @@ impl Collection {
                 ),
             ));
         }
-        self.insert_inner(InsertBatch {
-            num_rows: n,
-            columns,
-        })
+        self.insert_partition_inner(
+            InsertBatch {
+                num_rows: n,
+                columns,
+            },
+            partition,
+        )
     }
 
     pub(crate) fn delete_from_db(&mut self, pks: &[Pk]) -> Result<usize> {
+        self.delete_partition_from_db(pks, "")
+    }
+
+    pub(crate) fn delete_partition_from_db(
+        &mut self,
+        pks: &[Pk],
+        partition: &str,
+    ) -> Result<usize> {
         if self.deleted {
             return Err(EngineError::CollectionNotFound(self.name.clone()));
         }
         if pks.is_empty() {
             return Ok(0);
         }
+        let target = self.resolve_delete_partition(partition)?;
         let seq = self.next_seq;
         self.next_seq = seq
             .checked_add(1)
             .ok_or_else(|| EngineError::invalid("_seq space exhausted"))?;
-        self.delete_at_seq(pks, seq)
+        self.delete_at_seq(pks, seq, target)
     }
 
-    pub(crate) fn delete_literals_from_db(&mut self, literals: &[PkLiteral]) -> Result<Vec<Pk>> {
+    pub(crate) fn delete_partition_literals_from_db(
+        &mut self,
+        literals: &[PkLiteral],
+        partition: &str,
+    ) -> Result<Vec<Pk>> {
         if self.deleted {
             return Err(EngineError::CollectionNotFound(self.name.clone()));
         }
         if literals.is_empty() {
             return Ok(Vec::new());
         }
+        let target = self.resolve_delete_partition(partition)?;
         let seq = self.next_seq;
         self.next_seq = seq
             .checked_add(1)
@@ -1779,14 +2186,14 @@ impl Collection {
                 }
             })
             .collect::<Result<Vec<_>>>()?;
-        self.delete_at_seq(&pks, seq)?;
+        self.delete_at_seq(&pks, seq, target)?;
         Ok(pks)
     }
 
-    fn delete_at_seq(&mut self, pks: &[Pk], seq: u64) -> Result<usize> {
+    fn delete_at_seq(&mut self, pks: &[Pk], seq: u64, target: Option<u32>) -> Result<usize> {
         if let Some(persistent) = self.persistent.as_mut() {
             persistent
-                .append_delete(&self.schema, pks, seq)
+                .append_partition_delete(&self.schema, pks, seq, target)
                 .map_err(EngineError::Storage)?;
         }
         for pk in pks {
@@ -1798,6 +2205,36 @@ impl Collection {
     }
 
     fn insert_inner(&mut self, batch: InsertBatch) -> Result<Vec<Pk>> {
+        self.insert_partition_inner(batch, "_default")
+    }
+
+    fn resolve_delete_partition(&self, name: &str) -> Result<Option<u32>> {
+        if name.is_empty() {
+            Ok(None)
+        } else {
+            self.resolve_write_partition(name).map(Some)
+        }
+    }
+
+    fn resolve_write_partition(&self, name: &str) -> Result<u32> {
+        let name = if name.is_empty() { "_default" } else { name };
+        if let Some(p) = &self.persistent {
+            if !p.manifest.partitions.contains_key(name) {
+                return Err(EngineError::PartitionNotFound(name.to_owned()));
+            }
+            return p
+                .partitions
+                .id(name)
+                .ok_or_else(|| EngineError::Storage("partition identifier missing".into()));
+        }
+        if name == "_default" {
+            Ok(0)
+        } else {
+            Err(EngineError::PartitionNotFound(name.to_owned()))
+        }
+    }
+
+    fn insert_partition_inner(&mut self, batch: InsertBatch, partition: &str) -> Result<Vec<Pk>> {
         if self.deleted {
             return Err(EngineError::CollectionNotFound(self.name.clone()));
         }
@@ -1844,6 +2281,7 @@ impl Collection {
         for row in 0..n {
             self.validate_row(&by_name, &dynamic, row, &json_checks, row)?;
         }
+        let partition = self.resolve_write_partition(partition)?;
 
         let pk_field = &self.schema.fields[self.pk_pos];
         let auto_pk = pk_field.auto_id && !by_name.contains_key(pk_field.name.as_str());
@@ -1914,7 +2352,7 @@ impl Collection {
         self.next_seq = next_seq;
         if let Some(persistent) = self.persistent.as_mut() {
             persistent
-                .append(&self.schema, &seqs, &columns, meta.as_deref())
+                .append_partition(&self.schema, &seqs, &columns, meta.as_deref(), partition)
                 .map_err(EngineError::Storage)?;
         }
         // WAL 已成功追加；后续内存更新必须保持不可失败。
@@ -1972,13 +2410,53 @@ impl Collection {
 
     /// 只钉住命中的数据块，主键索引留在状态锁内，避免按总行数复制索引。
     pub fn prepare_get(&self, pks: &[Pk], output_fields: &[String]) -> Result<GetSnapshot> {
+        self.prepare_partition_get(pks, output_fields, &[])
+    }
+
+    pub fn prepare_partition_get(
+        &self,
+        pks: &[Pk],
+        output_fields: &[String],
+        names: &[String],
+    ) -> Result<GetSnapshot> {
         self.require_loaded()?;
+        let selected = self.resolve_partitions(names)?;
         let mut snapshot = self.read_metadata();
         let mut mapping = HashMap::new();
+        let mut locations = HashMap::<_, std::collections::BTreeMap<usize, (usize, &Chunk)>>::new();
+        if selected.is_some() {
+            for (&id, chunk) in &self.chunks {
+                locations
+                    .entry(chunk.source)
+                    .or_default()
+                    .insert(chunk.row_start, (id, chunk));
+            }
+        }
         let refs = pks
             .iter()
             .filter_map(|pk| {
-                let mut at = *self.pk_index.get(pk)?;
+                let mut at = if let Some(selected) = &selected {
+                    if let Some(p) = &self.persistent {
+                        let at = p.visibility.visible_data(pk, Some(selected))?;
+                        let (id, chunk) =
+                            locations.get(&at.source)?.range(..=at.row).next_back()?.1;
+                        if at.row - chunk.row_start >= chunk.seqs.len() {
+                            return None;
+                        }
+                        RowRef {
+                            chunk: *id,
+                            row: at.row - chunk.row_start,
+                            order: chunk.orders[at.row - chunk.row_start],
+                        }
+                    } else {
+                        if !selected.contains(&0) {
+                            return None;
+                        }
+                        *self.pk_index.get(pk)?
+                    }
+                } else {
+                    *self.pk_index.get(pk)?
+                };
                 at.chunk = *mapping.entry(at.chunk).or_insert_with(|| {
                     let index = snapshot.chunks.len();
                     snapshot.chunks.push(self.chunks[&at.chunk].clone());
@@ -2005,6 +2483,15 @@ impl Collection {
         literals: &[PkLiteral],
         output_fields: &[String],
     ) -> Result<GetSnapshot> {
+        self.prepare_partition_get_literals(literals, output_fields, &[])
+    }
+
+    pub fn prepare_partition_get_literals(
+        &self,
+        literals: &[PkLiteral],
+        output_fields: &[String],
+        names: &[String],
+    ) -> Result<GetSnapshot> {
         let int_pk = self.schema.fields[self.pk_pos].data_type == DataType::Int64;
         let pks: Vec<Pk> = literals
             .iter()
@@ -2014,7 +2501,7 @@ impl Collection {
                 _ => None,
             })
             .collect();
-        self.prepare_get(&pks, output_fields)
+        self.prepare_partition_get(&pks, output_fields, names)
     }
 
     pub fn get_literals(
@@ -2083,6 +2570,96 @@ impl Collection {
             })
             .collect();
         snapshot
+    }
+
+    /// 分区有效位复用同一列式读取管线；只重建位图，不复制列、向量或逐行判版本。
+    pub fn read_snapshot_with_visibility(
+        &self,
+        visibility: &crate::storage::visibility::VisibilitySnapshot,
+    ) -> Result<ReadSnapshot> {
+        let ranks: HashMap<_, _> = visibility
+            .source_order
+            .iter()
+            .enumerate()
+            .map(|(rank, &id)| (id, rank))
+            .collect();
+        let mut snapshot = self.read_metadata();
+        for chunk in self.chunks.values() {
+            let rank = *ranks
+                .get(&chunk.source)
+                .ok_or_else(|| EngineError::Storage("selected visibility source missing".into()))?;
+            let Some(bits) = visibility.source_bits(chunk.source) else {
+                continue;
+            };
+            let mut chunk = chunk.clone();
+            chunk.live = bits.slice(chunk.row_start, chunk.live.len).ok_or_else(|| {
+                EngineError::Storage("selected visibility rows are incomplete".into())
+            })?;
+            chunk.source_rank = rank;
+            snapshot.chunks.push(chunk);
+        }
+        snapshot
+            .chunks
+            .sort_by_key(|chunk| (chunk.source_rank, chunk.row_start));
+        Ok(snapshot)
+    }
+
+    pub fn read_named_snapshot(&self, names: &[String]) -> Result<ReadSnapshot> {
+        match self.resolve_partitions(names)? {
+            None => Ok(self.read_snapshot()),
+            Some(ids) if self.persistent.is_some() => self.read_partition_snapshot(Some(&ids)),
+            Some(ids) if ids.contains(&0) => Ok(self.read_snapshot()),
+            Some(_) => Ok(self.read_metadata()),
+        }
+    }
+
+    pub fn partition_count(&self) -> usize {
+        self.persistent
+            .as_ref()
+            .map_or(1, |p| p.manifest.partitions.len())
+    }
+
+    pub fn count_partition(&self, name: &str) -> Result<usize> {
+        let exists = self.persistent.as_ref().map_or(name == "_default", |p| {
+            p.manifest.partitions.contains_key(name)
+        });
+        if !exists {
+            return Err(EngineError::PartitionNotFound(name.into()));
+        }
+        let ids = self.resolve_partitions(&[name.into()])?;
+        if let Some(p) = &self.persistent {
+            Ok(p.visibility.selected_snapshot(ids.as_deref()).live_count)
+        } else {
+            Ok(self.count())
+        }
+    }
+
+    pub fn read_partition_snapshot(&self, selected: Option<&[u32]>) -> Result<ReadSnapshot> {
+        let persistent = self.persistent.as_ref().ok_or_else(|| {
+            EngineError::Storage("partition snapshot requires persistence".into())
+        })?;
+        self.read_snapshot_with_visibility(&persistent.visibility.selected_snapshot(selected))
+    }
+
+    pub fn resolve_partitions(&self, names: &[String]) -> Result<Option<Vec<u32>>> {
+        if names.is_empty() {
+            return Ok(None);
+        }
+        let mut ids = Vec::new();
+        if let Some(p) = &self.persistent {
+            for name in names {
+                if p.manifest.partitions.contains_key(name) {
+                    ids.push(p.partitions.id(name).ok_or_else(|| {
+                        EngineError::Storage("partition identifier missing".into())
+                    })?);
+                }
+            }
+        } else if names.iter().any(|name| name == "_default") {
+            ids.push(0);
+        }
+        ids.sort_unstable();
+        ids.dedup();
+        Ok(Some(ids))
     }
 
     pub fn search(&self, req: SearchRequest, compute: &Compute) -> Result<SearchResult> {
@@ -3074,6 +3651,99 @@ mod tests {
     use super::*;
 
     #[test]
+    fn selected_visibility_reuses_columns_and_old_vector_snapshot_after_mask_update() {
+        use crate::storage::visibility::partitions::{
+            PartitionRow, PartitionVisibility, SourceKind,
+        };
+        use crate::storage::visibility::{RowLocation, SourceId};
+        let mut id = FieldSchema::new("id", DataType::Int64);
+        id.is_primary = true;
+        let mut vector = FieldSchema::new("v", DataType::FloatVector);
+        vector.dim = Some(2);
+        let mut collection = Collection::new(
+            "c",
+            CollectionSchema {
+                fields: vec![id, vector],
+                enable_dynamic_field: false,
+                properties: vec![],
+            },
+        )
+        .unwrap();
+        collection
+            .insert(InsertBatch {
+                num_rows: 2,
+                columns: vec![
+                    ("id".into(), InputValues::Int(vec![1, 2])),
+                    (
+                        "v".into(),
+                        InputValues::FloatVector {
+                            dim: 2,
+                            values: vec![1., 0., 2., 0.],
+                        },
+                    ),
+                ],
+            })
+            .unwrap();
+        let mut visibility = PartitionVisibility::default();
+        visibility
+            .register_source(SourceId(1), 2, SourceKind::Active)
+            .unwrap();
+        for row in 0..2 {
+            visibility
+                .insert(
+                    Pk::Int64(row + 1),
+                    PartitionRow {
+                        partition: row as u32,
+                        location: RowLocation {
+                            source: SourceId(1),
+                            row: row as usize,
+                            seq: row as u64 + 1,
+                        },
+                    },
+                )
+                .unwrap();
+        }
+        let snapshot = collection
+            .read_snapshot_with_visibility(&visibility.snapshot(Some(&[0])))
+            .unwrap();
+        assert!(Arc::ptr_eq(
+            &snapshot.chunks[0].data,
+            &collection.chunks.values().next().unwrap().data
+        ));
+        visibility.committed_delete(Pk::Int64(1), 3).unwrap();
+        assert_eq!(
+            snapshot
+                .query("", &["v".into()], None, 0)
+                .unwrap()
+                .rows
+                .fields[0]
+                .1,
+            ColumnData::FloatVector {
+                dim: 2,
+                values: vec![1., 0.]
+            }
+        );
+        assert_eq!(
+            collection
+                .read_snapshot_with_visibility(&visibility.snapshot(Some(&[0])))
+                .unwrap()
+                .count_filtered("")
+                .unwrap(),
+            0
+        );
+        let mut wrong = PartitionVisibility::default();
+        wrong
+            .register_source(SourceId(1), 1, SourceKind::Active)
+            .unwrap();
+        assert!(
+            collection
+                .read_snapshot_with_visibility(&wrong.snapshot(None))
+                .is_err()
+        );
+        assert_eq!(collection.count(), 2);
+    }
+
+    #[test]
     fn active_range_rejects_nan_scores_and_nan_bounds() {
         for metric in [Metric::L2, Metric::Ip, Metric::Cosine] {
             for range in [
@@ -3182,8 +3852,10 @@ mod tests {
             c.release();
             let p = c.persistent_mut().unwrap();
             // 零行数据文件在恢复入口已拒绝；直接验证 load 原语对零行来源的跳过边界。
-            p.data_sources
-                .insert("data/zero.parquet".into(), p.active.source);
+            p.data_sources.insert(
+                ("_default".into(), "data/zero.parquet".into()),
+                p.active.source,
+            );
             let parent = p.dir.join("partitions/_default");
             std::fs::create_dir_all(&parent).unwrap();
             std::fs::write(parent.join("indexes"), b"stat would fail").unwrap();
@@ -3827,7 +4499,7 @@ mod tests {
             &get.snapshot.chunks[0].data,
             &c.chunks[&at.chunk].data
         ));
-        c.delete_at_seq(&[Pk::Int64(1)], c.next_seq).unwrap();
+        c.delete_at_seq(&[Pk::Int64(1)], c.next_seq, None).unwrap();
         assert!(!c.chunks[&at.chunk].live.get(at.row));
         assert!(snapshot.chunks[at.chunk].live.get(at.row));
         assert!(Arc::ptr_eq(

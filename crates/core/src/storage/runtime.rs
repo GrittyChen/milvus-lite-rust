@@ -113,6 +113,8 @@ impl Drop for FlushRetryWindowGuard {
 pub struct FrozenGeneration {
     pub number: u64,
     pub table: FrozenMemTable,
+    pub(crate) partitions: Vec<(u32, String)>,
+    pub(crate) partitioned: bool,
     wal_files: Mutex<Vec<(WalKind, File)>>,
 }
 
@@ -140,12 +142,23 @@ impl FrozenGeneration {
 }
 
 pub struct FlushOutcome {
+    pub(crate) partitioned: Option<PartitionFlushOutcome>,
     pub manifest: Manifest,
     pub mapping: Vec<Option<usize>>,
     /// 与实际写出 Parquet 相同的批次，锁外解码后交给读取视图。
     pub data: Option<DecodedData>,
     pub norms: Vec<f32>,
     pub post_commit_error: Option<PostCommitError>,
+}
+
+pub(crate) struct FlushedPartition {
+    pub id: u32,
+    pub data: DecodedData,
+    pub norms: Vec<f32>,
+}
+pub(crate) struct PartitionFlushOutcome {
+    pub mapping: Vec<Option<(u32, usize)>>,
+    pub data: Vec<FlushedPartition>,
 }
 
 pub enum PostCommitError {
@@ -156,14 +169,16 @@ pub enum PostCommitError {
 pub struct PersistentCollection {
     pub dir: PathBuf,
     pub manifest: Manifest,
+    pub(crate) partitions: super::partition_paths::Registry,
     pub visibility: Visibility,
     pub active: MemTable,
     pub generation: u64,
-    pub(crate) data_sources: BTreeMap<String, SourceId>,
+    pub(crate) data_sources: BTreeMap<(String, String), SourceId>,
     pub(crate) pinned_files: crate::storage::snapshot::PinnedFiles,
     retained_old_wal: bool,
     pub(crate) maintenance_status: Arc<crate::maintenance::Status>,
     pub(crate) compaction_cleanup: Vec<PathBuf>,
+    pub(crate) partition_cleanup: bool,
     pub(crate) committed_deletes: HashMap<Pk, u64>,
     next_source: u64,
     data_wal: Option<WalWriter>,
@@ -199,6 +214,7 @@ impl PersistentCollection {
         Ok(Self {
             dir,
             manifest: Manifest::default(),
+            partitions: super::partition_paths::Registry::from_manifest(&Manifest::default())?,
             visibility,
             active: MemTable::new(SourceId(1)),
             generation: 1,
@@ -207,6 +223,7 @@ impl PersistentCollection {
             retained_old_wal: false,
             maintenance_status: Arc::new(Default::default()),
             compaction_cleanup: Vec::new(),
+            partition_cleanup: false,
             committed_deletes: HashMap::new(),
             next_source: 2,
             data_wal: None,
@@ -226,11 +243,12 @@ impl PersistentCollection {
     pub(crate) fn recovered(
         dir: PathBuf,
         recovered: RecoveredCollection,
-        data_sources: BTreeMap<String, SourceId>,
+        data_sources: BTreeMap<(String, String), SourceId>,
     ) -> Self {
         let next_source = recovered.active_memtable.source.0 + 1;
         Self {
             dir,
+            partitions: recovered.partitions,
             manifest: recovered.manifest,
             visibility: recovered.visibility,
             active: recovered.active_memtable,
@@ -240,6 +258,7 @@ impl PersistentCollection {
             retained_old_wal: recovered.retained_old_wal,
             maintenance_status: Arc::new(Default::default()),
             compaction_cleanup: Vec::new(),
+            partition_cleanup: false,
             committed_deletes: recovered.committed_deletes,
             next_source,
             data_wal: None,
@@ -294,32 +313,39 @@ impl PersistentCollection {
     ) -> Result<(), String> {
         let mut sources = self.data_sources.clone();
         for input in &prepared.inputs {
-            sources.remove(&input.relative);
+            sources.remove(&(input.partition.clone(), input.relative.clone()));
         }
         for (output, source) in prepared.outputs.iter().zip(ids) {
             sources.insert(
-                output
-                    .relative
-                    .clone()
-                    .ok_or("compaction output name missing")?,
+                (
+                    prepared.partition.clone(),
+                    output
+                        .relative
+                        .clone()
+                        .ok_or("compaction output name missing")?,
+                ),
                 *source,
             );
         }
-        let mut order = manifest.partitions["_default"]
-            .data_files
+        // 参照缓存保留未合并 segment 的相对顺序，再追加新输出；冻结代及活跃源在其后。
+        let committed: std::collections::HashSet<_> = self.data_sources.values().copied().collect();
+        let mut order: Vec<_> = self
+            .visibility
+            .source_order()
             .iter()
-            .map(|name| {
-                sources
-                    .get(name)
-                    .copied()
-                    .ok_or("compacted manifest source missing")
+            .copied()
+            .filter(|source| {
+                committed.contains(source) && !prepared.inputs.iter().any(|i| i.source == *source)
             })
-            .collect::<Result<Vec<_>, _>>()?;
-        for &source in self.visibility.source_order() {
-            if !prepared.inputs.iter().any(|i| i.source == source) && !order.contains(&source) {
-                order.push(source);
-            }
-        }
+            .collect();
+        order.extend_from_slice(ids);
+        order.extend(
+            self.visibility
+                .source_order()
+                .iter()
+                .copied()
+                .filter(|source| !committed.contains(source)),
+        );
         let outputs: Vec<_> = prepared
             .outputs
             .iter()
@@ -339,7 +365,7 @@ impl PersistentCollection {
             self.record_failure(reason);
         } else {
             self.visibility
-                .gc_deletes(threshold, self.manifest.current_seq);
+                .gc_deletes(threshold, self.manifest.current_seq)?;
             self.committed_deletes
                 .retain(|_, seq| threshold.is_some_and(|t| *seq >= t));
             // 删除重负载后不能让已过期表长期保留峰值桶容量。
@@ -375,6 +401,37 @@ impl PersistentCollection {
         !self.pending.is_empty()
     }
 
+    pub(crate) fn pending_generations(&self) -> impl Iterator<Item = &Arc<FrozenGeneration>> {
+        self.pending.iter()
+    }
+
+    pub(crate) fn rebuild_partition_visibility(
+        &mut self,
+        build: impl FnOnce(
+            &Self,
+            crate::storage::visibility::partitions::PartitionVisibility,
+        ) -> Result<
+            crate::storage::visibility::partitions::PartitionVisibility,
+            String,
+        >,
+    ) -> Result<(), String> {
+        if self.poisoned {
+            return Err("collection state is unusable after a storage failure".into());
+        }
+        if self.visibility.is_partitioned() {
+            return Ok(());
+        }
+        // 重建全程持状态写锁；先封锁失败/展开路径，避免同时保留两份全库主键表。
+        self.poisoned = true;
+        let index = self.visibility.release_version_index_for_rebuild();
+        let visibility =
+            crate::storage::visibility::partitions::PartitionVisibility::with_reused_index(index);
+        let visibility = build(self, visibility)?;
+        self.visibility.enable_partitions(visibility);
+        self.poisoned = false;
+        Ok(())
+    }
+
     pub fn inherited_synced(&self) -> bool {
         self.inherited_synced
     }
@@ -394,14 +451,31 @@ impl PersistentCollection {
         columns: &[ColumnData],
         meta: Option<&[Map<String, Value>]>,
     ) -> Result<(), String> {
+        self.append_partition(schema, seqs, columns, meta, 0)
+    }
+
+    pub fn append_partition(
+        &mut self,
+        schema: &CollectionSchema,
+        seqs: &[u64],
+        columns: &[ColumnData],
+        meta: Option<&[Map<String, Value>]>,
+        partition: u32,
+    ) -> Result<(), String> {
         if self.poisoned {
             return Err("collection state is unusable after a storage failure".to_owned());
         }
         if self.needs_retry() {
             return Err("a failed flush must complete before another write".to_owned());
         }
-        let batch =
-            arrow_data::wal_data_batch(schema, seqs, "_default", columns, meta).map_err(err)?;
+        let name = self
+            .partitions
+            .name(partition)
+            .ok_or("write partition missing")?;
+        if !self.manifest.partitions.contains_key(name) {
+            return Err("write partition is not registered".into());
+        }
+        let batch = arrow_data::wal_data_batch(schema, seqs, name, columns, meta).map_err(err)?;
         if self.data_wal.is_none() {
             let wal_dir = self.dir.join("wal");
             fs_commit::create_dir_synced(&wal_dir).map_err(err)?;
@@ -426,9 +500,9 @@ impl PersistentCollection {
             columns: columns.to_vec(),
             meta: meta.map(<[Map<String, Value>]>::to_vec),
         };
-        if let Err(error) = self
-            .active
-            .apply_data(schema, decoded, &mut self.visibility)
+        if let Err(error) =
+            self.active
+                .apply_partition_data(schema, decoded, &mut self.visibility, &[partition])
         {
             // WAL 已追加成功。不能继续在可能只更新一半的内存状态上服务请求。
             self.poisoned = true;
@@ -443,6 +517,16 @@ impl PersistentCollection {
         pks: &[Pk],
         seq: u64,
     ) -> Result<(), String> {
+        self.append_partition_delete(schema, pks, seq, None)
+    }
+
+    pub fn append_partition_delete(
+        &mut self,
+        schema: &CollectionSchema,
+        pks: &[Pk],
+        seq: u64,
+        target: Option<u32>,
+    ) -> Result<(), String> {
         if pks.is_empty() {
             return Ok(());
         }
@@ -453,7 +537,15 @@ impl PersistentCollection {
             return Err("a failed flush must complete before another write".to_owned());
         }
         let seqs = vec![seq; pks.len()];
-        let batch = arrow_data::wal_delta_batch(schema, pks, &seqs, "_all").map_err(err)?;
+        let name = if let Some(part) = target {
+            self.partitions
+                .name(part)
+                .filter(|name| self.manifest.partitions.contains_key(*name))
+                .ok_or("delete partition is not registered")?
+        } else {
+            "_all"
+        };
+        let batch = arrow_data::wal_delta_batch(schema, pks, &seqs, name).map_err(err)?;
         if self.delta_wal.is_none() {
             let wal_dir = self.dir.join("wal");
             fs_commit::create_dir_synced(&wal_dir).map_err(err)?;
@@ -476,7 +568,10 @@ impl PersistentCollection {
             self.failed_flush = true;
             return Err(error.to_string());
         }
-        if let Err(error) = self.active.apply_delete(pks, seq, &mut self.visibility) {
+        if let Err(error) =
+            self.active
+                .apply_partition_delete(pks, seq, target, &mut self.visibility)
+        {
             self.poisoned = true;
             return Err(error.to_string());
         }
@@ -491,6 +586,18 @@ impl PersistentCollection {
         if self.active.size() == 0 && !even_if_empty {
             return Ok(());
         }
+        let partitions: Vec<_> = self
+            .manifest
+            .partitions
+            .keys()
+            .map(|name| {
+                self.partitions
+                    .id(name)
+                    .map(|id| (id, name.clone()))
+                    .ok_or_else(|| "freeze partition metadata missing".to_owned())
+            })
+            .collect::<Result<_, _>>()?;
+        let partitioned = self.visibility.is_partitioned();
         let next_generation = self
             .generation
             .checked_add(1)
@@ -500,6 +607,9 @@ impl PersistentCollection {
             .next_source
             .checked_add(1)
             .ok_or("source ID space exhausted")?;
+        self.visibility
+            .freeze_source(self.active.source)
+            .map_err(err)?;
         self.visibility.add_source(new_source, 0).map_err(err)?;
         let old = std::mem::replace(&mut self.active, MemTable::new(new_source));
         // 视图构建若 panic，原 writer 必须仍由 self 持有，不能随局部 File 容器析构。
@@ -514,6 +624,8 @@ impl PersistentCollection {
             wal_files.push((WalKind::Delta, writer.into_file()));
         }
         self.pending.push_back(Arc::new(FrozenGeneration {
+            partitions,
+            partitioned,
             number: self.generation,
             table: frozen,
             wal_files: Mutex::new(wal_files),
@@ -625,6 +737,49 @@ impl PersistentCollection {
         Ok(())
     }
 
+    pub(crate) fn validate_partition_commit(&self) -> Result<(), String> {
+        if self.poisoned || self.needs_retry() {
+            return Err("collection has unfinished storage work".into());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn publish_partition_manifest(
+        &mut self,
+        candidate: Manifest,
+        registry: super::partition_paths::Registry,
+        committed: Result<fs_commit::ManifestCommit, fs_commit::CommitError>,
+    ) -> Result<(), String> {
+        let durability = match committed {
+            Ok(report) => {
+                if let Some(error) = report.prev_copy_error {
+                    eprintln!(
+                        "partition manifest backup copy failed for {:?}: {error}",
+                        self.dir
+                    );
+                }
+                None
+            }
+            Err(error) if error.phase == CommitPhase::BeforeReplace => {
+                return Err(error.to_string());
+            }
+            Err(error) => Some(error.to_string()),
+        };
+        // 正常写者由独占许可排除；若先前维护的异常收尾已封锁实例，不能发布半状态。
+        if let Err(error) = self.validate_partition_commit() {
+            self.poisoned = true;
+            return Err(error);
+        }
+        self.manifest = candidate;
+        self.partitions = registry;
+        if let Some(error) = durability {
+            self.retry_manifest = true;
+            self.record_failure(error.clone());
+            return Err(error);
+        }
+        Ok(())
+    }
+
     /// flush 锁持有者提交一代，之后在状态写锁内发布位图映射。
     pub fn publish(
         &mut self,
@@ -674,7 +829,8 @@ impl PersistentCollection {
             return Err(error.to_string());
         }
         if let Some(file) = new_file {
-            self.data_sources.insert(file, segment_source);
+            self.data_sources
+                .insert(("_default".into(), file), segment_source);
         }
         self.manifest = manifest;
         self.pending.pop_front();
@@ -696,6 +852,112 @@ impl PersistentCollection {
         Ok(segment_source)
     }
 
+    pub(crate) fn publish_partitioned(
+        &mut self,
+        generation: &Arc<FrozenGeneration>,
+        manifest: Manifest,
+        publication: &PartitionFlushOutcome,
+        source_rows: &[(Pk, usize, u64)],
+        after_replace_error: bool,
+    ) -> Result<Vec<(u32, SourceId)>, String> {
+        if !self
+            .pending
+            .front()
+            .is_some_and(|front| Arc::ptr_eq(front, generation))
+        {
+            return Err("flush generation changed before publication".into());
+        }
+        let mut targets = Vec::new();
+        let mut names = Vec::new();
+        let mut sources = Vec::new();
+        for data in &publication.data {
+            let name = self
+                .partitions
+                .name(data.id)
+                .ok_or("published partition missing")?;
+            let old = &self
+                .manifest
+                .partitions
+                .get(name)
+                .ok_or("old partition missing")?
+                .data_files;
+            let new = &manifest
+                .partitions
+                .get(name)
+                .ok_or("new partition missing")?
+                .data_files;
+            let added: Vec<_> = new
+                .iter()
+                .filter(|file| !old.contains(file))
+                .cloned()
+                .collect();
+            if added.len() != 1 {
+                return Err("published partition filename is incomplete".into());
+            }
+            let source = SourceId(self.next_source);
+            self.next_source = self
+                .next_source
+                .checked_add(1)
+                .ok_or("source ID space exhausted")?;
+            targets.push((data.id, source));
+            sources.push((
+                source,
+                data.data.seqs.len(),
+                crate::storage::visibility::partitions::SourceKind::Immutable(data.id),
+            ));
+            names.push(((name.to_owned(), added[0].clone()), source));
+        }
+        let mut mapping = Vec::with_capacity(source_rows.len());
+        for (pk, row, seq) in source_rows {
+            let target = match publication
+                .mapping
+                .get(*row)
+                .ok_or("partition source mapping missing")?
+            {
+                None => None,
+                Some((part, row)) => Some(crate::storage::visibility::RowLocation {
+                    source: targets
+                        .iter()
+                        .find(|(id, _)| id == part)
+                        .map(|(_, source)| *source)
+                        .ok_or("partition target source missing")?,
+                    row: *row,
+                    seq: *seq,
+                }),
+            };
+            mapping.push((pk.clone(), *row, target));
+        }
+        let mut order = Vec::new();
+        for &source in self.visibility.source_order() {
+            if source == generation.table.source() {
+                order.extend(targets.iter().map(|(_, source)| *source));
+            } else {
+                order.push(source);
+            }
+        }
+        self.visibility
+            .replace_partition_source(generation.table.source(), mapping, &sources, &order)
+            .map_err(err)?;
+        self.data_sources.extend(names);
+        self.manifest = manifest;
+        self.pending.pop_front();
+        self.last_published_generation = Some(generation.number);
+        for (pk, seq) in generation.table.delete_entries() {
+            self.committed_deletes
+                .entry(pk.clone())
+                .and_modify(|old| *old = (*old).max(seq))
+                .or_insert(seq);
+        }
+        self.retained_old_wal = false;
+        self.inherited_synced = true;
+        self.failed_flush = false;
+        self.retry_manifest |= after_replace_error;
+        if !self.retry_manifest {
+            self.last_failure = None;
+        }
+        Ok(targets)
+    }
+
     pub fn failed_before_replace(&mut self, reason: impl Into<String>) {
         self.failed_flush = true;
         self.record_failure(reason);
@@ -706,6 +968,10 @@ impl PersistentCollection {
             flush::cleanup_wal(&self.dir.join("wal"), last).map_err(err)?;
         }
         Ok(())
+    }
+
+    pub(crate) fn retained_old_wal(&self) -> bool {
+        self.retained_old_wal
     }
 
     pub fn sync_retained_wal(&mut self) -> Result<(), String> {
@@ -817,6 +1083,9 @@ pub fn flush_one(
     schema: &CollectionSchema,
     sync_inherited_files: bool,
 ) -> Result<FlushOutcome, FlushError> {
+    if generation.partitioned {
+        return flush_one_partitioned(dir, manifest, generation, schema, sync_inherited_files);
+    }
     let (materialized, data, norms) =
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             #[cfg(feature = "fault-injection")]
@@ -915,6 +1184,7 @@ pub fn flush_one(
         sync_inherited_files,
     ) {
         Ok(manifest) => Ok(FlushOutcome {
+            partitioned: None,
             manifest,
             mapping: materialized.mapping,
             data,
@@ -933,6 +1203,7 @@ pub fn flush_one(
                     cleanup_failed: false,
                 })?;
             Ok(FlushOutcome {
+                partitioned: None,
                 manifest: (**manifest).clone(),
                 mapping: materialized.mapping,
                 data,
@@ -946,6 +1217,141 @@ pub fn flush_one(
         }
         Err(error) => Err(error),
     }
+}
+
+fn prepare_error(dir: &Path, reason: impl ToString) -> FlushError {
+    FlushError {
+        path: dir.to_path_buf(),
+        phase: CommitPhase::BeforeReplace,
+        reason: reason.to_string(),
+        committed_manifest: None,
+        cleanup_failed: false,
+    }
+}
+
+fn flush_one_partitioned(
+    dir: &Path,
+    manifest: &Manifest,
+    generation: &FrozenGeneration,
+    schema: &CollectionSchema,
+    sync_inherited_files: bool,
+) -> Result<FlushOutcome, FlushError> {
+    let (materialized, data) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        #[cfg(feature = "fault-injection")]
+        if PREPARE_PANIC.with(|slot| slot.replace(false)) {
+            panic!("injected flush preparation panic");
+        }
+        let known: Vec<_> = generation.partitions.iter().map(|(id, _)| *id).collect();
+        let materialized = generation
+            .table
+            .materialize_partitions(schema, &known)
+            .map_err(|error| prepare_error(dir, error))?;
+        let mut data = Vec::new();
+        for (&id, batch) in &materialized.batches {
+            if let Some(batch) = &batch.data {
+                let decoded = arrow_data::decode_data_batch(schema, batch)
+                    .map_err(|error| prepare_error(dir, error))?;
+                let norms = decoded
+                    .columns
+                    .iter()
+                    .find_map(|column| {
+                        if let ColumnData::FloatVector { dim, values } = column {
+                            Some(values.chunks_exact(*dim).map(crate::flat::norm).collect())
+                        } else {
+                            None
+                        }
+                    })
+                    .ok_or_else(|| {
+                        prepare_error(dir, "published data has no dense vector column")
+                    })?;
+                data.push(FlushedPartition {
+                    id,
+                    data: decoded,
+                    norms,
+                });
+            }
+        }
+        #[cfg(feature = "fault-injection")]
+        BEFORE_COMMIT_PAUSE.with(|slot| -> Result<(), FlushError> {
+            if let Some((entered, resume)) = slot.borrow_mut().take() {
+                entered
+                    .send(())
+                    .map_err(|error| prepare_error(dir, error))?;
+                resume.recv().map_err(|error| prepare_error(dir, error))?;
+            }
+            Ok(())
+        })?;
+        generation
+            .sync_and_close_wal(dir)
+            .map_err(|error| prepare_error(dir.join("wal").as_path(), error))?;
+        Ok::<_, FlushError>((materialized, data))
+    }))
+    .unwrap_or_else(|panic| {
+        Err(prepare_error(
+            dir,
+            format!(
+                "flush preparation panicked: {}",
+                crate::error::panic_description(panic.as_ref())
+            ),
+        ))
+    })?;
+    let mut plans = Vec::new();
+    for (id, batch) in &materialized.batches {
+        let name = generation
+            .partitions
+            .iter()
+            .find(|(part, _)| part == id)
+            .map(|(_, name)| name.as_str())
+            .ok_or_else(|| prepare_error(dir, "frozen partition name missing"))?;
+        plans.push(flush::PartitionFlush {
+            name,
+            data: batch.data.as_ref(),
+            delta: batch.delta.as_ref(),
+        });
+    }
+    if plans.is_empty() {
+        plans.push(flush::PartitionFlush {
+            name: "_default",
+            data: None,
+            delta: None,
+        });
+    }
+    let result = flush::flush_partitions_generation(
+        dir,
+        manifest,
+        generation.number,
+        generation.table.max_seq(),
+        &plans,
+        sync_inherited_files,
+    );
+    let (manifest, post_commit_error) = match result {
+        Ok(manifest) => (manifest, None),
+        Err(error) if error.phase == CommitPhase::AfterReplace => {
+            let manifest = error.committed_manifest.ok_or_else(|| {
+                prepare_error(dir, "committed manifest missing from post-replace error")
+            })?;
+            (
+                *manifest,
+                Some(if error.cleanup_failed {
+                    PostCommitError::WalCleanup(error.reason)
+                } else {
+                    PostCommitError::Durability(error.reason)
+                }),
+            )
+        }
+        Err(error) => return Err(error),
+    };
+    Ok(FlushOutcome {
+        manifest,
+        partitioned: Some(PartitionFlushOutcome {
+            mapping: materialized.mapping,
+            data,
+        }),
+        mapping: Vec::new(),
+        data: None,
+        norms: Vec::new(),
+        post_commit_error,
+    })
 }
 
 fn err(error: impl std::fmt::Display) -> String {

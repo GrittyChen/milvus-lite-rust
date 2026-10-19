@@ -132,6 +132,10 @@ impl<V> Default for PkMap<V> {
 }
 
 impl<V> PkMap<V> {
+    pub(crate) fn clear(&mut self) {
+        self.ints.clear();
+        self.strings.clear();
+    }
     pub(crate) fn get(&self, key: &Pk) -> Option<&V> {
         match key {
             Pk::Int64(k) => self.ints.get(k),
@@ -158,6 +162,16 @@ impl<V> PkMap<V> {
     }
     pub(crate) fn len(&self) -> usize {
         self.ints.len() + self.strings.len()
+    }
+    pub(crate) fn into_entries(self) -> impl Iterator<Item = (Pk, V)> {
+        self.ints
+            .into_iter()
+            .map(|(key, value)| (Pk::Int64(key), value))
+            .chain(
+                self.strings
+                    .into_iter()
+                    .map(|(key, value)| (Pk::VarChar(key), value)),
+            )
     }
     pub(crate) fn reserve(&mut self, kind: DataType, additional: usize) {
         match kind {

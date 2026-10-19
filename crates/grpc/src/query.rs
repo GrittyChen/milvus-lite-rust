@@ -50,10 +50,7 @@ pub(crate) fn query(
             if timezone {
                 return Err(unsupported("timezone"));
             }
-            if req.partition_names.iter().any(|p| p != "_default") {
-                return Err(unsupported("partitions other than '_default'"));
-            }
-            let snapshot = c.read_snapshot();
+            let snapshot = c.read_named_snapshot(&req.partition_names)?;
             drop(c);
             return Ok(count_result(
                 snapshot.name(),
@@ -78,17 +75,19 @@ pub(crate) fn query(
     let parsed = parsed?;
     // Get 保留请求中的主键次序且不分页；iterator 必须走过滤、排序后分页的通用路线。
     let literals = (!iterator).then(|| parsed.primary_keys(&pk)).flatten();
-    if req.partition_names.iter().any(|p| p != "_default") {
-        return Err(unsupported("partitions other than '_default'"));
-    }
     if timezone {
         return Err(unsupported("timezone"));
     }
     let prepared = literals
         .as_ref()
-        .map(|literals| c.prepare_get_literals(literals, &req.output_fields))
+        .map(|literals| {
+            c.prepare_partition_get_literals(literals, &req.output_fields, &req.partition_names)
+        })
         .transpose()?;
-    let snapshot = prepared.is_none().then(|| c.read_snapshot());
+    let snapshot = prepared
+        .is_none()
+        .then(|| c.read_named_snapshot(&req.partition_names))
+        .transpose()?;
     drop(c);
     #[cfg(test)]
     AFTER_PREPARE.with(|hook| {

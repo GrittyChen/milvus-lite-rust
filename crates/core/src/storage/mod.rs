@@ -7,6 +7,8 @@ pub mod fs_commit;
 pub mod manifest;
 pub mod memtable;
 pub mod parquet_file;
+pub(crate) mod partition_drop;
+pub(crate) mod partition_paths;
 pub mod recovery;
 pub mod runtime;
 pub mod schema_file;

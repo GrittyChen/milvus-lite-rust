@@ -82,6 +82,29 @@ fn panic_at_manifest_replace(phase: CommitPhase) {
     }
 }
 
+#[cfg(feature = "fault-injection")]
+type ManifestPause = (std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>);
+#[cfg(feature = "fault-injection")]
+thread_local! { static AFTER_REPLACE_PAUSE: std::cell::RefCell<Option<ManifestPause>> = const { std::cell::RefCell::new(None) }; }
+#[cfg(feature = "fault-injection")]
+pub fn pause_manifest_after_replace_once(
+    entered: std::sync::mpsc::Sender<()>,
+    resume: std::sync::mpsc::Receiver<()>,
+) {
+    AFTER_REPLACE_PAUSE.with(|slot| *slot.borrow_mut() = Some((entered, resume)));
+}
+#[cfg(feature = "fault-injection")]
+fn manifest_after_replace_pause() -> io::Result<()> {
+    let pause = AFTER_REPLACE_PAUSE.with(|slot| slot.borrow_mut().take());
+    if let Some((entered, resume)) = pause {
+        entered.send(()).map_err(io::Error::other)?;
+        resume
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .map_err(io::Error::other)?;
+    }
+    Ok(())
+}
+
 /// 仅测试构建可用；发布 wheel 默认不含故障注入点。
 #[cfg(feature = "fault-injection")]
 pub fn inject_manifest_dir_sync_failure_once() {
@@ -316,6 +339,8 @@ impl PreparedManifest {
                     io::Error::other("injected manifest directory sync failure"),
                 ));
             }
+            #[cfg(feature = "fault-injection")]
+            manifest_after_replace_pause().map_err(|e| CommitError::after(&self.dir, e))?;
             sync_dir(&self.dir).map_err(|e| CommitError::after(&self.dir, e))?;
             Ok(ManifestCommit {
                 prev_copy_error: self.prev_copy_error.take(),

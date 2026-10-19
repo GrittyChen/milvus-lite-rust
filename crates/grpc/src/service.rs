@@ -211,7 +211,7 @@ impl Service for MilvusService {
                 schema: Some(schema::encode(c.name(), c.schema())?),
                 collection_name: c.name().to_owned(),
                 shards_num: 1,
-                num_partitions: 1,
+                num_partitions: i64::try_from(c.partition_count()).unwrap_or(i64::MAX),
                 properties: c
                     .schema()
                     .properties
@@ -265,6 +265,91 @@ impl Service for MilvusService {
                 .read()
                 .count();
             Ok(svc::GetCollectionStatisticsResponse {
+                status: Some(success()),
+                stats: vec![schema::kv("row_count", count.to_string())],
+            })
+        })
+        .await
+    }
+
+    async fn create_partition(
+        &self,
+        request: Request<svc::CreatePartitionRequest>,
+    ) -> Result<Response<common::Status>, Status> {
+        let database = database(&request, |r| &r.db_name);
+        let req = request.into_inner();
+        self.run(Branch::Engine, move |db| {
+            db.create_partition(&database, &req.collection_name, &req.partition_name)?;
+            Ok(success())
+        })
+        .await
+    }
+
+    async fn drop_partition(
+        &self,
+        request: Request<svc::DropPartitionRequest>,
+    ) -> Result<Response<common::Status>, Status> {
+        let database = database(&request, |r| &r.db_name);
+        let req = request.into_inner();
+        self.run(Branch::Engine, move |db| {
+            db.drop_partition(&database, &req.collection_name, &req.partition_name)?;
+            Ok(success())
+        })
+        .await
+    }
+
+    async fn has_partition(
+        &self,
+        request: Request<svc::HasPartitionRequest>,
+    ) -> Result<Response<svc::BoolResponse>, Status> {
+        let database = database(&request, |r| &r.db_name);
+        let req = request.into_inner();
+        self.run(Branch::Engine, move |db| {
+            Ok(svc::BoolResponse {
+                status: Some(success()),
+                value: db.has_partition(&database, &req.collection_name, &req.partition_name)?,
+            })
+        })
+        .await
+    }
+
+    #[allow(deprecated)]
+    async fn show_partitions(
+        &self,
+        request: Request<svc::ShowPartitionsRequest>,
+    ) -> Result<Response<svc::ShowPartitionsResponse>, Status> {
+        let database = database(&request, |r| &r.db_name);
+        let req = request.into_inner();
+        self.run(Branch::Engine, move |db| {
+            let (mut names, state) = db.list_partitions(&database, &req.collection_name)?;
+            if !req.partition_names.is_empty() {
+                names.retain(|name| req.partition_names.contains(name));
+            }
+            Ok(svc::ShowPartitionsResponse {
+                status: Some(success()),
+                in_memory_percentages: vec![
+                    if state == LoadState::Loaded { 100 } else { 0 };
+                    names.len()
+                ],
+                partition_names: names,
+                ..Default::default()
+            })
+        })
+        .await
+    }
+
+    async fn get_partition_statistics(
+        &self,
+        request: Request<svc::GetPartitionStatisticsRequest>,
+    ) -> Result<Response<svc::GetPartitionStatisticsResponse>, Status> {
+        let database = database(&request, |r| &r.db_name);
+        let req = request.into_inner();
+        self.run(Branch::Engine, move |db| {
+            let count = db
+                .collection(&database, &req.collection_name)?
+                .read()
+                .count_partition(&req.partition_name)?;
+            Ok(svc::GetPartitionStatisticsResponse {
                 status: Some(success()),
                 stats: vec![schema::kv("row_count", count.to_string())],
             })
@@ -406,10 +491,12 @@ impl Service for MilvusService {
         self.run(Branch::Engine, move |db| {
             let _handle = db.collection(&database, &req.collection_name)?;
             let batch = insert::decode(req.fields_data, req.num_rows)?;
-            if batch.num_rows > 0 && !matches!(req.partition_name.as_str(), "" | "_default") {
-                return Err(schema::unsupported("partitions other than '_default'"));
-            }
-            let outcome = db.insert_with_pk_type(&database, &req.collection_name, batch)?;
+            let outcome = db.insert_partition_with_pk_type(
+                &database,
+                &req.collection_name,
+                batch,
+                &req.partition_name,
+            )?;
             let pks = outcome.pks;
             let n = u32::try_from(pks.len()).unwrap_or(u32::MAX);
             Ok(svc::MutationResult {
@@ -458,10 +545,12 @@ impl Service for MilvusService {
                 return Err(schema::unsupported("field_ops"));
             }
             let batch = insert::decode(req.fields_data, req.num_rows)?;
-            if batch.num_rows > 0 && !matches!(req.partition_name.as_str(), "" | "_default") {
-                return Err(schema::unsupported("partitions other than '_default'"));
-            }
-            let outcome = db.upsert_with_pk_type(&database, &req.collection_name, batch)?;
+            let outcome = db.upsert_partition_with_pk_type(
+                &database,
+                &req.collection_name,
+                batch,
+                &req.partition_name,
+            )?;
             let pks = outcome.pks;
             let n = u32::try_from(pks.len()).unwrap_or(u32::MAX);
             Ok(svc::MutationResult {
@@ -534,7 +623,7 @@ impl Service for MilvusService {
             let parsed = search::parse(&req)?;
             let snapshot = {
                 let guard = handle.read();
-                guard.read_snapshot()
+                guard.read_named_snapshot(&req.partition_names)?
             };
             #[cfg(test)]
             if let Some(pause) = after_snapshot {
