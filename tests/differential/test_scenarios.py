@@ -96,8 +96,7 @@ def test_duplicate_upsert_merges_each_row_against_prior_batch_state(diff):
         {"id": 1, "vector": [0.0, 1.0], "last": 3},
     ]))
     read = lambda c: c.get("dup", ids=[1], output_fields=["base", "first", "last"])
-    assert run(read, diff.rust) == ("ok", [{"id": 1, "base": 1, "first": 2, "last": 3}])
-    assert run(read, diff.ref) == ("ok", [{"id": 1, "base": 1, "last": 3}])
+    assert diff.step("read_duplicate", read) == ("ok", [{"id": 1, "base": 1, "last": 3}])
 
 
 def test_delete_invalid_primary_keys_match_reference(diff):

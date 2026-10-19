@@ -262,7 +262,7 @@ fn delete_and_partial_upsert_survive_flush_and_reopen() {
 }
 
 #[test]
-fn upsert_repeated_pk_merges_with_earlier_row_in_same_batch() {
+fn upsert_repeated_new_pk_keeps_last_row_after_reopen() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("merge.db");
     let db = Db::new(DataDir::open(&path).unwrap(), compute()).unwrap();
@@ -290,6 +290,110 @@ fn upsert_repeated_pk_merges_with_earlier_row_in_same_batch() {
     let reopened = Db::new(DataDir::open(&path).unwrap(), compute()).unwrap();
     assert_eq!(reopened.collection("", "c").unwrap().read().count(), 1);
     reopened.close();
+}
+
+#[test]
+fn duplicate_upsert_merges_each_row_from_request_base() {
+    for varchar_pk in [false, true] {
+        for existing in [false, true] {
+            for flushed in [false, true] {
+                let root = tempfile::tempdir().unwrap();
+                let path = root.path().join("request-base.db");
+                let db = Db::new(DataDir::open(&path).unwrap(), compute()).unwrap();
+                let mut s = schema();
+                s.enable_dynamic_field = true;
+                if varchar_pk {
+                    s.fields[0].data_type = DataType::VarChar;
+                    s.fields[0].max_length = Some(64);
+                }
+                db.create_collection("", "c", s).unwrap();
+                let pk = if varchar_pk {
+                    Pk::VarChar("同键".into())
+                } else {
+                    Pk::Int64(1)
+                };
+                let ids = |n| {
+                    if varchar_pk {
+                        InputValues::Str(vec!["同键".into(); n])
+                    } else {
+                        InputValues::Int(vec![1; n])
+                    }
+                };
+                if existing {
+                    let mut initial = batch(&[1]);
+                    initial.columns[0].1 = ids(1);
+                    initial.columns.push((
+                        "$meta".into(),
+                        InputValues::Json(vec![br#"{"x":0,"y":0}"#.to_vec()]),
+                    ));
+                    db.insert("", "c", initial).unwrap();
+                }
+                if flushed {
+                    db.flush_collection("", "c").unwrap();
+                }
+                let old = db.collection("", "c").unwrap().read().read_snapshot();
+                let mut update = InsertBatch {
+                    num_rows: 2,
+                    columns: vec![
+                        ("id".into(), ids(2)),
+                        (
+                            "$meta".into(),
+                            InputValues::Json(vec![br#"{"x":1}"#.to_vec(), br#"{"y":2}"#.to_vec()]),
+                        ),
+                    ],
+                };
+                if !existing {
+                    update.columns.push((
+                        "v".into(),
+                        InputValues::FloatVector {
+                            dim: 2,
+                            values: vec![1., 0., 1., 0.],
+                        },
+                    ));
+                }
+                assert_eq!(
+                    db.upsert_with_pk_type("", "c", update).unwrap().pks,
+                    vec![pk.clone(), pk.clone()]
+                );
+                let expected = if existing {
+                    serde_json::json!({"x":0,"y":2})
+                } else {
+                    serde_json::json!({"y":2})
+                };
+                let check = |db: &Db| {
+                    let c = db.collection("", "c").unwrap();
+                    let c = c.read();
+                    assert_eq!(c.count(), 1);
+                    let out = c
+                        .get(
+                            std::slice::from_ref(&pk),
+                            &["x".into(), "y".into(), "v".into()],
+                        )
+                        .unwrap();
+                    assert_eq!(
+                        out.rows.meta.unwrap(),
+                        vec![expected.as_object().unwrap().clone()]
+                    );
+                    assert_eq!(
+                        out.rows.fields[0].1,
+                        milvus_lite_core::ColumnData::FloatVector {
+                            dim: 2,
+                            values: vec![1., 0.]
+                        }
+                    );
+                };
+                check(&db);
+                assert_eq!(old.count_filtered("x == 0").unwrap(), usize::from(existing));
+                db.flush_collection("", "c").unwrap();
+                check(&db);
+                db.close();
+                drop(db);
+                let reopened = Db::new(DataDir::open(&path).unwrap(), compute()).unwrap();
+                check(&reopened);
+                reopened.close();
+            }
+        }
+    }
 }
 
 #[test]

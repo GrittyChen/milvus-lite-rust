@@ -2016,7 +2016,6 @@ impl Collection {
         }
         retain_masked_json(&supplied, &mut json_checks);
         let pk_field = &self.schema.fields[self.pk_pos];
-        let mut pending: HashMap<Pk, (Vec<InputValues>, Map<String, Value>)> = HashMap::new();
         let mut fields: Vec<ColumnData> =
             self.schema.fields.iter().map(ColumnData::empty).collect();
         let mut array_inputs: HashMap<usize, Vec<Option<InputValues>>> = HashMap::new();
@@ -2025,11 +2024,8 @@ impl Collection {
             let candidate = supplied
                 .get(pk_field.name.as_str())
                 .and_then(|values| input_pk(values, row));
-            let previous = candidate.as_ref().and_then(|pk| pending.get(pk));
             let current = candidate.as_ref().and_then(|pk| self.pk_index.get(pk));
-            let mut values = if let Some((old, _)) = previous {
-                old.clone()
-            } else if let Some(old) = current {
+            let mut values = if let Some(old) = current {
                 self.chunks[&old.chunk]
                     .columns
                     .iter()
@@ -2046,7 +2042,7 @@ impl Collection {
                     .map(|_| InputValues::Int(Vec::new()))
                     .collect();
             }
-            let mut present = vec![previous.is_some() || current.is_some(); values.len()];
+            let mut present = vec![current.is_some(); values.len()];
             for (i, field) in self.schema.fields.iter().enumerate() {
                 if let Some(input) = supplied.get(field.name.as_str()) {
                     values[i] = input_row(input, row);
@@ -2065,9 +2061,7 @@ impl Collection {
                 ]);
                 present[self.pk_pos] = true;
             }
-            let mut meta = if let Some((_, old)) = previous {
-                old.clone()
-            } else if let Some(old) = current {
+            let mut meta = if let Some(old) = current {
                 self.chunks[&old.chunk]
                     .meta
                     .as_ref()
@@ -2096,16 +2090,12 @@ impl Collection {
                             .ok_or_else(|| EngineError::schema("validated ARRAY lost field"))?;
                     let list = crate::data::array::row_input(&input, index)?
                         .map(std::borrow::Cow::into_owned);
-                    values[i] = InputValues::Array(vec![list.clone()]);
                     array_inputs.entry(i).or_default().push(list);
                     continue;
                 }
                 let converted = convert_optional(field, present[i].then_some(&values[i]), 1)?;
                 fields[i].push_row(&converted, 0);
-                values[i] = input_from_column(&converted, 0);
             }
-            let pk = pk_at(&fields[self.pk_pos], row);
-            pending.insert(pk, (values, meta.clone()));
             metas.push(meta);
         }
         // 与参照一样，全部行的业务检查完成后才做 ARRAY 元素的 Arrow 转换。
