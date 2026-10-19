@@ -12,9 +12,16 @@ use arrow_ipc::writer::StreamWriter;
 use arrow_schema::{ArrowError, Schema, SchemaRef};
 
 #[cfg(feature = "fault-injection")]
+type AppendPause = (
+    usize,
+    std::sync::mpsc::Sender<()>,
+    std::sync::mpsc::Receiver<()>,
+);
+
+#[cfg(feature = "fault-injection")]
 thread_local! {
-    static FAIL_NEXT_APPEND_AFTER_BYTES: std::cell::Cell<Option<(usize, bool)>> = const { std::cell::Cell::new(None) };
-    static AFTER_APPEND_IO: std::cell::RefCell<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>> = const { std::cell::RefCell::new(None) };
+    static FAIL_NEXT_APPEND_AFTER_BYTES: std::cell::Cell<Option<(usize, usize, bool)>> = const { std::cell::Cell::new(None) };
+    static AFTER_APPEND_IO: std::cell::RefCell<Option<AppendPause>> = const { std::cell::RefCell::new(None) };
 }
 
 /// 观察真实 File 写出之后、append 尚未返回的窗口，供进程崩溃模型使用。
@@ -23,12 +30,26 @@ pub fn pause_append_after_io_once(
     entered: std::sync::mpsc::Sender<()>,
     resume: std::sync::mpsc::Receiver<()>,
 ) {
-    AFTER_APPEND_IO.with(|slot| *slot.borrow_mut() = Some((entered, resume)));
+    pause_append_after_io_after(0, entered, resume);
+}
+/// 指定完整/部分 File 追加次数后的观测点；未返回的完整 batch 也可在重开时恢复。
+#[cfg(feature = "fault-injection")]
+pub fn pause_append_after_io_after(
+    skip: usize,
+    entered: std::sync::mpsc::Sender<()>,
+    resume: std::sync::mpsc::Receiver<()>,
+) {
+    AFTER_APPEND_IO.with(|slot| *slot.borrow_mut() = Some((skip, entered, resume)));
 }
 #[cfg(feature = "fault-injection")]
 fn after_append_io() -> io::Result<()> {
     AFTER_APPEND_IO.with(|slot| {
-        if let Some((entered, resume)) = slot.borrow_mut().take() {
+        let point = slot.borrow_mut().take();
+        if let Some((skip, entered, resume)) = point {
+            if skip != 0 {
+                *slot.borrow_mut() = Some((skip - 1, entered, resume));
+                return Ok(());
+            }
             entered.send(()).map_err(io::Error::other)?;
             resume.recv().map_err(io::Error::other)?;
         }
@@ -39,13 +60,31 @@ fn after_append_io() -> io::Result<()> {
 /// 仅测试构建可用；模拟 File 写出一部分 batch 后报错。
 #[cfg(feature = "fault-injection")]
 pub fn inject_append_failure_after_bytes(bytes: usize) {
-    FAIL_NEXT_APPEND_AFTER_BYTES.with(|cell| cell.set(Some((bytes, false))));
+    FAIL_NEXT_APPEND_AFTER_BYTES.with(|cell| cell.set(Some((0, bytes, false))));
 }
 
 /// 在 File 边界注入部分写入后 ENOSPC；不要求测试填满宿主磁盘。
 #[cfg(feature = "fault-injection")]
 pub fn inject_storage_full_after_bytes(bytes: usize) {
-    FAIL_NEXT_APPEND_AFTER_BYTES.with(|cell| cell.set(Some((bytes, true))));
+    FAIL_NEXT_APPEND_AFTER_BYTES.with(|cell| cell.set(Some((0, bytes, true))));
+}
+
+/// 跳过若干次真实 append 后，在 File 边界注入 ENOSPC，覆盖同请求的后桶。
+#[cfg(feature = "fault-injection")]
+pub fn inject_storage_full_on_append(skip: usize, bytes: usize) {
+    FAIL_NEXT_APPEND_AFTER_BYTES.with(|cell| cell.set(Some((skip, bytes, true))));
+}
+
+#[cfg(feature = "fault-injection")]
+fn append_fault() -> Option<(usize, bool)> {
+    FAIL_NEXT_APPEND_AFTER_BYTES.with(|cell| match cell.take() {
+        Some((0, bytes, full)) => Some((bytes, full)),
+        Some((skip, bytes, full)) => {
+            cell.set(Some((skip - 1, bytes, full)));
+            None
+        }
+        None => None,
+    })
 }
 
 #[cfg(feature = "fault-injection")]
@@ -156,7 +195,7 @@ impl WalWriter {
         // 会拼接多个 stream，3.x 的 open_stream 在第二个 schema 处报错。
         let encoded = std::mem::take(self.stream.get_mut());
         #[cfg(feature = "fault-injection")]
-        if let Some((bytes, storage_full)) = FAIL_NEXT_APPEND_AFTER_BYTES.with(|cell| cell.take()) {
+        if let Some((bytes, storage_full)) = append_fault() {
             // 真实 write_all 失败只发生在写入尚未完成时，不能伪造「全批写完后仍失败」。
             let prefix = bytes.min(encoded.len().saturating_sub(1));
             if let Err(source) = self.file.write_all(&encoded[..prefix]) {

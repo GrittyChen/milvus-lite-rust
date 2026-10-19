@@ -695,6 +695,21 @@ impl Db {
             cleanup_failed_staging(&staging);
             return Err(storage(error));
         }
+        let mut initial_manifest = crate::storage::manifest::Manifest::default();
+        crate::partition_key::register(collection.schema(), &mut initial_manifest);
+        if collection.schema().partition_key().is_some() {
+            let result = initial_manifest
+                .to_bytes()
+                .map_err(storage)
+                .and_then(|bytes| {
+                    fs_commit::write_new_schema(&staging.join("manifest.json"), &bytes)
+                        .map_err(storage)
+                });
+            if let Err(error) = result {
+                cleanup_failed_staging(&staging);
+                return Err(error);
+            }
+        }
         let rename = guarded_io(|| {
             #[cfg(feature = "fault-injection")]
             directory_fault(DirectoryOperation::Create, DirectoryPoint::BeforeRename)?;
@@ -740,7 +755,8 @@ impl Db {
         *blocked = true;
         self.open_failures.write().remove(name);
         collection.attach_persistence(
-            runtime::PersistentCollection::new(target.clone()).map_err(EngineError::Storage)?,
+            runtime::PersistentCollection::with_manifest(target.clone(), initial_manifest)
+                .map_err(EngineError::Storage)?,
         );
         self.collections
             .write()
@@ -1068,6 +1084,12 @@ impl Db {
         let handle = checked_read_handle(self.collection_inner(name)?)?;
         {
             let collection = handle.read();
+            if let Some(key) = collection.schema().partition_key() {
+                return Err(EngineError::schema(format!(
+                    "cannot create manual partitions when partition key is set (partition_key field: {})",
+                    crate::error::py_repr(&key.name)
+                )));
+            }
             let p = collection
                 .persistent()
                 .ok_or_else(|| storage("persistent state missing"))?;
@@ -1175,6 +1197,12 @@ impl Db {
         }
         let _namespace = self.namespace.lock();
         let handle = checked_read_handle(self.collection_inner(name)?)?;
+        if let Some(key) = handle.read().schema().partition_key() {
+            return Err(EngineError::schema(format!(
+                "cannot drop partitions when partition key is set (partition_key field: {})",
+                crate::error::py_repr(&key.name)
+            )));
+        }
         if !handle
             .read()
             .persistent()

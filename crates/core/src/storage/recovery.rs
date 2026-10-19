@@ -462,7 +462,7 @@ pub fn load_committed(collection_dir: &Path) -> Result<RecoveredCollection, Reco
     let schema = schema_file.to_core()?;
     let manifest_path = collection_dir.join("manifest.json");
     let prev_path = collection_dir.join("manifest.json.prev");
-    let manifest = match fs::symlink_metadata(&manifest_path) {
+    let mut manifest = match fs::symlink_metadata(&manifest_path) {
         Ok(_) => {
             regular_file(&manifest_path)?;
             Manifest::read(&manifest_path)?
@@ -482,6 +482,7 @@ pub fn load_committed(collection_dir: &Path) -> Result<RecoveredCollection, Reco
             });
         }
     };
+    crate::partition_key::register(&schema, &mut manifest);
     let pinned_files = snapshot::load_pins(collection_dir)?;
     super::partition_paths::validate(collection_dir, &manifest, &pinned_files, None)
         .map_err(RecoveryError::Unsupported)?;

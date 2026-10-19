@@ -78,6 +78,59 @@ pub(crate) fn validate(
     Ok(())
 }
 
+/// Flush 首次物化隐含桶后也必须检查全部候选；失败只回收本次自建的空目录。
+pub(crate) fn prepare_flush(
+    collection: &Path,
+    manifest: &Manifest,
+    pins: &PinnedFiles,
+    names: &[&str],
+) -> Result<(), String> {
+    validate(collection, manifest, pins, None)?;
+    let mut created = Vec::new();
+    let result = (|| {
+        let root = collection.join("partitions");
+        let mut paths = vec![root.clone()];
+        for name in names {
+            if !manifest.partitions.contains_key(*name) {
+                return Err("flush partition is not registered".to_owned());
+            }
+            let partition = root.join(name);
+            paths.extend([
+                partition.clone(),
+                partition.join("data"),
+                partition.join("delta"),
+            ]);
+        }
+        for path in paths {
+            let existed = directory(&path)?.is_some();
+            if !existed {
+                created.push(path.clone());
+            }
+            super::fs_commit::create_dir_synced(&path).map_err(|e| e.to_string())?;
+        }
+        validate(collection, manifest, pins, None)
+    })();
+    if let Err(mut reason) = result {
+        for path in created.iter().rev() {
+            let cleanup = match std::fs::remove_dir(path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                result => result,
+            }
+            .and_then(|()| {
+                super::fs_commit::sync_dir(path.parent().unwrap_or(collection))
+                    .map_err(std::io::Error::other)
+            });
+            if let Err(error) = cleanup {
+                reason.push_str(&format!(
+                    "; cannot remove prepared empty directory {path:?}: {error}"
+                ));
+            }
+        }
+        return Err(reason);
+    }
+    Ok(())
+}
+
 fn validate_file_chain(root: &Path, relative: &str) -> Result<(), String> {
     let path = Path::new(relative);
     let mut current = root.to_path_buf();

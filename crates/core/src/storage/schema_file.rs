@@ -111,7 +111,7 @@ impl SchemaFile {
                 analyzer_params: None,
                 enable_match: false,
                 is_function_output: false,
-                is_partition_key: false,
+                is_partition_key: field.is_partition_key,
             })
             .collect();
         let properties = schema
@@ -195,7 +195,6 @@ impl SchemaFile {
                     || field.analyzer_params.is_some()
                     || field.enable_match
                     || field.is_function_output
-                    || field.is_partition_key
                 {
                     return Err(SchemaFileError::Unsupported(format!(
                         "field {:?} has unsupported attributes",
@@ -227,6 +226,7 @@ impl SchemaFile {
                     name: field.name.clone(),
                     data_type: dtype,
                     is_primary: field.is_primary,
+                    is_partition_key: field.is_partition_key,
                     auto_id: field.auto_id,
                     dim: field.dim,
                     max_length: field.max_length,

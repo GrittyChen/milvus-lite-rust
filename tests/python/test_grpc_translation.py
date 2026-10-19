@@ -953,7 +953,6 @@ def test_pymilvus_entry_points_remaining_unsupported(env):
     decay = Function(name="r", function_type=FunctionType.RERANK, input_field_names=["id"],
                      params={"reranker": "decay", "function": "gauss", "origin": 0, "scale": 1})
     cases = [
-        (with_field("k", DataType.INT64, is_partition_key=True), f"partition key: {feature}"),
         (lambda: client.create_database("d"), f"CreateDatabase: {rpc}"),
         (lambda: client.list_databases(), f"ListDatabases: {rpc}"),
         (lambda: client.using_database("default"), f"DescribeDatabase: {rpc}"),

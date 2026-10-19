@@ -320,7 +320,7 @@ M1 证明了整条链路可行，但数据只在内存中，不发布（[0004](0
 ### 三、数据目录的兼容
 
 14. **本实现不支持或无法安全处理的内容。** **建议按 collection 做 fail-closed**。
-    - **后续范围修订**：[0015](0015-nullable-defaults-and-array.md) 的切片 A 已支持既有标量的 nullable 与默认值，B 接入八种标量元素的 ARRAY；这些已支持属性不再单独导致拒绝打开。[0017](0017-partitions.md) 的 A 在开发源码中接入显式分区；安全的已登记分区不再单独导致拒绝，需实际回放的未知 WAL 分区、危险路径、目录别名及链接仍明确拒绝（过期 WAL 的序号保护沿用 0007，精确边界见 0017）。下列条件保留 M2 当时的范围记录，nullable 向量及其余尚未接入能力仍按当前 schema 支持矩阵拒绝。
+    - **后续范围修订**：[0015](0015-nullable-defaults-and-array.md) 的切片 A 已支持既有标量的 nullable 与默认值，B 接入八种标量元素的 ARRAY；这些已支持属性不再单独导致拒绝打开。[0017](0017-partitions.md) 的 A 在开发源码中接入显式分区，B 接入合法 INT64 / VARCHAR partition key（产品验收另列于 0017）；这些已支持属性及安全的已登记分区不再单独导致拒绝，需实际回放的未知 WAL 分区、危险路径、目录别名及链接仍明确拒绝（过期 WAL 的序号保护沿用 0007，精确边界见 0017）。下列条件保留 M2 当时的范围记录，nullable 向量及其余尚未接入能力仍按当前 schema 支持矩阵拒绝。
     - **判定条件**，满足任一条即 fail-closed：
       - schema 属于 M1 的 CreateCollection 会拒绝的：M1 范围之外的字段类型、nullable 或默认值、function、多个向量字段、partition key、`enable_analyzer` / `enable_match` / `analyzer_params`、properties 中的 `timezone`；
       - manifest 中有 `_default` 以外的分区，或 WAL 中出现 manifest 没有的分区。delta WAL 中的 `_all` 表示跨分区删除，不算分区：pymilvus 不指定分区的 delete，3.x 在 WAL 中就写 `_all`（实测）；data WAL 中不应出现 `_all`；

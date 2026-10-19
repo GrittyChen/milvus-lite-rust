@@ -241,15 +241,13 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<CollectionSchema, EngineError> {
         if default_value.is_some() && data_type == Some(DataType::FloatVector) {
             note("vector default values");
         }
-        if f.is_partition_key {
-            note("partition key");
-        }
         if f.is_function_output {
             note("functions");
         }
         if let Some(data_type) = data_type {
             fields.push(FieldSchema {
                 is_primary: f.is_primary_key,
+                is_partition_key: f.is_partition_key,
                 auto_id: f.auto_id,
                 dim,
                 max_length,
@@ -336,6 +334,7 @@ pub(crate) fn encode(
                 data_type: milvus_type(f.data_type),
                 element_type: f.element_type.map_or(0, milvus_type),
                 is_primary_key: f.is_primary,
+                is_partition_key: f.is_partition_key,
                 auto_id: f.auto_id,
                 type_params,
                 nullable: f.nullable,

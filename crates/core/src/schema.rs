@@ -54,6 +54,7 @@ pub struct FieldSchema {
     pub data_type: DataType,
     pub is_primary: bool,
     pub auto_id: bool,
+    pub is_partition_key: bool,
     pub nullable: bool,
     pub default_value: Option<serde_json::Value>,
     /// FLOAT_VECTOR 的维度。保持有符号，以便原样报告 `dim > 0` 的校验错误。
@@ -71,6 +72,7 @@ impl FieldSchema {
             data_type,
             is_primary: false,
             auto_id: false,
+            is_partition_key: false,
             nullable: false,
             default_value: None,
             dim: None,
@@ -213,6 +215,28 @@ impl CollectionSchema {
                 "schema has no vector field (FLOAT_VECTOR or SPARSE_FLOAT_VECTOR)",
             ));
         }
+        let keys: Vec<_> = self.fields.iter().filter(|f| f.is_partition_key).collect();
+        if keys.len() > 1 {
+            return Err(EngineError::schema(format!(
+                "at most one field can be partition key, got {}",
+                py_repr_list(keys.iter().map(|f| f.name.as_str()))
+            )));
+        }
+        if let Some(key) = keys.first() {
+            if key.is_primary {
+                return Err(EngineError::schema(format!(
+                    "partition key {} must not be the primary key",
+                    py_repr(&key.name)
+                )));
+            }
+            if !matches!(key.data_type, DataType::Int64 | DataType::VarChar) {
+                return Err(EngineError::schema(format!(
+                    "partition key {} must be INT64 or VARCHAR, got {}",
+                    py_repr(&key.name),
+                    key.data_type.name()
+                )));
+            }
+        }
         // 3.x 接受多个 FLOAT_VECTOR；M1 只支持一个（0004「不支持」）。
         if vectors > 1 {
             return Err(EngineError::unsupported(
@@ -231,6 +255,10 @@ impl CollectionSchema {
             ));
         }
         Ok(())
+    }
+
+    pub fn partition_key(&self) -> Option<&FieldSchema> {
+        self.fields.iter().find(|f| f.is_partition_key)
     }
 
     pub fn primary_position(&self) -> Option<usize> {

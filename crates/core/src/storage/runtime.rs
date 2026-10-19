@@ -209,12 +209,20 @@ impl std::fmt::Debug for PersistentCollection {
 
 impl PersistentCollection {
     pub fn new(dir: PathBuf) -> Result<Self, String> {
-        let mut visibility = Visibility::default();
+        Self::with_manifest(dir, Manifest::default())
+    }
+
+    pub(crate) fn with_manifest(dir: PathBuf, manifest: Manifest) -> Result<Self, String> {
+        let mut visibility = if manifest.partitions.len() > 1 {
+            Visibility::new_partitioned()
+        } else {
+            Visibility::default()
+        };
         visibility.add_source(SourceId(1), 0).map_err(err)?;
         Ok(Self {
             dir,
-            manifest: Manifest::default(),
-            partitions: super::partition_paths::Registry::from_manifest(&Manifest::default())?,
+            partitions: super::partition_paths::Registry::from_manifest(&manifest)?,
+            manifest,
             visibility,
             active: MemTable::new(SourceId(1)),
             generation: 1,
@@ -476,10 +484,32 @@ impl PersistentCollection {
             return Err("write partition is not registered".into());
         }
         let batch = arrow_data::wal_data_batch(schema, seqs, name, columns, meta).map_err(err)?;
+        let decoded = DecodedData {
+            seqs: seqs.to_vec(),
+            columns: columns.to_vec(),
+            meta: meta.map(<[Map<String, Value>]>::to_vec),
+        };
+        self.append_prepared_partition(schema, batch, decoded, partition)
+    }
+
+    /// 调用方已完成全部桶的编码；这里仅追加既有 WAL stream 并发布当前桶。
+    pub(crate) fn append_prepared_partition(
+        &mut self,
+        schema: &CollectionSchema,
+        batch: arrow_array::RecordBatch,
+        decoded: DecodedData,
+        partition: u32,
+    ) -> Result<(), String> {
+        if self.poisoned {
+            return Err("collection state is unusable after a storage failure".to_owned());
+        }
+        if self.needs_retry() {
+            return Err("a failed flush must complete before another write".to_owned());
+        }
         if self.data_wal.is_none() {
             let wal_dir = self.dir.join("wal");
             fs_commit::create_dir_synced(&wal_dir).map_err(err)?;
-            let wal_schema = arrow_data::wal_data_schema(schema).map_err(err)?;
+            let wal_schema = batch.schema();
             match WalWriter::create(&wal_dir, WalKind::Data, self.generation, &wal_schema) {
                 Ok(writer) => self.data_wal = Some(writer),
                 Err(error) => {
@@ -495,11 +525,6 @@ impl PersistentCollection {
             self.failed_flush = true;
             return Err(error.to_string());
         }
-        let decoded = DecodedData {
-            seqs: seqs.to_vec(),
-            columns: columns.to_vec(),
-            meta: meta.map(<[Map<String, Value>]>::to_vec),
-        };
         if let Err(error) =
             self.active
                 .apply_partition_data(schema, decoded, &mut self.visibility, &[partition])

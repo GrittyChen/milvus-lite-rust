@@ -16,6 +16,7 @@ pub use maintenance::{
     CompactionFault, CompactionPausePoint, MaintenanceReport,
     inject_start_failure_once as inject_maintenance_start_failure_once,
 };
+mod partition_key;
 pub mod projection;
 pub mod pyjson;
 pub mod schema;

@@ -196,3 +196,23 @@ MILVUS_LITE_3X_PYTHON="$AUDIT_REF_PYTHON" "$AUDIT_RUST_PYTHON" \
 ```
 
 固定两种主键、混合及重开、全部/单/组合/未知选择及范围开关，40 项逐页对照；严格核对完整条数和主键，再沿用 0004 分数误差预算。记录实际客户端迭代器类型，未知分区必须为空页；SDK 的空初始页诊断保留在日志，不当作服务端失败。此工具同样不进入默认 pytest、不覆盖已有目录。
+
+
+## 0017 B partition key 参照调查
+
+对应[调查记录](../../docs/testing/0017-partition-key-investigation.md)与 [0017 B 合同](../../docs/decisions/0017-partitions.md#b-合同设计已通过)。三项方案已采纳，完整合同等待用户评审，通过前不进入实现。这是固定 3.x 的真实观察，不是 Rust B 差分或实施验收，不进入默认测试、不联网、不安装依赖；参照 checkout 保持只读。
+
+```bash
+"$AUDIT_REF_PYTHON" tests/compatibility_audit/partition_key_truth.py \
+  --reference references/milvus-lite --work-dir "$AUDIT_WORK/partition-key" \
+  --verify tests/compatibility_audit/fixtures/partition_key_v321.json
+.venv/bin/python tests/compatibility_audit/selfcheck.py
+```
+
+解释器需已安装固定参照引擎并实际从所给 checkout 导入，HEAD 为 `43d1257774e629bc9f66873977ab7c320d5bf5a7` 且无改动；CPython 3.12，pyarrow 15.0.0 / 25.0.1，pymilvus 2.6.17 / 3.0.2。Arrow 15 仍按[互通环境](../storage_interop/README.md)准备 NumPy 1.26.4。四套实际环境和互相核验的边界见调查记录，不能把允许的版本集合写成全笛卡尔积均已执行。
+
+工作目录必须在仓库外且不存在，拒绝复用及参照目录内路径。`--mode direct` / `rpc` 可单独采集，但默认 fixture 是完整矩阵，`--verify` 不允许删去另一半观察再通过；完整核验使用默认 all。内部 `--phase` / `--case` 由运行器管理，恢复要求同版本工具创建的场景所有权标记，且目录内无符号链接，不能用于已有应用目录。
+
+默认每轮采集 34 个直接引擎场景、65 个 RPC/SDK 观察组；含 13 个子进程直接退出点。`wal-late` 在第二桶追加前注入 OSError，`after-first` 在首桶真实应用后退出，均仅修改当前实例的方法，不改参照文件；普通 ARRAY 越界与 raw gRPC 报错后退出没有引擎故障替身。错误响应、部分前缀、auto_id / seq、磁盘 manifest、WAL batch、重开、SDK 预填和后续覆盖均保留。进程退出不推导断电保证。
+
+`--verify` 只核对参照版本和完整 cases 的规范 JSON（保留 bool/int/float、空值和列表次序），不覆盖 fixture。单次运行的 root/result.json 保留实际平台、解释器、Arrow、SDK 及工具 SHA256；已有目录报错，失败日志保留。修改工具导致所有权标记不匹配时，另建工作目录重新采集，不继续复用旧目录。

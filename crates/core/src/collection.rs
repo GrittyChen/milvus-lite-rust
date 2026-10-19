@@ -6,6 +6,8 @@ use std::sync::Arc;
 
 use serde_json::{Map, Value};
 
+mod partition_key;
+
 use crate::compute::Compute;
 use crate::data::{
     ColumnData, InputValues, InsertBatch, META_FIELD, Pk, PkMap, Rows, check_column_len, field_dim,
@@ -616,6 +618,7 @@ pub struct Collection {
     load_state: LoadState,
     next_order: u64,
     persistent: Option<PersistentCollection>,
+    memory_key: Option<Box<partition_key::MemoryKey>>,
     deleted: bool,
 }
 
@@ -634,6 +637,10 @@ impl Collection {
                     "schema has no vector field (FLOAT_VECTOR or SPARSE_FLOAT_VECTOR)",
                 )
             })?;
+        let memory_key = schema
+            .partition_key()
+            .map(|_| partition_key::MemoryKey::new(&schema).map(Box::new))
+            .transpose()?;
         Ok(Self {
             name: name.into(),
             schema,
@@ -648,11 +655,13 @@ impl Collection {
             load_state: LoadState::Loaded,
             next_order: 0,
             persistent: None,
+            memory_key,
             deleted: false,
         })
     }
 
     pub(crate) fn attach_persistence(&mut self, persistent: PersistentCollection) {
+        self.memory_key = None;
         self.persistent = Some(persistent);
     }
 
@@ -867,6 +876,7 @@ impl Collection {
         if !collection.indexes.is_empty() {
             collection.load_state = LoadState::Released;
         }
+        collection.memory_key = None;
         collection.persistent = Some(PersistentCollection::recovered(
             dir,
             recovered,
@@ -1980,6 +1990,9 @@ impl Collection {
         batch: InsertBatch,
         partition: &str,
     ) -> Result<Vec<Pk>> {
+        if self.schema.partition_key().is_some() {
+            return self.insert_key_batch(batch, true);
+        }
         if self.deleted {
             return Err(EngineError::CollectionNotFound(self.name.clone()));
         }
@@ -2196,6 +2209,14 @@ impl Collection {
                 .append_partition_delete(&self.schema, pks, seq, target)
                 .map_err(EngineError::Storage)?;
         }
+        if let Some(memory) = self.memory_key.as_mut() {
+            for pk in pks {
+                memory
+                    .visibility
+                    .apply_local_delete(SourceId(1), pk.clone(), seq)
+                    .map_err(|e| EngineError::Storage(e.to_string()))?;
+            }
+        }
         for pk in pks {
             if let Some(old) = self.pk_index.remove(pk) {
                 self.clear_live(old);
@@ -2227,6 +2248,12 @@ impl Collection {
                 .id(name)
                 .ok_or_else(|| EngineError::Storage("partition identifier missing".into()));
         }
+        if let Some(memory) = &self.memory_key {
+            return memory
+                .registry
+                .id(name)
+                .ok_or_else(|| EngineError::PartitionNotFound(name.into()));
+        }
         if name == "_default" {
             Ok(0)
         } else {
@@ -2235,6 +2262,9 @@ impl Collection {
     }
 
     fn insert_partition_inner(&mut self, batch: InsertBatch, partition: &str) -> Result<Vec<Pk>> {
+        if self.schema.partition_key().is_some() {
+            return self.insert_key_batch(batch, false);
+        }
         if self.deleted {
             return Err(EngineError::CollectionNotFound(self.name.clone()));
         }
@@ -2355,6 +2385,19 @@ impl Collection {
                 .append_partition(&self.schema, &seqs, &columns, meta.as_deref(), partition)
                 .map_err(EngineError::Storage)?;
         }
+        Ok(self.publish_insert(columns, meta, norms, seqs, source, row_start))
+    }
+
+    fn publish_insert(
+        &mut self,
+        columns: Vec<ColumnData>,
+        meta: Option<Vec<Map<String, Value>>>,
+        norms: Vec<f32>,
+        seqs: Vec<u64>,
+        source: SourceId,
+        row_start: usize,
+    ) -> Vec<Pk> {
+        let n = seqs.len();
         // WAL 已成功追加；后续内存更新必须保持不可失败。
         let chunk_idx = self.next_chunk;
         self.next_chunk += 1;
@@ -2405,7 +2448,7 @@ impl Collection {
         }
         self.chunks.insert(chunk_idx, chunk);
         self.merge_tail();
-        Ok(ids)
+        ids
     }
 
     /// 只钉住命中的数据块，主键索引留在状态锁内，避免按总行数复制索引。
@@ -2436,8 +2479,8 @@ impl Collection {
             .iter()
             .filter_map(|pk| {
                 let mut at = if let Some(selected) = &selected {
-                    if let Some(p) = &self.persistent {
-                        let at = p.visibility.visible_data(pk, Some(selected))?;
+                    if let Some(visibility) = self.partition_visibility() {
+                        let at = visibility.visible_data(pk, Some(selected))?;
                         let (id, chunk) =
                             locations.get(&at.source)?.range(..=at.row).next_back()?.1;
                         if at.row - chunk.row_start >= chunk.seqs.len() {
@@ -2607,7 +2650,9 @@ impl Collection {
     pub fn read_named_snapshot(&self, names: &[String]) -> Result<ReadSnapshot> {
         match self.resolve_partitions(names)? {
             None => Ok(self.read_snapshot()),
-            Some(ids) if self.persistent.is_some() => self.read_partition_snapshot(Some(&ids)),
+            Some(ids) if self.partition_visibility().is_some() => {
+                self.read_partition_snapshot(Some(&ids))
+            }
             Some(ids) if ids.contains(&0) => Ok(self.read_snapshot()),
             Some(_) => Ok(self.read_metadata()),
         }
@@ -2616,29 +2661,43 @@ impl Collection {
     pub fn partition_count(&self) -> usize {
         self.persistent
             .as_ref()
-            .map_or(1, |p| p.manifest.partitions.len())
+            .map_or(if self.memory_key.is_some() { 17 } else { 1 }, |p| {
+                p.manifest.partitions.len()
+            })
     }
 
     pub fn count_partition(&self, name: &str) -> Result<usize> {
-        let exists = self.persistent.as_ref().map_or(name == "_default", |p| {
-            p.manifest.partitions.contains_key(name)
-        });
+        let exists = self.persistent.as_ref().map_or_else(
+            || {
+                self.memory_key
+                    .as_ref()
+                    .map_or(name == "_default", |m| m.registry.id(name).is_some())
+            },
+            |p| p.manifest.partitions.contains_key(name),
+        );
         if !exists {
             return Err(EngineError::PartitionNotFound(name.into()));
         }
         let ids = self.resolve_partitions(&[name.into()])?;
-        if let Some(p) = &self.persistent {
-            Ok(p.visibility.selected_snapshot(ids.as_deref()).live_count)
+        if let Some(visibility) = self.partition_visibility() {
+            Ok(visibility.selected_snapshot(ids.as_deref()).live_count)
         } else {
             Ok(self.count())
         }
     }
 
+    fn partition_visibility(&self) -> Option<&crate::storage::visibility::Visibility> {
+        self.persistent
+            .as_ref()
+            .map(|p| &p.visibility)
+            .or_else(|| self.memory_key.as_ref().map(|m| &m.visibility))
+    }
+
     pub fn read_partition_snapshot(&self, selected: Option<&[u32]>) -> Result<ReadSnapshot> {
-        let persistent = self.persistent.as_ref().ok_or_else(|| {
-            EngineError::Storage("partition snapshot requires persistence".into())
+        let visibility = self.partition_visibility().ok_or_else(|| {
+            EngineError::Storage("partition snapshot requires partition state".into())
         })?;
-        self.read_snapshot_with_visibility(&persistent.visibility.selected_snapshot(selected))
+        self.read_snapshot_with_visibility(&visibility.selected_snapshot(selected))
     }
 
     pub fn resolve_partitions(&self, names: &[String]) -> Result<Option<Vec<u32>>> {
@@ -2654,6 +2713,8 @@ impl Collection {
                     })?);
                 }
             }
+        } else if let Some(memory) = &self.memory_key {
+            ids.extend(names.iter().filter_map(|name| memory.registry.id(name)));
         } else if names.iter().any(|name| name == "_default") {
             ids.push(0);
         }
@@ -3263,7 +3324,9 @@ fn check_value(field: &FieldSchema, values: &InputValues, row: usize) -> Result<
             .filter(|n| !n.as_str().contains(['.', 'e', 'E']));
         let ok = match field.data_type {
             DataType::Bool => value.is_boolean(),
-            DataType::Int64 => integer.is_some(),
+            DataType::Int64 => {
+                integer.is_some_and(|n| !field.is_partition_key || n.as_i64().is_some())
+            }
             DataType::Int8 => integer
                 .and_then(|n| n.as_i64())
                 .is_some_and(|v| i8::try_from(v).is_ok()),
@@ -3297,10 +3360,22 @@ fn check_value(field: &FieldSchema, values: &InputValues, row: usize) -> Result<
         return if ok {
             Ok(())
         } else {
+            // key 的宽整数在 P1 拒绝，诊断仍保留 Python int 的十进制文本。
+            // 只处理本片新增 key；非 key 的既有默认值诊断不在这里改动。
+            let value_repr = if field.is_partition_key {
+                integer
+                    .map(|n| {
+                        n.as_i64()
+                            .map_or_else(|| n.as_str().to_owned(), |n| n.to_string())
+                    })
+                    .unwrap_or_else(|| py_json_repr(value))
+            } else {
+                py_json_repr(value)
+            };
             Err(EngineError::schema(format!(
                 "field {} value {} does not match dtype {}",
                 py_repr(&field.name),
-                py_json_repr(value),
+                value_repr,
                 field.data_type.qualified()
             )))
         };

@@ -17,6 +17,68 @@ from partition_boundaries import checked_target, stable_result
 
 
 class AuditChecks(unittest.TestCase):
+
+    def test_partition_key_fixture_preserves_prefix_and_id_collision(self):
+        cases = json.loads((Path(__file__).parent/'fixtures/partition_key_v321.json').read_text())['cases']
+        rows = cases['grouped-auto']['seed']['after']['active']
+        self.assertEqual([(r['id'], r['_seq']) for r in rows], [(1, 1), (3, 2), (2, 3)])
+        failure = cases['raw-crash']
+        self.assertEqual(failure['seed']['outcome']['status']['code'], 1)
+        self.assertEqual([r['id'] for r in failure['seed']['after']], [1, 3])
+        self.assertEqual(failure['recover']['followup']['value'], [3])
+        self.assertEqual([r['tag'] for r in failure['recover']['after_followup']['all']], ['a-first', 'after-reopen'])
+        self.assertIsNone(cases['grouped-auto']['seed']['after']['disk_manifest'])
+
+    def test_partition_key_fixture_distinguishes_sdk_prefill_from_partial(self):
+        cases = json.loads((Path(__file__).parent/'fixtures/partition_key_v321.json').read_text())['cases']['rpc']
+        self.assertIsNone(cases['sdk_upsert_0_0']['all'][0]['k'])
+        self.assertEqual(cases['sdk_upsert_0_1']['all'][0]['k'], 42)
+        for name in ['sdk_upsert_1_0', 'sdk_upsert_1_1']:
+            self.assertEqual(cases[name]['all'][0]['k'], 0)
+        rows = cases['route-21-default2-sdk1']['all']
+        self.assertEqual([r['k'] for r in rows if r['id'] == 99], [''])
+
+    def test_partition_key_recovery_requires_owned_case_and_rejects_links(self):
+        from partition_key_truth import owned_root
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp)/'new'
+            with self.assertRaises(FileNotFoundError): owned_root(path, 'case')
+            owned_root(path, 'case', create=True)
+            self.assertEqual(owned_root(path, 'case'), path.resolve())
+            with self.assertRaises(FileExistsError): owned_root(path, 'case', create=True)
+            with self.assertRaises(ValueError): owned_root(path, 'other')
+            (path/'link').symlink_to(Path(tmp), target_is_directory=True)
+            with self.assertRaises(ValueError): owned_root(path, 'case')
+        with self.assertRaises(ValueError): owned_root(REPO/'never-create-key-probe', 'case', create=True)
+        self.assertFalse((REPO/'never-create-key-probe').exists())
+
+    def test_partition_key_failure_control_actually_crosses_buckets(self):
+        from partition_key_truth import bucket, direct_cases
+        cases = direct_cases()
+        self.assertNotEqual(bucket(0), bucket(1))
+        self.assertNotEqual(bucket('é'), bucket('e\u0301'))
+        late = cases['arrow-late-auto1-crash']
+        first, bad, last = late['rows']
+        self.assertEqual(bucket(first['k']), bucket(last['k']))
+        self.assertNotEqual(bucket(first['k']), bucket(bad['k']))
+        self.assertEqual(bad['a'], [128])
+        self.assertTrue(late['crash'])
+        self.assertNotIn('id', last)
+        self.assertFalse(cases['arrow-late-auto1-close']['followup_live'])
+        self.assertTrue(cases['arrow-late-auto1-close']['recover_followup'])
+
+    def test_partition_key_verification_does_not_coerce_types_or_drop_rows(self):
+        from partition_key_truth import verify_truth
+        from run import REF
+        expected = {'reference': REF, 'cases': {'rows': [1, False, None], 'status': 1}}
+        verify_truth(expected, copy.deepcopy(expected))
+        for value in [[1.0, False, None], [True, False, None], [1, 0, None], [1, False], [None, False, 1]]:
+            changed = copy.deepcopy(expected); changed['cases']['rows'] = value
+            with self.assertRaises(AssertionError): verify_truth(expected, changed)
+        changed = copy.deepcopy(expected); changed['reference'] = 'other'
+        with self.assertRaises(AssertionError): verify_truth(expected, changed)
+
+
     def test_engine_resource_seed_guard_holds_lock_and_rejects_pending_wal_or_links(self):
         spec=importlib.util.spec_from_file_location('partition_resource_tool',REPO/'benchmarks/partition-visibility/run.py')
         tool=importlib.util.module_from_spec(spec);spec.loader.exec_module(tool)

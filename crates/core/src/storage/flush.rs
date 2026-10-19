@@ -213,15 +213,10 @@ pub(crate) fn flush_partitions_generation(
                 "nonempty flush has no WAL for recovery",
             ));
         }
-        for plan in plans {
-            let root = collection_dir.join("partitions").join(plan.name);
-            for kind in ["data", "delta"] {
-                let dir = root.join(kind);
-                fs_commit::create_dir_synced(&dir)
-                    .map_err(|error| FlushError::before(&dir, error))?;
-            }
-        }
         let pinned = snapshot::load_pins(collection_dir)
+            .map_err(|error| FlushError::before(collection_dir, error))?;
+        let names: Vec<_> = plans.iter().map(|plan| plan.name).collect();
+        super::partition_paths::prepare_flush(collection_dir, old_manifest, &pinned, &names)
             .map_err(|error| FlushError::before(collection_dir, error))?;
         if sync_inherited_files {
             sync_inherited(collection_dir, old_manifest)?;

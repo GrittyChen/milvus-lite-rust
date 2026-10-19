@@ -12,6 +12,7 @@ fault-injection = []
 
 [dependencies]
 libc.workspace = true
+md5.workspace = true
 arrow-array.workspace = true
 arrow-ipc.workspace = true
 arrow-schema.workspace = true
