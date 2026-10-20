@@ -70,6 +70,7 @@
 | 0.3.0rc1 已不可变预发布（冻结 / tag 为 27aabf2；候选与发布后记录均独立复审通过，公开安装检查通过；完整三层 FI 与两 Linux 原生矩阵） | [候选及发布验收](docs/testing/0.3.0rc1-acceptance.md)、[范围与执行清单](docs/releases/next-candidate-plan.md)、[发行说明](docs/releases/0.3.0rc1.md) |
 | 0015／0016 冻结提交的跨平台开发验收、平台证据边界与 SDK 临时端口复用的缓存隔离 | [跨平台验收](docs/testing/0015-0016-cross-platform-acceptance.md) |
 | 0.2.0rc1 已发布：冻结范围、固定发行说明、候选复审及公开下载证据 | [0013](docs/decisions/0013-first-release-platform-and-packaging.md#首发候选矩阵)、[发行范围与说明](docs/releases/0.2.0rc1.md)、[候选验收](docs/testing/0.2.0rc1-acceptance.md) |
+| 0018 JSON 写入优化：调查、合同、诊断工具修复及产品实施均已独立评审通过，J01–J08 以本次本地提交收口；峰值资源问题继续单独跟进，未推送 / 发布 | [合同](docs/decisions/0018-json-write-normalization.md)、[调查与证据](docs/testing/0018-json-write-investigation.md)、[实施验收](docs/testing/0018-json-write-acceptance.md)、[诊断工具](benchmarks/json-write/diagnostics/README.md) |
 | 性能基线怎么测 / 口径 / 注意事项 | [benchmarks/baseline/README.md](benchmarks/baseline/README.md) |
 | 代码审查 / 修复复审（冻结合同、完整调用链、同类全域清扫、分级与证据门槛、二三阶影响矩阵） | [code-review-rules](.agents/skills/code-review-rules/SKILL.md)（Claude Code 经 `.claude/skills` 软链读取同一份） |
 
@@ -204,6 +205,7 @@ cd <work_dir> && MILVUS_LITE_3X_PYTHON=<3.x 的 venv>/bin/python v26/bin/python 
 | Range search / V1 与普通检索回归四方对照 | 环境、数据与轮换见 [专项 README](benchmarks/range-search/README.md) |
 | Query iterator 首批、全量分页及普通读取回归 | 环境、轮换与命令见 [专项 README](benchmarks/query-iterator/README.md) |
 | JSON 写入回归专项（预序列化 raw RPC / SDK 端到端，逐批校验） | 环境、轮换与命令见 [benchmarks/json-write/README.md](benchmarks/json-write/README.md) |
+| JSON 原组件与分进程资源诊断（独立冻结副本；不修改产品） | [构建、运行与口径](benchmarks/json-write/diagnostics/README.md)；`python benchmarks/json-write/diagnostics/selfcheck.py` |
 | Linux 容器的 LOCK 与 strace 验收 | 环境、非 root 执行与命令见 [tests/platform/README.md](tests/platform/README.md) |
 | 已安装产物的 nullable／ARRAY／iterator／range 联合冒烟 | `<installed-wheel-python> tests/platform/feature_smoke.py --repo <source-root> --work-dir <new-outside-directory>`；见 [平台流程](tests/platform/README.md) |
 

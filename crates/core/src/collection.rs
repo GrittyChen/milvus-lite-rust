@@ -2344,18 +2344,24 @@ impl Collection {
             };
             columns.push(column);
         }
-        if self.persistent.is_some() {
-            crate::storage::arrow_data::normalize_data_json(&self.schema, &mut columns).map_err(
-                |error| match error {
-                    crate::storage::arrow_data::ArrowDataError::NonFiniteJsonNumber { .. } => {
-                        EngineError::InvalidArgument(error.to_string())
-                    }
-                    _ => EngineError::Storage(error.to_string()),
-                },
-            )?;
-        }
+        let mut normalized = None;
+        let column_values = if self.persistent.is_some() {
+            normalized
+                .insert(
+                    crate::storage::arrow_data::normalize_data_json(&self.schema, &mut columns)
+                        .map_err(|error| match error {
+                            crate::storage::arrow_data::ArrowDataError::NonFiniteJsonNumber {
+                                ..
+                            } => EngineError::InvalidArgument(error.to_string()),
+                            _ => EngineError::Storage(error.to_string()),
+                        })?,
+                )
+                .columns()
+        } else {
+            &columns
+        };
         // schema 校验保证 dim > 0。
-        let (dim, values) = vector_values(&columns[self.vector_pos]);
+        let (dim, values) = vector_values(&column_values[self.vector_pos]);
         let norms = values.chunks_exact(dim).map(flat::norm).collect();
         let meta = self.schema.enable_dynamic_field.then_some(dynamic.maps);
         let (source, row_start) = self.persistent.as_ref().map_or_else(
@@ -2372,7 +2378,13 @@ impl Collection {
         self.next_seq = next_seq;
         if let Some(persistent) = self.persistent.as_mut() {
             persistent
-                .append_partition(&self.schema, &seqs, &columns, meta.as_deref(), partition)
+                .append_normalized_partition(
+                    &seqs,
+                    normalized
+                        .ok_or_else(|| EngineError::Storage("normalized columns missing".into()))?,
+                    meta.as_deref(),
+                    partition,
+                )
                 .map_err(EngineError::Storage)?;
         }
         Ok(self.publish_insert(columns, meta, norms, seqs, source, row_start))
@@ -3714,6 +3726,199 @@ fn check_loaded(name: &str, state: LoadState, deleted: bool, unusable: bool) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn persistent_json_default_keeps_normalized_wal_bytes() {
+        use crate::{Compute, DataDir, Db};
+        for key in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let db = Db::new(
+                DataDir::open(root.path()).unwrap(),
+                Compute::new(std::num::NonZeroUsize::MIN).unwrap(),
+            )
+            .unwrap();
+            db.create_collection(
+                "",
+                "c",
+                CollectionSchema {
+                    fields: vec![
+                        FieldSchema {
+                            is_primary: true,
+                            ..FieldSchema::new("id", DataType::Int64)
+                        },
+                        FieldSchema {
+                            is_partition_key: key,
+                            ..FieldSchema::new("k", DataType::Int64)
+                        },
+                        FieldSchema {
+                            dim: Some(2),
+                            ..FieldSchema::new("v", DataType::FloatVector)
+                        },
+                        FieldSchema {
+                            default_value: Some(
+                                serde_json::from_str(r#"{"z":1E2,"a":"中文"}"#).unwrap(),
+                            ),
+                            ..FieldSchema::new("j", DataType::Json)
+                        },
+                    ],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            crate::storage::arrow_data::take_json_encoding_count();
+            db.insert(
+                "",
+                "c",
+                InsertBatch {
+                    num_rows: 2,
+                    columns: vec![
+                        ("id".into(), InputValues::Int(vec![1, 2])),
+                        ("k".into(), InputValues::Int(vec![0, 1])),
+                        (
+                            "v".into(),
+                            InputValues::FloatVector {
+                                dim: 2,
+                                values: vec![1.; 4],
+                            },
+                        ),
+                    ],
+                },
+            )
+            .unwrap();
+            assert_eq!(crate::storage::arrow_data::take_json_encoding_count(), 2);
+            let wal = crate::storage::wal::read_prefix(
+                &root.path().join("collections/c/wal/wal_data_000001.arrow"),
+            )
+            .unwrap();
+            assert_eq!(
+                wal.batches
+                    .iter()
+                    .map(arrow_array::RecordBatch::num_rows)
+                    .sum::<usize>(),
+                2
+            );
+            for batch in wal.batches {
+                let column = batch
+                    .column(5)
+                    .as_any()
+                    .downcast_ref::<arrow_array::StringArray>()
+                    .unwrap();
+                for row in 0..batch.num_rows() {
+                    assert_eq!(
+                        column.value(row).as_bytes(),
+                        r#"{"z": 100.0, "a": "中文"}"#.as_bytes()
+                    );
+                }
+            }
+            db.close();
+        }
+    }
+
+    #[test]
+    fn persistent_json_write_normalizes_once_for_insert_and_upsert_in_every_bucket() {
+        use crate::storage::arrow_data::take_json_encoding_count;
+        use crate::{Compute, DataDir, Db};
+        for key in [false, true] {
+            for nullable in [false, true] {
+                let root = tempfile::tempdir().unwrap();
+                let db = Db::new(
+                    DataDir::open(root.path()).unwrap(),
+                    Compute::new(std::num::NonZeroUsize::MIN).unwrap(),
+                )
+                .unwrap();
+                let schema = CollectionSchema {
+                    fields: vec![
+                        FieldSchema {
+                            is_primary: true,
+                            ..FieldSchema::new("id", DataType::Int64)
+                        },
+                        FieldSchema {
+                            is_partition_key: key,
+                            ..FieldSchema::new("k", DataType::Int64)
+                        },
+                        FieldSchema {
+                            dim: Some(2),
+                            ..FieldSchema::new("v", DataType::FloatVector)
+                        },
+                        FieldSchema {
+                            nullable,
+                            ..FieldSchema::new("j", DataType::Json)
+                        },
+                    ],
+                    ..Default::default()
+                };
+                db.create_collection("", "c", schema).unwrap();
+                let mut json = InputValues::Json(vec![
+                    br#" {"z":1E2,"a":2} "#.to_vec(),
+                    br#"{"k":[1,2.5]}"#.to_vec(),
+                    br#"{"last":true}"#.to_vec(),
+                ]);
+                if nullable {
+                    json = InputValues::Nullable {
+                        values: Box::new(json),
+                        validity: crate::data::Validity::from_bools(&[true, false, true]),
+                    };
+                }
+                let batch = InsertBatch {
+                    num_rows: 3,
+                    columns: vec![
+                        ("id".into(), InputValues::Int(vec![1, 2, 1])),
+                        ("k".into(), InputValues::Int(vec![0, 1, 11])),
+                        (
+                            "v".into(),
+                            InputValues::FloatVector {
+                                dim: 2,
+                                values: vec![1.; 6],
+                            },
+                        ),
+                        ("j".into(), json),
+                    ],
+                };
+                take_json_encoding_count();
+                db.insert("", "c", batch.clone()).unwrap();
+                assert_eq!(
+                    take_json_encoding_count(),
+                    3,
+                    "insert key={key} nullable={nullable}"
+                );
+                db.upsert_with_pk_type("", "c", batch.clone()).unwrap();
+                assert_eq!(
+                    take_json_encoding_count(),
+                    3,
+                    "upsert key={key} nullable={nullable}"
+                );
+                let handle = db.collection("", "c").unwrap();
+                let next_seq = handle.read().next_seq;
+                let wal_dir = root.path().join("collections/c/wal");
+                let files = || {
+                    std::fs::read_dir(&wal_dir)
+                        .unwrap()
+                        .map(|entry| {
+                            let path = entry.unwrap().path();
+                            (
+                                path.file_name().unwrap().to_owned(),
+                                std::fs::read(path).unwrap(),
+                            )
+                        })
+                        .collect::<std::collections::BTreeMap<_, _>>()
+                };
+                let before = files();
+                let mut bad = batch;
+                bad.columns[3].1 = InputValues::Json(vec![
+                    b"{}".to_vec(),
+                    br#"{"bad":1e999}"#.to_vec(),
+                    b"{}".to_vec(),
+                ]);
+                assert!(db.insert("", "c", bad.clone()).is_err());
+                assert_eq!(handle.read().next_seq, next_seq);
+                assert_eq!(files(), before);
+                assert!(db.upsert_with_pk_type("", "c", bad).is_err());
+                assert_eq!(handle.read().next_seq, next_seq);
+                assert_eq!(files(), before);
+                db.close();
+            }
+        }
+    }
 
     #[test]
     fn selected_visibility_reuses_columns_and_old_vector_snapshot_after_mask_update() {

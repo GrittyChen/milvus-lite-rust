@@ -470,6 +470,34 @@ impl PersistentCollection {
         meta: Option<&[Map<String, Value>]>,
         partition: u32,
     ) -> Result<(), String> {
+        let name = self.write_partition_name(partition)?;
+        let batch = arrow_data::wal_data_batch(schema, seqs, name, columns, meta).map_err(err)?;
+        let decoded = DecodedData {
+            seqs: seqs.to_vec(),
+            columns: columns.to_vec(),
+            meta: meta.map(<[Map<String, Value>]>::to_vec),
+        };
+        self.append_prepared_partition(schema, batch, decoded, partition)
+    }
+
+    pub(crate) fn append_normalized_partition(
+        &mut self,
+        seqs: &[u64],
+        columns: arrow_data::NormalizedColumns<'_>,
+        meta: Option<&[Map<String, Value>]>,
+        partition: u32,
+    ) -> Result<(), String> {
+        let name = self.write_partition_name(partition)?;
+        let batch = columns.wal_batch(seqs, name, meta).map_err(err)?;
+        let decoded = DecodedData {
+            seqs: seqs.to_vec(),
+            columns: columns.columns().to_vec(),
+            meta: meta.map(<[Map<String, Value>]>::to_vec),
+        };
+        self.append_prepared_partition(columns.schema(), batch, decoded, partition)
+    }
+
+    fn write_partition_name(&self, partition: u32) -> Result<&str, String> {
         if self.poisoned {
             return Err("collection state is unusable after a storage failure".to_owned());
         }
@@ -483,13 +511,7 @@ impl PersistentCollection {
         if !self.manifest.partitions.contains_key(name) {
             return Err("write partition is not registered".into());
         }
-        let batch = arrow_data::wal_data_batch(schema, seqs, name, columns, meta).map_err(err)?;
-        let decoded = DecodedData {
-            seqs: seqs.to_vec(),
-            columns: columns.to_vec(),
-            meta: meta.map(<[Map<String, Value>]>::to_vec),
-        };
-        self.append_prepared_partition(schema, batch, decoded, partition)
+        Ok(name)
     }
 
     /// 调用方已完成全部桶的编码；这里仅追加既有 WAL stream 并发布当前桶。

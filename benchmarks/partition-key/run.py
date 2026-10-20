@@ -1,5 +1,6 @@
 """0017 B：key 单/多桶的编码、写入、Upsert、读取与进程内峰值。"""
 import argparse
+import copy
 import hashlib
 import importlib.metadata as metadata
 import json
@@ -23,6 +24,15 @@ def exact(actual,expected):
         raise RuntimeError('结果的行、值或类型不同')
 
 
+def sdk_payload(expected):
+    return [{**copy.deepcopy(row), 'vector': [1., 0.]} for row in expected]
+
+
+def check_sdk_response(result, method, rows):
+    exact(result['insert_count' if method == 'Insert' else 'upsert_count'], rows)
+    exact(list(result['ids']), list(range(rows)))
+
+
 def samples(count,call,check):
     times=[]
     for i in range(count+1):
@@ -40,8 +50,10 @@ def main():
     parser.add_argument('--rows',type=int,default=5000)
     parser.add_argument('--samples',type=int,default=5)
     parser.add_argument('--build',required=True)
+    parser.add_argument('--transport',choices=['raw','sdk'],default='raw')
     a=parser.parse_args();database_path(a.database)
     if a.rows<100 or a.samples<3:parser.error('rows 至少100，samples 至少3')
+    if a.workload=='read' and a.transport!='raw':parser.error('transport 仅适用于写入专项')
     import grpc
     from pymilvus import MilvusClient,DataType
     from pymilvus.grpc_gen import schema_pb2 as pb,milvus_pb2 as rpc
@@ -95,23 +107,29 @@ def main():
                 for _ in range(n):v.scalars.array_data.data.add().long_data.data.extend(value)
             fd.append(v)
             expected=[{'id':i,'k':key(i),'value':value} for i in range(n)]
+            sdk_rows=sdk_payload(expected) if a.transport=='sdk' else None
             def check(r):
-                exact((r.status.code,r.status.error_code,r.status.reason),(0,0,''))
-                exact(list(r.IDs.int_id.data),list(range(n)));exact(list(r.succ_index),list(range(n)))
-                exact(r.insert_cnt if method=='Insert' else r.upsert_cnt,n)
-                exact(list(r.err_index),[])
+                if a.transport=='raw':
+                    exact((r.status.code,r.status.error_code,r.status.reason),(0,0,''))
+                    exact(list(r.IDs.int_id.data),list(range(n)));exact(list(r.succ_index),list(range(n)))
+                    exact(r.insert_cnt if method=='Insert' else r.upsert_cnt,n)
+                    exact(list(r.err_index),[])
+                else:
+                    check_sdk_response(r,method,n)
                 exact(sorted(list(c.query('c',filter='',output_fields=['id','k','value'],limit=n)),key=lambda r:r['id']),expected)
             with grpc.insecure_channel(uri.removeprefix('http://'),options=[('grpc.max_send_message_length',-1),('grpc.max_receive_message_length',-1)]) as channel:
                 for method in ['Insert','Upsert']:
                     raw=getattr(rpc,method+'Request')(collection_name='c',num_rows=n,fields_data=fd).SerializeToString()
                     call=channel.unary_unary('/milvus.proto.milvus.MilvusService/'+method,request_serializer=lambda v:v,response_deserializer=rpc.MutationResult.FromString)
-                    out[method.lower()]=samples(a.samples,lambda:call(raw),check)
+                    operation=(lambda:call(raw)) if a.transport=='raw' else (lambda:getattr(c,method.lower())('c',sdk_rows))
+                    out[method.lower()]=samples(a.samples,operation,check)
         # 当前进程高水位，含固定客户端输入。C++ 独立子进程不在该口径内。
         peak=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss/(1024**2 if sys.platform=='darwin' else 1024)
         start=time.perf_counter();c.flush('c');out['flush']=[time.perf_counter()-start]
         exact(list(c.query('c',filter='',output_fields=['count(*)'])),[{'count(*)':a.rows}])
         native=Path(milvus_lite.__file__).parent/'_native.abi3.so'
         result={'build':a.build,'mode':a.mode,'workload':a.workload,'rows':a.rows,'dim':dim,'samples':a.samples,
+                'write_transport':None if a.workload=='read' else a.transport,
                 'seconds':out,'process_peak_rss_mib':peak,'rss_scope':'Python client plus in-process service; excludes external C++ server',
                 'native_sha256':hashlib.sha256(native.read_bytes()).hexdigest() if native.exists() else None,
                 'script_sha256':hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),

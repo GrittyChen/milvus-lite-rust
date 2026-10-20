@@ -238,15 +238,24 @@ impl Collection {
                 };
                 columns.push(column);
             }
-            if self.persistent.is_some() {
-                crate::storage::arrow_data::normalize_data_json(&self.schema, &mut columns)
-                    .map_err(|error| match error {
+            let mut normalized = None;
+            let column_values = if self.persistent.is_some() {
+                normalized
+                    .insert(
+                        crate::storage::arrow_data::normalize_data_json(&self.schema, &mut columns)
+                            .map_err(|error| {
+                                match error {
                         crate::storage::arrow_data::ArrowDataError::NonFiniteJsonNumber {
                             ..
                         } => EngineError::InvalidArgument(error.to_string()),
                         _ => EngineError::Storage(error.to_string()),
-                    })?;
-            }
+                    }
+                            })?,
+                    )
+                    .columns()
+            } else {
+                &columns
+            };
             let meta = self.schema.enable_dynamic_field.then(|| {
                 rows.iter()
                     .map(|&row| {
@@ -258,21 +267,16 @@ impl Collection {
                     })
                     .collect::<Vec<_>>()
             });
-            let (dim, vectors) = vector_values(&columns[self.vector_pos]);
+            let (dim, vectors) = vector_values(&column_values[self.vector_pos]);
             let norms = vectors.chunks_exact(dim).map(flat::norm).collect();
             let partition = self.resolve_write_partition(&name(bucket))?;
-            let (wal, decoded) = if self.persistent.is_some() {
-                let wal = crate::storage::arrow_data::wal_data_batch(
-                    &self.schema,
-                    &seqs,
-                    &name(bucket),
-                    &columns,
-                    meta.as_deref(),
-                )
-                .map_err(|e| EngineError::Storage(e.to_string()))?;
+            let (wal, decoded) = if let Some(normalized) = normalized {
+                let wal = normalized
+                    .wal_batch(&seqs, &name(bucket), meta.as_deref())
+                    .map_err(|e| EngineError::Storage(e.to_string()))?;
                 let decoded = DecodedData {
                     seqs: seqs.clone(),
-                    columns: columns.clone(),
+                    columns: normalized.columns().to_vec(),
                     meta: meta.clone(),
                 };
                 (Some(wal), Some(decoded))

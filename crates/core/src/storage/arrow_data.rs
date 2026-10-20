@@ -105,6 +105,8 @@ fn partition_labels(batch: &RecordBatch, column: usize) -> Result<PartitionLabel
 }
 
 fn json_strings(name: &str, values: &[Vec<u8>]) -> Result<Vec<String>, ArrowDataError> {
+    #[cfg(test)]
+    JSON_ENCODED_VALUES.with(|count| count.set(count.get() + values.len()));
     values
         .iter()
         .map(|raw| {
@@ -118,6 +120,49 @@ fn json_strings(name: &str, values: &[Vec<u8>]) -> Result<Vec<String>, ArrowData
             Ok(pyjson::dumps_unicode(&value))
         })
         .collect()
+}
+
+#[cfg(test)]
+thread_local! {
+    static JSON_ENCODED_VALUES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn take_json_encoding_count() -> usize {
+    JSON_ENCODED_VALUES.with(|count| count.replace(0))
+}
+
+/// 独占借用结束后只暴露只读列，WAL 复用期间不能替换已规范化的字节或 schema。
+#[derive(Debug)]
+pub(crate) struct NormalizedColumns<'a> {
+    schema: &'a CollectionSchema,
+    columns: &'a [ColumnData],
+}
+
+impl NormalizedColumns<'_> {
+    pub(crate) fn columns(&self) -> &[ColumnData] {
+        self.columns
+    }
+
+    pub(crate) fn schema(&self) -> &CollectionSchema {
+        self.schema
+    }
+
+    pub(crate) fn wal_batch(
+        &self,
+        seqs: &[u64],
+        partition: &str,
+        meta: Option<&[Map<String, Value>]>,
+    ) -> Result<RecordBatch, ArrowDataError> {
+        build_batch(
+            self.schema,
+            seqs,
+            Some(partition),
+            self.columns,
+            meta,
+            JsonEncoding::Normalized,
+        )
+    }
 }
 
 fn check_finite_json_numbers(name: &str, value: &Value) -> Result<(), ArrowDataError> {
@@ -148,11 +193,11 @@ fn check_finite_json_numbers(name: &str, value: &Value) -> Result<(), ArrowDataE
 }
 
 /// 持久化读取视图与写出的 Arrow 批采用同一 JSON 文本，发布不改变读取字节。
-pub(crate) fn normalize_data_json(
-    schema: &CollectionSchema,
-    columns: &mut [ColumnData],
-) -> Result<(), ArrowDataError> {
-    for (field, column) in schema.fields.iter().zip(columns) {
+pub(crate) fn normalize_data_json<'a>(
+    schema: &'a CollectionSchema,
+    columns: &'a mut [ColumnData],
+) -> Result<NormalizedColumns<'a>, ArrowDataError> {
+    for (field, column) in schema.fields.iter().zip(columns.iter_mut()) {
         if let ColumnData::Json(values) = column.values_mut() {
             *values = json_strings(&field.name, values)?
                 .into_iter()
@@ -160,7 +205,7 @@ pub(crate) fn normalize_data_json(
                 .collect();
         }
     }
-    Ok(())
+    Ok(NormalizedColumns { schema, columns })
 }
 
 pub fn data_schema(schema: &CollectionSchema) -> Result<Schema, ArrowDataError> {
@@ -456,7 +501,14 @@ pub fn data_batch(
     columns: &[ColumnData],
     meta: Option<&[Map<String, Value>]>,
 ) -> Result<RecordBatch, ArrowDataError> {
-    build_batch(schema, seqs, None, columns, meta)
+    build_batch(
+        schema,
+        seqs,
+        None,
+        columns,
+        meta,
+        JsonEncoding::Canonicalize,
+    )
 }
 
 pub fn wal_data_batch(
@@ -466,7 +518,48 @@ pub fn wal_data_batch(
     columns: &[ColumnData],
     meta: Option<&[Map<String, Value>]>,
 ) -> Result<RecordBatch, ArrowDataError> {
-    build_batch(schema, seqs, Some(partition), columns, meta)
+    build_batch(
+        schema,
+        seqs,
+        Some(partition),
+        columns,
+        meta,
+        JsonEncoding::Canonicalize,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum JsonEncoding {
+    Canonicalize,
+    Normalized,
+}
+
+fn json_array(
+    name: &str,
+    values: &[Vec<u8>],
+    validity: Option<&Validity>,
+    encoding: JsonEncoding,
+) -> Result<ArrayRef, ArrowDataError> {
+    let owned;
+    let strings: Vec<&str> = match encoding {
+        JsonEncoding::Canonicalize => {
+            owned = json_strings(name, values)?;
+            owned.iter().map(String::as_str).collect()
+        }
+        JsonEncoding::Normalized => values
+            .iter()
+            .map(|raw| {
+                std::str::from_utf8(raw)
+                    .map_err(|_| ArrowDataError::TypeMismatch { name: name.into() })
+            })
+            .collect::<Result<_, _>>()?,
+    };
+    Ok(Arc::new(StringArray::from_iter(
+        strings
+            .into_iter()
+            .enumerate()
+            .map(|(row, value)| validity.is_none_or(|v| v.get(row)).then_some(value)),
+    )))
 }
 
 fn build_batch(
@@ -475,6 +568,7 @@ fn build_batch(
     partition: Option<&str>,
     columns: &[ColumnData],
     meta: Option<&[Map<String, Value>]>,
+    json_encoding: JsonEncoding,
 ) -> Result<RecordBatch, ArrowDataError> {
     if columns.len() != schema.fields.len() {
         return Err(ArrowDataError::ColumnCount);
@@ -497,7 +591,7 @@ fn build_batch(
         let array: ArrayRef = match column {
             ColumnData::Array(array) => encode_array(array, None)?,
             ColumnData::Nullable { values, validity } => {
-                nullable_array(&field.name, values, validity)?
+                nullable_array(&field.name, values, validity, json_encoding)?
             }
             ColumnData::Bool(v) => Arc::new(BooleanArray::from(v.clone())),
             ColumnData::Int8(v) => Arc::new(Int8Array::from(v.clone())),
@@ -507,7 +601,7 @@ fn build_batch(
             ColumnData::Float(v) => Arc::new(Float32Array::from(v.clone())),
             ColumnData::Double(v) => Arc::new(Float64Array::from(v.clone())),
             ColumnData::VarChar(v) => Arc::new(StringArray::from_iter_values(v)),
-            ColumnData::Json(v) => Arc::new(StringArray::from(json_strings(&field.name, v)?)),
+            ColumnData::Json(v) => json_array(&field.name, v, None, json_encoding)?,
             ColumnData::FloatVector { dim, values } => {
                 let dim = i32::try_from(*dim)
                     .ok()
@@ -552,6 +646,7 @@ fn nullable_array(
     name: &str,
     values: &ColumnData,
     validity: &Validity,
+    json_encoding: JsonEncoding,
 ) -> Result<ArrayRef, ArrowDataError> {
     if values.len() != validity.len() {
         return Err(ArrowDataError::RowCount {
@@ -584,15 +679,7 @@ fn nullable_array(
                 .enumerate()
                 .map(|(i, v)| validity.get(i).then_some(v.as_str())),
         )),
-        ColumnData::Json(v) => {
-            let strings = json_strings(name, v)?;
-            Arc::new(StringArray::from_iter(
-                strings
-                    .iter()
-                    .enumerate()
-                    .map(|(i, v)| validity.get(i).then_some(v.as_str())),
-            ))
-        }
+        ColumnData::Json(v) => json_array(name, v, Some(validity), json_encoding)?,
         _ => return Err(ArrowDataError::TypeMismatch { name: name.into() }),
     })
 }
@@ -945,6 +1032,95 @@ mod tests {
     use crate::schema::FieldSchema;
 
     use super::*;
+
+    #[test]
+    fn normalized_wal_keeps_exact_json_bytes_and_validity_with_one_encoding() {
+        let raw = [
+            r#" {"z":1E2,"a":"中文\u0000\t\n\"\\","wide":184467440737095516160} "#,
+            r#"{"negative_zero":-0.0,"exponent":1e-12,"max":1.7976931348623157e308,"min":5e-324}"#,
+            r#"{"underflow":-1e-999,"nested":[true,null,{},[1,2.5]],"text":"\ud83d\ude00"}"#,
+            " null\t\r\n",
+            "[1,2,3]",
+            "{}",
+            "0.1",
+        ];
+        for mask in [
+            None,
+            Some(vec![true; raw.len()]),
+            Some(vec![false; raw.len()]),
+            Some((0..raw.len()).map(|i| i % 2 == 0).collect()),
+        ] {
+            let mut field = FieldSchema::new("j", DataType::Json);
+            field.nullable = mask.is_some();
+            let schema = CollectionSchema {
+                fields: vec![field],
+                enable_dynamic_field: true,
+                properties: vec![],
+            };
+            let mut column = ColumnData::Json(raw.iter().map(|s| s.as_bytes().to_vec()).collect());
+            if let Some(mask) = mask {
+                column = column.with_validity(&mask);
+            }
+            let mut columns = vec![column];
+            let seqs: Vec<_> = (1..=raw.len() as u64).collect();
+            let meta = vec![
+                Map::from_iter([("unicode".into(), Value::String("中文".into()))]);
+                raw.len()
+            ];
+            let original = wal_data_batch(&schema, &seqs, "_pk_10", &columns, Some(&meta)).unwrap();
+            take_json_encoding_count();
+            let normalized = normalize_data_json(&schema, &mut columns).unwrap();
+            assert_eq!(take_json_encoding_count(), raw.len());
+            let repeated =
+                wal_data_batch(&schema, &seqs, "_pk_10", normalized.columns(), Some(&meta))
+                    .unwrap();
+            assert_eq!(take_json_encoding_count(), raw.len());
+            assert_eq!(original, repeated);
+            let optimized = normalized.wal_batch(&seqs, "_pk_10", Some(&meta)).unwrap();
+            assert_eq!(take_json_encoding_count(), 0);
+            assert_eq!(original, optimized);
+            let strings = optimized
+                .column(2)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            for row in 0..raw.len() {
+                let original_strings = original
+                    .column(2)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap();
+                assert_eq!(strings.is_valid(row), original_strings.is_valid(row));
+                assert_eq!(
+                    strings.value(row).as_bytes(),
+                    original_strings.value(row).as_bytes()
+                );
+                if strings.is_valid(row) {
+                    let ColumnData::Json(values) = columns[0].values() else {
+                        panic!("JSON column")
+                    };
+                    assert_eq!(strings.value(row).as_bytes(), values[row]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn normalized_wal_keeps_generic_rejection_including_masked_json() {
+        let schema = CollectionSchema {
+            fields: vec![FieldSchema {
+                nullable: true,
+                ..FieldSchema::new("j", DataType::Json)
+            }],
+            ..Default::default()
+        };
+        for raw in [b"{bad".as_slice(), b"{\"a\":1e999}", &[0xff, 0xfe]] {
+            let mut columns = vec![ColumnData::Json(vec![raw.to_vec()]).with_validity(&[false])];
+            assert!(data_batch(&schema, &[1], &columns, None).is_err());
+            assert!(wal_data_batch(&schema, &[1], "_default", &columns, None).is_err());
+            assert!(normalize_data_json(&schema, &mut columns).is_err());
+        }
+    }
 
     #[test]
     fn json_overflow_rejects_nested_floats_but_keeps_wide_integers_and_literal_strings() {

@@ -24,3 +24,24 @@ def test_existing_link_and_repository_paths_are_rejected(tmp_path):
 @pytest.mark.parametrize('value',[True,1.0,None,'1'])
 def test_result_types_are_not_coerced(value):
     with pytest.raises(RuntimeError):bench.exact([{'v':value}],[{'v':1}])
+
+
+def test_sdk_payload_does_not_share_mutable_truth():
+    expected=[{'id':0,'k':1,'value':{'items':[True,2]}}, {'id':1,'k':0,'value':None}]
+    rows=bench.sdk_payload(expected)
+    assert rows==[{'id':0,'k':1,'value':{'items':[True,2]},'vector':[1.,0.]},
+                  {'id':1,'k':0,'value':None,'vector':[1.,0.]}]
+    rows[0]['value']['items'][0]=False
+    rows[0]['vector'][0]=3.
+    assert expected==[{'id':0,'k':1,'value':{'items':[True,2]}}, {'id':1,'k':0,'value':None}]
+    assert rows[1]['vector']==[1.,0.]
+
+
+@pytest.mark.parametrize('method',['Insert','Upsert'])
+def test_sdk_result_requires_exact_ids_and_count(method):
+    count='insert_count' if method=='Insert' else 'upsert_count'
+    bench.check_sdk_response({count:2,'ids':[0,1]},method,2)
+    bench.check_sdk_response({count:2,'ids':iter([0,1])},method,2)
+    for result in [{count:True,'ids':[0,1]}, {count:1,'ids':[0,1]},
+                   {count:2,'ids':[1,0]}, {count:2,'ids':[0]}, {count:2,'ids':[False,1]}]:
+        with pytest.raises(RuntimeError):bench.check_sdk_response(result,method,2)
