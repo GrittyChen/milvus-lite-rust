@@ -71,7 +71,7 @@
 | 0015／0016 冻结提交的跨平台开发验收、平台证据边界与 SDK 临时端口复用的缓存隔离 | [跨平台验收](docs/testing/0015-0016-cross-platform-acceptance.md) |
 | 0.2.0rc1 已发布：冻结范围、固定发行说明、候选复审及公开下载证据 | [0013](docs/decisions/0013-first-release-platform-and-packaging.md#首发候选矩阵)、[发行范围与说明](docs/releases/0.2.0rc1.md)、[候选验收](docs/testing/0.2.0rc1-acceptance.md) |
 | 0018 JSON 写入优化：调查、合同、诊断工具修复及产品实施均已独立评审通过，J01–J08 以本次本地提交收口；峰值资源问题继续单独跟进，未推送 / 发布 | [合同](docs/decisions/0018-json-write-normalization.md)、[调查与证据](docs/testing/0018-json-write-investigation.md)、[实施验收](docs/testing/0018-json-write-acceptance.md)、[诊断工具](benchmarks/json-write/diagnostics/README.md) |
-| 0.3.0rc2 候选方案及版本与发行文档准备变更均已独立评审通过，仅纳入已审 0018 优化；已获准本地提交、冻结并启动完整候选矩阵，产物验收另行记录 | [候选方案](docs/releases/0.3.0rc2-candidate-plan.md)、[发行说明](docs/releases/0.3.0rc2.md)、[准备核验](docs/testing/0.3.0rc2-preparation.md) |
+| 0.3.0rc2 冻结 df6fd30 的完整候选矩阵、离线证据门槛及独立候选复审均通过；仅纳入已审 0018 优化，收口文档已获本地提交授权，未推送 / 打 tag / 发布 | [候选验收](docs/testing/0.3.0rc2-acceptance.md)、[候选方案](docs/releases/0.3.0rc2-candidate-plan.md)、[发行说明](docs/releases/0.3.0rc2.md)、[准备核验](docs/testing/0.3.0rc2-preparation.md) |
 | 性能基线怎么测 / 口径 / 注意事项 | [benchmarks/baseline/README.md](benchmarks/baseline/README.md) |
 | 代码审查 / 修复复审（冻结合同、完整调用链、同类全域清扫、分级与证据门槛、二三阶影响矩阵） | [code-review-rules](.agents/skills/code-review-rules/SKILL.md)（Claude Code 经 `.claude/skills` 软链读取同一份） |
 
