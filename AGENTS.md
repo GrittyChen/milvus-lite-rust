@@ -67,6 +67,7 @@
 | partition key B：设计、实施验收及独立产品评审通过，已本地提交 d2729f8、未推送/发布；三项差异与证据单列 | [B 调查](docs/testing/0017-partition-key-investigation.md)、[B 合同](docs/decisions/0017-partitions.md#b-合同设计已通过)、[B 验收](docs/testing/0017-partition-key-acceptance.md)、[B 性能](docs/testing/0017-partition-key-performance.md) |
 | 非 key 同批重复主键 Upsert：撤销累计合并差异，按请求前状态独立合并；实施及独立评审通过、单独本地提交，未推送/发布 | [修复记录](docs/testing/0017-non-key-upsert-fix.md) |
 | 0017 整体跨平台开发验收（独立评审通过；FI Clippy 仅开启 core，最终候选须覆盖完整 FI 编译面；与最终发布矩阵分开） | [跨平台收口](docs/testing/0017-cross-platform-acceptance.md) |
+| 0.3.0rc1 候选准备（版本与范围已确认；分区 A/B 与 Upsert 修复；审阅、获准本地提交并冻结后才启动完整矩阵） | [范围与执行清单](docs/releases/next-candidate-plan.md)、[发行说明](docs/releases/0.3.0rc1.md) |
 | 0015／0016 冻结提交的跨平台开发验收、平台证据边界与 SDK 临时端口复用的缓存隔离 | [跨平台验收](docs/testing/0015-0016-cross-platform-acceptance.md) |
 | 0.2.0rc1 已发布：冻结范围、固定发行说明、候选复审及公开下载证据 | [0013](docs/decisions/0013-first-release-platform-and-packaging.md#首发候选矩阵)、[发行范围与说明](docs/releases/0.2.0rc1.md)、[候选验收](docs/testing/0.2.0rc1-acceptance.md) |
 | 性能基线怎么测 / 口径 / 注意事项 | [benchmarks/baseline/README.md](benchmarks/baseline/README.md) |

@@ -809,7 +809,7 @@ dependencies = [
 
 [[package]]
 name = "milvus-lite-core"
-version = "0.2.0-rc.1"
+version = "0.3.0-rc.1"
 dependencies = [
  "arrow-array",
  "arrow-ipc",
@@ -827,7 +827,7 @@ dependencies = [
 
 [[package]]
 name = "milvus-lite-grpc"
-version = "0.2.0-rc.1"
+version = "0.3.0-rc.1"
 dependencies = [
  "milvus-lite-core",
  "prost",
@@ -844,7 +844,7 @@ dependencies = [
 
 [[package]]
 name = "milvus-lite-py"
-version = "0.2.0-rc.1"
+version = "0.3.0-rc.1"
 dependencies = [
  "milvus-lite-grpc",
  "pyo3",

@@ -1,6 +1,6 @@
 # 首发发行物验收
 
-合同见 [0013](../../docs/decisions/0013-first-release-platform-and-packaging.md)。检查器默认版本为 `0.2.0rc1`；脚本不上传或发布发行物。根 `pyproject.toml` 是唯一配置；从仓库根和 sdist 解包根执行 `maturin build`，也可以保留 `-m crates/py/Cargo.toml`。
+合同见 [0013](../../docs/decisions/0013-first-release-platform-and-packaging.md)。检查器默认版本为 `0.3.0rc1`；脚本不上传或发布发行物。根 `pyproject.toml` 是唯一配置；从仓库根和 sdist 解包根执行 `maturin build`，也可以保留 `-m crates/py/Cargo.toml`。
 
 ## 构建与安装
 

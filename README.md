@@ -2,7 +2,7 @@
 
 以 Rust 实现的非官方 milvus-lite，与 Milvus / Zilliz 无隶属关系。目标是让 `pymilvus` 用户继续使用 `MilvusClient("./demo.db")`，并读取官方 3.x 的数据目录。
 
-**`0.2.0rc1` 为预发布试用版本，不建议用于生产。** 本文对应该版本的源码与发行候选，下方安装命令在对应 GitHub Release 发布后使用。已发布版本以仓库 Releases 页面为准；本项目目前未发布到 PyPI，PyPI 上若出现同名包，并非本项目发布。平台表沿用已确认的验收范围，各行实际达到的证据层级以 Release 说明为准。
+**`0.3.0rc1` 为预发布试用版本，不建议用于生产。** 本文对应该版本的源码与发行候选，下方安装命令在对应 GitHub Release 发布后使用。已发布版本以仓库 Releases 页面为准；本项目目前未发布到 PyPI，PyPI 上若出现同名包，并非本项目发布。平台表沿用已确认的验收范围，各行实际达到的证据层级以 Release 说明为准。
 
 源码：<https://github.com/GrittyChen/milvus-lite-rust>；问题反馈：<https://github.com/GrittyChen/milvus-lite-rust/issues>。设计决策与验收记录在源码树的 docs 目录中维护。
 
@@ -20,13 +20,13 @@ pymilvus 从 PyPI 安装；本包只从 GitHub Release 的附件安装，`--no-i
 
 ```bash
 python -m pip install pymilvus
-python -m pip install --no-index --only-binary :all: --find-links https://github.com/GrittyChen/milvus-lite-rust/releases/expanded_assets/v0.2.0rc1 milvus-lite-rust==0.2.0rc1
+python -m pip install --no-index --only-binary :all: --find-links https://github.com/GrittyChen/milvus-lite-rust/releases/expanded_assets/v0.3.0rc1 milvus-lite-rust==0.3.0rc1
 ```
 
-需要先核对文件时，从 [v0.2.0rc1 Release](https://github.com/GrittyChen/milvus-lite-rust/releases/tag/v0.2.0rc1) 下载本平台的 wheel 与 `SHA256SUMS`，在同一目录核对后安装本地文件：
+需要先核对文件时，从 [v0.3.0rc1 Release](https://github.com/GrittyChen/milvus-lite-rust/releases/tag/v0.3.0rc1) 下载本平台的 wheel 与 `SHA256SUMS`，在同一目录核对后安装本地文件：
 
 ```bash
-shasum -a 256 -c --ignore-missing SHA256SUMS && python -m pip install --no-index ./milvus_lite_rust-0.2.0rc1-*.whl
+shasum -a 256 -c --ignore-missing SHA256SUMS && python -m pip install --no-index ./milvus_lite_rust-0.3.0rc1-*.whl
 ```
 
 核对失败时不会执行安装。Linux 上也可以用 `sha256sum -c --ignore-missing SHA256SUMS` 代替 `shasum -a 256 -c --ignore-missing SHA256SUMS`。
@@ -76,16 +76,21 @@ finally:
 
 `.db` 的父目录必须存在。同路径服务复用，`MilvusClient.close()` 关闭客户端而非本地服务；正常脚本退出会收尾服务并排空已接受的后台合并。
 
-本候选在已发布 rc3 的基础上增加标量 nullable / 默认值、八种标量元素 ARRAY、Query iterator 和 range search / search iterator V1；范围与验收依据见源码树中的 0015、0016 决策。
+本候选继承 0.2.0rc1 的标量 nullable / 默认值、八种标量元素 ARRAY、Query iterator 和 range search / search iterator V1，新增显式分区、partition key，并修正非 key 同批重复主键 Upsert 的合并行为；范围与验收依据见源码树中的 0015、0016、0017 决策。本版实际验收结果以对应 Release 链接的记录为准，开发验收不替代最终产物验收。
 
-`0.2.0rc1` 的范围包括基本 CRUD、Upsert/Delete、Flush/关闭重开、FLAT 的 L2/IP/COSINE、标量与动态字段比较、and/or/not、in/not in、LIKE、is null/exists、JSON 与动态字段路径、json_contains/array_contains 系列及 array_length、后台 compaction 与 tombstone 回收，以及下述新增能力。过滤按官方 3.x 的整条表达式路线执行，各路线对缺失值、短路和类型错误的处理不同；范围与参照缺陷见 0014。算术运算、text_match、几何与时间谓词、分区、alias/rename、BM25/function chain、稀疏向量等范围外能力保持明确的 UNIMPLEMENTED，不静默忽略条件。官方 3.x 数据互通仍受类型、索引与已登记历史目录限制约束，不宣称兼容它的全部功能。
+`0.3.0rc1` 的范围包括基本 CRUD、Upsert/Delete、Flush/关闭重开、FLAT 的 L2/IP/COSINE、标量与动态字段比较、and/or/not、in/not in、LIKE、is null/exists、JSON 与动态字段路径、json_contains/array_contains 系列及 array_length、后台 compaction 与 tombstone 回收，以及下述新增能力。过滤按官方 3.x 的整条表达式路线执行，各路线对缺失值、短路和类型错误的处理不同；范围与参照缺陷见 0014。算术运算、text_match、几何与时间谓词、alias/rename、BM25/function chain、稀疏向量等范围外能力保持明确的 UNIMPLEMENTED，不静默忽略条件。官方 3.x 数据互通仍受类型、索引与已登记历史目录限制约束，不宣称兼容它的全部功能。
 
+- 显式分区支持 Create / Drop / Has / Show / statistics，以及写入和读取的分区选择；LoadPartitions / ReleasePartitions 仍未实现。读取先选分区再判版本，删除按主键全局生效；Drop 保留其它分区仍需的全局删除记录，避免重开后已删除行复活。目录安全拒绝和参照差异见 0017。
+- partition key 支持非主键 INT64 / VARCHAR，按参照固定哈希路由至 16 桶，另保留 `_default`。生成 auto_id 取分桶后的行序号，返回顺序仍对应原请求，可能得到 `[1,3,2]`；确定性校验 / 转换失败在追加任何 WAL 前整批拒绝，自动 ID 会覆盖可读旧行时整批拒绝。真实 I/O 故障仍按已校验前缀恢复，不保证整批原子写入。
+- 非 key 同批重复主键 Upsert 的每一行现在都从请求前的旧值独立合并。旧行 `dict(id=1,x=0,y=0)`，同批 partial Upsert `[dict(id=1,x=1),dict(id=1,y=2)]` 的结果从已发布 0.2.0rc1 的 `dict(id=1,x=1,y=2)` 变为 `dict(id=1,x=0,y=2)`，与参照 3.x 一致；分成两个请求时仍依次合并。
 - nullable / 默认值支持 BOOL、INT8/16/32/64、FLOAT/DOUBLE、VARCHAR、JSON；主键与向量的 nullable 仍不支持。
 - ARRAY 支持 BOOL、INT8/16/32/64、FLOAT/DOUBLE、VARCHAR 元素及父列 null；不支持嵌套、JSON 或向量元素。存量数组中的元素 null 可保留，但经 Query/Search 投影时报错，与参照实现一致。
 - Query iterator 按 INT64 / VARCHAR 主键排序，每个请求取得独立快照；不提供跨请求的一致性快照。
 - range search 沿用 3.x 的有限候选窗口，不是全量范围扫描；阈值附近可能出现已登记浮点误差范围内的成员差异。服务端不实现 Search iterator V2，会忽略 V2 探测参数并返回不含 V2 结果字段的普通 Search 结果；SDK 据此自动回退 V1，与官方 3.x 一致。V1 的探测算法在部分批量和数据分布下可能提前结束，不保证任意场景都遍历全部数据。
 
-新能力沿用 3.x 的 schema.json、Arrow WAL 和 Parquet 编码，不增加私有格式。已发布 rc1–rc3 不支持新增的 schema 属性，回退时会明确拒绝相应 collection；升级与回退的具体范围见源码树中的 0015 验收记录。
+新能力沿用 3.x 的 schema.json、Arrow WAL、Parquet 和 manifest format 2 编码，不增加私有数据格式。回退到已发布 0.2.0rc1 时，非默认分区 manifest 或 partition key schema 会使相应 collection 被明确拒绝，不能降级后继续读写这些集合；拒绝不应改坏目录，健康 collection 仍可打开。删除全部非默认分区且不含 key 等旧版不支持属性后，仅剩 `_default` 的目录可能回到旧版能力范围，具体见 0017。更早的 0.1.0rc1–rc3 还会拒绝 nullable / ARRAY 等新 schema 属性，见 0015。
+
+JSON 写入及进程峰值资源相对参照 3.x 的差距仍单独跟进，本次未解决，也不新增性能提升承诺。
 
 向量检索只有 FLAT（精确暴力检索）。新建索引时，FLAT 与 BRUTE_FORCE 原生支持；AUTOINDEX（pymilvus 快速建表使用）、HNSW、HNSW_SQ、IVF_FLAT、IVF_SQ8 可创建并原样保存定义，向量仍按 FLAT 执行，召回不低于 ANN 但数据量大时更慢。标量字段上的 INVERTED 可创建，过滤仍按扫描执行，结果可能与官方在已建索引数据上的结果不同。新建稠密向量索引时，AUTOINDEX、HNSW、HNSW_SQ、IVF_FLAT、IVF_SQ8 只接受 COSINE / L2 / IP；BM25 / NONE 返回 UNIMPLEMENTED，避免写出官方 3.x 无法 load 的定义。FLAT / BRUTE_FORCE 保持原度量校验。
 

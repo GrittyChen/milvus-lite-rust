@@ -14,7 +14,7 @@ import tempfile
 import zipfile
 from urllib.parse import urlsplit
 
-VERSION = "0.2.0rc1"
+VERSION = "0.3.0rc1"
 # 已确认的公开仓库（0013 候选阶段决策 4）；按路径段匹配，同前缀的其它仓库不放行。
 PROJECT = "https://github.com/GrittyChen/milvus-lite-rust"
 PROJECT_URLS = {"Repository, " + PROJECT, "Issues, " + PROJECT + "/issues"}
