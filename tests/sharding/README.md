@@ -10,7 +10,7 @@
 # 差分：使用会话级服务的用例整组放入同一片，按收集顺序执行。
 python tests/sharding/shard.py plan --python <被测解释器> --suite tests/differential --out <plan_dir> \
     --shards 4 --group-fixture diff --group-fixture rust_uri --group-fixture ref_uri \
-    --expect 420 --expect-group 117 \
+    --expect 421 --expect-group 118 \
     [--durations <上一轮的 shard-*.json> ...] [--order balanced|round-robin|reverse]
 python tests/sharding/shard.py run --plan <plan_dir>/plan.json --out <run_dir>
 

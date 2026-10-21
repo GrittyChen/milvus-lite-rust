@@ -109,8 +109,8 @@ M1 的对外行为与 3.x 有阶段性差异，本文按 [AGENTS.md](../../AGENT
 1. **端到端差分**：
    - **场景**：在 3.x README 的 Quick Start 基础上，去掉过滤与删除，再补上几种用法：显式 schema、`auto_id`、IP 与 L2 度量、VARCHAR 主键、先建表后建索引、release 后再 load。
    - **版本与运行方式**：在 pymilvus 2.6.17 与 3.0.2 下各跑一遍。本包与官方包占用同一个 `milvus_lite` 模块，不能装在一起，因此 3.x 装在另一个 venv 里，在独立进程中运行它的 gRPC 服务；差分脚本用 URI 分别连接两边。
-     - 独立进程不用 `milvus-lite server`，而是在 3.x 的 venv 里运行一个辅助脚本，由它调用 `start_server_in_thread(port=0)`。二者经同一个 `_build_server` 构造服务，servicer、256MB 消息上限与线程数都相同。
-     - 改用脚本的原因：CLI 的 `--port 0` 不回报实际端口；gRPC 在端口上设了 SO_REUSEPORT，两个 CLI 服务绑同一端口时都不报错，请求全落在先启动的那个上，所以先挑空闲端口再启动存在察觉不到的竞争；CLI 只在 KeyboardInterrupt 时关闭数据库。辅助脚本打印实际端口，stdin 关闭时关闭服务与数据库，日志写到文件。
+     - 独立进程不用 `milvus-lite server`，而是在 3.x 的 venv 里运行一个辅助脚本，由它调用 `start_server_in_thread(port=0)`。二者经同一个 `_build_server` 构造服务，servicer、256MB 消息上限与线程数都相同；唯一的差别是辅助脚本关闭 SO_REUSEPORT，理由见 [server3x.py](../../tests/differential/server3x.py) 与 [0019「试点发现」](0019-test-sharding.md#试点发现参照服务的端口复用)。
+     - 改用脚本的原因：CLI 的 `--port 0` 不回报实际端口；gRPC 在端口上设了 SO_REUSEPORT，两个 CLI 服务绑同一端口时都不报错，连接会落到其中任一个上（macOS 落在先启动的那个，Linux 按连接哈希分流），所以先挑空闲端口再启动存在察觉不到的竞争；CLI 只在 KeyboardInterrupt 时关闭数据库。辅助脚本打印实际端口，stdin 关闭时关闭服务与数据库，日志写到文件。
    - **数据量**：每个 collection 少于 1 万行。3.x 满 1 万行才 flush，在此之前数据都在 memtable 中暴力检索，结果是精确的；AUTOINDEX 也不会建成 HNSW。
    - **比较口径**：主键集合（包括 `auto_id` 生成的主键）、输出字段、`count(*)`、load 状态、错误码与错误信息逐项相等；距离的允许误差见「决策」。
 2. **复用参照实现的用例**：候选文件大多只通过 [conftest.py](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/conftest.py#L57) 的 `grpc_server` fixture 起服务，不在顶层导入内部模块。阻碍有三个：
