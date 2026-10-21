@@ -68,7 +68,7 @@
 | 非 key 同批重复主键 Upsert：撤销累计合并差异，按请求前状态独立合并；实施及独立评审通过、单独提交，已随 0.3.0rc1 交付 | [修复记录](docs/testing/0017-non-key-upsert-fix.md) |
 | 0017 整体跨平台开发验收（独立评审通过；FI Clippy 仅开启 core，最终候选须覆盖完整 FI 编译面；与最终发布矩阵分开） | [跨平台收口](docs/testing/0017-cross-platform-acceptance.md) |
 | 0.3.0rc1 已不可变预发布（冻结 / tag 为 27aabf2；候选与发布后记录均独立复审通过，公开安装检查通过；完整三层 FI 与两 Linux 原生矩阵） | [候选及发布验收](docs/testing/0.3.0rc1-acceptance.md)、[范围与执行清单](docs/releases/next-candidate-plan.md)、[发行说明](docs/releases/0.3.0rc1.md) |
-| 候选测试的并行编排与确定性分片：实测耗时依据、不损失测试效果的定义、P0 编排并行、P1 分片工具、门槛与试点（方案与分片工具均评审通过；试点进行中，已处理其发现的参照端口复用与参照崩溃索引文件问题） | [0019](docs/decisions/0019-test-sharding.md) |
+| 候选测试的并行编排与确定性分片：实测耗时依据、不损失测试效果的定义、P0 编排并行、P1 分片工具、门槛与试点（方案与分片工具均评审通过；三平台试点完成并处理其发现的参照端口复用与参照崩溃索引文件问题；负责人确认下一候选采用 P0 + P1） | [0019](docs/decisions/0019-test-sharding.md)、[试点验收](docs/testing/0019-pilot-acceptance.md) |
 | 0015／0016 冻结提交的跨平台开发验收、平台证据边界与 SDK 临时端口复用的缓存隔离 | [跨平台验收](docs/testing/0015-0016-cross-platform-acceptance.md) |
 | 0.2.0rc1 已发布：冻结范围、固定发行说明、候选复审及公开下载证据 | [0013](docs/decisions/0013-first-release-platform-and-packaging.md#首发候选矩阵)、[发行范围与说明](docs/releases/0.2.0rc1.md)、[候选验收](docs/testing/0.2.0rc1-acceptance.md) |
 | 0018 JSON 写入优化：调查、合同、诊断工具修复及产品实施均已独立评审通过，J01–J08 已随 0.3.0rc2 交付；峰值资源问题继续单独跟进 | [合同](docs/decisions/0018-json-write-normalization.md)、[调查与证据](docs/testing/0018-json-write-investigation.md)、[实施验收](docs/testing/0018-json-write-acceptance.md)、[诊断工具](benchmarks/json-write/diagnostics/README.md) |

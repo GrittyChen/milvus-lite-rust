@@ -1,6 +1,6 @@
 # 0019：候选测试的并行编排与分片
 
-- 状态：首轮评审（负责人与独立复审）意见已修订，负责人复核通过，复核建议已采纳；负责人已确认方向（P0 编排并行进入下一候选，P1 采用自写确定性分片）。分片工具已实现（[tests/sharding](../../tests/sharding/README.md)），实现经负责人与独立复审两轮评审通过，复核建议已采纳。试点进行中，已发现并处理参照服务端口复用与参照实现崩溃时索引文件两项问题（见两节「试点发现」）。
+- 状态：首轮评审（负责人与独立复审）意见已修订，负责人复核通过，复核建议已采纳；负责人已确认方向（P0 编排并行进入下一候选，P1 采用自写确定性分片）。分片工具已实现（[tests/sharding](../../tests/sharding/README.md)），实现经负责人与独立复审两轮评审通过，复核建议已采纳。三平台试点完成，发现并处理参照服务端口复用与参照实现崩溃时索引文件两项问题（见两节「试点发现」），默认并发度与采用方式经负责人确认，见[试点验收](../testing/0019-pilot-acceptance.md)；下一候选采用 P0 与 P1。
 - 日期：2026-10-21。
 - 基线：已发布 `0.3.0rc2`，冻结提交 `df6fd3071f18daec5d4c8a375c99e91c6b6ad16a`；耗时取自该候选仓库外的原始证据（[候选验收](../testing/0.3.0rc2-acceptance.md)记载其证据包身份）。
 - 依据：[0013 首发候选矩阵](0013-first-release-platform-and-packaging.md#首发候选矩阵)、[进程内测试隔离](../testing/process-test-isolation.md)、[SDK 端点缓存隔离](../testing/0015-0016-cross-platform-acceptance.md#本轮发现两条-sdk-的跨用例-schema-缓存污染)。
@@ -100,7 +100,7 @@ x86 为多人共享物理机，按当时的可用核数、负载与 uid 进程�
 
 Linux x86_64 的 P1（N = 4，单元顺序轮转）中，差分 3.0.2 的 `test_upsert_request_base.py::test_duplicate_upsert_uses_request_base[False-True-reopen-False]` 失败：关闭重开后本实现正常 load，3.x 参照报 `collection 'c' does not exist`。同一用例在其余运行与平台均通过。
 
-参照服务经 [server3x.py](../../tests/differential/server3x.py) 调用参照实现的 `_build_server`，grpcio 默认开启 SO_REUSEPORT。该主机内核为 3.10，端口 0 自动分配时会把同一用户下另一个 SO_REUSEPORT 监听者正在使用的端口再分给新服务，Linux 随后按连接哈希把请求分流到错误的数据目录。实测在 50 个存活监听下 20000 次自动分配，3.10 内核撞上 38 次，arm64 linuxkit 7.0 与 macOS 为 0；同时运行 20 个真实参照服务时，修复前撞上 18 次、修复后 0 次。差分进程本身就同时开着会话级与用例级参照服务，因此串行也有此风险，并行使其放大。
+参照服务经 [server3x.py](../../tests/differential/server3x.py) 调用参照实现的 `_build_server`，grpcio 默认开启 SO_REUSEPORT。该主机内核为 3.10，端口 0 自动分配时会把同一用户下另一个 SO_REUSEPORT 监听者正在使用的端口再分给新服务，Linux 随后按连接哈希把请求分流到错误的数据目录。内核探针与真实参照服务的对比显示，该主机会出现此类碰撞、修复后为 0，arm64 linuxkit 7.0 与 macOS 未出现（实测见[试点验收](../testing/0019-pilot-acceptance.md#试点发现)）。差分进程本身就同时开着会话级与用例级参照服务，因此串行也有此风险，并行使其放大。
 
 修复只关闭参照服务的 SO_REUSEPORT，servicer、消息上限与线程数仍经参照的 `_build_server` 构造（[0004](0004-m1-scope.md) 第 1 项同步登记），参照实现本身未改。回归用例 [test_connections.py](../../tests/differential/test_connections.py) 以另一个 SO_REUSEPORT socket 显式绑定参照端口，要求 EADDRINUSE；回退修复时失败。新用例使用会话级 `ref_uri`，差分收集与会话组相应变为 421 / 118。
 
@@ -114,7 +114,7 @@ Linux x86_64 的 P1（N = 4，单元顺序轮转）中，差分 3.0.2 的 `test_
 
 Linux arm64 的 P1（N = 3）中，互通 `test_partition_key.py::test_key_partition_bidirectional_read_append_and_real_encodings[mixed-reference15]` 失败：参照实现打开数据目录 load 时，读取 FLAT 索引侧车报 `No data left in file`。该用例的 `mixed` 状态在 flush 后插入两行并以 `os._exit(0)` 模拟崩溃。参照实现在 flush 后由后台线程为已加载的段构建并保存索引，`BruteForceIndex.save` 直接写最终路径；`os._exit` 打断时数据可能仍在写缓冲中，留下空的或截断的侧车（`No data left in file` 对应空文件）。再打开时参照只要侧车存在就加载，按 [0002](0002-data-dir-compat.md#共享状态的语义约束) 约束 5 的既有结论，不回退重建也不删除坏文件。本实现不读取 3.x 侧车，不受影响，也不修复该文件。并发与 CPU 争用使后台写入变慢、更易被打断，是对串行时未出现的推断。
 
-确定性复现：只在写入子进程内把参照的 `BruteForceIndex.save` 替换为先建空文件、等待 3 秒再写，参照实现本身不改。修复前的写入留下 0 字节侧车，参照 load 报出与试点相同的错误；修复后侧车完整（136 字节），交叉打开通过；修复前不加等待时侧车同样完整。
+独立复审以确定性慢写复现了该机制：只在写入子进程内放慢参照的索引保存，修复前留下空侧车，修复后侧车完整（观测见[试点验收](../testing/0019-pilot-acceptance.md#试点发现)）。
 
 处理只改测试：SDK 写入路径没有等待后台任务的接口（参照审计工具 [partition_truth.py](../../tests/compatibility_audit/partition_truth.py) 用引擎内部接口在 flush 后先等待再崩溃），`mixed` 因此在第一次 flush 后先正常关闭再重开：参照实现关闭时等待后台线程，本实现关闭时排空后台维护，随后的崩溃仍得到已 flush 的段加未 flush 的 WAL。两种写入方修复前后的文件集合与 manifest 的版本、序号和活跃 WAL 编号一致；用例不再覆盖同一进程内 flush 后、后台任务未完成时的崩溃，本实现侧该场景另由跨实现与 compaction 故障注入用例覆盖。互通套件其余 `os._exit` 模拟崩溃前均无带索引且已加载的 flush，不受此机制影响。
 
