@@ -14,7 +14,7 @@
 
 重构基线已定：**以 3.x 为基础，不以 2.5.1（C++）为基础**。3.x 的性能损失主要来自 Python 实现，架构内只有一处需要修正的设计；2.5.1 反而有冷启动全量重放、索引不落盘等架构级瓶颈；决策、数据与由此得出的实现约束见 [0001-重构基线选择](docs/decisions/0001-refactor-baseline.md)。
 
-当前状态：仓库有 README / LICENSE（Apache-2.0）、设计决策（[docs/decisions/](docs/decisions/)）与基线基准脚本（[benchmarks/baseline/](benchmarks/baseline/)），以及 M1（[0004](docs/decisions/0004-m1-scope.md)）完成的工程骨架：三个 crate、进程内服务的生命周期、内存引擎、gRPC 翻译、差分测试与基准。M2 的实现与验收见 [0006](docs/decisions/0006-m2-scope.md)、[0007](docs/decisions/0007-m2-storage-engine.md) 和 [验收记录](docs/testing/m2-acceptance.md)；首发平台与发行物见 [0013](docs/decisions/0013-first-release-platform-and-packaging.md)：`0.1.0rc3`、`0.2.0rc1` 与 `0.3.0rc1` 已通过 GitHub Release 预发布（[rc3 发布记录](docs/testing/first-release-acceptance.md#010rc3-发布)、[0.2.0rc1 发布记录](docs/testing/0.2.0rc1-acceptance.md#020rc1-发布)、[0.3.0rc1 发布记录](docs/testing/0.3.0rc1-acceptance.md#030rc1-发布)），未发布到 PyPI，未声明生产可用。新增 module、依赖或命令时同步更新本文的[架构地图](#架构地图跨文件心智)、[技术栈](#技术栈)与[常用命令](#常用命令)；这几节中标注「待定」的内容不得当作事实引用。
+当前状态：仓库有 README / LICENSE（Apache-2.0）、设计决策（[docs/decisions/](docs/decisions/)）与基线基准脚本（[benchmarks/baseline/](benchmarks/baseline/)），以及 M1（[0004](docs/decisions/0004-m1-scope.md)）完成的工程骨架：三个 crate、进程内服务的生命周期、内存引擎、gRPC 翻译、差分测试与基准。M2 的实现与验收见 [0006](docs/decisions/0006-m2-scope.md)、[0007](docs/decisions/0007-m2-storage-engine.md) 和 [验收记录](docs/testing/m2-acceptance.md)；首发平台与发行物见 [0013](docs/decisions/0013-first-release-platform-and-packaging.md)：`0.1.0rc3`、`0.2.0rc1`、`0.3.0rc1` 与 `0.3.0rc2` 已通过 GitHub Release 预发布（[rc3 发布记录](docs/testing/first-release-acceptance.md#010rc3-发布)、[0.2.0rc1 发布记录](docs/testing/0.2.0rc1-acceptance.md#020rc1-发布)、[0.3.0rc1 发布记录](docs/testing/0.3.0rc1-acceptance.md#030rc1-发布)、[0.3.0rc2 发布记录](docs/testing/0.3.0rc2-acceptance.md#030rc2-发布)），未发布到 PyPI，未声明生产可用。新增 module、依赖或命令时同步更新本文的[架构地图](#架构地图跨文件心智)、[技术栈](#技术栈)与[常用命令](#常用命令)；这几节中标注「待定」的内容不得当作事实引用。
 
 ## 核心业务术语
 
@@ -70,8 +70,8 @@
 | 0.3.0rc1 已不可变预发布（冻结 / tag 为 27aabf2；候选与发布后记录均独立复审通过，公开安装检查通过；完整三层 FI 与两 Linux 原生矩阵） | [候选及发布验收](docs/testing/0.3.0rc1-acceptance.md)、[范围与执行清单](docs/releases/next-candidate-plan.md)、[发行说明](docs/releases/0.3.0rc1.md) |
 | 0015／0016 冻结提交的跨平台开发验收、平台证据边界与 SDK 临时端口复用的缓存隔离 | [跨平台验收](docs/testing/0015-0016-cross-platform-acceptance.md) |
 | 0.2.0rc1 已发布：冻结范围、固定发行说明、候选复审及公开下载证据 | [0013](docs/decisions/0013-first-release-platform-and-packaging.md#首发候选矩阵)、[发行范围与说明](docs/releases/0.2.0rc1.md)、[候选验收](docs/testing/0.2.0rc1-acceptance.md) |
-| 0018 JSON 写入优化：调查、合同、诊断工具修复及产品实施均已独立评审通过，J01–J08 以本次本地提交收口；峰值资源问题继续单独跟进，未推送 / 发布 | [合同](docs/decisions/0018-json-write-normalization.md)、[调查与证据](docs/testing/0018-json-write-investigation.md)、[实施验收](docs/testing/0018-json-write-acceptance.md)、[诊断工具](benchmarks/json-write/diagnostics/README.md) |
-| 0.3.0rc2 冻结 df6fd30 的完整候选矩阵、离线证据门槛及独立候选复审均通过；仅纳入已审 0018 优化，收口文档已获本地提交授权，未推送 / 打 tag / 发布 | [候选验收](docs/testing/0.3.0rc2-acceptance.md)、[候选方案](docs/releases/0.3.0rc2-candidate-plan.md)、[发行说明](docs/releases/0.3.0rc2.md)、[准备核验](docs/testing/0.3.0rc2-preparation.md) |
+| 0018 JSON 写入优化：调查、合同、诊断工具修复及产品实施均已独立评审通过，J01–J08 已随 0.3.0rc2 交付；峰值资源问题继续单独跟进 | [合同](docs/decisions/0018-json-write-normalization.md)、[调查与证据](docs/testing/0018-json-write-investigation.md)、[实施验收](docs/testing/0018-json-write-acceptance.md)、[诊断工具](benchmarks/json-write/diagnostics/README.md) |
+| 0.3.0rc2 已不可变预发布（冻结 / tag 为 df6fd30；仅纳入已审 0018 优化；候选独立复审通过，公开安装与发布门槛通过，发布后记录独立复审通过） | [候选及发布验收](docs/testing/0.3.0rc2-acceptance.md)、[候选方案](docs/releases/0.3.0rc2-candidate-plan.md)、[发行说明](docs/releases/0.3.0rc2.md)、[准备核验](docs/testing/0.3.0rc2-preparation.md) |
 | 性能基线怎么测 / 口径 / 注意事项 | [benchmarks/baseline/README.md](benchmarks/baseline/README.md) |
 | 代码审查 / 修复复审（冻结合同、完整调用链、同类全域清扫、分级与证据门槛、二三阶影响矩阵） | [code-review-rules](.agents/skills/code-review-rules/SKILL.md)（Claude Code 经 `.claude/skills` 软链读取同一份） |
 
