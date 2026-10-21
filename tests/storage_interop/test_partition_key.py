@@ -19,6 +19,9 @@ p=c.prepare_index_params();p.add_index('vector',index_type='FLAT',metric_type='L
 for i,k in [(1,0),(2,1),(3,None)]:
  c.insert('c',[{'id':i,'k':k,'vector':[float(i),0.],'a':[i],'j':{'i':i},'extra':i}])
  if state in ('flushed','compacted') or state=='mixed' and i==1:c.flush('c')
+ # 3.x 在后台线程非原子地写索引文件，flush 后立即 os._exit 可能留下截断的文件；
+ # 正常关闭会等后台写完，随后崩溃时仍是已 flush 的段加未 flush 的 WAL（见 0019 关于参照实现崩溃时索引文件的「试点发现」）。
+ if state=='mixed' and i==1:c.close();m.release_server(path);c=MilvusClient(path,dedicated=True)
 if state=='compacted':
  for i in range(10,18):
   c.insert('c',[{'id':i,'k':0,'vector':[float(i),0.],'a':[i],'j':{'i':i},'extra':i}]);c.flush('c')

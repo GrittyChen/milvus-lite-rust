@@ -1,6 +1,6 @@
 # 0019：候选测试的并行编排与分片
 
-- 状态：首轮评审（负责人与独立复审）意见已修订，负责人复核通过，复核建议已采纳；负责人已确认方向（P0 编排并行进入下一候选，P1 采用自写确定性分片）。分片工具已实现（[tests/sharding](../../tests/sharding/README.md)），实现经负责人与独立复审两轮评审通过，复核建议已采纳。试点进行中，已发现并修复参照服务的端口复用缺陷（见「试点发现」）。
+- 状态：首轮评审（负责人与独立复审）意见已修订，负责人复核通过，复核建议已采纳；负责人已确认方向（P0 编排并行进入下一候选，P1 采用自写确定性分片）。分片工具已实现（[tests/sharding](../../tests/sharding/README.md)），实现经负责人与独立复审两轮评审通过，复核建议已采纳。试点进行中，已发现并处理参照服务端口复用与参照实现崩溃时索引文件两项问题（见两节「试点发现」）。
 - 日期：2026-10-21。
 - 基线：已发布 `0.3.0rc2`，冻结提交 `df6fd3071f18daec5d4c8a375c99e91c6b6ad16a`；耗时取自该候选仓库外的原始证据（[候选验收](../testing/0.3.0rc2-acceptance.md)记载其证据包身份）。
 - 依据：[0013 首发候选矩阵](0013-first-release-platform-and-packaging.md#首发候选矩阵)、[进程内测试隔离](../testing/process-test-isolation.md)、[SDK 端点缓存隔离](../testing/0015-0016-cross-platform-acceptance.md#本轮发现两条-sdk-的跨用例-schema-缓存污染)。
@@ -109,6 +109,16 @@ Linux x86_64 的 P1（N = 4，单元顺序轮转）中，差分 3.0.2 的 `test_
 同一构造方式另见 [基线服务进程](../../benchmarks/baseline/server_process.py) 与 [RPC 真值工具](../../tests/compatibility_audit/rpc_truth.py)，二者顺序或离线运行，只在老内核上与其他同用户 SO_REUSEPORT 服务同时运行时受影响，本次不改。
 
 试点据此接续：x86 以修复后的差分源码重做差分基线及 P0、P1、敏感用例，各运行保留参照服务日志；macOS 与 arm64 的试点基于修复前源码且不受此机制影响，作为该源码的证据，另以修复后源码各运行一次完整分片差分确认无回归。
+
+## 试点发现：参照实现崩溃时的索引文件
+
+Linux arm64 的 P1（N = 3）中，互通 `test_partition_key.py::test_key_partition_bidirectional_read_append_and_real_encodings[mixed-reference15]` 失败：参照实现打开数据目录 load 时，读取 FLAT 索引侧车报 `No data left in file`。该用例的 `mixed` 状态在 flush 后插入两行并以 `os._exit(0)` 模拟崩溃。参照实现在 flush 后由后台线程为已加载的段构建并保存索引，`BruteForceIndex.save` 直接写最终路径；`os._exit` 打断时数据可能仍在写缓冲中，留下空的或截断的侧车（`No data left in file` 对应空文件）。再打开时参照只要侧车存在就加载，按 [0002](0002-data-dir-compat.md#共享状态的语义约束) 约束 5 的既有结论，不回退重建也不删除坏文件。本实现不读取 3.x 侧车，不受影响，也不修复该文件。并发与 CPU 争用使后台写入变慢、更易被打断，是对串行时未出现的推断。
+
+确定性复现：只在写入子进程内把参照的 `BruteForceIndex.save` 替换为先建空文件、等待 3 秒再写，参照实现本身不改。修复前的写入留下 0 字节侧车，参照 load 报出与试点相同的错误；修复后侧车完整（136 字节），交叉打开通过；修复前不加等待时侧车同样完整。
+
+处理只改测试：SDK 写入路径没有等待后台任务的接口（参照审计工具 [partition_truth.py](../../tests/compatibility_audit/partition_truth.py) 用引擎内部接口在 flush 后先等待再崩溃），`mixed` 因此在第一次 flush 后先正常关闭再重开：参照实现关闭时等待后台线程，本实现关闭时排空后台维护，随后的崩溃仍得到已 flush 的段加未 flush 的 WAL。两种写入方修复前后的文件集合与 manifest 的版本、序号和活跃 WAL 编号一致；用例不再覆盖同一进程内 flush 后、后台任务未完成时的崩溃，本实现侧该场景另由跨实现与 compaction 故障注入用例覆盖。互通套件其余 `os._exit` 模拟崩溃前均无带索引且已加载的 flush，不受此机制影响。
+
+对既有证据的影响：该竞态只会使参照 load 失败而判为不通过，不会产生假通过，历次互通通过的结论不受影响。
 
 ## 构建缓存（PID 1）
 
