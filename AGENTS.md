@@ -73,7 +73,7 @@
 | 0.2.0rc1 已发布：冻结范围、固定发行说明、候选复审及公开下载证据 | [0013](docs/decisions/0013-first-release-platform-and-packaging.md#首发候选矩阵)、[发行范围与说明](docs/releases/0.2.0rc1.md)、[候选验收](docs/testing/0.2.0rc1-acceptance.md) |
 | 0018 JSON 写入优化：调查、合同、诊断工具修复及产品实施均已独立评审通过，J01–J08 已随 0.3.0rc2 交付；峰值资源问题继续单独跟进 | [合同](docs/decisions/0018-json-write-normalization.md)、[调查与证据](docs/testing/0018-json-write-investigation.md)、[实施验收](docs/testing/0018-json-write-acceptance.md)、[诊断工具](benchmarks/json-write/diagnostics/README.md) |
 | 0.3.0rc2 已不可变预发布（冻结 / tag 为 df6fd30；仅纳入已审 0018 优化；候选独立复审通过，公开安装与发布门槛通过，发布后记录独立复审通过） | [候选及发布验收](docs/testing/0.3.0rc2-acceptance.md)、[候选方案](docs/releases/0.3.0rc2-candidate-plan.md)、[发行说明](docs/releases/0.3.0rc2.md)、[准备核验](docs/testing/0.3.0rc2-preparation.md) |
-| 持续集成：快速层与对照层的范围、零跳过与汇总判定、必须通过检查与推送方式、不纳入 CI 的候选内容（方案评审通过；工作流已实施，待实施评审与试点） | [0020](docs/decisions/0020-continuous-integration.md)、[工作流与固定依赖](.github/ci/README.md) |
+| 持续集成：快速层与对照层的范围、零跳过与汇总判定、必须通过检查与推送方式、不纳入 CI 的候选内容（方案评审通过；工作流已实施、试点完成，main 必须通过 ci-pass 与 compare-pass） | [0020](docs/decisions/0020-continuous-integration.md)、[试点记录](docs/testing/0020-ci-pilot.md)、[工作流与固定依赖](.github/ci/README.md) |
 | 验收与调查记录引用的证据分哪几类、谁能复核（仓库内可重跑 / 公开产物 / 本地留存），以及验收与调查记录的写法约定 | [证据的存放与复核范围](docs/testing/README.md) |
 | 性能基线怎么测 / 口径 / 注意事项 | [benchmarks/baseline/README.md](benchmarks/baseline/README.md) |
 | 代码审查 / 修复复审（冻结合同、完整调用链、同类全域清扫、分级与证据门槛、二三阶影响矩阵） | [code-review-rules](.agents/skills/code-review-rules/SKILL.md)（Claude Code 经 `.claude/skills` 软链读取同一份） |

@@ -1,6 +1,6 @@
 # 0020：持续集成
 
-- 状态：方案经负责人与独立复审两轮评审、负责人两轮复审通过，复审建议已采纳。工作流已实施（[ci.yml](../../.github/workflows/ci.yml)、[compare.yml](../../.github/workflows/compare.yml)），待实施评审与试点。
+- 状态：方案经负责人与独立复审两轮评审、负责人两轮复审通过，复审建议已采纳。工作流已实施（[ci.yml](../../.github/workflows/ci.yml)、[compare.yml](../../.github/workflows/compare.yml)），试点完成（[试点记录](../testing/0020-ci-pilot.md)）；负责人决定 `main` 必须通过 `ci-pass` 与 `compare-pass`，分支保护已启用。
 - 日期：2026-10-22。
 - 依据：[0004 跨平台](0004-m1-scope.md#跨平台)、[0013 首发候选矩阵](0013-first-release-platform-and-packaging.md#首发候选矩阵)、[0019 分片](0019-test-sharding.md)、[证据的存放与复核范围](../testing/README.md)。
 
