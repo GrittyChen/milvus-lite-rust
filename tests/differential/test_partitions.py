@@ -1,5 +1,6 @@
 """0017 A：显式分区选择先于版本判定；对照参照 43d1257。"""
 import json
+from pathlib import Path
 
 import grpc
 import pytest
@@ -49,6 +50,15 @@ def test_partition_selection_read_write_and_iterators(pair, state, varchar):
         for i in range(4):
             d.step('repeat', lambda c: c.insert('c', rows(10+i, 11+i), partition_name='z'))
             d.step('repeat-flush', lambda c: c.flush('c'))
+            # 分区 z 的第四个文件触发合并：3.x 的后台合并整轮持 maintenance_lock，与 flush 串行，之后写入的行总在合并输出之后；
+            # 本实现准备期不持 flush_lock，提交时把输出追加到当时的 manifest 尾部，与随后的 flush 交错时来源顺序不同（0010 已登记）。
+            # 正常关闭会排空维护；先核对两边都已合并，否则重开后再次触发的合并仍会与下一次写入交错。
+            if i == 2:
+                pair.close()
+                for root in (pair.rust_path, pair.ref_path):
+                    manifest = json.loads((Path(root) / 'collections/c/manifest.json').read_text())
+                    assert len(manifest['partitions']['z']['data_files']) == 1, manifest['partitions']['z']
+                d = pair.open(); d.step('load', lambda c: c.load_collection('c'))
     if state in ['reopen', 'compacted']:
         pair.close(); d = pair.open(); d.step('load', lambda c: c.load_collection('c'))
     for parts in [[], ['z'], ['a'], ['a', 'z'], ['z', 'z', 'missing'], ['missing']]:
