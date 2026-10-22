@@ -13,6 +13,12 @@ def test_drop_and_recreate_an_open_collection_whose_directory_disappeared(pair, 
     diff.step("create",lambda c:c.create_collection(name,schema=schema(),index_params=index("L2")))
     diff.step("insert",lambda c:c.insert(name,[{"id":1,"vector":[1.0,0.0]}]))
     diff.step("flush",lambda c:c.flush(name))
+    # 3.x 在 flush 后由后台线程为新段构建并保存索引，保存时逐级建目录；若晚于下面的外部移走或删除，
+    # 就会重建原路径，使同名 create 遇到已存在的目录（0006 已登记）。正常关闭会等后台写完；重开后侧车已存在，
+    # 加载与重开时提交的后台任务只读取，集合仍处于打开状态。
+    pair.close()
+    diff=pair.open()
+    diff.step("load",lambda c:c.load_collection(name))
     for path in [Path(pair.rust_path),Path(pair.ref_path)]:
         collection=path/"collections"/name
         if move: collection.rename(path/"moved")
