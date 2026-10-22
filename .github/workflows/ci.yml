@@ -27,7 +27,7 @@ env:
   CARGO_PROFILE_TEST_DEBUG: "0"
   CARGO_TERM_COLOR: never
   UV_VERSION: "0.12.23"
-  UV_CACHE_DIR: ${{ github.workspace }}/../uv-cache
+  UV_CACHE_DIR: ${{ github.workspace }}-uv-cache
 
 jobs:
   rust:
@@ -37,7 +37,7 @@ jobs:
       matrix:
         os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -79,7 +79,7 @@ jobs:
       matrix:
         os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -110,7 +110,7 @@ jobs:
       matrix:
         os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -128,7 +128,7 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             ${{ env.UV_CACHE_DIR }}
-          key: python-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', '.github/ci/requirements/*.txt') }}
+          key: python-${{ runner.os }}-${{ runner.arch }}-uv${{ env.UV_VERSION }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', '.github/ci/requirements/*.txt') }}
       - name: 工具链与环境
         run: |
           rustup toolchain install && rustc --version
@@ -187,7 +187,7 @@ jobs:
   linux-extra:
     name: msrv-windows (ubuntu-24.04)
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 8
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

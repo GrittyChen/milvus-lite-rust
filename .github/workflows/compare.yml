@@ -27,7 +27,7 @@ env:
   CARGO_PROFILE_TEST_DEBUG: "0"
   CARGO_TERM_COLOR: never
   UV_VERSION: "0.12.23"
-  UV_CACHE_DIR: ${{ github.workspace }}/../uv-cache
+  UV_CACHE_DIR: ${{ github.workspace }}-uv-cache
   REFERENCE_COMMIT: 43d1257774e629bc9f66873977ab7c320d5bf5a7
 
 jobs:
@@ -46,7 +46,7 @@ jobs:
           - os: macos-15
             shards: 3
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 120
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -72,7 +72,7 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             ${{ env.UV_CACHE_DIR }}
-          key: compare-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', '.github/ci/requirements/*.txt') }}
+          key: compare-${{ runner.os }}-${{ runner.arch }}-uv${{ env.UV_VERSION }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', '.github/ci/requirements/*.txt') }}
       - name: 套件守卫
         # 以下各步按套件名执行；名字拼错或新增套件漏写步骤时，job 会一个用例都不跑而显示成功。
         run: |
