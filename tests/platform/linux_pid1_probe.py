@@ -68,29 +68,30 @@ def has_supervisor_kill(events, name):
     return any(e.get("Type") == "container" and e.get("Action") == "kill" and e.get("Actor", {}).get("Attributes", {}).get("name") == name and e["Actor"]["Attributes"].get("signal") == "9" for e in map(json.loads, events.splitlines()))
 
 
-def build_image(wheel, tag, base, log):
+def build_image(wheel, tag, base, log, constraints):
     with tempfile.TemporaryDirectory() as temp:
         path = Path(temp)
         shutil.copy2(wheel, path / Path(wheel).name)
+        shutil.copy2(constraints, path / "constraints.txt")
         for name in ["Dockerfile.pid1", "pid1_entry.py"]:
             shutil.copy2(Path(__file__).with_name(name), path / name)
         log.write_text(docker("build", "--build-arg", "BASE_IMAGE=" + base, "-f", path / "Dockerfile.pid1", "-t", tag, path, timeout=900) + "\n")
 
 
-def probe(formal, fi, base, output):
+def probe(formal, fi, base, output, constraints):
     from pymilvus import MilvusClient
     output = Path(output)
     output.mkdir(parents=True, exist_ok=False)
     import hashlib
-    identity = {"base_image": base, "base_image_id": json.loads(docker("image", "inspect", base))[0]["Id"], "docker": docker("version", "--format", "{{.Server.Version}}"), "formal_wheel_sha256": hashlib.sha256(Path(formal).read_bytes()).hexdigest(), "fi_wheel_sha256": hashlib.sha256(Path(fi).read_bytes()).hexdigest()}
+    identity = {"base_image": base, "base_image_id": json.loads(docker("image", "inspect", base))[0]["Id"], "docker": docker("version", "--format", "{{.Server.Version}}"), "formal_wheel_sha256": hashlib.sha256(Path(formal).read_bytes()).hexdigest(), "fi_wheel_sha256": hashlib.sha256(Path(fi).read_bytes()).hexdigest(), "constraints_sha256": hashlib.sha256(Path(constraints).read_bytes()).hexdigest()}
     (output / "identity.json").write_text(json.dumps(identity, indent=2) + "\n")
     token = "mlr-pid1-" + uuid.uuid4().hex[:10]
     images = {"formal": token + "-formal", "fi": token + "-fi", "base": token + "-base"}
     containers, volumes, records = [], [], []
     try:
         docker("tag", base, images["base"])
-        build_image(formal, images["formal"], images["base"], output / "formal-build.log")
-        build_image(fi, images["fi"], images["base"], output / "fi-build.log")
+        build_image(formal, images["formal"], images["base"], output / "formal-build.log", constraints)
+        build_image(fi, images["fi"], images["base"], output / "fi-build.log", constraints)
         for mode in ["normal", "drain", "kill"]:
             name = token + "-" + mode
             data, control = name + "-data", name + "-control"
@@ -179,8 +180,9 @@ def main():
     parser.add_argument("--fi-wheel", required=True, type=Path)
     parser.add_argument("--image", required=True)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--constraints", required=True, type=Path, help="complete pinned dependency set for CPython 3.10 and pymilvus 3.0.2")
     args = parser.parse_args()
-    print(json.dumps(probe(args.formal_wheel, args.fi_wheel, args.image, args.output)))
+    print(json.dumps(probe(args.formal_wheel, args.fi_wheel, args.image, args.output, args.constraints)))
 
 
 if __name__ == "__main__":

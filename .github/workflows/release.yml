@@ -1,0 +1,924 @@
+# 发行工作流：在 CI 中从冻结提交构建并验收发行物。范围、阶段与判据见 docs/decisions/0021-release-build-in-ci.md。
+# 只由 workflow_dispatch 触发；tag 与 Release 仍由负责人人工创建，本工作流没有 contents: write。
+name: Release
+run-name: ${{ inputs.dry_run && 'dry-run' || 'release' }} v${{ inputs.version }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit:
+        description: 冻结提交的完整 SHA，须是触发分支的最新提交
+        required: true
+        type: string
+      version:
+        description: 预期版本（Python 形式，如 0.4.0rc1）
+        required: true
+        type: string
+      dry_run:
+        description: 演练：不检查也不消费版本，不为正式附件签发证明
+        type: boolean
+        default: false
+      pid1_dry_run:
+        description: 正式运行引用的同一提交上含 PID 1 的成功演练，形如 <run-id>.<attempt>
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    # 显式指定后为 bash -eo pipefail，管道中任何命令失败都使步骤失败（0020 公共约定）。
+    shell: bash
+
+concurrency:
+  # 同一版本的运行依次执行，不取消进行中的运行（0021 第 3 条）。
+  group: release-${{ inputs.version }}
+  cancel-in-progress: false
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+  CARGO_TERM_COLOR: never
+  PYTHONDONTWRITEBYTECODE: "1"
+  UV_VERSION: "0.12.23"
+  MODE: ${{ inputs.dry_run && 'dry-run' || 'release' }}
+  VERSION: ${{ inputs.version }}
+  REFERENCE_COMMIT: 43d1257774e629bc9f66873977ab7c320d5bf5a7
+  # 兼容探针的上一版本：附件哈希写死，不在运行时取最新版本（0021 第 11 条）。
+  PREVIOUS_VERSION: 0.3.0rc2
+  PREVIOUS_WHEEL: milvus_lite_rust-0.3.0rc2-cp310-abi3-manylinux_2_28_x86_64.whl
+  PREVIOUS_WHEEL_SHA256: e61e929550e350cf05b2cc308ba1736aa6ccf0507ec247c0515e8b9c434261ae
+  ORJSON_SDIST_URL: https://files.pythonhosted.org/packages/source/o/orjson/orjson-3.13.0.tar.gz
+
+jobs:
+  precheck:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: 提交身份
+        env:
+          INPUT_COMMIT: ${{ inputs.commit }}
+        run: test "$GITHUB_SHA" = "$INPUT_COMMIT"
+      - name: 日常门槛、版本与 PID 1 演练
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PID1_DRY_RUN: ${{ inputs.pid1_dry_run }}
+        run: |
+          python3 tests/release/runs.py --repo "$GITHUB_REPOSITORY" precheck --sha "$GITHUB_SHA" --version "$VERSION" \
+            --mode "$MODE" --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT" --pid1-dry-run "$PID1_DRY_RUN" \
+            --out "$RUNNER_TEMP/meta.json"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: meta
+          path: ${{ runner.temp }}/meta.json
+          if-no-files-found: error
+          retention-days: 30
+
+  identity:
+    needs: precheck
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: 冻结身份
+        run: python3 tests/release/source_identity.py generate --commit "$GITHUB_SHA" --version "$VERSION" --out "$RUNNER_TEMP/identity"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: identity
+          path: |
+            ${{ runner.temp }}/identity/source.tar
+            ${{ runner.temp }}/identity/source-identity.json
+            ${{ runner.temp }}/identity/source-inputs.json
+            ${{ runner.temp }}/identity/product-inputs.json
+          if-no-files-found: error
+          retention-days: 30
+
+  orjson:
+    # Linux CPython 3.15 的唯一现场编译例外（0021 第 11 条）：独立 job，只有默认的 contents: read。
+    needs: identity
+    name: orjson (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            os: ubuntu-24.04
+            container: quay.io/pypa/manylinux_2_28_x86_64@sha256:4131ddd7acb9c6c966af02fe7e71edc51e078c2d41f475966697676430bfa2ae
+          - arch: aarch64
+            os: ubuntu-24.04-arm
+            container: quay.io/pypa/manylinux_2_28_aarch64@sha256:abd1230aa9e4058a74b89d27cd14ba18c0db036d7bfe6e6f219a29ea63c24eb6
+    runs-on: ${{ matrix.os }}
+    container: ${{ matrix.container }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: 环境
+        run: bash .github/ci/release_env.sh rust
+      - name: 构建
+        run: |
+          curl -sSfL --retry 3 -o "$RUNNER_TEMP/orjson-3.13.0.tar.gz" "$ORJSON_SDIST_URL"
+          "$DEV_PY" tests/release/orjson_wheel.py build --sdist "$RUNNER_TEMP/orjson-3.13.0.tar.gz" --python "$PY315" \
+            --maturin "$(dirname "$DEV_PY")/maturin" --work-dir "$RUNNER_TEMP/orjson-work" --out "$RUNNER_TEMP/orjson" \
+            --record "$RUNNER_TEMP/orjson/record.json"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: orjson-${{ matrix.arch }}
+          path: ${{ runner.temp }}/orjson
+          if-no-files-found: error
+          retention-days: 30
+
+  build:
+    needs: identity
+    name: build (${{ matrix.scope }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - scope: linux-x86_64
+            os: ubuntu-24.04
+            container: quay.io/pypa/manylinux_2_28_x86_64@sha256:4131ddd7acb9c6c966af02fe7e71edc51e078c2d41f475966697676430bfa2ae
+            compat: --compatibility manylinux_2_28
+          - scope: linux-aarch64
+            os: ubuntu-24.04-arm
+            container: quay.io/pypa/manylinux_2_28_aarch64@sha256:abd1230aa9e4058a74b89d27cd14ba18c0db036d7bfe6e6f219a29ea63c24eb6
+            compat: --compatibility manylinux_2_28
+          - scope: macos-arm64
+            os: macos-15
+            container: ""
+            compat: ""
+          - scope: macos-x86_64
+            os: macos-15-intel
+            container: ""
+            compat: ""
+    runs-on: ${{ matrix.os }}
+    container: ${{ matrix.container }}
+    timeout-minutes: 60
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+      RUNNER_IMAGE: ${{ matrix.container && format('{0} container {1}', matrix.os, matrix.container) || '' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        if: matrix.container == ''
+        with:
+          python-version: |
+            3.10
+            3.11
+            3.13
+            3.14
+            3.15
+            3.12
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: identity
+          path: ${{ runner.temp }}/identity
+      - name: 环境
+        run: bash .github/ci/release_env.sh rust
+      - name: 构建输入与冻结提交一致
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          "$DEV_PY" tests/release/source_identity.py check-worktree --source-inputs "$RUNNER_TEMP/identity/source-inputs.json"
+      - name: 构建
+        run: |
+          maturin="$(dirname "$DEV_PY")/maturin"
+          for key in RUSTFLAGS CARGO_ENCODED_RUSTFLAGS; do test -z "${!key:-}"; done
+          "$maturin" build --release --locked ${{ matrix.compat }} -i "$PY310" -o "$RUNNER_TEMP/dist/formal"
+          "$maturin" build --release --locked ${{ matrix.compat }} -i "$PY310" --features milvus-lite-py/fault-injection -o "$RUNNER_TEMP/dist/fi"
+          if [ "${{ matrix.scope }}" = linux-x86_64 ]; then
+            # maturin sdist 没有 --locked，由锁文件与工作树洁净检查兜底（0021 第 6 条）。
+            "$maturin" sdist -o "$RUNNER_TEMP/dist/sdist"
+          fi
+          git diff --exit-code -- Cargo.lock
+          "$DEV_PY" tests/release/source_identity.py check-worktree --source-inputs "$RUNNER_TEMP/identity/source-inputs.json"
+          # 构建机的工具版本随产物交给装配，进入候选结果的 build_environment（0021 第 5 条）。
+          "$DEV_PY" tests/release/stage.py --dir "$RUNNER_TEMP/dist" --scope "${{ matrix.scope }}" --build-env "$maturin"
+          "$DEV_PY" tests/release/sums.py write "$RUNNER_TEMP/dist" "$RUNNER_TEMP/dist/build.sha256"
+          cat "$RUNNER_TEMP/dist/build.sha256"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: build-${{ matrix.scope }}
+          path: ${{ runner.temp }}/dist
+          if-no-files-found: error
+          retention-days: 30
+
+  assemble:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: build-*
+          path: ${{ runner.temp }}/builds
+      - name: 装配正式集合
+        run: |
+          python3 - "$RUNNER_TEMP/builds" "$RUNNER_TEMP/formal" "$RUNNER_TEMP/fi" "$RUNNER_TEMP/build-env" <<'EOF'
+          import hashlib, os, shutil, sys
+          from pathlib import Path
+          sys.path.insert(0, "tests/release")
+          import candidate
+          builds, formal, fi, envs = map(Path, sys.argv[1:])
+          formal.mkdir(); fi.mkdir(); envs.mkdir()
+          for directory in sorted(builds.iterdir()):
+              recorded = {}
+              for line in (directory / "build.sha256").read_text().splitlines():
+                  digest, name = line.split("  ", 1)
+                  recorded[name] = digest
+              for name, digest in recorded.items():
+                  if hashlib.sha256((directory / name).read_bytes()).hexdigest() != digest:
+                      raise SystemExit(f"{directory.name}/{name} does not match its build record")
+                  if name.startswith("build-env-"):
+                      shutil.copy2(directory / name, envs / name)
+                      continue
+                  kind, file = name.split("/")
+                  if kind == "fi":
+                      (fi / directory.name).mkdir(exist_ok=True)
+                      shutil.copy2(directory / name, fi / directory.name / file)
+                  else:
+                      shutil.copy2(directory / name, formal / file)
+          present = sorted(p.name for p in formal.iterdir())
+          if present != candidate.formal_names(os.environ["VERSION"]):
+              raise SystemExit(f"formal set differs: {present}")
+          if sorted(p.name for p in fi.iterdir()) != sorted(f"build-{s}" for s in ("linux-x86_64", "linux-aarch64", "macos-arm64", "macos-x86_64")):
+              raise SystemExit("FI wheel set differs")
+          EOF
+          python3 tests/release/sums.py write "$RUNNER_TEMP/formal" "$RUNNER_TEMP/formal.sha256"
+          python3 tests/release/sums.py write "$RUNNER_TEMP/fi" "$RUNNER_TEMP/fi.sha256"
+          cat "$RUNNER_TEMP/formal.sha256" "$RUNNER_TEMP/fi.sha256"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: formal
+          path: |
+            ${{ runner.temp }}/formal
+            ${{ runner.temp }}/formal.sha256
+          if-no-files-found: error
+          retention-days: 30
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fi
+          path: |
+            ${{ runner.temp }}/fi
+            ${{ runner.temp }}/fi.sha256
+          if-no-files-found: error
+          retention-days: 30
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: build-env
+          path: ${{ runner.temp }}/build-env
+          if-no-files-found: error
+          retention-days: 30
+
+  tests:
+    # 第 9 条在四个标准层的门槛；Linux 在固定 manylinux_2_28 镜像中以非 root（UID 1001，托管机器工作区属主）运行，
+    # 只在 root 下执行的权限用例属源码级门槛，由 CI 快速层在宿主机上以 root 覆盖。
+    needs: [assemble, orjson]
+    name: tests (${{ matrix.platform.scope }}, ${{ matrix.part }})
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [static, python, compare, fi]
+        platform:
+          - scope: linux-x86_64
+            os: ubuntu-24.04
+            # 映射形式的 container 不接受空 image，因此整体放进矩阵值；macOS 为空字符串即不用容器。
+            container: {image: "quay.io/pypa/manylinux_2_28_x86_64@sha256:4131ddd7acb9c6c966af02fe7e71edc51e078c2d41f475966697676430bfa2ae", options: "--user 1001"}
+            tag: manylinux_2_28_x86_64
+            arch: x86_64
+            shards: 4
+          - scope: linux-aarch64
+            os: ubuntu-24.04-arm
+            # 映射形式的 container 不接受空 image，因此整体放进矩阵值；macOS 为空字符串即不用容器。
+            container: {image: "quay.io/pypa/manylinux_2_28_aarch64@sha256:abd1230aa9e4058a74b89d27cd14ba18c0db036d7bfe6e6f219a29ea63c24eb6", options: "--user 1001"}
+            tag: manylinux_2_28_aarch64
+            arch: aarch64
+            shards: 4
+          - scope: macos-arm64
+            os: macos-15
+            container: ""
+            tag: macosx_11_0_arm64
+            arch: ""
+            shards: 3
+          - scope: macos-x86_64
+            os: macos-15-intel
+            container: ""
+            tag: macosx_11_0_x86_64
+            arch: ""
+            shards: 3
+    runs-on: ${{ matrix.platform.os }}
+    container: ${{ matrix.platform.container }}
+    timeout-minutes: 120
+    env:
+      SCOPE: ${{ matrix.platform.scope }}
+      RUNNER_IMAGE: ${{ matrix.platform.container && format('{0} container {1}', matrix.platform.os, matrix.platform.container.image) || '' }}
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: 取得参照实现
+        if: matrix.part == 'compare'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: milvus-io/milvus-lite
+          ref: ${{ env.REFERENCE_COMMIT }}
+          path: references/milvus-lite
+          fetch-depth: 1
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        if: matrix.platform.container == ''
+        with:
+          python-version: |
+            3.10
+            3.11
+            3.13
+            3.14
+            3.15
+            3.12
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: formal
+          path: ${{ runner.temp }}/artifacts
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: fi
+          path: ${{ runner.temp }}/fi-artifact
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        if: matrix.part == 'python' && matrix.platform.arch != ''
+        with:
+          name: orjson-${{ matrix.platform.arch }}
+          path: ${{ runner.temp }}/orjson
+      - name: 环境
+        run: bash .github/ci/release_env.sh ${{ (matrix.part == 'static' || matrix.part == 'compare') && 'rust' || '' }}
+      - name: 产物
+        run: |
+          "$DEV_PY" tests/release/sums.py check "$RUNNER_TEMP/artifacts/formal.sha256" "$RUNNER_TEMP/artifacts/formal"
+          "$DEV_PY" tests/release/sums.py check "$RUNNER_TEMP/fi-artifact/fi.sha256" "$RUNNER_TEMP/fi-artifact/fi"
+          wheel="$RUNNER_TEMP/artifacts/formal/milvus_lite_rust-$VERSION-cp310-abi3-${{ matrix.platform.tag }}.whl"
+          fi_wheel="$RUNNER_TEMP/fi-artifact/fi/build-$SCOPE/milvus_lite_rust-$VERSION-cp310-abi3-${{ matrix.platform.tag }}.whl"
+          test -f "$wheel" && test -f "$fi_wheel"
+          { echo "WHEEL=$wheel"; echo "FI_WHEEL=$fi_wheel"; echo "SDIST=$RUNNER_TEMP/artifacts/formal/milvus_lite_rust-$VERSION.tar.gz";
+            echo "STAGES=$RUNNER_TEMP/stages"; } >> "$GITHUB_ENV"
+      - name: 归档、二进制与 Rust
+        if: matrix.part == 'static'
+        run: |
+          record() { "$DEV_PY" tests/release/stage.py --dir "$STAGES" --scope "$SCOPE" "$@"; }
+          "$DEV_PY" tests/packaging/check_artifacts.py --version "$VERSION" --wheel "$WHEEL" --sdist "$SDIST" --repo . --kind formal --binary
+          record --stage artifacts-formal
+          "$DEV_PY" tests/packaging/check_artifacts.py --version "$VERSION" --wheel "$FI_WHEEL" --sdist "$SDIST" --repo . --kind "fi" --binary
+          record --stage artifacts-fi
+          export PYO3_PYTHON="$PY312"
+          cargo test --workspace --locked 2>&1 | tee "$RUNNER_TEMP/rust-default.log"
+          record --stage rust-default --cargo-log "$RUNNER_TEMP/rust-default.log"
+          cargo test --workspace --features milvus-lite-py/fault-injection --locked 2>&1 | tee "$RUNNER_TEMP/rust-fi.log"
+          record --stage rust-fi --cargo-log "$RUNNER_TEMP/rust-fi.log"
+          git diff --exit-code -- Cargo.lock
+      - name: 端到端全套与联合冒烟
+        if: matrix.part == 'python'
+        run: |
+          record() { "$DEV_PY" tests/release/stage.py --dir "$STAGES" --scope "$SCOPE" "$@"; }
+          expect=$("$DEV_PY" tests/release/scorecard.py expect "$SCOPE" python-3.10-3.0.2 collected)
+          req=.github/ci/requirements
+          for python in 3.10 3.15; do
+            for sdk in 2.6.17 3.0.2; do
+              constraints="$req/sdk30.txt"
+              [ "$sdk" = 2.6.17 ] && constraints="$req/sdk26.txt"
+              [ "$sdk" = 2.6.17 ] && [ "$python" = 3.15 ] && constraints="$req/sdk26-py315.txt"
+              interpreter="PY3${python#3.}"
+              # glibc 2.28 上 orjson 只有本运行构建的 cp315 wheel（0021 第 11 条），两条 SDK 共用同一份，构建记录写入阶段环境。
+              unset UV_FIND_LINKS ORJSON_RECORD
+              if [ "$python" = 3.15 ] && [ -d "$RUNNER_TEMP/orjson" ]; then
+                export UV_FIND_LINKS="$RUNNER_TEMP/orjson" ORJSON_RECORD="$RUNNER_TEMP/orjson/record.json"
+              fi
+              "$DEV_PY" tests/packaging/run_acceptance.py --work-dir "$RUNNER_TEMP/acc-$python-$sdk" \
+                --python "${!interpreter}" --sdk "$sdk" --constraints "$constraints" --wheel "$WHEEL" --sdist "$SDIST" \
+                --suite --suite-expect "$expect" | tee "$RUNNER_TEMP/acc-$python-$sdk.json"
+              if [ -n "${ORJSON_RECORD:-}" ]; then
+                "$DEV_PY" tests/release/orjson_wheel.py check-installed --record "$ORJSON_RECORD" \
+                  --python "$RUNNER_TEMP/acc-$python-$sdk/sdk/bin/python"
+              fi
+              record --stage "python-$python-$sdk" --acceptance "$RUNNER_TEMP/acc-$python-$sdk.json"
+            done
+          done
+          unset UV_FIND_LINKS ORJSON_RECORD
+          for python in 3.11 3.12 3.13 3.14; do
+            interpreter="PY3${python#3.}"
+            "$DEV_PY" tests/packaging/run_acceptance.py --work-dir "$RUNNER_TEMP/smoke-$python" --python "${!interpreter}" \
+              --sdk 3.0.2 --constraints "$req/sdk30.txt" --wheel "$WHEEL" --sdist "$SDIST"
+            "$RUNNER_TEMP/smoke-$python/sdk/bin/python" tests/platform/feature_smoke.py --repo . --work-dir "$RUNNER_TEMP/smoke-$python/features"
+            record --stage "smoke-$python"
+          done
+      - name: 正式 wheel 上的差分与互通
+        if: matrix.part == 'compare'
+        env:
+          MILVUS_LITE_3X_PYTHON: ${{ runner.temp }}/ref25/bin/python
+          MILVUS_LITE_ARROW25_PYTHON: ${{ runner.temp }}/ref25/bin/python
+          MILVUS_LITE_ARROW15_PYTHON: ${{ runner.temp }}/ref15/bin/python
+        run: |
+          record() { "$DEV_PY" tests/release/stage.py --dir "$STAGES" --scope "$SCOPE" "$@"; }
+          head=$(git -C references/milvus-lite rev-parse HEAD); test "$head" = "$REFERENCE_COMMIT"
+          req=.github/ci/requirements
+          for arrow in 25 15; do
+            uv venv -q -p "$PY312" "$RUNNER_TEMP/ref$arrow"
+            uv pip install -q --python "$RUNNER_TEMP/ref$arrow/bin/python" --no-build -r "$req/ref$arrow.txt"
+            uv pip install -q --python "$RUNNER_TEMP/ref$arrow/bin/python" --no-deps --build-constraint "$req/build.txt" -e references/milvus-lite
+          done
+          # 与对照层相同的两条线，Python 侧改为装配交出的正式 wheel，并核对实际加载的原生模块。
+          uv venv -q -p "$PY312" "$RUNNER_TEMP/w30"
+          uv pip install -q --python "$RUNNER_TEMP/w30/bin/python" --no-build -r "$req/sdk30.txt" && uv pip install -q --python "$RUNNER_TEMP/w30/bin/python" --no-deps "$WHEEL"
+          uv venv -q -p "$PY310" "$RUNNER_TEMP/w26"
+          uv pip install -q --python "$RUNNER_TEMP/w26/bin/python" --no-build -r "$req/sdk26.txt" && uv pip install -q --python "$RUNNER_TEMP/w26/bin/python" --no-deps "$WHEEL"
+          mkdir "$RUNNER_TEMP/outside"
+          for sdk in 3.0.2 2.6.17; do
+            py="$RUNNER_TEMP/w30/bin/python"; [ "$sdk" = 2.6.17 ] && py="$RUNNER_TEMP/w26/bin/python"
+            (cd "$RUNNER_TEMP/outside" && "$DEV_PY" "$GITHUB_WORKSPACE/tests/release/native_check.py" --python "$py" --wheel "$WHEEL")
+            collected=$("$DEV_PY" tests/release/scorecard.py expect "$SCOPE" "differential-$sdk" collected)
+            group=$("$DEV_PY" tests/release/scorecard.py expect "$SCOPE" "differential-$sdk" group)
+            "$DEV_PY" tests/sharding/shard.py plan --python "$py" --suite "$PWD/tests/differential" --cwd "$RUNNER_TEMP/outside" \
+              --out "$RUNNER_TEMP/diff-$sdk-plan" --shards ${{ matrix.platform.shards }} \
+              --group-fixture diff --group-fixture rust_uri --group-fixture ref_uri --expect "$collected" --expect-group "$group"
+            "$DEV_PY" tests/sharding/shard.py run --plan "$RUNNER_TEMP/diff-$sdk-plan/plan.json" --out "$RUNNER_TEMP/diff-$sdk-run"
+            record --stage "differential-$sdk" --summary "$RUNNER_TEMP/diff-$sdk-run/summary.json"
+          done
+          # 互通用例另行调用的 Rust 示例与 FI 测试程序从冻结提交构建，属源码级组件（0021 第 9 条）。
+          export PYO3_PYTHON="$PY312"
+          # 先构建并核对 fresh，避免分片同时编译（0019 P0 第 3 条，与对照层相同）。
+          i=0
+          for command in "build -p milvus-lite-core --example storage_interop" \
+                         "test -p milvus-lite-core --features fault-injection --test crash_recovery --no-run" \
+                         "build -p milvus-lite-core --features fault-injection --example index_change_fault"; do
+            read -ra args <<< "$command"
+            cargo "${args[@]}" --locked
+            cargo "${args[@]}" --locked --message-format=json > "$RUNNER_TEMP/fresh-$i.json"
+            "$DEV_PY" .github/ci/cargo_fresh.py "$RUNNER_TEMP/fresh-$i.json"
+            i=$((i + 1))
+          done
+          expect=$("$DEV_PY" tests/release/scorecard.py expect "$SCOPE" interop collected)
+          "$DEV_PY" tests/sharding/shard.py plan --python "$RUNNER_TEMP/w30/bin/python" --suite tests/storage_interop \
+            --out "$RUNNER_TEMP/interop-plan" --shards ${{ matrix.platform.shards }} --expect "$expect" --expect-group 0
+          "$DEV_PY" tests/sharding/shard.py run --plan "$RUNNER_TEMP/interop-plan/plan.json" --out "$RUNNER_TEMP/interop-run"
+          record --stage interop --summary "$RUNNER_TEMP/interop-run/summary.json"
+          git diff --exit-code -- Cargo.lock
+          dirty=$(git -C references/milvus-lite status --porcelain); test -z "$dirty"
+      - name: FI wheel 恢复专项
+        if: matrix.part == 'fi'
+        run: |
+          record() { "$DEV_PY" tests/release/stage.py --dir "$STAGES" --scope "$SCOPE" "$@"; }
+          req=.github/ci/requirements
+          mkdir "$RUNNER_TEMP/outside"
+          for sdk in 2.6.17 3.0.2; do
+            venv="$RUNNER_TEMP/fi-$sdk"; py="$PY312"; constraints="$req/sdk30.txt"
+            [ "$sdk" = 2.6.17 ] && py="$PY310" && constraints="$req/sdk26.txt"
+            uv venv -q -p "$py" "$venv"
+            uv pip install -q --python "$venv/bin/python" --no-build -r "$constraints" && uv pip install -q --python "$venv/bin/python" --no-deps "$FI_WHEEL"
+            (cd "$RUNNER_TEMP/outside" && "$DEV_PY" "$GITHUB_WORKSPACE/tests/release/native_check.py" --python "$venv/bin/python" --wheel "$FI_WHEEL")
+            expect=$("$DEV_PY" tests/release/scorecard.py expect "$SCOPE" "fi-recovery-$sdk" collected)
+            "$DEV_PY" tests/sharding/shard.py plan --python "$venv/bin/python" --suite "$PWD/tests/compaction" --cwd "$RUNNER_TEMP/outside" \
+              --out "$RUNNER_TEMP/fi-$sdk-plan" --shards 1 --order round-robin --expect "$expect" --expect-group 0
+            "$DEV_PY" tests/sharding/shard.py run --plan "$RUNNER_TEMP/fi-$sdk-plan/plan.json" --out "$RUNNER_TEMP/fi-$sdk-run"
+            record --stage "fi-recovery-$sdk" --summary "$RUNNER_TEMP/fi-$sdk-run/summary.json"
+          done
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: stages-tests-${{ matrix.platform.scope }}-${{ matrix.part }}
+          path: ${{ runner.temp }}/stages
+          if-no-files-found: error
+          retention-days: 30
+      - name: 保存运行记录
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: failure-tests-${{ matrix.platform.scope }}-${{ matrix.part }}
+          path: |
+            ${{ runner.temp }}/*-plan
+            ${{ runner.temp }}/*-run
+            ${{ runner.temp }}/*.log
+            ${{ runner.temp }}/acc-*/*.log
+          if-no-files-found: ignore
+          retention-days: 14
+
+  linux-system:
+    # LOCK 与 strace（第 9 条）：strace 需要容器的 ptrace 权限。
+    needs: assemble
+    name: linux-system (${{ matrix.scope }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - scope: linux-x86_64
+            os: ubuntu-24.04
+            container: quay.io/pypa/manylinux_2_28_x86_64@sha256:4131ddd7acb9c6c966af02fe7e71edc51e078c2d41f475966697676430bfa2ae
+            tag: manylinux_2_28_x86_64
+          - scope: linux-aarch64
+            os: ubuntu-24.04-arm
+            container: quay.io/pypa/manylinux_2_28_aarch64@sha256:abd1230aa9e4058a74b89d27cd14ba18c0db036d7bfe6e6f219a29ea63c24eb6
+            tag: manylinux_2_28_aarch64
+    runs-on: ${{ matrix.os }}
+    # 以 root 运行以便安装镜像未自带的 strace；LOCK 争抢与同步顺序不依赖非 root 的权限语义。
+    container:
+      image: ${{ matrix.container }}
+      options: --cap-add SYS_PTRACE
+    timeout-minutes: 60
+    env:
+      SCOPE: ${{ matrix.scope }}
+      RUNNER_IMAGE: ${{ format('{0} container {1}', matrix.os, matrix.container) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: 取得参照实现
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: milvus-io/milvus-lite
+          ref: ${{ env.REFERENCE_COMMIT }}
+          path: references/milvus-lite
+          fetch-depth: 1
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: formal
+          path: ${{ runner.temp }}/artifacts
+      - name: 环境
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          # strace 来自固定镜像的软件源，版本写入日志；它只采集系统调用，判定由仓库内的检查器完成。
+          dnf install -y -q strace
+          strace -V | head -1
+          bash .github/ci/release_env.sh rust
+      - name: LOCK 与 strace
+        run: |
+          record() { "$DEV_PY" tests/release/stage.py --dir "$RUNNER_TEMP/stages" --scope "$SCOPE" "$@"; }
+          "$DEV_PY" tests/release/sums.py check "$RUNNER_TEMP/artifacts/formal.sha256" "$RUNNER_TEMP/artifacts/formal"
+          req=.github/ci/requirements
+          uv venv -q -p "$PY312" "$RUNNER_TEMP/w30"
+          uv pip install -q --python "$RUNNER_TEMP/w30/bin/python" --no-build -r "$req/sdk30.txt"
+          wheel="$RUNNER_TEMP/artifacts/formal/milvus_lite_rust-$VERSION-cp310-abi3-${{ matrix.tag }}.whl"
+          uv pip install -q --python "$RUNNER_TEMP/w30/bin/python" --no-deps "$wheel"
+          (cd "$RUNNER_TEMP" && "$DEV_PY" "$GITHUB_WORKSPACE/tests/release/native_check.py" --python "$RUNNER_TEMP/w30/bin/python" --wheel "$wheel")
+          uv venv -q -p "$PY312" "$RUNNER_TEMP/ref25"
+          uv pip install -q --python "$RUNNER_TEMP/ref25/bin/python" --no-build -r "$req/ref25.txt"
+          uv pip install -q --python "$RUNNER_TEMP/ref25/bin/python" --no-deps --build-constraint "$req/build.txt" -e references/milvus-lite
+          "$RUNNER_TEMP/w30/bin/python" tests/platform/linux_lock_probe.py "$RUNNER_TEMP/w30/bin/python" "$RUNNER_TEMP/ref25/bin/python" "$RUNNER_TEMP/lock"
+          record --stage lock
+          export PYO3_PYTHON="$PY312"
+          bin=$(cargo test -p milvus-lite-core --features fault-injection --locked --test concurrency_faults --no-run --message-format=json \
+            | "$DEV_PY" -c 'import json,sys; print(next(m["executable"] for m in map(json.loads, sys.stdin) if m.get("reason") == "compiler-artifact" and m.get("executable") and m["target"]["name"] == "concurrency_faults"))')
+          mkdir "$RUNNER_TEMP/strace"
+          strace -ff -ttt -yy -e trace=fsync,fdatasync,rename,renameat,renameat2,unlink,unlinkat,flock -o "$RUNNER_TEMP/strace/fs.trace" \
+            "$bin" inherited_and_new_files_are_synced_before_replace_and_wal_unlinks_stay_ordered --exact --test-threads=1
+          calls=$("$DEV_PY" tests/platform/check_strace.py "$RUNNER_TEMP/strace/fs.trace" | "$DEV_PY" -c 'import json,sys; print(json.load(sys.stdin)["successful_calls"])')
+          record --stage strace --counts "{\"successful_calls\": $calls}"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: stages-system-${{ matrix.scope }}
+          path: ${{ runner.temp }}/stages
+          if-no-files-found: error
+          retention-days: 30
+      - name: 保存运行记录
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: failure-system-${{ matrix.scope }}
+          path: |
+            ${{ runner.temp }}/lock
+            ${{ runner.temp }}/strace
+          if-no-files-found: ignore
+          retention-days: 14
+
+  pid1:
+    # job 名称是前置检查核对演练时的固定键（tests/release/runs.py 的 PID1_JOBS），不能改。
+    needs: assemble
+    name: pid1 (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            scope: linux-x86_64
+            tag: manylinux_2_28_x86_64
+          - os: ubuntu-24.04-arm
+            scope: linux-aarch64
+            tag: manylinux_2_28_aarch64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    env:
+      SCOPE: ${{ matrix.scope }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: |
+            3.10
+            3.11
+            3.13
+            3.14
+            3.15
+            3.12
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: formal
+          path: ${{ runner.temp }}/artifacts
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: fi
+          path: ${{ runner.temp }}/fi-artifact
+      - name: 环境
+        run: bash .github/ci/release_env.sh
+      - name: PID 1、命名卷 LOCK 与强杀恢复
+        run: |
+          "$DEV_PY" tests/release/sums.py check "$RUNNER_TEMP/artifacts/formal.sha256" "$RUNNER_TEMP/artifacts/formal"
+          "$DEV_PY" tests/release/sums.py check "$RUNNER_TEMP/fi-artifact/fi.sha256" "$RUNNER_TEMP/fi-artifact/fi"
+          # 基础镜像按公开仓库摘要固定（0021 第 10 条），不使用可变 tag；摘要只在阶段矩阵中维护，候选结果按同一处核对。
+          image=$("$DEV_PY" tests/release/scorecard.py pid1-image "$SCOPE")
+          docker pull "$image"
+          "$DEV_PY" tests/platform/linux_pid1_probe.py \
+            --formal-wheel "$RUNNER_TEMP/artifacts/formal/milvus_lite_rust-$VERSION-cp310-abi3-${{ matrix.tag }}.whl" \
+            --fi-wheel "$RUNNER_TEMP/fi-artifact/fi/build-$SCOPE/milvus_lite_rust-$VERSION-cp310-abi3-${{ matrix.tag }}.whl" \
+            --image "$image" --constraints .github/ci/requirements/sdk30.txt --output "$RUNNER_TEMP/pid1"
+          # 阶段环境的 pid1_image 取自探针实际记录的镜像与镜像 ID，不取自工作流文本。
+          PID1_IDENTITY="$RUNNER_TEMP/pid1/identity.json" "$DEV_PY" tests/release/stage.py --dir "$RUNNER_TEMP/stages" \
+            --scope "$SCOPE" --stage pid1
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: stages-pid1-${{ matrix.scope }}
+          path: ${{ runner.temp }}/stages
+          if-no-files-found: error
+          retention-days: 30
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: pid1-identity-${{ matrix.scope }}
+          path: ${{ runner.temp }}/pid1/identity.json
+          if-no-files-found: error
+          retention-days: 30
+      - name: 保存运行记录
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: failure-pid1-${{ matrix.scope }}
+          path: ${{ runner.temp }}/pid1
+          if-no-files-found: ignore
+          retention-days: 14
+
+  sdist:
+    needs: [assemble, identity]
+    runs-on: ubuntu-24.04
+    container:
+      image: quay.io/pypa/manylinux_2_28_x86_64@sha256:4131ddd7acb9c6c966af02fe7e71edc51e078c2d41f475966697676430bfa2ae
+      options: --user 1001
+    timeout-minutes: 60
+    env:
+      RUNNER_IMAGE: ubuntu-24.04 container quay.io/pypa/manylinux_2_28_x86_64@sha256:4131ddd7acb9c6c966af02fe7e71edc51e078c2d41f475966697676430bfa2ae
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: formal
+          path: ${{ runner.temp }}/artifacts
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: identity
+          path: ${{ runner.temp }}/identity
+      - name: 环境
+        run: bash .github/ci/release_env.sh rust
+      - name: sdist 构建、安装与拒绝边界
+        run: |
+          rustup toolchain install 1.89.0 --profile minimal
+          rustup target add --toolchain "$RUSTUP_TOOLCHAIN" x86_64-pc-windows-msvc
+          "$DEV_PY" tests/release/sums.py check "$RUNNER_TEMP/artifacts/formal.sha256" "$RUNNER_TEMP/artifacts/formal"
+          "$DEV_PY" tests/release/sdist_checks.py --sdist "$RUNNER_TEMP/artifacts/formal/milvus_lite_rust-$VERSION.tar.gz" \
+            --version "$VERSION" --product-inputs "$RUNNER_TEMP/identity/product-inputs.json" --work-dir "$RUNNER_TEMP/sdist-check" \
+            --stage-dir "$RUNNER_TEMP/stages" --tool-python "$DEV_PY" --constraints .github/ci/requirements/dev.txt \
+            --build-constraints .github/ci/requirements/dev.txt \
+            --free-threaded-python /opt/python/cp314-cp314t/bin/python --pypy-python /opt/python/pp311-pypy311_pp73/bin/python
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: stages-sdist
+          path: ${{ runner.temp }}/stages
+          if-no-files-found: error
+          retention-days: 30
+
+  previous-reader:
+    needs: assemble
+    runs-on: ubuntu-24.04
+    container:
+      image: quay.io/pypa/manylinux_2_28_x86_64@sha256:4131ddd7acb9c6c966af02fe7e71edc51e078c2d41f475966697676430bfa2ae
+      options: --user 1001
+    timeout-minutes: 30
+    env:
+      RUNNER_IMAGE: ubuntu-24.04 container quay.io/pypa/manylinux_2_28_x86_64@sha256:4131ddd7acb9c6c966af02fe7e71edc51e078c2d41f475966697676430bfa2ae
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: formal
+          path: ${{ runner.temp }}/artifacts
+      - name: 环境
+        run: bash .github/ci/release_env.sh
+      - name: 上一版本读取新目录
+        run: |
+          "$DEV_PY" tests/release/sums.py check "$RUNNER_TEMP/artifacts/formal.sha256" "$RUNNER_TEMP/artifacts/formal"
+          req=.github/ci/requirements
+          curl -sSfL --retry 3 -o "$RUNNER_TEMP/$PREVIOUS_WHEEL" \
+            "https://github.com/$GITHUB_REPOSITORY/releases/download/v$PREVIOUS_VERSION/$PREVIOUS_WHEEL"
+          test "$("$DEV_PY" tests/release/sums.py digest "$RUNNER_TEMP/$PREVIOUS_WHEEL")" = "$PREVIOUS_WHEEL_SHA256"
+          for side in new old; do
+            uv venv -q -p "$PY312" "$RUNNER_TEMP/$side"
+            uv pip install -q --python "$RUNNER_TEMP/$side/bin/python" --no-build -r "$req/sdk30.txt"
+          done
+          wheel="$RUNNER_TEMP/artifacts/formal/milvus_lite_rust-$VERSION-cp310-abi3-manylinux_2_28_x86_64.whl"
+          uv pip install -q --python "$RUNNER_TEMP/new/bin/python" --no-deps "$wheel"
+          (cd "$RUNNER_TEMP" && "$DEV_PY" "$GITHUB_WORKSPACE/tests/release/native_check.py" --python "$RUNNER_TEMP/new/bin/python" --wheel "$wheel")
+          uv pip install -q --python "$RUNNER_TEMP/old/bin/python" --no-deps "$RUNNER_TEMP/$PREVIOUS_WHEEL"
+          native=$("$DEV_PY" -c 'import sys; sys.path.insert(0, "tests/packaging"); import run_acceptance as r; print(r.wheel_native(sys.argv[1]))' "$RUNNER_TEMP/$PREVIOUS_WHEEL")
+          "$DEV_PY" tests/release/previous_reader.py --work-dir "$RUNNER_TEMP/previous" --new-python "$RUNNER_TEMP/new/bin/python" \
+            --old-python "$RUNNER_TEMP/old/bin/python" --old-version "$PREVIOUS_VERSION" --old-native-sha256 "$native" \
+            | tee "$RUNNER_TEMP/previous.json"
+          cases=$("$DEV_PY" -c 'import json,sys; print(json.load(open(sys.argv[1]))["cases"])' "$RUNNER_TEMP/previous.json")
+          "$DEV_PY" tests/release/stage.py --dir "$RUNNER_TEMP/stages" --scope linux-x86_64 --stage previous-reader --counts "{\"cases\": $cases}"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: stages-previous-reader
+          path: ${{ runner.temp }}/stages
+          if-no-files-found: error
+          retention-days: 30
+
+  candidate:
+    # 只接受全部前序 job 为 success；随后生成候选结果与最终 SHA256SUMS（0021 第 12 条）。
+    if: always()
+    needs: [precheck, identity, orjson, build, assemble, tests, linux-system, pid1, sdist, previous-reader]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: 前序 job 全部成功
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          echo "$NEEDS" | python3 -c 'import json,sys; r={k: v["result"] for k, v in json.load(sys.stdin).items()}; print(r); sys.exit(0 if r and all(v == "success" for v in r.values()) else 1)'
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: stages-*
+          path: ${{ runner.temp }}/stages
+          merge-multiple: true
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: meta
+          path: ${{ runner.temp }}/meta
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: build-env
+          path: ${{ runner.temp }}/build-env
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: identity
+          path: ${{ runner.temp }}/identity
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: formal
+          path: ${{ runner.temp }}/artifacts
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: fi
+          path: ${{ runner.temp }}/fi-artifact
+      - name: 候选结果与 SHA256SUMS
+        run: |
+          python3 tests/release/sums.py check "$RUNNER_TEMP/artifacts/formal.sha256" "$RUNNER_TEMP/artifacts/formal"
+          python3 tests/release/sums.py check "$RUNNER_TEMP/fi-artifact/fi.sha256" "$RUNNER_TEMP/fi-artifact/fi"
+          # 工作流产物里的归档须与身份记录一致，复核者才能直接拿它对照，而不必从冻结提交重建。
+          test "$(python3 tests/release/sums.py digest "$RUNNER_TEMP/identity/source.tar")" = \
+            "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["archive_sha256"])' "$RUNNER_TEMP/identity/source-identity.json")"
+          stages=()
+          for file in "$RUNNER_TEMP"/stages/*.json; do stages+=(--stage "$file"); done
+          python3 tests/release/candidate.py write --meta "$RUNNER_TEMP/meta/meta.json" \
+            --identity "$RUNNER_TEMP/identity/source-identity.json" --artifacts "$RUNNER_TEMP/artifacts/formal" \
+            --fi "$RUNNER_TEMP/fi-artifact/fi" --build-env "$RUNNER_TEMP/build-env" "${stages[@]}" --out "$RUNNER_TEMP/candidate" \
+            --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT"
+          cp "$RUNNER_TEMP"/artifacts/formal/* "$RUNNER_TEMP/candidate/"
+          ls -l "$RUNNER_TEMP/candidate"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ env.MODE }}-candidate-v${{ inputs.version }}
+          path: ${{ runner.temp }}/candidate
+          if-no-files-found: error
+          retention-days: 30
+
+  attest:
+    # 最后一个 job：签发前复核，然后一次多主体签发（0021 第 13 条）。job 与步骤名是版本消费判定的固定键
+    # （tests/release/runs.py 的 ATTEST_JOB / SIGN_STEP），不能改。
+    needs: candidate
+    name: attest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: meta
+          path: ${{ runner.temp }}/meta
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ env.MODE }}-candidate-v${{ inputs.version }}
+          path: ${{ runner.temp }}/candidate
+      - name: 签发前复核
+        id: subjects
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 tests/release/runs.py --repo "$GITHUB_REPOSITORY" recheck --meta "$RUNNER_TEMP/meta/meta.json" --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT"
+          cd "$RUNNER_TEMP/candidate"
+          if [ "$MODE" = release ]; then
+            # 正式：五个正式附件、候选结果与 SHA256SUMS，共七个主体。
+            subjects=$(ls milvus_lite_rust-* candidate-*.json SHA256SUMS)
+            test "$(echo "$subjects" | wc -l)" -eq 7
+          else
+            # 演练：只签两个文件名带运行 ID 的演练文件，正式附件的摘要不进入透明日志。
+            subjects=$(ls dry-run-candidate-*.json dry-run-SHA256SUMS-*)
+            test "$(echo "$subjects" | wc -l)" -eq 2
+          fi
+          {
+            echo "paths<<SUBJECTS"
+            while read -r name; do echo "$RUNNER_TEMP/candidate/$name"; done <<< "$subjects"
+            echo "SUBJECTS"
+          } >> "$GITHUB_OUTPUT"
+      - name: sign
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: ${{ steps.subjects.outputs.paths }}
+      - name: 验证签发结果
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "$MODE" = release ]; then
+            mkdir "$RUNNER_TEMP/release"
+            cp "$RUNNER_TEMP"/candidate/milvus_lite_rust-* "$RUNNER_TEMP"/candidate/candidate-*.json "$RUNNER_TEMP/candidate/SHA256SUMS" "$RUNNER_TEMP/release/"
+            python3 tests/release/release_set.py --dir "$RUNNER_TEMP/release" --version "$VERSION" --repo "$GITHUB_REPOSITORY"
+          else
+            mapfile -t names < <(cd "$RUNNER_TEMP/candidate" && ls dry-run-candidate-*.json dry-run-SHA256SUMS-*)
+            test "${#names[@]}" -eq 2
+            for file in "$RUNNER_TEMP"/candidate/dry-run-candidate-*.json "$RUNNER_TEMP"/candidate/dry-run-SHA256SUMS-*; do
+              gh attestation verify "$file" --repo "$GITHUB_REPOSITORY" --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
+                --source-digest "$GITHUB_SHA" --format json \
+                | python3 -c '
+          import json, os, sys
+          names = set(sys.argv[1:])
+          results = json.load(sys.stdin)
+          assert results
+          for item in results:
+              statement = item["verificationResult"]["statement"]
+              assert statement["predicate"]["buildDefinition"]["resolvedDependencies"][0]["digest"]["gitCommit"] == os.environ["GITHUB_SHA"]
+              # 演练证明的主体只能是这两个演练文件，不得出现正式附件名（「实施与试点」第 3 条）。
+              assert {s["name"] for s in statement["subject"]} == names, statement["subject"]
+          ' "${names[@]}"
+            done
+            # 演练不得为正式附件的摘要留下任何证明：要求接口明确返回 404，网络错误不算通过。
+            for file in "$RUNNER_TEMP"/candidate/milvus_lite_rust-*; do
+              digest=$(python3 tests/release/sums.py digest "$file")
+              if out=$(gh api "repos/$GITHUB_REPOSITORY/attestations/sha256:$digest" 2>&1); then
+                echo "dry run left an attestation for $(basename "$file")"; exit 1
+              fi
+              grep -q "HTTP 404" <<< "$out" || { echo "cannot confirm absence for $(basename "$file"): $out"; exit 1; }
+            done
+          fi

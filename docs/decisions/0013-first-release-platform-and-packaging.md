@@ -176,9 +176,9 @@ homepage/repository 只填真实公开且获授权的项目地址，不填官方
 
 ```bash
 <python> tests/packaging/check_artifacts.py --wheel <wheel> --sdist <sdist> --repo <repo>
-<python> tests/packaging/run_acceptance.py --work-dir <outside-repo>
-<python> tests/packaging/run_acceptance.py --work-dir <another-outside-repo> --python <test-python> --wheel <same-wheel> --sdist <same-sdist>
-<python> tests/platform/linux_pid1_probe.py --formal-wheel <linux-wheel> --fi-wheel <linux-fi-wheel> --image <pinned-image> --output <outside-repo>
+<python> tests/packaging/run_acceptance.py --work-dir <outside-repo> --constraints <constraints>
+<python> tests/packaging/run_acceptance.py --work-dir <another-outside-repo> --python <test-python> --constraints <constraints> --wheel <same-wheel> --sdist <same-sdist>
+<python> tests/platform/linux_pid1_probe.py --formal-wheel <linux-wheel> --fi-wheel <linux-fi-wheel> --image <pinned-image> --constraints <constraints> --output <outside-repo>
 ```
 
 ## 具体交付物
@@ -193,7 +193,7 @@ homepage/repository 只填真实公开且获授权的项目地址，不填官方
 | crates/py/build.rs 与构建依赖声明 | 目标解释器与目标 OS 检查 → Windows/free-threaded/非 CPython 明确拒绝 → 拒绝消息反证及受支持 GIL 包验证 |
 | tests/packaging/check_artifacts.py | 检查版本、标签、入口、LICENSE/README、长描述内容与链接、禁入文件 → 缺任一项失败 → 真实归档 + 删除/错内容/相对链接反例 |
 | tests/packaging/install_smoke.py | 仓库外安装和真实 `.db`/CLI/重开 → 输出模型一致 → 无 SDK CLI 环境与两条 SDK 环境分开执行 |
-| tests/packaging/run_acceptance.py | 调用构建、安装、适用套件并收集身份 → 子步骤失败不产出通过记录 → 人为失败传播自检 |
+| tests/packaging/run_acceptance.py | 调用构建、按完整约束安装、经分片工具执行适用套件并收集身份 → 子步骤失败、收集数不符或原生模块不符均不产出通过记录 → 人为失败传播自检（约束与分片执行由 [0021](0021-release-build-in-ci.md) 实施时补入） |
 | tests/packaging/test_artifact_checks.py / test_acceptance.py | 反证检查器与运行器 → 错版本/标签/许可/输出/清理失败被捕获 → pytest |
 | tests/platform/Dockerfile.pid1 / pid1_entry.py | 正式 ENTRYPOINT 与 FI 包装入口分开 → 实际 PID 1 与检查点可见 → 不增加产品接口 |
 | tests/platform/linux_pid1_probe.py / test_pid1_probe.py | 执行上表与恢复 → 错退出码/少行/未放行不通过 → 模型反证 + 真实 Docker |

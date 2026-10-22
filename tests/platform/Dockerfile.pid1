@@ -1,6 +1,8 @@
 ARG BASE_IMAGE=python:3.10-slim-bookworm
 FROM ${BASE_IMAGE}
-RUN python -m pip install --timeout 120 pymilvus==3.0.2 \
+COPY constraints.txt /tmp/constraints.txt
+# SDK 及其依赖按固定的完整依赖集合安装，只用 wheel，不在构建镜像时解析最新版本。
+RUN python -m pip install --timeout 120 --only-binary :all: --constraint /tmp/constraints.txt pymilvus==3.0.2 \
     && useradd --create-home --uid 1000 tester \
     && mkdir /data /control \
     && chown tester:tester /data /control

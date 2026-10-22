@@ -6,11 +6,13 @@
 
 ```bash
 # work_dir 必须是仓库外的全新目录。构建模式需要 uv、maturin 和实际目标解释器。
-.venv/bin/python tests/packaging/run_acceptance.py --work-dir <work_dir> --suite
+.venv/bin/python tests/packaging/run_acceptance.py --work-dir <work_dir> --constraints <constraints.txt> --suite --suite-expect 473
 # 将这一轮构建出的同一个 wheel/sdist 复用于不同 Python / SDK；测试解释器不用装 maturin。
-.venv/bin/python tests/packaging/run_acceptance.py --work-dir <test310> --python <python310> --sdk 2.6.17 --wheel <same.whl> --sdist <same.tar.gz> --suite
-.venv/bin/python tests/packaging/run_acceptance.py --work-dir <test315> --python <python315> --sdk 3.0.2 --wheel <same.whl> --sdist <same.tar.gz> --suite
+.venv/bin/python tests/packaging/run_acceptance.py --work-dir <test310> --python <python310> --sdk 2.6.17 --constraints <constraints.txt> --wheel <same.whl> --sdist <same.tar.gz> --suite --suite-expect 473
+.venv/bin/python tests/packaging/run_acceptance.py --work-dir <test315> --python <python315> --sdk 3.0.2 --constraints <constraints.txt> --wheel <same.whl> --sdist <same.tar.gz> --suite --suite-expect 473
 ```
+
+`--constraints` 必填，是该解释器与 SDK 组合的完整固定依赖集合（例如 [.github/ci/requirements/](../../.github/ci/requirements/) 下对应的 `.txt`），两个安装环境都按它安装，结果记录其 SHA256。安装后核对两个环境实际加载的原生模块与 wheel 内的一致。`--suite` 经 [分片工具](../sharding/README.md) 单片执行 tests/python（`--shards 1 --order round-robin --expect-group 0`，工作目录在仓库外），按 `summary.json` 要求收集数与执行数都等于 `--suite-expect`，任何 skip、xpass 或失败都不输出通过记录；发行工作流从 [阶段矩阵](../release/scorecard.py) 取该数量。
 
 运行器使用目标默认 CPU、locked 构建，macOS 显式部署下限 11.0。实际 Linux 构建须在 glibc 2.28 环境执行，并使用 `maturin build --compatibility manylinux_2_28`；随后检查 ELF 版本依赖，不将重命名标签视为下限证明。
 

@@ -56,8 +56,10 @@ strace -ff -ttt -yy -e trace=fsync,fdatasync,rename,renameat,renameat2,unlink,un
 ```bash
 .venv/bin/python tests/platform/linux_pid1_probe.py \
   --formal-wheel <formal-linux-wheel> --fi-wheel <fi-linux-wheel> \
-  --image <base-image-id-or-digest> --output <new_outside_directory>
+  --image <base-image-id-or-digest> --constraints .github/ci/requirements/sdk30.txt --output <new_outside_directory>
 ```
+
+镜像内的 pymilvus 3.0.2 及其依赖按 `--constraints` 给出的完整依赖集合安装，只用 wheel；身份记录包含该文件的 SHA256。
 
 正式场景用 console script 的 exec ENTRYPOINT；FI 场景用 Python 包装脚本作为 PID 1。Docker logs 的 PAUSED/DEFAULT 标志确定暂停及 SIG_DFL 切点，独立控制卷的 resume 文件放行。另一个容器争抢同数据卷的 LOCK，必须在放行前失败、停服后成功。正常关闭退出 0；PID 1 后续 SIGTERM 被忽略、监督器超时 SIGKILL 退出 137 且不是 OOM。重开逐项核对已确认行、值与 `_seq`。原始日志与 kill 事件放在输出目录。
 

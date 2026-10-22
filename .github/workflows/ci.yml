@@ -158,7 +158,7 @@ jobs:
       - name: 工具自检
         # tests/benchmarks 的部分用例会导入已安装的扩展，因此与端到端同在本 job。
         run: |
-          for suite in packaging:157 platform:13 benchmarks:70 compatibility_audit/selfcheck.py:22; do
+          for suite in packaging:167 platform:13 benchmarks:70 release:198 compatibility_audit/selfcheck.py:22; do
             name=${suite%%:*}; name=${name%%/*}
             .venv/bin/python tests/sharding/shard.py plan --python .venv/bin/python --suite "tests/${suite%:*}" \
               --out "$RUNNER_TEMP/$name-plan" --shards 1 --order round-robin --expect "${suite##*:}" --expect-group 0
