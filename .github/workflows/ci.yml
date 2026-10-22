@@ -172,7 +172,8 @@ jobs:
       - name: 锁文件未变
         run: git diff --exit-code -- Cargo.lock && df -h .
       - name: 保存运行记录
-        if: always()
+        # 只在失败时上传：成功运行的收集数、执行数与汇总已在日志中，运行记录含测试临时数据，只用于排查失败。
+        if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: python-${{ matrix.os }}
