@@ -755,10 +755,12 @@ mod tests {
                 };
                 crate::storage::wal::inject_storage_full_on_append(skip, bytes);
             }
+            // WAL 暂停恢复信号的发送端须存活到子进程以 exit(88) 结束；在块内 drop 会让暂停在写入后立即断连并 panic，
+            // 与监视线程的 exit 竞争，结果随调度而变。
+            let (_resume, wait) = std::sync::mpsc::channel::<()>();
             if mode.starts_with("full-") || mode.starts_with("partial-") {
                 let skip = usize::from(mode.contains("second"));
                 let (entered, reached) = std::sync::mpsc::channel();
-                let (_resume, wait) = std::sync::mpsc::channel();
                 crate::storage::wal::pause_append_after_io_after(skip, entered, wait);
                 std::thread::spawn(move || {
                     reached
