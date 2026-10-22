@@ -1,0 +1,198 @@
+# 对照层：与参照实现 v3.2.1 的差分、存储互通与固定真值核验。范围与判据见 docs/decisions/0020-continuous-integration.md。
+name: Compare
+
+on:
+  push:
+    branches-ignore: [main]
+  pull_request:
+  schedule:
+    - cron: "17 19 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    # 显式指定后为 bash -eo pipefail，管道中任何命令失败都使步骤失败。
+    shell: bash
+
+concurrency:
+  group: compare-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+  CARGO_TERM_COLOR: never
+  UV_VERSION: "0.12.23"
+  UV_CACHE_DIR: ${{ github.workspace }}/../uv-cache
+  REFERENCE_COMMIT: 43d1257774e629bc9f66873977ab7c320d5bf5a7
+
+jobs:
+  compare:
+    name: ${{ matrix.suite }} (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15]
+        suite: [diff-3.0.2, diff-2.6.17, interop, truth]
+        include:
+          - os: ubuntu-24.04
+            shards: 4
+          - os: ubuntu-24.04-arm
+            shards: 4
+          - os: macos-15
+            shards: 3
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: 取得参照实现
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: milvus-io/milvus-lite
+          ref: ${{ env.REFERENCE_COMMIT }}
+          path: references/milvus-lite
+          fetch-depth: 1
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: |
+            3.10
+            3.12
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            ${{ env.UV_CACHE_DIR }}
+          key: compare-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', '.github/ci/requirements/*.txt') }}
+      - name: 套件守卫
+        # 以下各步按套件名执行；名字拼错或新增套件漏写步骤时，job 会一个用例都不跑而显示成功。
+        run: |
+          case "${{ matrix.suite }}" in diff-3.0.2|diff-2.6.17|interop|truth) ;; *) exit 1 ;; esac
+      - name: 工具链与环境
+        run: |
+          # 先赋值再比较：命令替换直接作为 test 的参数时，git 自身的失败不会使步骤失败。
+          head=$(git -C references/milvus-lite rev-parse HEAD); test "$head" = "$REFERENCE_COMMIT"
+          dirty=$(git -C references/milvus-lite status --porcelain); test -z "$dirty"
+          rustup toolchain install && rustc --version && df -h .
+          python3.12 -m pip install "uv==$UV_VERSION"
+          req=.github/ci/requirements
+          uv venv -p python3.12 .venv
+          uv pip install --python .venv/bin/python --no-build -r $req/dev.txt
+          uv venv -p python3.10 "$RUNNER_TEMP/v26"
+          uv pip install --python "$RUNNER_TEMP/v26/bin/python" --no-build -r $req/sdk26.txt
+          for arrow in 25 15; do
+            uv venv -p python3.12 "$RUNNER_TEMP/ref$arrow"
+            uv pip install --python "$RUNNER_TEMP/ref$arrow/bin/python" --no-build -r $req/ref$arrow.txt
+            # 可编辑安装固定 checkout，参照解释器从它导入（互通与真值核验的前置检查要求）。
+            uv pip install --python "$RUNNER_TEMP/ref$arrow/bin/python" --no-deps --build-constraint $req/build.txt -e references/milvus-lite
+          done
+          dirty=$(git -C references/milvus-lite status --porcelain); test -z "$dirty"
+          for env in "$RUNNER_TEMP/ref25" "$RUNNER_TEMP/ref15"; do uv pip freeze --python "$env/bin/python"; done
+      - name: 构建扩展
+        # 真值核验不经过本实现的 Python 包，不需要构建。
+        if: matrix.suite != 'truth'
+        run: |
+          if [ "${{ matrix.suite }}" = diff-2.6.17 ]; then
+            .venv/bin/maturin build -m crates/py/Cargo.toml --release --locked -o "$RUNNER_TEMP/wheels"
+            uv pip install --python "$RUNNER_TEMP/v26/bin/python" --no-deps "$RUNNER_TEMP"/wheels/milvus_lite_rust-*.whl
+            uv pip freeze --python "$RUNNER_TEMP/v26/bin/python"
+          else
+            .venv/bin/maturin develop -m crates/py/Cargo.toml --release --locked --uv
+            uv pip freeze --python .venv/bin/python
+          fi
+      - name: 差分（pymilvus 3.0.2）
+        if: matrix.suite == 'diff-3.0.2'
+        env:
+          MILVUS_LITE_3X_PYTHON: ${{ runner.temp }}/ref25/bin/python
+        run: |
+          .venv/bin/python tests/sharding/shard.py plan --python .venv/bin/python --suite tests/differential \
+            --out "$RUNNER_TEMP/plan" --shards ${{ matrix.shards }} \
+            --group-fixture diff --group-fixture rust_uri --group-fixture ref_uri --expect 421 --expect-group 118
+          .venv/bin/python tests/sharding/shard.py run --plan "$RUNNER_TEMP/plan/plan.json" --out "$RUNNER_TEMP/run"
+      - name: 差分（pymilvus 2.6.17，安装 wheel，仓库外运行）
+        if: matrix.suite == 'diff-2.6.17'
+        env:
+          MILVUS_LITE_3X_PYTHON: ${{ runner.temp }}/ref25/bin/python
+        run: |
+          mkdir "$RUNNER_TEMP/outside"
+          .venv/bin/python tests/sharding/shard.py plan --python "$RUNNER_TEMP/v26/bin/python" --suite "$PWD/tests/differential" \
+            --cwd "$RUNNER_TEMP/outside" --out "$RUNNER_TEMP/plan" --shards ${{ matrix.shards }} \
+            --group-fixture diff --group-fixture rust_uri --group-fixture ref_uri --expect 421 --expect-group 118
+          .venv/bin/python tests/sharding/shard.py run --plan "$RUNNER_TEMP/plan/plan.json" --out "$RUNNER_TEMP/run"
+      - name: 存储互通
+        if: matrix.suite == 'interop'
+        env:
+          MILVUS_LITE_3X_PYTHON: ${{ runner.temp }}/ref25/bin/python
+          MILVUS_LITE_ARROW25_PYTHON: ${{ runner.temp }}/ref25/bin/python
+          MILVUS_LITE_ARROW15_PYTHON: ${{ runner.temp }}/ref15/bin/python
+        run: |
+          # 用例内部会以同样的环境调用这三条命令；先构建并核对 fresh，避免分片同时编译（0019 P0 第 3 条）。
+          commands=(
+            "build -p milvus-lite-core --example storage_interop"
+            "test -p milvus-lite-core --features fault-injection --test crash_recovery --no-run"
+            "build -p milvus-lite-core --features fault-injection --example index_change_fault"
+          )
+          for i in "${!commands[@]}"; do
+            read -ra args <<< "${commands[$i]}"
+            cargo "${args[@]}" --locked
+            cargo "${args[@]}" --locked --message-format=json > "$RUNNER_TEMP/fresh-$i.json"
+            python3 .github/ci/cargo_fresh.py "$RUNNER_TEMP/fresh-$i.json"
+          done
+          .venv/bin/python tests/sharding/shard.py plan --python .venv/bin/python --suite tests/storage_interop \
+            --out "$RUNNER_TEMP/plan" --shards ${{ matrix.shards }} --expect 211 --expect-group 0
+          .venv/bin/python tests/sharding/shard.py run --plan "$RUNNER_TEMP/plan/plan.json" --out "$RUNNER_TEMP/run"
+      - name: 固定真值核验
+        if: matrix.suite == 'truth'
+        run: |
+          uv pip freeze --python .venv/bin/python
+          ref25="$RUNNER_TEMP/ref25/bin/python"; ref15="$RUNNER_TEMP/ref15/bin/python"
+          "$ref25" tests/differential/generate_filter_parse_fixtures.py --verify
+          "$ref25" tests/differential/generate_dynamic_filter_fixtures.py --verify
+          for ref in "$ref25" "$ref15"; do
+            "$ref" tests/differential/generate_filter_tree_fixtures.py --verify
+            "$ref" tests/differential/generate_array_fixtures.py --verify
+            "$ref" tests/compatibility_audit/schema_truth.py --reference references/milvus-lite --kind filters \
+              --output "$RUNNER_TEMP/schema-$(basename "$(dirname "$(dirname "$ref")")").json" --verify-nullable-filter-fixture
+          done
+          .venv/bin/python tests/differential/generate_filter_unicode.py --verify
+          cargo build -p milvus-lite-core --release --example partition_visibility_probe --locked
+          target/release/examples/partition_visibility_probe verify-core tests/compatibility_audit/fixtures/partition_visibility_v321.json
+      - name: 锁文件与参照未变
+        run: |
+          git diff --exit-code -- Cargo.lock
+          dirty=$(git -C references/milvus-lite status --porcelain); test -z "$dirty"
+          df -h .
+      - name: 保存运行记录
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ matrix.suite }}-${{ matrix.os }}
+          path: |
+            ${{ runner.temp }}/plan
+            ${{ runner.temp }}/run
+            ${{ runner.temp }}/fresh-*.json
+            ${{ runner.temp }}/schema-*.json
+          if-no-files-found: ignore
+          retention-days: 14
+
+  compare-pass:
+    # 与 CI 的汇总 job 相同：总是运行，只接受全部上游为 success。
+    if: always()
+    needs: [compare]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: 汇总
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          echo "$NEEDS" | python3 -c 'import json,sys; r={k: v["result"] for k, v in json.load(sys.stdin).items()}; print(r); sys.exit(0 if r and all(v == "success" for v in r.values()) else 1)'

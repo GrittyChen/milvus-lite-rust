@@ -1,0 +1,234 @@
+# 快速层：范围、判据与不纳入 CI 的内容见 docs/decisions/0020-continuous-integration.md。
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    # 显式指定后为 bash -eo pipefail；默认的 bash -e 下，cargo test | tee 的结果只取决于 tee，测试进程崩溃会被吞掉。
+    shell: bash
+
+concurrency:
+  group: ci-${{ github.ref }}
+  # main 上的每个提交都要得到结果，只取消工作分支上被新推送取代的运行。
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  # 关闭增量缓存与调试符号以控制磁盘；用例内部自行调用的 cargo 继承同一组变量。
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+  CARGO_TERM_COLOR: never
+  UV_VERSION: "0.12.23"
+  UV_CACHE_DIR: ${{ github.workspace }}/../uv-cache
+
+jobs:
+  rust:
+    name: rust (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+      - name: 工具链
+        run: rustup toolchain install && rustc --version && df -h .
+      - name: fmt
+        run: cargo fmt --all --check
+      - name: Clippy（默认）
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: 测试（默认）
+        run: |
+          cargo test --workspace --locked 2>&1 | tee "$RUNNER_TEMP/rust-default.log"
+          python3 .github/ci/rust_results.py "$RUNNER_TEMP/rust-default.log"
+      - name: 以 root 运行权限用例（Linux）
+        # 权限用例中凭据不同与外来所有权两个分支只在 root 下执行，非 root 时略过并显示为通过；子进程会降权为普通用户。
+        # Linux 上 permissions 模块共 4 项，按数量核对，避免改名后筛选落空。
+        if: runner.os == 'Linux'
+        run: |
+          bin=$(cargo test -p milvus-lite-core --test index_changes --no-run --locked --message-format=json \
+            | python3 -c 'import json,sys; print(next(m["executable"] for m in map(json.loads, sys.stdin) if m.get("reason") == "compiler-artifact" and m.get("executable") and m["target"]["name"] == "index_changes"))')
+          sudo "$bin" permissions:: 2>&1 | tee "$RUNNER_TEMP/rust-root.log"
+          python3 .github/ci/rust_results.py "$RUNNER_TEMP/rust-root.log" 4
+      - name: 锁文件未变
+        run: git diff --exit-code -- Cargo.lock && df -h .
+
+  rust-fi:
+    name: rust-fi (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+      - name: 工具链
+        run: rustup toolchain install && rustc --version && df -h .
+      - name: Clippy（完整 FI）
+        run: cargo clippy --workspace --all-targets --features milvus-lite-py/fault-injection --locked -- -D warnings
+      - name: 测试（完整 FI）
+        run: |
+          cargo test --workspace --features milvus-lite-py/fault-injection --locked 2>&1 | tee "$RUNNER_TEMP/rust-fi.log"
+          python3 .github/ci/rust_results.py "$RUNNER_TEMP/rust-fi.log"
+      - name: 锁文件未变
+        run: git diff --exit-code -- Cargo.lock && df -h .
+
+  python:
+    name: python (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: |
+            3.10
+            3.12
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            ${{ env.UV_CACHE_DIR }}
+          key: python-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', '.github/ci/requirements/*.txt') }}
+      - name: 工具链与环境
+        run: |
+          rustup toolchain install && rustc --version
+          python3.12 -m pip install "uv==$UV_VERSION"
+          uv venv -p python3.12 .venv
+          uv pip install --python .venv/bin/python --no-build -r .github/ci/requirements/dev.txt
+          uv venv -p python3.10 "$RUNNER_TEMP/v26"
+          uv pip install --python "$RUNNER_TEMP/v26/bin/python" --no-build -r .github/ci/requirements/sdk26.txt
+      - name: 构建
+        run: |
+          .venv/bin/maturin develop -m crates/py/Cargo.toml --release --locked --uv
+          .venv/bin/maturin build -m crates/py/Cargo.toml --release --locked -o "$RUNNER_TEMP/wheels"
+          uv pip install --python "$RUNNER_TEMP/v26/bin/python" --no-deps "$RUNNER_TEMP"/wheels/milvus_lite_rust-*.whl
+          uv pip freeze --python .venv/bin/python
+          uv pip freeze --python "$RUNNER_TEMP/v26/bin/python"
+      - name: tests/python（pymilvus 3.0.2）
+        run: |
+          .venv/bin/python tests/sharding/shard.py plan --python .venv/bin/python --suite tests/python \
+            --out "$RUNNER_TEMP/py30-plan" --shards 1 --order round-robin --expect 473 --expect-group 0
+          .venv/bin/python tests/sharding/shard.py run --plan "$RUNNER_TEMP/py30-plan/plan.json" --out "$RUNNER_TEMP/py30-run"
+      - name: tests/python（pymilvus 2.6.17，安装 wheel，仓库外运行）
+        run: |
+          mkdir "$RUNNER_TEMP/outside"
+          .venv/bin/python tests/sharding/shard.py plan --python "$RUNNER_TEMP/v26/bin/python" --suite "$PWD/tests/python" \
+            --cwd "$RUNNER_TEMP/outside" --out "$RUNNER_TEMP/py26-plan" --shards 1 --order round-robin --expect 473 --expect-group 0
+          .venv/bin/python tests/sharding/shard.py run --plan "$RUNNER_TEMP/py26-plan/plan.json" --out "$RUNNER_TEMP/py26-run"
+      - name: 工具自检
+        # tests/benchmarks 的部分用例会导入已安装的扩展，因此与端到端同在本 job。
+        run: |
+          for suite in packaging:157 platform:13 benchmarks:70 compatibility_audit/selfcheck.py:22; do
+            name=${suite%%:*}; name=${name%%/*}
+            .venv/bin/python tests/sharding/shard.py plan --python .venv/bin/python --suite "tests/${suite%:*}" \
+              --out "$RUNNER_TEMP/$name-plan" --shards 1 --order round-robin --expect "${suite##*:}" --expect-group 0
+            .venv/bin/python tests/sharding/shard.py run --plan "$RUNNER_TEMP/$name-plan/plan.json" --out "$RUNNER_TEMP/$name-run"
+          done
+          .venv/bin/python -m pytest -q -p no:cacheprovider tests/sharding 2>&1 | tee "$RUNNER_TEMP/sharding.log"
+          .venv/bin/python .github/ci/pytest_summary.py "$RUNNER_TEMP/sharding.log" 52
+          # 该自检以 subtests 组织，分片工具按用例计数时与 JUnit 不符，改由 unittest 输出核对（0020 公共约定 4 的例外）。
+          .venv/bin/python benchmarks/json-write/diagnostics/selfcheck.py 2>&1 | tee "$RUNNER_TEMP/diagnostics.log"
+          .venv/bin/python .github/ci/unittest_summary.py "$RUNNER_TEMP/diagnostics.log" 8
+      - name: 锁文件未变
+        run: git diff --exit-code -- Cargo.lock && df -h .
+      - name: 保存运行记录
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: python-${{ matrix.os }}
+          path: |
+            ${{ runner.temp }}/*-plan
+            ${{ runner.temp }}/*-run
+            ${{ runner.temp }}/*.log
+          if-no-files-found: ignore
+          retention-days: 14
+
+  linux-extra:
+    name: msrv-windows (ubuntu-24.04)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+      - name: 工具链
+        run: |
+          rustup toolchain install
+          rustup target add x86_64-pc-windows-msvc
+          rustup toolchain install 1.89 --profile minimal
+      - name: MSRV（默认与完整 FI）
+        run: |
+          cargo +1.89 check --workspace --all-targets --locked
+          cargo +1.89 check --workspace --all-targets --features milvus-lite-py/fault-injection --locked
+      - name: Windows 交叉检查（core / grpc，默认与 FI）
+        run: |
+          for fi in no yes; do
+            args=(-p milvus-lite-core -p milvus-lite-grpc --target x86_64-pc-windows-msvc --all-targets --locked)
+            if [ "$fi" = yes ]; then args+=(--features milvus-lite-grpc/fault-injection); fi
+            cargo check "${args[@]}"
+            cargo clippy "${args[@]}" -- -D warnings
+          done
+      - name: 锁文件未变
+        run: git diff --exit-code -- Cargo.lock && df -h .
+
+  ci-pass:
+    # 分支保护的检查入口。上游失败时普通依赖会让本 job 变为 skipped，而 skipped 会被分支保护放行，
+    # 因此总是运行，并只接受全部上游为 success。
+    if: always()
+    needs: [rust, rust-fi, python, linux-extra]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: 汇总
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          echo "$NEEDS" | python3 -c 'import json,sys; r={k: v["result"] for k, v in json.load(sys.stdin).items()}; print(r); sys.exit(0 if r and all(v == "success" for v in r.values()) else 1)'

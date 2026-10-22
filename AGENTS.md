@@ -73,6 +73,7 @@
 | 0.2.0rc1 已发布：冻结范围、固定发行说明、候选复审及公开下载证据 | [0013](docs/decisions/0013-first-release-platform-and-packaging.md#首发候选矩阵)、[发行范围与说明](docs/releases/0.2.0rc1.md)、[候选验收](docs/testing/0.2.0rc1-acceptance.md) |
 | 0018 JSON 写入优化：调查、合同、诊断工具修复及产品实施均已独立评审通过，J01–J08 已随 0.3.0rc2 交付；峰值资源问题继续单独跟进 | [合同](docs/decisions/0018-json-write-normalization.md)、[调查与证据](docs/testing/0018-json-write-investigation.md)、[实施验收](docs/testing/0018-json-write-acceptance.md)、[诊断工具](benchmarks/json-write/diagnostics/README.md) |
 | 0.3.0rc2 已不可变预发布（冻结 / tag 为 df6fd30；仅纳入已审 0018 优化；候选独立复审通过，公开安装与发布门槛通过，发布后记录独立复审通过） | [候选及发布验收](docs/testing/0.3.0rc2-acceptance.md)、[候选方案](docs/releases/0.3.0rc2-candidate-plan.md)、[发行说明](docs/releases/0.3.0rc2.md)、[准备核验](docs/testing/0.3.0rc2-preparation.md) |
+| 持续集成：快速层与对照层的范围、零跳过与汇总判定、必须通过检查与推送方式、不纳入 CI 的候选内容（方案评审通过；工作流已实施，待实施评审与试点） | [0020](docs/decisions/0020-continuous-integration.md)、[工作流与固定依赖](.github/ci/README.md) |
 | 验收与调查记录引用的证据分哪几类、谁能复核（仓库内可重跑 / 公开产物 / 本地留存），以及验收与调查记录的写法约定 | [证据的存放与复核范围](docs/testing/README.md) |
 | 性能基线怎么测 / 口径 / 注意事项 | [benchmarks/baseline/README.md](benchmarks/baseline/README.md) |
 | 代码审查 / 修复复审（冻结合同、完整调用链、同类全域清扫、分级与证据门槛、二三阶影响矩阵） | [code-review-rules](.agents/skills/code-review-rules/SKILL.md)（Claude Code 经 `.claude/skills` 软链读取同一份） |
@@ -165,7 +166,7 @@ pymilvus ──server_manager──▶ adapter/grpc ──▶ db（多 collectio
 | ISO 时间组件直接模糊对照（不经服务；参照环境为 CPython 3.12，报告放仓库外） | `cargo build -p milvus-lite-core --example filter_parse_probe`，再 `<3.x 的 venv>/bin/python tests/differential/fuzz_temporal.py --cases 200000 --seed 29 --output <work_dir>/temporal.json` |
 | S1 Unicode 分类表核验（CPython 3.12 / Unicode 15.0） | `<CPython 3.12>/bin/python tests/differential/generate_filter_unicode.py --verify` |
 | 端到端测试（真实 pymilvus；含 [tests/python/adapter/](tests/python/adapter/) 中复制自参照实现的用例，逐条状态见其 INVENTORY.md） | `.venv/bin/python -m pytest tests/python` |
-| 与 3.x 的差分测试（3.x 的 venv 可用 `benchmarks/baseline/setup.sh <work_dir>` 建出的 `<work_dir>/v3`；不设环境变量时报错，不跳过；上一行的命令不包含它） | `MILVUS_LITE_3X_PYTHON=<3.x 的 venv>/bin/python .venv/bin/python -m pytest tests/differential` |
+| 与 3.x 的差分测试（3.x 的 venv 按 [互通 README](tests/storage_interop/README.md) 建 Arrow 25 参照环境；`benchmarks/baseline/setup.sh` 建出的环境不固定 pyarrow，arm64 上会被 S1 用例拒绝；不设环境变量时报错，不跳过；上一行的命令不包含它） | `MILVUS_LITE_3X_PYTHON=<3.x 的 venv>/bin/python .venv/bin/python -m pytest tests/differential` |
 | ARRAY 元素转换、schema/default 与三路线组件真值（真实 3.x / `43d1257`，Arrow 15/25 各执行） | `<参照解释器> tests/differential/generate_array_fixtures.py --verify`；重新生成用 Arrow 25，随后以 Arrow 15 核验 |
 | 固定兼容样本统计、nullable 反事实与 schema 真值（离线、显式执行，不进入默认测试） | [统计工具与命令](tests/compatibility_audit/README.md)；`<参照解释器> tests/compatibility_audit/schema_truth.py --reference references/milvus-lite --kind filters --output <仓库外报告> --verify-nullable-filter-fixture` 核验空值过滤组件 |
 | M2 存储文件双向互通矩阵（环境准备见 [tests/storage_interop/README.md](tests/storage_interop/README.md)；Arrow 15/25 均须安装固定参照引擎，Arrow 15 固定 pyarrow 15.0.0 / NumPy 1.26.4） | `MILVUS_LITE_3X_PYTHON=<v3>/bin/python MILVUS_LITE_ARROW15_PYTHON=<arrow15>/bin/python MILVUS_LITE_ARROW25_PYTHON=<v3>/bin/python .venv/bin/python -m pytest tests/storage_interop` |

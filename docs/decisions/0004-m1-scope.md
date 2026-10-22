@@ -190,6 +190,8 @@ M1 的对外行为与 3.x 有阶段性差异，本文按 [AGENTS.md](../../AGENT
 
 ## 跨平台
 
+后续：Windows 由 [0013](0013-first-release-platform-and-packaging.md) 延后，CI 由 [0020](0020-continuous-integration.md) 接续，其中跨架构距离逐位相同只由两种架构上的求和顺序用例间接支持，未新增黄金值比对；以下保留当时的要求。
+
 M1 只在本机（macOS）验收。Linux 与 Windows 的 CI 与 wheel 构建单独立项，最迟在首次发布前完成（M2 不发布，见 [0006](0006-m2-scope.md) 第 4 项；M2 期间在本机 Linux 容器中先跑一部分，见第 7 项）。
 
 跨平台 CI 还要验证：本实现在 x86 与 aarch64 上对同一输入算出的距离逐位相同（求和顺序只由源码决定，见 [flat.rs](../../crates/core/src/flat.rs)），与 3.x 之间仍按「决策」中的误差比较。NaN 距离只要求仍为 NaN：Rust 不保证 NaN 的符号与 payload，随平台与代码生成而变，同一查询单独打分与按 4 条一组打分也可能不同，因此对外 NaN 分数的符号与 payload 不作保证；排序把所有 NaN 视为相同，结果顺序不受影响。
