@@ -6,6 +6,13 @@ import importlib.metadata
 import json
 from pathlib import Path
 import subprocess
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import grpc_fork  # noqa: E402
+
+# 本驱动导入 pymilvus 后还会派生子进程，须在任何导入 grpc 的模块之前执行（见 tests/grpc_fork.py）。
+grpc_fork.disable_fork_handlers()
 
 from run import REF, outside
 from partition_truth import attempt

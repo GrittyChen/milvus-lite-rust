@@ -9,6 +9,12 @@ import shutil
 import subprocess
 import sys
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import grpc_fork  # noqa: E402
+
+# 本驱动导入 pymilvus 后还会派生子进程，须在任何导入 grpc 的模块之前执行（见 tests/grpc_fork.py）。
+grpc_fork.disable_fork_handlers()
+
 
 def hashes(path):
     return {str(p.relative_to(path)): hashlib.sha256(p.read_bytes()).hexdigest()

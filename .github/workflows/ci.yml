@@ -175,7 +175,7 @@ jobs:
         # tests/benchmarks 的部分用例会导入已安装的开发扩展，因此在 3.0.2 线的 job 中、端到端之后串行执行。
         if: matrix.sdk == '3.0.2'
         run: |
-          for suite in packaging:167 platform:13 benchmarks:70 release:200 ci:41 compatibility_audit/selfcheck.py:22; do
+          for suite in packaging:167 platform:13 benchmarks:70 release:200 ci:43 compatibility_audit/selfcheck.py:22; do
             name=${suite%%:*}; name=${name%%/*}
             .venv/bin/python tests/sharding/shard.py plan --python .venv/bin/python --suite "tests/${suite%:*}" \
               --out "$RUNNER_TEMP/$name-plan" --shards 1 --order round-robin --expect "${suite##*:}" --expect-group 0

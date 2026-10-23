@@ -1,8 +1,14 @@
-"""独立数据库用例不继承此前服务地址上的 SDK 状态。"""
+"""独立数据库用例不继承此前服务地址上的 SDK 状态；pytest 进程派生子进程时不运行 grpcio 的 fork 处理。"""
 
 import sys
 
-import pytest
+import grpc_fork
+
+# 根 conftest 先于各子目录的 conftest 与测试模块导入，须在任何模块导入 pymilvus 或 grpc 之前执行；
+# 不需要 SDK 的工具自检环境可以没有 grpcio。
+grpc_fork.disable_fork_handlers(required=False)
+
+import pytest  # noqa: E402
 
 
 @pytest.fixture(autouse=True)

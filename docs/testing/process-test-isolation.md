@@ -89,3 +89,57 @@ for round_number in range(1, 31):
 - `cargo fmt --all --check`、默认与完整 FI（`--features milvus-lite-py/fault-injection`）两种 Clippy、`git diff --check` 通过。
 
 Linux 上的结果由修复提交推送后 CI 的 rust-fi job 验证；本地 30 轮只是 macOS 的结果，不作为跨平台结论，也不声明窗口在任何调度下都不再出现。
+
+## 后续：测试驱动进程中 grpcio 的 fork 处理（2026-10-23）
+
+### 发现
+
+0020 试点后的拓扑调整（提交 `a01c4cb`）验证中，临时分支 `tmp/docs-after-code` 的快速层运行 39931684921 在 `python-3.0.2 (macos-15)` 失败：`tests/python/test_server_manager.py::test_lock_held_by_other_process_returns_none` 启动的持锁子进程没有输出 `ready`，父进程 64 秒后读到空行；持锁子进程本身没有任何输出。同一运行其余 job 成功。计数随即停止，`a01c4cb` 上已有的运行不计入。
+
+用例结束时，一个刚 fork 出的进程在 3 毫秒内向捕获的 stderr 打印 333 行 grpcio 的 `FD from fork parent still in poll list`。持锁子进程不加载 grpcio，这只能来自 pytest 进程 fork 之后、exec 之前的子进程。
+
+### 机制
+
+pytest 进程经 pymilvus 加载 grpcio（1.84.0）。grpcio 核心在 `grpc_init` 时读取一次 `GRPC_ENABLE_FORK_SUPPORT`，默认注册 `pthread_atfork`；Python 层自己的 fork 支持默认关闭，不影响核心这一层。于是测试进程每次经 `subprocess` 派生子进程，子进程在 exec 之前都会恢复 gRPC 的线程、轮询父进程的描述符。这些线程可能触发致命断言而 abort；abort 早于 exec 时子进程无声退出，`subprocess` 把它当作 exec 成功，父进程读到空输出。fork 发生在 64 秒的末尾，fork 前的等待推断来自 gRPC 的 prefork 处理，未单独证实。
+
+### 本机对照
+
+macOS arm64，带活动服务与 channel 的进程每轮 600 次 `Popen`（探针在仓库外）：
+
+| 配置 | 子进程中的致命断言 `Check failed: wakeup_fd_->ConsumeWakeup().ok()` | `FD from fork parent` 日志 |
+| --- | --- | --- |
+| 默认，空闲（两轮） | 6、0 | 8879、5419 行 |
+| 默认，60 个遗留服务与客户端 | 0 | 74251 行 |
+| 默认，后台并发调用 | 0（gRPC 跳过 fork 处理） | 5256 行 |
+| 本进程关闭 fork 处理后从环境删除变量 | 0 | 0 |
+
+本机没有观察到子进程死在 exec 之前（abort 都晚于 exec），也没有复现 64 秒的等待；以上对照证明 fork 处理在 exec 前的子进程中运行并能触发致命断言，关闭后消失，不是失败瞬间的确定性复现。
+
+### 修复与清扫
+
+- 新增 [tests/grpc_fork.py](../../tests/grpc_fork.py)：在首次导入 grpc 之前设置 `GRPC_ENABLE_FORK_SUPPORT=0`、导入 grpc 完成核心初始化，随后恢复变量原值。只改变本进程；exec 出的子进程（包括验证 fork 行为的探针）看不到该变量，按默认配置初始化自己的 gRPC。grpc 已先导入时报错，不假装生效。
+- 根 [tests/conftest.py](../../tests/conftest.py) 先于各子目录 conftest 与测试模块执行它，覆盖 tests 下全部 pytest 进程；不需要 SDK 的工具自检环境可以没有 grpcio。
+- 同类清扫：以 AST 找出自身导入 pymilvus 或 grpc、又派生子进程的模块。pytest 进程由根 conftest 覆盖；独立驱动 [linux_pid1_probe.py](../../tests/platform/linux_pid1_probe.py)（发行工作流直接执行）与 compatibility_audit 的 `partition_boundaries`、`partition_key_truth`、`partition_truth`、`partition_visibility_truth`、`query_iteration_truth`、`range_truth`、`rollback_probe` 在导入任何会加载 grpc 的模块之前调用同一函数。[install_smoke.py](../../tests/packaging/install_smoke.py) 只在 SDK 分支导入 pymilvus，之后不派生子进程，不改。benchmarks 下的驱动不在本次范围：`baseline/bench.py` 与 `concurrency.py` 的 multiprocessing 子进程 fork 后直接使用 gRPC，需要 fork 处理；`compaction` 与 `json-write/diagnostics` 的驱动另行评估。
+- 测试 [tests/ci/test_grpc_fork.py](../../tests/ci/test_grpc_fork.py)：pytest 进程按是否安装 grpcio 走对应路径（开发环境须实际完成初始化），环境中没有该变量、exec 的子进程看不到它；未安装时 `required=False` 返回不可用、`required=True` 报错；顶层包存在而包内模块缺失时原样失败，不当作未安装；grpc 已先导入时失败；调用前的原值原样恢复。
+- 没有增加 retry、sleep 或放宽断言；产品代码未改。
+
+### 验证
+
+macOS arm64（修复后的源码，开发环境 CPython 3.12、pymilvus 3.0.2、grpcio 1.84.0）：
+
+- 同一探针改为先调用 `grpc_fork.disable_fork_handlers()`：空闲与 60 个遗留服务两种模式各 600 次 `Popen`，致命断言与 fork 日志均为 0；同轮默认配置分别有 5419 与 74251 行 fork 日志。
+- 由修复后的进程以 `subprocess` 启动默认探针，30 次 fork 产生 655 行 fork 日志：exec 出的子进程恢复默认 fork 支持；同样启动的修复版探针为 0。
+- 按 CI 的方式经分片工具运行 tests/python：473 项通过。
+- `tests/python/test_server_manager.py` 整个文件默认并行连续 30 轮（含目标用例、全部 `test_fork_*` 与继承 LOCK 场景）：30/30 轮 21 passed，全部日志中没有 fork 日志或致命断言。
+- tests/ci 43 项、tests/release 200 项、tests/platform 13 项通过；只装 pytest、没有 grpcio 的隔离 venv 中 tests/ci 43 项同样通过。去掉恢复原值、未安装时总是报错、去掉先导入检查、把包内模块缺失当作未安装，四个变异均被检出。
+
+Linux arm64（本机 Docker 中固定摘要的 manylinux_2_28 容器，glibc 2.28，内核 7.0.14-linuxkit；CPython 3.12、pymilvus 3.0.2、grpcio 1.84.0；安装 `78d1f6f` 演练构建的 Linux aarch64 正式 wheel，此后产品代码未变）：
+
+- 同一探针在默认与修复两种配置下均没有 fork 日志或致命断言：Linux 上 grpcio 使用 epoll 引擎，不走打印该日志的 poll 引擎，现象在此观察不到，Linux 结果只说明修复不改变其他行为。
+- 在仓库外目录运行 tests/python：473 项通过；`test_server_manager.py` 默认并行连续 30 轮：30/30 轮 21 passed。
+
+修改过的 8 个独立驱动以 `--help` 经过初始化与全部模块导入，compatibility_audit 自检 22 项通过；这些驱动的真值生成需要 3.x 参照环境，本次没有实际重跑。
+
+修复后的 [linux_pid1_probe.py](../../tests/platform/linux_pid1_probe.py) 在本机 arm64 Docker 上以开发环境为驱动、本地 `python:3.10-slim-bookworm` 为基础镜像，安装同一演练的 Linux aarch64 正式与 FI wheel：normal / drain / kill 退出码 0 / 0 / 137，三项均通过，驱动日志中没有 fork 日志。容器内的服务进程不经过本函数，按默认配置运行。
+
+CI 上的结果以修复提交在最终拓扑上的 10 / 5 计数为准，计数完成后记入 [0020 试点记录](0020-ci-pilot.md)。本地重复只是有限次数，不声明该窗口在任何调度下都不再出现。
