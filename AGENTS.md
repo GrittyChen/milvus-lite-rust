@@ -176,6 +176,7 @@ pymilvus ──server_manager──▶ adapter/grpc ──▶ db（多 collectio
 | 核对依赖图中没有 C++ 构建与 protoc | `cargo tree --workspace -e all` |
 | 发行物与安装验收（根配置；工作目录在仓库外） | `.venv/bin/python tests/packaging/run_acceptance.py --work-dir <work_dir> --constraints <constraints.txt> --suite --suite-expect 473`；约束文件与完整步骤见 [打包验收](tests/packaging/README.md) |
 | 发行物/平台脚本自检 | `.venv/bin/python -m pytest tests/packaging tests/platform` |
+| CI 纯文档分类与汇总判定自检 | `.venv/bin/python -m pytest tests/ci` |
 | 候选测试的确定性分片（plan / run / verify，合同见 0019）及自检 | 用法见 [tests/sharding/README.md](tests/sharding/README.md)；自检：`.venv/bin/python -m pytest tests/sharding` |
 | Linux PID 1、命名卷 LOCK 与强杀恢复 | `.venv/bin/python tests/platform/linux_pid1_probe.py --formal-wheel <linux-wheel> --fi-wheel <linux-fi-wheel> --image <image-id> --constraints .github/ci/requirements/sdk30.txt --output <work_dir>`；见 [平台流程](tests/platform/README.md) |
 | Windows 准备检查（无运行证据） | `pwsh -NoProfile -File tests/platform/windows_run.ps1 -WorkDirectory <work_dir>`（PowerShell ≥7.2）；见 [平台流程](tests/platform/README.md) |

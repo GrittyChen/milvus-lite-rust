@@ -45,6 +45,13 @@ def check_job(jobs, name):
             f"job {name} is not a single success: {[(j['status'], j['conclusion']) for j in matched]}")
 
 
+def check_full_run(jobs, path):
+    """继承的运行须为全量且每个 job 都成功：纯文档提交的运行会合法地跳过测试 job，汇总 job 仍为 success，
+    只看汇总会继承一次没有执行任何测试的运行（0020 公共约定 9）。"""
+    bad = [(j["name"], j["status"], j["conclusion"]) for j in jobs if (j["status"], j["conclusion"]) != ("completed", "success")]
+    require(jobs and not bad, f"{path} run is not a full run with every job successful (dispatch full CI and Compare runs): {bad}")
+
+
 def signing_started(jobs):
     """签发步骤一旦开始即消费版本。跳过或排队的步骤不算；job 已分配执行机而步骤信息缺失时按已开始处理。"""
     for job in jobs:
@@ -137,7 +144,9 @@ def inherited_runs(gh, sha):
     for name, (path, summary) in INHERITED.items():
         rows = gh.workflow_runs(path, f"&head_sha={sha}")
         latest = select_latest(rows, sha, path)
-        check_job(gh.jobs(latest["id"], latest["run_attempt"]), summary)
+        jobs = gh.jobs(latest["id"], latest["run_attempt"])
+        check_job(jobs, summary)
+        check_full_run(jobs, path)
         refs[name] = run_ref(latest)
         snapshot[name] = run_snapshot(rows, sha, path)
     return refs, snapshot

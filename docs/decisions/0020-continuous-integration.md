@@ -1,6 +1,6 @@
 # 0020：持续集成
 
-- 状态：方案经负责人与独立复审两轮评审、负责人两轮复审通过，复审建议已采纳。工作流已实施（[ci.yml](../../.github/workflows/ci.yml)、[compare.yml](../../.github/workflows/compare.yml)），试点完成（[试点记录](../testing/0020-ci-pilot.md)）；负责人决定 `main` 必须通过 `ci-pass` 与 `compare-pass`，分支保护已启用。
+- 状态：方案经负责人与独立复审两轮评审、负责人两轮复审通过，复审建议已采纳。工作流已实施（[ci.yml](../../.github/workflows/ci.yml)、[compare.yml](../../.github/workflows/compare.yml)），试点完成（[试点记录](../testing/0020-ci-pilot.md)）；负责人决定 `main` 必须通过 `ci-pass` 与 `compare-pass`，分支保护已启用。试点后修订（待 GitHub 实测与最终拓扑的 10 / 5 计数）：重新计数范围（「判定与流程」第 2 条）；Rust 默认与完整 FI 合并、真值核验并入互通、两条 SDK 线分为两个 job、纯文档提交跳过测试 job（公共约定 5、9，「判定与流程」第 3 条）。
 - 日期：2026-10-22。
 - 依据：[0004 跨平台](0004-m1-scope.md#跨平台)、[0013 首发候选矩阵](0013-first-release-platform-and-packaging.md#首发候选矩阵)、[0019 分片](0019-test-sharding.md)、[证据的存放与复核范围](../testing/README.md)。
 
@@ -20,17 +20,17 @@ CI 分快速层与对照层，在三个标准平台的托管机器上运行：Li
 2. **Cargo**：工作流直接执行的 cargo 与 maturin 命令一律加 `--locked`，包括 0019 的三条互通预构建命令；用例内部自行调用的 cargo 不改，job 结束时以 `git diff --exit-code -- Cargo.lock` 确认锁文件未变。不设 `CARGO_TARGET_DIR`，因为互通用例写死仓库内 `target/debug/examples` 的产物路径。`CARGO_INCREMENTAL=0`、`CARGO_PROFILE_DEV_DEBUG=0`、`CARGO_PROFILE_TEST_DEBUG=0` 在 job 级设置，使用例内部的构建与预构建一致；它们关闭增量缓存与调试符号，不改变测试选择或断言。
 3. **Python 环境**：uv 经 setup-python 以 `pip install uv==<固定版本>` 安装。每个环境按仓库内提交的完整 constraints 安装（[.github/ci/requirements](../../.github/ci/README.md)），constraints 由 uv 生成，覆盖构建后端、pytest 与全部传递依赖，三平台共用，更新随提交评审；每个环境把 `uv pip freeze --python <解释器>` 写入日志。环境共四套：开发（CPython 3.12、pymilvus 3.0.2）、2.6 线（CPython 3.10、pymilvus 2.6.17）、参照 Arrow 25（CPython 3.12、可编辑安装参照 checkout、pyarrow 25.0.1、pymilvus 3.0.2）与参照 Arrow 15（pyarrow 15.0.0、NumPy 1.26.4）。
 4. **零跳过**（规则 4）：所有 pytest 运行都经 0019 的分片工具执行，`summary.json` 的 `passed` 进入判定；该工具逐项记录结果，拒绝 skipped、xfailed 与 xpassed（非严格的 xpass 在普通 pytest 中退出码为 0，JUnit 也只记为普通用例），并按写在工作流中的收集数核对用例集合。差分与互通按对照层分片；`tests/python` 与各工具自检以 `--shards 1 --order round-robin` 单片执行，保持原收集顺序（`balanced` 在无耗时数据时会按 nodeid 重排）。例外有两个：分片工具自身的 `tests/sharding`，为避免用工具验证工具，以普通 pytest 运行，要求退出码为 0，且末行汇总中 passed 的数量等于工作流中写明的收集数、不出现 failed、error、skipped、xfailed 与 xpassed（pytest 的汇总行会分别列出它们）；warnings 与耗时不影响判定；以 subtests 组织的 `benchmarks/json-write/diagnostics/selfcheck.py`，分片工具按用例计数时与 JUnit 不符，改为核对 unittest 输出恰好运行预期数量且末行为不带附注的 `OK`。Rust 测试汇总的 ignored 须为 0。[index_changes.rs](../../crates/core/tests/index_changes.rs) 中凭据不同与外来所有权两个分支只在 root 下执行、非 root 时略过并显示为通过，因此两个 Linux 平台另以 root 运行已构建的 `index_changes` 测试二进制中的权限用例，并按用例数量核对，避免筛选落空。
-5. **时序与信号**：同一 job 内 Python 全套串行执行，不与 cargo test 或其他套件同时运行；按 0019 P0 第 2 条，在 Python 全套与差分前记录 SIGINT / SIGQUIT 的实际处理函数。
+5. **时序与信号**：同一 job（即同一执行机）内 Python 全套串行执行，不与 cargo test 或其他套件同时运行；两条 SDK 线分在两个 job、各自的执行机上，可以并行（标定只要求同一执行机上没有争用，见 0019 P0 第 4 条）。按 0019 P0 第 2 条，在 Python 全套与差分前记录 SIGINT / SIGQUIT 的实际处理函数。
 6. **超时**：每个 job 设 `timeout-minutes`，取试点最长耗时的 2–3 倍；超时计为失败。分片工具没有单分片看门狗，用例挂死只能由此结束。
 7. **缓存**：只缓存 Cargo registry 与 uv 下载缓存，不缓存 `target`；键包含 `runner.os`、`runner.arch`、工具链版本、`Cargo.lock` 与 constraints 的哈希。缓存只影响耗时，试点中以一次无缓存运行对照确认。
 8. **shell**：所有步骤显式以 bash 运行（GitHub 此时使用 `bash -eo pipefail`）。未指定时为 `bash -e`，`cargo test | tee` 的结果只取决于 `tee`，测试进程崩溃或中途退出会被吞掉。
-9. **不条件跳过 job**：任何 job 都不以 `if` 条件跳过，每个工作流的每种触发都运行其全部 job；平台差异以矩阵内的独立 job 表达。因此汇总判定中 skipped 一律视为失败，见「判定与流程」第 3 条；对照层按套件执行的步骤前有守卫，套件名不在已知清单中时失败。矩阵设 `fail-fast: false`，一个平台失败时仍收齐其余结果。
+9. **条件跳过只有纯文档一种**：每个工作流先由分类 job（[changes.py](../../.github/ci/changes.py)）判定本次是否为纯文档，其余 job 只按这一判定整体跳过，不设其他 job 条件；平台差异以矩阵内的独立 job 表达。纯文档指待合入的全部差异只是 `docs/` 下 Markdown 与根 `AGENTS.md` 的普通文件增删改；`README.md`（进入 sdist 与长描述）、发行台账 `docs/releases/consumed-versions.json`（工具自检校验它）及任何其他路径都按全量执行。差异范围按待合入的全部内容取：PR 为 base 与 PR 提交的 merge-base 到 PR 提交；main 以外分支的推送为 `origin/main` 与 HEAD 的 merge-base 到 HEAD，只比较本次推送会让此前未经验证的代码提交借最后一个纯文档提交放行；main 的推送为 before..after。手动触发与定时运行始终全量；base 缺失或为全零、git 失败、差异为空或出现任何不认识的情形，一律全量。汇总判定见「判定与流程」第 3 条，发行工作流不继承纯文档运行（[0021](0021-release-build-in-ci.md) 第 2 条）。对照层与快速层 Python 按套件或 SDK 线执行的步骤前有守卫，名字不在已知清单中时失败。矩阵设 `fail-fast: false`，一个平台失败时仍收齐其余结果。
 
 ### 快速层
 
 触发：推送到分支（不含 tag）、PR、手动。同仓分支一般直接推送、不开 PR；开 PR 时同一提交会运行两次，接受这一重复，不用 job 条件去重。
 
-按磁盘与并行拆成独立 job：每个平台的默认 Rust（第 1 项默认 Clippy 与 fmt、第 2 项默认测试及 Linux 上的 root 权限用例）、完整 FI Rust（第 1 项 FI Clippy、第 2 项 FI 测试）、Python（第 3、4 项；`tests/benchmarks` 有用例导入已安装的扩展，因此工具自检与端到端同在一个 job）各为一个 job，第 5 项在 Linux x86_64 单独成 job。
+按磁盘与并行拆成独立 job：每个平台的 Rust（第 1、2 项的默认与完整 FI 两个编译面，及 Linux 上的 root 权限用例，依次执行）为一个 job；Python 按 SDK 线分为两个 job，3.0.2 线执行开发环境的端到端与第 4 项工具自检（`tests/benchmarks` 有用例导入已安装的开发扩展），2.6 线执行 wheel 的端到端；第 5 项在 Linux x86_64 单独成 job。默认与完整 FI 原为两个 job，试点中单个 job 的磁盘增长只有 1–3 GB，合并后第三方依赖只编译一次，并少占一个 macOS 执行机。
 
 1. `cargo fmt --all --check`；Clippy 覆盖默认与完整 FI 两个编译面（经 py → grpc → core 开启 FI，即 [0017 跨平台收口](../testing/0017-cross-platform-acceptance.md)要求最终候选覆盖的口径）：`cargo clippy --workspace --all-targets --locked -- -D warnings` 与 `cargo clippy --workspace --all-targets --features milvus-lite-py/fault-injection --locked -- -D warnings`。
 2. `cargo test --workspace --locked` 与 `cargo test --workspace --features milvus-lite-py/fault-injection --locked`；后者同时覆盖 core、grpc 与 py 的 FI 测试，包括只在 grpc FI 构建下编译的服务宿主用例。
@@ -44,7 +44,7 @@ CI 分快速层与对照层，在三个标准平台的托管机器上运行：Li
 
 触发：推送到非 main 分支（不含 tag）、PR、main 每晚一次、手动。
 
-每个平台的两条 SDK 差分、互通与固定真值核验各为一个 job。
+每个平台的两条 SDK 差分各为一个 job；互通与固定真值核验同在一个 job，真值核验在互通全部分片结束后执行。真值核验原为独立 job，只需数分钟，并入后少占一个 macOS 执行机。
 
 1. **参照**：以 depth 1 取公开仓库 `milvus-io/milvus-lite` 的固定 commit `43d1257774e629bc9f66873977ab7c320d5bf5a7`（即 tag `v3.2.1`），放到被忽略的 `references/milvus-lite/`，核对 HEAD 与工作树干净；参照只在运行时取得，不入库。差分的 `MILVUS_LITE_3X_PYTHON` 使用参照 Arrow 25 环境：[test_filter_s1.py](../../tests/differential/test_filter_s1.py) 在 arm64 上要求参照的 pyarrow 为 25.0.1，不固定 pyarrow 的环境会在两个 arm64 平台失败。
 2. **差分与互通**：两条 SDK 线的完整差分与 Arrow 15 / 25 互通按 0019 用 tests/sharding 分片执行，`summary.json` 的 `passed` 与各项核对进入判定。`--expect` / `--expect-group` 写在工作流中（当前差分 421 / 118、互通 211 / 0），与增删用例的提交一同修改、一同评审，不从同一次收集取值。互通先按 0019 执行三条预构建命令并核对 `fresh`；同一 job 内 FI 的 cargo test 不与互通同时运行。并发度按托管机器的核数与内存在试点中确定。
@@ -57,8 +57,8 @@ CI 分快速层与对照层，在三个标准平台的托管机器上运行：Li
 ## 判定与流程
 
 1. **失败处理**：按规则 5，任何失败都要定位根因；不加 retry，不以重新运行变绿作为放行依据。重新运行只用于收集诊断。某个提交出现过失败，即使重新运行后变绿，也须先在修复提交或试点记录中写明根因，才能快进到 main。
-2. **试点阈值**：按平台、按 job 分别计数，快速层连续 10 次、对照层连续 5 次运行无失败；出现失败时修复根因后重新计数。达到后由负责人决定是否设为必须通过检查。
-3. **必须通过检查**：每个工作流以一个依赖其全部 job 的汇总 job 作为分支保护的检查入口，矩阵调整时不留下过时的必须检查。上游失败时普通依赖会使汇总 job 变为 skipped，而分支保护把 skipped 视为可接受，因此汇总 job 以 `if: always()` 运行，逐个检查 `needs.*.result`，只有全部为 `success` 才通过，`failure`、`cancelled` 与 `skipped` 都主动以非零退出。分支保护把该检查的来源限定为 GitHub Actions，并开启「Do not allow bypassing the above settings」，否则仓库管理员不受分支保护限制（[About protected branches](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches/about-protected-branches)）。分支保护属于仓库设置，由负责人操作。
+2. **试点阈值与重新计数**：按平台、按 job 分别计数，快速层连续 10 次、对照层连续 5 次运行无失败；出现失败时修复根因后重新计数。达到后由负责人决定是否设为必须通过检查。设为必须通过检查之后，以下变化须对受影响的工作流按同一阈值重新计数，或经评审约定针对受影响 job 的重复验证（次数与范围写入对应记录）：测试代码或测试集合；依赖、工具链或固定环境；分片、并发度或 job 内的执行顺序；平台或资源矩阵；job 的拆分与合并、执行条件或汇总判定；新增 job 或工作流；修复偶发失败。只跑一次不能证明这些变化后的稳定性：0021 合入计数中，`59d3a5f` 前 3 次成功、第 4 次才暴露库内测试的派生竞态（[0021 试点记录](../testing/0021-release-pilot.md)）。不涉及上述各项的改动，同一提交的两项必须通过检查通过一次即可。
+3. **必须通过检查**：每个工作流以一个依赖其全部 job 的汇总 job 作为分支保护的检查入口，矩阵调整时不留下过时的必须检查。上游失败时普通依赖会使汇总 job 变为 skipped，而分支保护把 skipped 视为可接受，因此汇总 job 以 `if: always()` 运行，由 [summary.py](../../.github/ci/summary.py) 逐个检查 `needs.*.result`，只接受两种形态：分类为全量时全部上游为 `success`；分类为纯文档时分类 job 为 `success`、其余上游全部为 `skipped`。分类 job 未成功或输出缺失、部分跳过、`failure`、`cancelled` 与混合状态都主动以非零退出。分支保护把该检查的来源限定为 GitHub Actions，并开启「Do not allow bypassing the above settings」，否则仓库管理员不受分支保护限制（[About protected branches](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches/about-protected-branches)）。分支保护属于仓库设置，由负责人操作。
 4. **推送方式**：设必须通过后，先推送工作分支，CI 通过后将同一提交快进到 main（`git push origin <commit>:main`），保持线性历史，不产生 merge commit；必须通过检查按提交哈希判定，快进时无需重跑。外部 PR 不用 GitHub 的 rebase / squash 合并（会生成未经检查的新提交），由负责人在本地 rebase 到 main 后按同一方式推送。
 5. **证据归类**：CI 日志在公开仓库中任何人可见，但有保留期限；记录中引用时写运行链接与提交号，不作为发布证据，候选验收仍按 0013 留证。
 
@@ -71,7 +71,7 @@ CI 分快速层与对照层，在三个标准平台的托管机器上运行：Li
 
 ## 资源与已知风险
 
-- **磁盘**：本机同一 target 依次加入默认、完整 FI、MSRV 与 Windows 目标后约 13 GiB（调试信息开启），托管机器存储为 14 GB。快速层已按默认 / FI / MSRV 与 Windows 拆成独立 job，并关闭调试信息；试点记录每个 job 的峰值占用与剩余空间，不足时继续拆分。
+- **磁盘**：本机同一 target 依次加入默认、完整 FI、MSRV 与 Windows 目标后约 13 GiB（调试信息开启），托管机器存储为 14 GB。快速层把 MSRV 与 Windows 拆成独立 job，并关闭调试信息；试点中单个 job 磁盘增长 1–3 GB（[试点记录](../testing/0020-ci-pilot.md#资源)），默认与完整 FI 因此合并为一个 job。剩余空间不足时再拆分。
 - **时序敏感用例**：Python 全套含按 CPU 速度标定的停服用例，LOCK 重开与 compaction 等待也受调度影响。托管机器的性能波动可能暴露新的时序问题，按根因处理。
 - **端口窗口**：0019 记录的 CLI 用例端口交接窗口在分片下仍存在，处理方式不变。参照服务关闭 SO_REUSEPORT 后，端口自动分配与内核版本无关。
 - **定时运行**：schedule 只在默认分支运行，负载高时可能延迟；公开仓库 60 天无活动时定时工作流会被停用（[触发事件](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows)），需要时手动重新启用。

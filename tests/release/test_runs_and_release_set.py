@@ -142,6 +142,11 @@ def test_precheck_passes_and_records_runs(gh):
     (lambda gh: gh.ci.append(run(3, "11:00", "in_progress", None)), "in_progress"),
     (lambda gh: gh.ci.append(run(3, "11:00", conclusion="failure")), "failure"),
     (lambda gh: gh.jobs_by_attempt.update({(1, 1): [job("ci-pass", conclusion="failure")]}), "ci-pass"),
+    # 纯文档运行：汇总合法为 success，但测试 job 被跳过。
+    (lambda gh: gh.jobs_by_attempt.update({(1, 1): [job("changes"), job("rust (macos-15)", conclusion="skipped"),
+                                                     job("ci-pass")]}), "not a full run"),
+    (lambda gh: gh.jobs_by_attempt.update({(2, 1): [job("changes"), job("interop (macos-15)", conclusion="skipped"),
+                                                     job("compare-pass")]}), "not a full run"),
     (lambda gh: gh.tags.add(f"v{VERSION}"), "tag"),
     (lambda gh: gh.releases.append({"tag_name": f"v{VERSION}", "name": "x"}), "release"),
     (lambda gh: gh.ledger["versions"].append({"version": VERSION, "run_id": 5, "run_attempt": 1, "outcome": "abandoned"}), "ledger"),

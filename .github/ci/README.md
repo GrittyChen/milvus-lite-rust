@@ -25,6 +25,10 @@ Linux 上的 CPython 3.15 例外：`orjson==3.13.0` 的 cp315 Linux wheel 只有
 - [pytest_summary.py](pytest_summary.py)：仅用于分片工具自身的自检，核对普通 pytest 的末行汇总。
 - [unittest_summary.py](unittest_summary.py)：用于以 subtests 组织的自检，核对运行数量与末行 `OK`。
 - [cargo_fresh.py](cargo_fresh.py)：互通预构建后复跑的全部产物须为 fresh。
+- [changes.py](changes.py)：两个工作流的分类 job 判定是否为纯文档，以待合入的全部差异为准，任何异常按全量执行（0020 公共约定 9）。
+- [summary.py](summary.py)：`ci-pass` 与 `compare-pass` 的判定，只接受全量全部成功或纯文档时测试 job 全部跳过两种形态。
+
+两者的自检在 [tests/ci](../../tests/ci/test_ci_scripts.py)，随快速层工具自检运行。
 
 ## 工作流静态检查
 
