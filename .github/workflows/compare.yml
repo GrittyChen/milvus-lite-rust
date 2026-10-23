@@ -137,6 +137,7 @@ jobs:
         env:
           MILVUS_LITE_3X_PYTHON: ${{ runner.temp }}/ref25/bin/python
         run: |
+          . .github/ci/crash_capture.sh
           .venv/bin/python tests/sharding/shard.py plan --python .venv/bin/python --suite tests/differential \
             --out "$RUNNER_TEMP/plan" --shards ${{ matrix.shards }} \
             --group-fixture diff --group-fixture rust_uri --group-fixture ref_uri --expect 421 --expect-group 118
@@ -146,6 +147,7 @@ jobs:
         env:
           MILVUS_LITE_3X_PYTHON: ${{ runner.temp }}/ref25/bin/python
         run: |
+          . .github/ci/crash_capture.sh
           mkdir "$RUNNER_TEMP/outside"
           .venv/bin/python tests/sharding/shard.py plan --python "$RUNNER_TEMP/v26/bin/python" --suite "$PWD/tests/differential" \
             --cwd "$RUNNER_TEMP/outside" --out "$RUNNER_TEMP/plan" --shards ${{ matrix.shards }} \
@@ -158,6 +160,7 @@ jobs:
           MILVUS_LITE_ARROW25_PYTHON: ${{ runner.temp }}/ref25/bin/python
           MILVUS_LITE_ARROW15_PYTHON: ${{ runner.temp }}/ref15/bin/python
         run: |
+          . .github/ci/crash_capture.sh
           # 用例内部会以同样的环境调用这三条命令；先构建并核对 fresh，避免分片同时编译（0019 P0 第 3 条）。
           commands=(
             "build -p milvus-lite-core --example storage_interop"
@@ -177,6 +180,7 @@ jobs:
         # 在互通之后串行执行，不与互通的分片同时运行。
         if: matrix.suite == 'interop'
         run: |
+          . .github/ci/crash_capture.sh
           ref25="$RUNNER_TEMP/ref25/bin/python"; ref15="$RUNNER_TEMP/ref15/bin/python"
           "$ref25" tests/differential/generate_filter_parse_fixtures.py --verify
           "$ref25" tests/differential/generate_dynamic_filter_fixtures.py --verify
@@ -207,6 +211,12 @@ jobs:
             ${{ runner.temp }}/schema-*.json
           if-no-files-found: ignore
           retention-days: 14
+      - name: 崩溃现场
+        # 只在失败时运行：打出崩溃进程的原生调用栈（见 .github/ci/crash_report.py），不改变 job 结论；
+        # 排在保存运行记录之后，并限时，不能因诊断拖到 job 超时而丢掉失败附件。
+        if: failure()
+        timeout-minutes: 10
+        run: python3 .github/ci/crash_report.py
 
   compare-pass:
     # 与 CI 的汇总 job 相同：总是运行，只接受全量时全部成功、纯文档时测试 job 全部跳过两种形态。

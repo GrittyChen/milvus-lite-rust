@@ -83,6 +83,7 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: 测试（默认）
         run: |
+          . .github/ci/crash_capture.sh
           cargo test --workspace --locked 2>&1 | tee "$RUNNER_TEMP/rust-default.log"
           python3 .github/ci/rust_results.py "$RUNNER_TEMP/rust-default.log"
       - name: 以 root 运行权限用例（Linux）
@@ -90,16 +91,25 @@ jobs:
         # Linux 上 permissions 模块共 4 项，按数量核对，避免改名后筛选落空。
         if: runner.os == 'Linux'
         run: |
+          . .github/ci/crash_capture.sh
           bin=$(cargo test -p milvus-lite-core --test index_changes --no-run --locked --message-format=json \
             | python3 -c 'import json,sys; print(next(m["executable"] for m in map(json.loads, sys.stdin) if m.get("reason") == "compiler-artifact" and m.get("executable") and m["target"]["name"] == "index_changes"))')
-          sudo "$bin" permissions:: 2>&1 | tee "$RUNNER_TEMP/rust-root.log"
+          # sudo 默认把 RLIMIT_CORE 设为 0，经 CRASH_SUDO 恢复，崩溃时才能留下 core（见 .github/ci/crash_capture.sh）。
+          "${CRASH_SUDO[@]}" "$bin" permissions:: 2>&1 | tee "$RUNNER_TEMP/rust-root.log"
           python3 .github/ci/rust_results.py "$RUNNER_TEMP/rust-root.log" 4
       - name: Clippy（完整 FI）
         run: cargo clippy --workspace --all-targets --features milvus-lite-py/fault-injection --locked -- -D warnings
       - name: 测试（完整 FI）
         run: |
+          . .github/ci/crash_capture.sh
           cargo test --workspace --features milvus-lite-py/fault-injection --locked 2>&1 | tee "$RUNNER_TEMP/rust-fi.log"
           python3 .github/ci/rust_results.py "$RUNNER_TEMP/rust-fi.log"
+      - name: 崩溃现场
+        # 只在失败时运行：打出崩溃进程的原生调用栈（见 .github/ci/crash_report.py），不改变 job 结论；
+        # 限时：不能因诊断拖到 job 超时。
+        if: failure()
+        timeout-minutes: 10
+        run: python3 .github/ci/crash_report.py
       - name: 锁文件未变
         run: git diff --exit-code -- Cargo.lock && df -h .
 
@@ -161,12 +171,14 @@ jobs:
       - name: tests/python（pymilvus 3.0.2）
         if: matrix.sdk == '3.0.2'
         run: |
+          . .github/ci/crash_capture.sh
           .venv/bin/python tests/sharding/shard.py plan --python .venv/bin/python --suite tests/python \
             --out "$RUNNER_TEMP/py30-plan" --shards 1 --order round-robin --expect 473 --expect-group 0
           .venv/bin/python tests/sharding/shard.py run --plan "$RUNNER_TEMP/py30-plan/plan.json" --out "$RUNNER_TEMP/py30-run"
       - name: tests/python（pymilvus 2.6.17，安装 wheel，仓库外运行）
         if: matrix.sdk == '2.6.17'
         run: |
+          . .github/ci/crash_capture.sh
           mkdir "$RUNNER_TEMP/outside"
           .venv/bin/python tests/sharding/shard.py plan --python "$RUNNER_TEMP/v26/bin/python" --suite "$PWD/tests/python" \
             --cwd "$RUNNER_TEMP/outside" --out "$RUNNER_TEMP/py26-plan" --shards 1 --order round-robin --expect 473 --expect-group 0
@@ -175,6 +187,7 @@ jobs:
         # tests/benchmarks 的部分用例会导入已安装的开发扩展，因此在 3.0.2 线的 job 中、端到端之后串行执行。
         if: matrix.sdk == '3.0.2'
         run: |
+          . .github/ci/crash_capture.sh
           for suite in packaging:167 platform:13 benchmarks:70 release:200 ci:43 compatibility_audit/selfcheck.py:22; do
             name=${suite%%:*}; name=${name%%/*}
             .venv/bin/python tests/sharding/shard.py plan --python .venv/bin/python --suite "tests/${suite%:*}" \
@@ -200,6 +213,12 @@ jobs:
             ${{ runner.temp }}/*.log
           if-no-files-found: ignore
           retention-days: 14
+      - name: 崩溃现场
+        # 只在失败时运行：打出崩溃进程的原生调用栈（见 .github/ci/crash_report.py），不改变 job 结论；
+        # 排在保存运行记录之后，并限时，不能因诊断拖到 job 超时而丢掉失败附件。
+        if: failure()
+        timeout-minutes: 10
+        run: python3 .github/ci/crash_report.py
 
   linux-extra:
     name: msrv-windows (ubuntu-24.04)
