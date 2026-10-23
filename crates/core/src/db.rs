@@ -3245,6 +3245,8 @@ mod tests {
         #[cfg(feature = "fault-injection")]
         let modes = ["close", "nowait", "spawn-failure"];
         for mode in modes {
+            // 解锁失败后只能靠关闭全部描述符释放锁，与库内派生子进程互斥。
+            let _spawn = crate::data_dir::SUBPROCESS_SPAWN.read();
             let root = tempfile::tempdir().unwrap();
             crate::data_dir::inject_unlock_failure_for_next_open();
             let dir = DataDir::open(root.path()).unwrap();

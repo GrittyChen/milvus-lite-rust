@@ -6,6 +6,13 @@ use std::path::{Path, PathBuf};
 
 pub const LOCK_FILENAME: &str = "LOCK";
 
+/// 库内单元测试派生子进程时，子进程在 fork 与 exec 之间继承此刻打开的全部描述符。裸 `DataDir` 析构只关闭
+/// 自身描述符，被继承的那份仍持有 flock，紧接着的重开会得到 Locked。派生子进程只在写锁内调用 `spawn()`；
+/// 依赖裸句柄析构释放锁、随后重开的用例，从首次打开到最后一次重开持读锁。见
+/// docs/testing/process-test-isolation.md。
+#[cfg(test)]
+pub(crate) static SUBPROCESS_SPAWN: parking_lot::RwLock<()> = parking_lot::RwLock::new(());
+
 #[cfg(any(test, feature = "fault-injection"))]
 thread_local! { static UNLOCK_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
 #[cfg(any(test, feature = "fault-injection"))]
@@ -273,6 +280,7 @@ mod tests {
 
     #[test]
     fn second_open_in_same_process_is_locked_until_first_dropped() {
+        let _spawn = SUBPROCESS_SPAWN.read();
         let root = tmp();
         let first = DataDir::open(root.path()).unwrap();
         let err = DataDir::open(root.path()).unwrap_err();
@@ -284,6 +292,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn dropping_a_bare_handle_does_not_unlock_a_shared_description() {
+        let _spawn = SUBPROCESS_SPAWN.read();
         let root = tmp();
         let dir = DataDir::open(root.path()).unwrap();
         let inherited = dir.duplicate_lock_for_test().unwrap();
@@ -298,6 +307,7 @@ mod tests {
 
     #[test]
     fn lock_release_does_not_depend_on_existing_entries() {
+        let _spawn = SUBPROCESS_SPAWN.read();
         let root = tmp();
         File::create(root.path().join("schema.json")).unwrap();
         drop(DataDir::open(root.path()).unwrap());

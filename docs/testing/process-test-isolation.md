@@ -2,7 +2,7 @@
 
 日期：2026-10-14。基线为已评审的 load 修复 `17dd87a`。本记录只覆盖测试隔离与产品边界说明，不改变引擎、LOCK 原语或关闭协议。
 
-本记录保留测试隔离提交时的证据。后续产品已改为排空后显式解锁，消除下面描述的正常关闭继承窗口；当前行为以 [0003](../decisions/0003-in-process-server-lifecycle.md#fork) 与 [显式解锁验收](explicit-unlock.md) 为准，完整用例守卫继续保留。
+本记录保留测试隔离提交时的证据；2026-10-23 在 core 库内单元测试中发现的同类窗口及其修复见文末[后续：库内单元测试](#后续库内单元测试2026-10-23)。后续产品已改为排空后显式解锁，消除下面描述的正常关闭继承窗口；当前行为以 [0003](../decisions/0003-in-process-server-lifecycle.md#fork) 与 [显式解锁验收](explicit-unlock.md) 为准，完整用例守卫继续保留。
 
 2026-10-17 的两条 Python SDK 线端口复用与 schema 缓存隔离另见[跨平台验收记录](0015-0016-cross-platform-acceptance.md#本轮发现两条-sdk-的跨用例-schema-缓存污染)；它由 [pytest 函数级隔离](../../tests/conftest.py)处理，与本文的 Rust 进程内锁守卫是两个独立边界。
 
@@ -58,3 +58,34 @@ for round_number in range(1, 31):
 ```
 
 该命令复验相同范围；本轮实跑使用已编译的三份可执行文件，省去每轮 Cargo 的构建检查，原始输出保留在仓库外。
+
+## 后续：库内单元测试（2026-10-23）
+
+### 发现
+
+0021 快速层计数中，提交 `59d3a5f` 的第 4 次运行（GitHub Actions 39819137221）在 rust-fi（ubuntu-24.04）失败：core 库内单元测试 `collection::partition_key::tests::old_snapshot_survives_bucket_write_while_close_and_new_reads_wait_for_permission` 关闭后重开数据目录时得到 `Locked`。同一次运行的其余 10 个 job 成功；计数按 0020 停止，没有重跑。
+
+上文的清扫只覆盖当时的进程派生点，库内单元测试那时没有派生子进程。之后 partition key 的崩溃边界用例 `crash_boundaries_recover_only_actual_wal_prefix` 在库内以 `Command` 重新启动测试二进制，库内测试从此处在与上文相同的窗口中：该用例派生子进程时，子进程在 exec 之前继承其他用例此刻打开的描述符；失败用例先以裸 `DataDir` 打开并直接析构（只关闭自身描述符、不解锁），随后的重开撞上子进程持有的 flock。
+
+### 确定性复现
+
+在失败用例的裸 `DataDir` 打开期间，由另一线程派生一个在 exec 前停留 500 ms 的子进程，再析构、重开：macOS arm64 上 3/3 次在同一位置得到与 CI 相同的 `Locked`。复现改动不提交。
+
+### 修复与清扫
+
+- 新增仅测试编译的进程内读写锁 [`data_dir::SUBPROCESS_SPAWN`](../../crates/core/src/data_dir.rs)。崩溃边界用例改为 `stdin` 空、`stdout` / `stderr` 管道后，只在写锁内调用 `spawn()`，退出写锁后再 `wait_with_output()`；std 在子进程 exec 之后才从 `spawn()` 返回，写锁覆盖 fork 到 exec 的窗口，不覆盖子进程运行的数秒。原有退出码与输出断言不变。
+- 依赖裸句柄析构释放锁、随后重开的 5 个用例，从首次打开到最后一次重开持读锁：partition key 的上述失败用例；`data_dir` 的 `second_open_in_same_process_is_locked_until_first_dropped`、`dropping_a_bare_handle_does_not_unlock_a_shared_description`、`lock_release_does_not_depend_on_existing_entries`；`db` 的 `unlock_failure_is_reported_by_synchronous_and_asynchronous_close`（注入解锁失败后只能靠关闭全部描述符释放锁，按循环的每次迭代取读锁）。读锁只让这些用例与派生互斥，用例内部的线程与真实并发不变。
+- 经 `Db` 正常关闭的用例不需要守卫：`Db` 收尾时显式解锁（[db.rs](../../crates/core/src/db.rs) 的 `release_data_dir`），对子进程继承的同一打开文件描述同样生效；`all_close_paths_unlock_while_a_duplicated_descriptor_remains_open` 的解锁成功路径即为这一点的覆盖。
+- 搜索范围：`Command::new|process::Command|current_exe|fork(` 于整个 workspace 的 `crates/**/*.rs`。库内只有 [partition_key.rs](../../crates/core/src/collection/partition_key.rs) 一个写者；集成测试中 `index_changes.rs`、`crash_recovery.rs`、`concurrency_faults.rs` 由上文的 CASE_LOCK 覆盖；`partitions.rs` 有两个派生点，但该二进制只经 `Db` 打开数据目录、不使用注入的解锁失败，`Db` 关闭总是显式解锁，不存在依赖裸句柄析构的重开，因此不加守卫。grpc 与 py crate 没有派生点。
+- 没有增加 retry、sleep 或放宽断言；产品代码未改。
+
+### 验证
+
+以下均在 macOS arm64、修复后的源码上执行：
+
+- 可控探针：沿用上面的复现时序，探针的子进程改为在写锁内 `spawn()`，10/10 次通过；不加写锁的同一探针作为对照，10/10 次得到 `Locked`。
+- `cargo test -p milvus-lite-core --lib --features fault-injection --locked` 连续 30 轮，保留默认测试线程数并移除 `RUST_TEST_THREADS` 覆盖：30/30 轮 219 passed、0 failed、0 ignored。
+- `cargo test --workspace --locked` 默认并行：361 passed、0 failed、0 ignored。
+- `cargo fmt --all --check`、默认与完整 FI（`--features milvus-lite-py/fault-injection`）两种 Clippy、`git diff --check` 通过。
+
+Linux 上的结果由修复提交推送后 CI 的 rust-fi job 验证；本地 30 轮只是 macOS 的结果，不作为跨平台结论，也不声明窗口在任何调度下都不再出现。

@@ -803,9 +803,18 @@ mod tests {
             db.flush_collection("", "c").unwrap();
             db.close();
             drop(db);
-            let status=std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact","collection::partition_key::tests::crash_boundaries_recover_only_actual_wal_prefix","--nocapture"])
-                .env(ROOT,root.path()).env(MODE,mode).output().unwrap();
+            // 写锁只覆盖 spawn：std 在子进程 exec 之后才返回，等待子进程结束不在锁内。
+            let child = {
+                let _spawn = crate::data_dir::SUBPROCESS_SPAWN.write();
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact","collection::partition_key::tests::crash_boundaries_recover_only_actual_wal_prefix","--nocapture"])
+                    .env(ROOT,root.path()).env(MODE,mode)
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn().unwrap()
+            };
+            let status = child.wait_with_output().unwrap();
             assert_eq!(status.status.code(), Some(88), "{mode}: {:?}", status);
             let db = self::db(root.path());
             let handle = db.collection("", "c").unwrap();
@@ -830,6 +839,7 @@ mod tests {
     fn old_snapshot_survives_bucket_write_while_close_and_new_reads_wait_for_permission() {
         use std::sync::mpsc::channel;
         use std::time::Duration;
+        let spawn_guard = crate::data_dir::SUBPROCESS_SPAWN.read();
         let root = tempfile::tempdir().unwrap();
         let db = db(root.path());
         db.create_collection("", "c", schema(true)).unwrap();
@@ -866,6 +876,7 @@ mod tests {
         drop(db);
         assert!(DataDir::open(root.path()).is_ok());
         let reopened = self::db(root.path());
+        drop(spawn_guard);
         assert_eq!(reopened.collection("", "c").unwrap().read().count(), 4);
         reopened.close();
     }
