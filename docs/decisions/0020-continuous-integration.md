@@ -1,6 +1,6 @@
 # 0020：持续集成
 
-- 状态：方案经负责人与独立复审两轮评审、负责人两轮复审通过，复审建议已采纳。工作流已实施（[ci.yml](../../.github/workflows/ci.yml)、[compare.yml](../../.github/workflows/compare.yml)），试点完成（[试点记录](../testing/0020-ci-pilot.md)）；负责人决定 `main` 必须通过 `ci-pass` 与 `compare-pass`，分支保护已启用。试点后修订（待 GitHub 实测与最终拓扑的 10 / 5 计数）：重新计数范围（「判定与流程」第 2 条）；Rust 默认与完整 FI 合并、真值核验并入互通、两条 SDK 线分为两个 job、纯文档提交跳过测试 job（公共约定 5、9，「判定与流程」第 3 条）。
+- 状态：方案经负责人与独立复审两轮评审、负责人两轮复审通过，复审建议已采纳。工作流已实施（[ci.yml](../../.github/workflows/ci.yml)、[compare.yml](../../.github/workflows/compare.yml)），试点完成（[试点记录](../testing/0020-ci-pilot.md)）；负责人决定 `main` 必须通过 `ci-pass` 与 `compare-pass`，分支保护已启用。试点后修订（`dd86a57` 上完成 10 / 5 计数，见[试点记录](../testing/0020-ci-pilot.md#试点后的拓扑调整)）：重新计数范围（「判定与流程」第 2 条）；Rust 默认与完整 FI 合并、真值核验并入互通、两条 SDK 线分为两个 job、纯文档提交跳过测试 job（公共约定 5、9，「判定与流程」第 3 条）。
 - 日期：2026-10-22。
 - 依据：[0004 跨平台](0004-m1-scope.md#跨平台)、[0013 首发候选矩阵](0013-first-release-platform-and-packaging.md#首发候选矩阵)、[0019 分片](0019-test-sharding.md)、[证据的存放与复核范围](../testing/README.md)。
 

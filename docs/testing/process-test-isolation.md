@@ -94,7 +94,7 @@ Linux 上的结果由修复提交推送后 CI 的 rust-fi job 验证；本地 30
 
 ### 发现
 
-0020 试点后的拓扑调整（提交 `a01c4cb`）验证中，临时分支 `tmp/docs-after-code` 的快速层运行 39931684921 在 `python-3.0.2 (macos-15)` 失败：`tests/python/test_server_manager.py::test_lock_held_by_other_process_returns_none` 启动的持锁子进程没有输出 `ready`，父进程 64 秒后读到空行；持锁子进程本身没有任何输出。同一运行其余 job 成功。计数随即停止，`a01c4cb` 上已有的运行不计入。
+0020 试点后的拓扑调整（提交 `a01c4cb`）验证中，临时分支 `tmp/docs-after-code`（head `6087aeb`，在 `a01c4cb` 上追加一个纯文档提交）的快速层运行 39931684921 在 `python-3.0.2 (macos-15)` 失败：`tests/python/test_server_manager.py::test_lock_held_by_other_process_returns_none` 启动的持锁子进程没有输出 `ready`，父进程 64 秒后读到空行；持锁子进程本身没有任何输出。同一运行其余 job 成功。计数随即停止，`a01c4cb` 上已有的运行不计入。
 
 用例结束时，一个刚 fork 出的进程在 3 毫秒内向捕获的 stderr 打印 333 行 grpcio 的 `FD from fork parent still in poll list`。持锁子进程不加载 grpcio，这只能来自 pytest 进程 fork 之后、exec 之前的子进程。
 
