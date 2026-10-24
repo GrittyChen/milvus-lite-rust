@@ -2,6 +2,7 @@
 # 只由 workflow_dispatch 触发；tag 与 Release 仍由负责人人工创建，本工作流没有 contents: write。
 # 临时分支：0021 失败注入 A 阶段的脚手架，不合入。attest 没有 id-token / attestations 权限，sign 与其验证步骤
 # 恒不执行，正式运行在签发前复核之后由 A 阶段闩直接失败；inject 输入只在本分支存在。
+# 第二个提交：只用于“引用的演练不是同一提交”。
 name: Release
 run-name: ${{ inputs.dry_run && 'dry-run' || 'release' }} v${{ inputs.version }}
 
