@@ -2,7 +2,7 @@
 
 - 状态：试点完成。计数数据经负责人评审通过；缓存与超时修改后确认了缓存保存与命中；分支保护由负责人设置，保护下的快进与失败推送均已实测。试点后的拓扑调整在 `dd86a57` 上完成 10 / 5 计数并快进到 `main`；其中一次停服路径段错误根因未查明，按显式风险接受处理（见「试点后的拓扑调整」）。
 - 依据：[0020](../decisions/0020-continuous-integration.md)「判定与流程」第 1、2 条与「实施与试点」第 3 条。
-- 范围：试点分支 `ci/pilot`（工作流 [ci.yml](../../.github/workflows/ci.yml) 快速层、[compare.yml](../../.github/workflows/compare.yml) 对照层）、两次使用后即删除的失败注入分支 `ci/pilot-fail`，以及受保护的 `main`，2026-10-22；试点后的拓扑调整（见「试点后的拓扑调整」）另涉及工作分支 `ci/release`、四个验证后即删除的行为测试分支（`tmp/docs-after-code`、`tmp/classifier-fail` 及其 `-2`）、段错误诊断分支 `diag/segv-a`，2026-10-23 至 2026-10-24。
+- 范围：试点分支 `ci/pilot`（工作流 [ci.yml](../../.github/workflows/ci.yml) 快速层、[compare.yml](../../.github/workflows/compare.yml) 对照层）、两次使用后即删除的失败注入分支 `ci/pilot-fail`，以及受保护的 `main`，2026-10-22；试点后的拓扑调整（见「试点后的拓扑调整」）另涉及工作分支 `ci/release`、四个验证后即删除的行为测试分支（`tmp/docs-after-code`、`tmp/classifier-fail` 及其 `-2`）、段错误诊断分支 `diag/segv-a`、纯文档验证的工作分支 `docs/ci-pilot-record` 与 PR #1，2026-10-23 至 2026-10-24（除 `ci/release` 外均已删除）。
 - 证据：按[证据的存放与复核范围](README.md)，GitHub Actions 运行日志公开、有保留期限，下文引用运行 ID 与提交号；仓库的 Actions 页面可按 ID 查看。
 
 ## 结论
@@ -150,6 +150,18 @@
 | `09653c2` | `44140dc` | 注入分类 job 失败 | 快速层 39944379736、对照层 39944379774 | 分类 job 失败，测试 job 全部 skipped，`ci-pass`、`compare-pass` 为 failure |
 | `a01c4cb` | `6087aeb` | 在基线上追加一个纯文档提交 | 快速层 39931684921、对照层 39931684738 | 分类为全量；快速层出现下面第 1 项失败，对照层成功 |
 | `a01c4cb` | `30d5480` | 注入分类 job 失败 | 快速层 39931685133、对照层 39931685113 | 与 `44140dc` 相同 |
+
+### 纯文档跳过
+
+拓扑合入 `main` 之后，以纯文档提交 `606b997`（基于 `dd86a57`，只改 `docs/` 下 4 个 Markdown 文件）验证公共约定 9 与 0021 第 2 条：
+
+| 场景 | 运行 | 结果 |
+| --- | --- | --- |
+| 工作分支 `docs/ci-pilot-record` 推送 | 快速层 40101218827、对照层 40101218890 | 分类为纯文档（`dd86a57..606b997`），测试 job 全部 skipped，`ci-pass`、`compare-pass` 为 success |
+| 纯文档 PR #1 | 快速层 40101510551、对照层 40101510552 | 以 base 与 GitHub Actions 生成的测试合并提交 `450d691`（`refs/pull/1/merge`）的 merge-base 判定，结果同上 |
+| 在该提交上触发发行工作流演练 | 40102059658 | 前置检查拒绝：继承的快速层运行不是全量（列出被跳过的 rust、python、msrv-windows）；候选结果 job 的“前序 job 全部成功”守卫失败，冻结身份、构建、测试、装配与签发等其余 job 均 skipped；产物列表为空，没有候选结果与来源证明 |
+| 手动触发快速层与对照层 | 快速层 40102174228、对照层 40102231201 | 全量运行，12 个与 11 个 job 全部 success |
+| 快进 `main`（`dd86a57` → `606b997`） | 快速层 40103497174 | 以 before..after 判定为纯文档，测试 job skipped，`ci-pass` 为 success；PR #1 随之显示为已合并，最终合并提交即 `606b997` |
 
 ### 失败与根因
 
