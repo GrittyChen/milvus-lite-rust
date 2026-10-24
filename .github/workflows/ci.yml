@@ -6,6 +6,11 @@ on:
     branches: ["**"]
   pull_request:
   workflow_dispatch:
+    # 临时分支：0021 失败注入 A 阶段的脚手架，不合入。用于在同一提交上制造一次失败的新运行。
+    inputs:
+      inject_failure:
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -41,6 +46,11 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+      - name: A 阶段注入
+        if: inputs.inject_failure
+        run: |
+          echo "A injection: failing CI run"
+          exit 1
       - id: classify
         name: 分类
         env:
