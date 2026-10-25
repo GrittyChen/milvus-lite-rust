@@ -1,4 +1,11 @@
 {
   "format": 1,
-  "versions": []
+  "versions": [
+    {
+      "version": "0.0.1rc901",
+      "run_id": 40189116947,
+      "run_attempt": 1,
+      "outcome": "signing-failed"
+    }
+  ]
 }
