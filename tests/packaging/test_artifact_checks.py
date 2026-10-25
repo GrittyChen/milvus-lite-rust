@@ -17,8 +17,8 @@ def artifacts(tmp_path):
         path = root / name
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes((repo / name).read_bytes())
-    metadata = ("Metadata-Version: 2.4\nName: milvus-lite-rust\nVersion: 0.3.0rc2\nRequires-Python: >=3.10\nLicense-Expression: Apache-2.0\nLicense-File: LICENSE\nLicense-File: crates/grpc/proto/LICENSE\nProject-URL: Repository, https://github.com/GrittyChen/milvus-lite-rust\nProject-URL: Issues, https://github.com/GrittyChen/milvus-lite-rust/issues\nDescription-Content-Type: text/markdown; charset=UTF-8\n\n" + (root / "README.md").read_text()).encode()
-    info = "milvus_lite_rust-0.3.0rc2.dist-info"
+    metadata = ("Metadata-Version: 2.4\nName: milvus-lite-rust\nVersion: 0.0.1rc903\nRequires-Python: >=3.10\nLicense-Expression: Apache-2.0\nLicense-File: LICENSE\nLicense-File: crates/grpc/proto/LICENSE\nProject-URL: Repository, https://github.com/GrittyChen/milvus-lite-rust\nProject-URL: Issues, https://github.com/GrittyChen/milvus-lite-rust/issues\nDescription-Content-Type: text/markdown; charset=UTF-8\n\n" + (root / "README.md").read_text()).encode()
+    info = "milvus_lite_rust-0.0.1rc903.dist-info"
     wheel_files = {
         info + "/METADATA": metadata,
         info + "/WHEEL": b"Wheel-Version: 1.0\nTag: cp310-abi3-macosx_11_0_arm64\n",
@@ -63,7 +63,7 @@ def test_invalid_artifact_never_passes(case, artifacts):
     elif case == "source_license":
         del s["LICENSE"]
     elif case == "version":
-        w[info + "/METADATA"] = w[info + "/METADATA"].replace(b"Version: 0.3.0rc2", b"Version: 9.0")
+        w[info + "/METADATA"] = w[info + "/METADATA"].replace(b"Version: 0.0.1rc903", b"Version: 9.0")
     elif case == "python_cap":
         w[info + "/METADATA"] = w[info + "/METADATA"].replace(b">=3.10", b">=3.10,<3.16")
     elif case == "tag":
@@ -229,16 +229,16 @@ def described(addition):
 
 @pytest.mark.parametrize("addition", [
     "```bash\npython -m pip install pymilvus milvus-lite-rust\n```",
-    "```bash\npip install milvus-lite-rust==0.3.0rc2 --find-links https://github.com/GrittyChen/milvus-lite-rust/releases/expanded_assets/v0.3.0rc2\n```",
-    '`uv pip install "milvus_lite_rust==0.3.0rc2"`',
+    "```bash\npip install milvus-lite-rust==0.0.1rc903 --find-links https://github.com/GrittyChen/milvus-lite-rust/releases/expanded_assets/v0.0.1rc903\n```",
+    '`uv pip install "milvus_lite_rust==0.0.1rc903"`',
     "```bash\npython -m pip install \\\n  Milvus.Lite.Rust\n```",
-    "```bash\npython -m pip install milvus-lite-\\\nrust==0.3.0rc2\n```",
+    "```bash\npython -m pip install milvus-lite-\\\nrust==0.0.1rc903\n```",
     "`pip3 install milvus-lite-rust[extra]>=0.1`",
-    "```bash\npip install milvus-lite-rust==0.3.0rc2 # --no-index\n```",
-    "```bash\npip install milvus-lite-rust==0.3.0rc2 && echo --no-index\n```",
+    "```bash\npip install milvus-lite-rust==0.0.1rc903 # --no-index\n```",
+    "```bash\npip install milvus-lite-rust==0.0.1rc903 && echo --no-index\n```",
     "```bash\npip install --no-index ./x.whl; pip install milvus-lite-rust\n```",
-    "```bash\npython -m pip --quiet install milvus-lite-rust==0.3.0rc2\n```",
-    "```bash\npip install \"milvus--lite__rust==0.3.0rc2\"\n```",
+    "```bash\npython -m pip --quiet install milvus-lite-rust==0.0.1rc903\n```",
+    "```bash\npip install \"milvus--lite__rust==0.0.1rc903\"\n```",
     "```bash\npip install milvus-lite-rust --prefix --no-index\n```",
     "```bash\npip install milvus\\-lite\\-rust\n```",
     "```bash\npip install \"milvus-\"\"lite-rust\"\n```",
@@ -256,7 +256,7 @@ def described(addition):
     "pip install milvus-lite-<b>rust</b>",
     "pip install milvus-lite-<!-- x -->rust",
     "安装：pip install `milvus-lite-rust`",
-    "pip install `milvus-lite-rust`==0.3.0rc2",
+    "pip install `milvus-lite-rust`==0.0.1rc903",
     "pip install ``milvus-lite-rust``",
     "pip install [milvus-lite-](https://www.apache.org/ \"a)b\")rust",
     "pip install [milvus-lite-](<https://www.apache.org/a)b>)rust",
@@ -265,10 +265,10 @@ def described(addition):
     "`printf '%s' milvus-lite- rust | tr -d ' ' | xargs pip install`",
     "`python -c \"import subprocess; subprocess.run(['pip', 'install', 'milvus-lite-' 'rust'])\"`",
     "不要用 `pip install milvus-lite-rust --no-index` 以外的写法安装",
-    "`pip install --no-index --find-links https://github.com/GrittyChen/milvus-lite-rust/releases/expanded_assets/v0.3.0rc2 milvus-lite-rust==0.3.0rc2`",
-    "`pip install ./milvus_lite_rust-0.3.0rc2-cp310-abi3-macosx_11_0_arm64.whl`",
+    "`pip install --no-index --find-links https://github.com/GrittyChen/milvus-lite-rust/releases/expanded_assets/v0.0.1rc903 milvus-lite-rust==0.0.1rc903`",
+    "`pip install ./milvus_lite_rust-0.0.1rc903-cp310-abi3-macosx_11_0_arm64.whl`",
     "python -m pip install --no-index --only-binary :all: --find-links https://github.com/GrittyChen/milvus-lite-rust/releases/expanded_assets/v0.1.0rc2 milvus-lite-rust==0.1.0rc2",
-    "python -m pip install --no-index --only-binary :all: --find-links https://github.com/GrittyChen/milvus-lite-rust/releases/expanded_assets/v0.3.0rc2 milvus-lite-rust==0.3.0rc2; pip install milvus-lite-rust",
+    "python -m pip install --no-index --only-binary :all: --find-links https://github.com/GrittyChen/milvus-lite-rust/releases/expanded_assets/v0.0.1rc903 milvus-lite-rust==0.0.1rc903; pip install milvus-lite-rust",
 ])
 def test_naming_this_package_outside_release_commands_is_rejected(addition):
     from check_artifacts import check_description
@@ -301,7 +301,7 @@ def test_only_the_confirmed_address_itself_is_removed_before_name_detection():
 
 
 @pytest.mark.parametrize("version,change,reason", [
-    ("0.3.0rc2", "missing", "missing release install command"),
+    ("0.0.1rc903", "missing", "missing release install command"),
     ("0.1.0rc2", None, "names this package outside the release commands"),
 ])
 def test_release_commands_must_match_this_version(version, change, reason):
@@ -314,7 +314,7 @@ def test_release_commands_must_match_this_version(version, change, reason):
 
 
 @pytest.mark.parametrize("addition", [
-    "`pip install https://github.com/GrittyChen/milvus-lite-rust/releases/download/v0.3.0rc2/milvus_lite_rust-0.3.0rc2-cp310-abi3-macosx_11_0_arm64.whl`",
+    "`pip install https://github.com/GrittyChen/milvus-lite-rust/releases/download/v0.0.1rc903/milvus_lite_rust-0.0.1rc903-cp310-abi3-macosx_11_0_arm64.whl`",
     "`pip install .`",
     "`pip install pymilvus`",
     "`pip uninstall milvus-lite`",
