@@ -506,16 +506,16 @@ jobs:
           path: ${{ runner.temp }}/stages
           if-no-files-found: error
           retention-days: 30
+      - name: 收集运行记录
+        if: failure()
+        run: bash .github/ci/collect_records.sh '*-plan' '*-run' '*.log' 'acc-*/*.log'
       - name: 保存运行记录
         if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: failure-tests-${{ matrix.platform.scope }}-${{ matrix.part }}
-          path: |
-            ${{ runner.temp }}/*-plan
-            ${{ runner.temp }}/*-run
-            ${{ runner.temp }}/*.log
-            ${{ runner.temp }}/acc-*/*.log
+          # 只给一个路径：容器 job 的多行 path 只有第一行会换算成容器内路径（见 collect_records.sh）。
+          path: ${{ runner.temp }}/failure-records
           if-no-files-found: ignore
           retention-days: 14
 
@@ -597,14 +597,15 @@ jobs:
           path: ${{ runner.temp }}/stages
           if-no-files-found: error
           retention-days: 30
+      - name: 收集运行记录
+        if: failure()
+        run: bash .github/ci/collect_records.sh lock strace
       - name: 保存运行记录
         if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: failure-system-${{ matrix.scope }}
-          path: |
-            ${{ runner.temp }}/lock
-            ${{ runner.temp }}/strace
+          path: ${{ runner.temp }}/failure-records
           if-no-files-found: ignore
           retention-days: 14
 
