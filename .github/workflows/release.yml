@@ -303,14 +303,14 @@ jobs:
           - scope: linux-x86_64
             os: ubuntu-24.04
             # 映射形式的 container 不接受空 image，因此整体放进矩阵值；macOS 为空字符串即不用容器。
-            container: {image: "quay.io/pypa/manylinux_2_28_x86_64@sha256:4131ddd7acb9c6c966af02fe7e71edc51e078c2d41f475966697676430bfa2ae", options: "--user 1001"}
+            container: {image: "quay.io/pypa/manylinux_2_28_x86_64@sha256:4131ddd7acb9c6c966af02fe7e71edc51e078c2d41f475966697676430bfa2ae", options: "--user 1001", volumes: ["/var/lib/systemd/coredump:/__coredump:ro"]}
             tag: manylinux_2_28_x86_64
             arch: x86_64
             shards: 4
           - scope: linux-aarch64
             os: ubuntu-24.04-arm
             # 映射形式的 container 不接受空 image，因此整体放进矩阵值；macOS 为空字符串即不用容器。
-            container: {image: "quay.io/pypa/manylinux_2_28_aarch64@sha256:abd1230aa9e4058a74b89d27cd14ba18c0db036d7bfe6e6f219a29ea63c24eb6", options: "--user 1001"}
+            container: {image: "quay.io/pypa/manylinux_2_28_aarch64@sha256:abd1230aa9e4058a74b89d27cd14ba18c0db036d7bfe6e6f219a29ea63c24eb6", options: "--user 1001", volumes: ["/var/lib/systemd/coredump:/__coredump:ro"]}
             tag: manylinux_2_28_aarch64
             arch: aarch64
             shards: 4
@@ -333,6 +333,8 @@ jobs:
       SCOPE: ${{ matrix.platform.scope }}
       RUNNER_IMAGE: ${{ matrix.platform.container && format('{0} container {1}', matrix.platform.os, matrix.platform.container.image) || '' }}
       MACOSX_DEPLOYMENT_TARGET: "11.0"
+      # 容器内的崩溃由宿主机的 systemd-coredump 接收，其目录只读挂入容器（见 crash_capture.sh）；macOS 不设。
+      CRASH_CORE_DIR: ${{ matrix.platform.container && '/__coredump' || '' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -384,6 +386,7 @@ jobs:
       - name: 归档、二进制与 Rust
         if: matrix.part == 'static'
         run: |
+          . .github/ci/crash_capture.sh
           record() { "$DEV_PY" tests/release/stage.py --dir "$STAGES" --scope "$SCOPE" "$@"; }
           "$DEV_PY" tests/packaging/check_artifacts.py --version "$VERSION" --wheel "$WHEEL" --sdist "$SDIST" --repo . --kind formal --binary
           record --stage artifacts-formal
@@ -398,6 +401,7 @@ jobs:
       - name: 端到端全套与联合冒烟
         if: matrix.part == 'python'
         run: |
+          . .github/ci/crash_capture.sh
           record() { "$DEV_PY" tests/release/stage.py --dir "$STAGES" --scope "$SCOPE" "$@"; }
           expect=$("$DEV_PY" tests/release/scorecard.py expect "$SCOPE" python-3.10-3.0.2 collected)
           req=.github/ci/requirements
@@ -437,6 +441,7 @@ jobs:
           MILVUS_LITE_ARROW25_PYTHON: ${{ runner.temp }}/ref25/bin/python
           MILVUS_LITE_ARROW15_PYTHON: ${{ runner.temp }}/ref15/bin/python
         run: |
+          . .github/ci/crash_capture.sh
           record() { "$DEV_PY" tests/release/stage.py --dir "$STAGES" --scope "$SCOPE" "$@"; }
           head=$(git -C references/milvus-lite rev-parse HEAD); test "$head" = "$REFERENCE_COMMIT"
           req=.github/ci/requirements
@@ -485,6 +490,7 @@ jobs:
       - name: FI wheel 恢复专项
         if: matrix.part == 'fi'
         run: |
+          . .github/ci/crash_capture.sh
           record() { "$DEV_PY" tests/release/stage.py --dir "$STAGES" --scope "$SCOPE" "$@"; }
           req=.github/ci/requirements
           mkdir "$RUNNER_TEMP/outside"
@@ -518,6 +524,12 @@ jobs:
           path: ${{ runner.temp }}/failure-records
           if-no-files-found: ignore
           retention-days: 14
+      - name: 崩溃现场
+        if: failure()
+        timeout-minutes: 10
+        run: |
+          # 只用于诊断（0020 公共约定 10）：环境步骤之前失败时没有测试步骤运行过，也没有 PY314。
+          if [ -n "${PY314:-}" ]; then "$PY314" .github/ci/crash_report.py; else echo "no test step ran"; fi
 
   linux-system:
     # LOCK 与 strace（第 9 条）：strace 需要容器的 ptrace 权限。
@@ -540,10 +552,13 @@ jobs:
     container:
       image: ${{ matrix.container }}
       options: --cap-add SYS_PTRACE
+      volumes:
+        - /var/lib/systemd/coredump:/__coredump:ro
     timeout-minutes: 60
     env:
       SCOPE: ${{ matrix.scope }}
       RUNNER_IMAGE: ${{ format('{0} container {1}', matrix.os, matrix.container) }}
+      CRASH_CORE_DIR: /__coredump
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -570,6 +585,7 @@ jobs:
           bash .github/ci/release_env.sh rust
       - name: LOCK 与 strace
         run: |
+          . .github/ci/crash_capture.sh
           record() { "$DEV_PY" tests/release/stage.py --dir "$RUNNER_TEMP/stages" --scope "$SCOPE" "$@"; }
           "$DEV_PY" tests/release/sums.py check "$RUNNER_TEMP/artifacts/formal.sha256" "$RUNNER_TEMP/artifacts/formal"
           req=.github/ci/requirements
@@ -608,6 +624,12 @@ jobs:
           path: ${{ runner.temp }}/failure-records
           if-no-files-found: ignore
           retention-days: 14
+      - name: 崩溃现场
+        if: failure()
+        timeout-minutes: 10
+        run: |
+          # 只用于诊断（0020 公共约定 10）：环境步骤之前失败时没有测试步骤运行过，也没有 PY314。
+          if [ -n "${PY314:-}" ]; then "$PY314" .github/ci/crash_report.py; else echo "no test step ran"; fi
 
   pid1:
     # job 名称是前置检查核对演练时的固定键（tests/release/runs.py 的 PID1_JOBS），不能改。
@@ -692,9 +714,12 @@ jobs:
     container:
       image: quay.io/pypa/manylinux_2_28_x86_64@sha256:4131ddd7acb9c6c966af02fe7e71edc51e078c2d41f475966697676430bfa2ae
       options: --user 1001
+      volumes:
+        - /var/lib/systemd/coredump:/__coredump:ro
     timeout-minutes: 60
     env:
       RUNNER_IMAGE: ubuntu-24.04 container quay.io/pypa/manylinux_2_28_x86_64@sha256:4131ddd7acb9c6c966af02fe7e71edc51e078c2d41f475966697676430bfa2ae
+      CRASH_CORE_DIR: /__coredump
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -712,6 +737,7 @@ jobs:
         run: bash .github/ci/release_env.sh rust
       - name: sdist 构建、安装与拒绝边界
         run: |
+          . .github/ci/crash_capture.sh
           rustup toolchain install 1.89.0 --profile minimal
           rustup target add --toolchain "$RUSTUP_TOOLCHAIN" x86_64-pc-windows-msvc
           "$DEV_PY" tests/release/sums.py check "$RUNNER_TEMP/artifacts/formal.sha256" "$RUNNER_TEMP/artifacts/formal"
@@ -726,6 +752,12 @@ jobs:
           path: ${{ runner.temp }}/stages
           if-no-files-found: error
           retention-days: 30
+      - name: 崩溃现场
+        if: failure()
+        timeout-minutes: 10
+        run: |
+          # 只用于诊断（0020 公共约定 10）：环境步骤之前失败时没有测试步骤运行过，也没有 PY314。
+          if [ -n "${PY314:-}" ]; then "$PY314" .github/ci/crash_report.py; else echo "no test step ran"; fi
 
   previous-reader:
     needs: assemble
@@ -733,9 +765,12 @@ jobs:
     container:
       image: quay.io/pypa/manylinux_2_28_x86_64@sha256:4131ddd7acb9c6c966af02fe7e71edc51e078c2d41f475966697676430bfa2ae
       options: --user 1001
+      volumes:
+        - /var/lib/systemd/coredump:/__coredump:ro
     timeout-minutes: 30
     env:
       RUNNER_IMAGE: ubuntu-24.04 container quay.io/pypa/manylinux_2_28_x86_64@sha256:4131ddd7acb9c6c966af02fe7e71edc51e078c2d41f475966697676430bfa2ae
+      CRASH_CORE_DIR: /__coredump
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -749,6 +784,7 @@ jobs:
         run: bash .github/ci/release_env.sh
       - name: 上一版本读取新目录
         run: |
+          . .github/ci/crash_capture.sh
           "$DEV_PY" tests/release/sums.py check "$RUNNER_TEMP/artifacts/formal.sha256" "$RUNNER_TEMP/artifacts/formal"
           req=.github/ci/requirements
           curl -sSfL --retry 3 -o "$RUNNER_TEMP/$PREVIOUS_WHEEL" \
@@ -774,6 +810,12 @@ jobs:
           path: ${{ runner.temp }}/stages
           if-no-files-found: error
           retention-days: 30
+      - name: 崩溃现场
+        if: failure()
+        timeout-minutes: 10
+        run: |
+          # 只用于诊断（0020 公共约定 10）：环境步骤之前失败时没有测试步骤运行过，也没有 PY314。
+          if [ -n "${PY314:-}" ]; then "$PY314" .github/ci/crash_report.py; else echo "no test step ran"; fi
 
   candidate:
     # 只接受全部前序 job 为 success；随后生成候选结果与最终 SHA256SUMS（0021 第 12 条）。

@@ -2,6 +2,8 @@
 
 段错误一类的崩溃概率很低时，事后无法复现；不在第一次发生时留下原生调用栈，就只能靠扩大重复去撞。
 Linux：对 $RUNNER_TEMP/cores 中的 core 临时安装 gdb，先完整打印收到信号的线程，再按线程限额打印其余线程。
+Linux 容器 job（设置 CRASH_CORE_DIR）：从挂入的宿主机 systemd-coredump 目录取本 job 内产生的 core，解压后用镜像自带的
+gdb 同样打印；解压 zstd 需要 Python 3.14 的 compression.zstd。
 macOS：从本 job 内产生的 ReportCrash 诊断报告（.ips）中提取异常、触发线程与其余线程的调用帧。
 """
 
@@ -9,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -55,6 +58,44 @@ def linux(temp):
         return
     # 以 root 运行或降权的进程写出的 core 归 root 所有且只有属主可读。
     run(["sudo", "chmod", "a+r", *map(str, cores)], 60)
+    analyse(cores)
+
+
+def container(temp, folder):
+    marker = temp / "crash-marker"
+    if not marker.exists():
+        print("no crash marker: no test step ran")
+        return
+    since = marker.stat().st_mtime
+    found = sorted((p for p in folder.iterdir() if p.is_file() and p.stat().st_mtime >= since), key=lambda p: p.stat().st_mtime)
+    print(f"{len(found)} core file(s) in {folder} since the marker: " + ", ".join(f"{p.name} ({p.stat().st_size} bytes)" for p in found))
+    if not found:
+        return
+    if shutil.which("gdb") is None:
+        print("gdb is not available in this image")
+        return
+    out = temp / "cores-extracted"
+    out.mkdir(exist_ok=True)
+    cores = []
+    for path in found[:MAX_REPORTS]:
+        if path.suffix != ".zst":
+            cores.append(path)
+            continue
+        try:
+            from compression import zstd
+        except ImportError:
+            print(f"cannot decompress {path.name}: needs Python 3.14 (compression.zstd)")
+            return
+        target = out / path.stem
+        with zstd.open(path, "rb") as source, target.open("wb") as sink:
+            shutil.copyfileobj(source, sink)
+        cores.append(target)
+    analyse(cores)
+    if len(found) > MAX_REPORTS:
+        print(f"{len(found) - MAX_REPORTS} later core file(s) not analysed")
+
+
+def analyse(cores):
     # setup-python 的 LD_LIBRARY_PATH 会让 gdb 自身的 Python 加载错误的 libpython。
     env = {k: v for k, v in os.environ.items() if k != "LD_LIBRARY_PATH"}
     for core in cores[:MAX_REPORTS]:
@@ -137,7 +178,12 @@ def main():
     sys.stdout.reconfigure(line_buffering=True)
     temp = Path(os.environ.get("RUNNER_TEMP", "."))
     try:
-        linux(temp) if sys.platform.startswith("linux") else macos(temp)
+        if os.environ.get("CRASH_CORE_DIR"):
+            container(temp, Path(os.environ["CRASH_CORE_DIR"]))
+        elif sys.platform.startswith("linux"):
+            linux(temp)
+        else:
+            macos(temp)
     except Exception as error:  # noqa: BLE001 诊断失败不能改变 job 结论，也不能吞掉：打印后照常结束。
         print(f"crash report failed: {error!r}")
     return 0

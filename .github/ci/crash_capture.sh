@@ -4,7 +4,13 @@
 # 读取。从 root 降权的子进程即使 fs.suid_dumpable 为 2（托管镜像的默认值）也不写出 core，实测如此，不在覆盖范围内。
 # macOS：系统的 ReportCrash 自动写带原生调用栈的诊断报告，不开 core（macOS 的 core 动辄数 GB）；只留一个时间标记，
 # 报告时只取本 job 内产生的诊断报告。
-if [ "$RUNNER_OS" = Linux ]; then
+# Linux 容器 job（工作流设置 CRASH_CORE_DIR）：core_pattern 属于宿主机内核，在容器内只读；托管机器默认交给宿主机的
+# systemd-coredump，按崩溃进程的 uid 加读取 ACL 并以 zstd 压缩存放。工作流把宿主机的 /var/lib/systemd/coredump 只读
+# 挂到 CRASH_CORE_DIR，这里同样只留时间标记，报告时只取本 job 内产生的 core。
+if [ -n "${CRASH_CORE_DIR:-}" ]; then
+  [ -e "$RUNNER_TEMP/crash-marker" ] || touch "$RUNNER_TEMP/crash-marker"
+  ulimit -c unlimited
+elif [ "$RUNNER_OS" = Linux ]; then
   mkdir -p "$RUNNER_TEMP/cores"
   chmod 1777 "$RUNNER_TEMP/cores"
   pattern="$RUNNER_TEMP/cores/core.%e.%p"
