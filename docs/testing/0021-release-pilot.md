@@ -1,8 +1,8 @@
 # 0021 发行工作流试点
 
-- 状态：合入前计数与第一次演练完成；0021「实施与试点」第 3 条的失败注入尚未执行，七主体正式签发留到首个真实候选（见「尚未执行」）。
+- 状态：合入前计数与第一次演练完成；0021「实施与试点」第 3 条中不签发正式证明的失败注入（A 阶段）已执行，发现的两个问题之一（容器 job 失败记录从未上传）已修复并补齐容器 job 的崩溃现场采集；涉及正式签发的注入（B 阶段）、公开下载工作流（C 阶段）与七主体正式签发尚未执行（见「尚未执行」）。
 - 依据：[0021](../decisions/0021-release-build-in-ci.md)「实施与试点」第 2–4 条；合入计数按当时的 [0020](../decisions/0020-continuous-integration.md)「判定与流程」第 2 条。
-- 范围：工作分支 `ci/pilot`、`test/lib-fork-lock-guard`、`ci/release` 与受保护的 `main`，发行工作流 [release.yml](../../.github/workflows/release.yml)，2026-10-22 至 2026-10-23。
+- 范围：工作分支 `ci/pilot`、`test/lib-fork-lock-guard`、`ci/release` 与受保护的 `main`，发行工作流 [release.yml](../../.github/workflows/release.yml)，2026-10-22 至 2026-10-23；A 阶段失败注入的临时分支 `test/fi-a`、`test/fi-a-sha2`，容器诊断的诊断分支 `diag/container-core`、工作分支 `ci/container-diagnostics` 与验证分支 `verify/container-diag`，2026-10-24 至 2026-10-25（除工作分支外均在使用后删除）。
 - 证据：按[证据的存放与复核范围](README.md)，GitHub Actions 运行日志公开、有保留期限，下文引用运行 ID 与提交号；工作流产物需要仓库访问权限，保留至 2026-11-22；演练的来源证明在公开透明日志中。
 
 ## 结论
@@ -95,10 +95,87 @@
 - 容器 job 的环境只能记录托管机器标签与容器镜像摘要，看不到宿主镜像版本；PID 1 job 不在容器内，记录了完整的宿主镜像版本。与 0021 第 12 条的预期一致。
 - 演练总时长主要取决于 macOS 差分与互通及 macOS 并发排队。
 
+## 失败注入 A 阶段（不签发正式证明）
+
+按 0021「实施与试点」第 3 条，在临时分支上执行不涉及正式签发的注入。每项都须使工作流失败，且不产生可被误认为候选通过的候选结果。
+
+### 条件
+
+- **测试版本**：`0.0.1rc909`（Cargo `0.0.1-rc.909`），属于负责人保留的发行流程测试号段 `0.0.1rc901`–`0.0.1rc909`，只用于 GitHub 发行流程测试，不上传任何包索引。A 阶段全部运行使用该版本，从不签发，结束后仍未消费，作为 A 阶段的哨兵不再复用。
+- **提交**：`test/fi-a` 上的 `e624323`（下称 B0，基于 `main` 的 `72fd39f`）把版本、安装命令与打包检查改为测试版本，README 标明发行流程测试、请勿安装；`test/fi-a-sha2` 上的 `c55c22e`（下称 B2）在 B0 上只加一行注释，只用于“引用的演练不是同一提交”。两者都不合入。
+- **分支内的签发闩**：attest job 去掉 `id-token: write` 与 `attestations: write`；sign 与“验证签发结果”两个步骤的条件恒为假，从不执行，因此不会被前置检查算作签发已开始；正式运行在签发前复核之后由一个闩步骤直接失败；演练运行的 attest 成功结束但不签发任何文件。
+- **注入入口**：发行工作流增加一个只在本分支存在的 `inject` 输入，每个取值只在 `linux-x86_64` 上触发一种注入；CI 增加只在本分支存在的 `inject_failure` 输入，用于在同一提交上制造一次失败的新运行。
+- **每次运行后的断言**：`main` 仍为 `72fd39f`，台账未变；没有 `v0.0.1rc909` 的 tag 或 Release；每个 attempt 的签发步骤都没有开始；没有正式候选结果产物；运行产出的全部 wheel、sdist、候选结果与 `SHA256SUMS` 在证明接口上都返回 404。断言先在第一次演练 39907086903 上做阳性对照，正确检出其签发步骤与两个演练主体的证明。
+- B0 与 B2 推送触发的快速层（40107397122、40107397329）与对照层（40107397114、40107397322）全部成功。
+
+### 结果
+
+全部注入都使工作流失败；候选结果 job 的“前序 job 全部成功”守卫失败，attest 跳过（复核一项除外，见表），断言全部通过。
+
+| 层 | 场景 | 运行 | 拦截位置与信息 |
+| --- | --- | --- | --- |
+| 前置 | 从非冻结提交触发（B2 分支、输入 B0） | 40109447943 | “提交身份”步骤 |
+| 前置 | 版本已存在（`0.3.0rc2`） | 40109461852 | `version already consumed: tag v0.3.0rc2 exists` |
+| 前置 | 正式运行未引用演练 | 40109604512 | `a release run must reference a dry run of the same commit that included PID 1` |
+| 前置 | 引用的不是演练（引用 40109604512） | 40109686137 | `run 40109604512 is not a dry run of 0.0.1rc909` |
+| 前置 | 同一提交的新快速层运行进行中（40109795804，随后成功） | 40109809204 | `latest … run 40109795804 attempt 1 is in_progress/None` |
+| 前置 | 同一提交的新快速层运行失败（40110481614，`inject_failure`） | 40110547726 | `latest … run 40110481614 attempt 1 is completed/failure`；之后手动全量快速层 40110647027 成功，恢复可继承状态 |
+| 签发前复核 | 演练前置检查之后对同一提交新开快速层（40117662412） | 40117626588 | 其余 33 个 job 全部成功；attest 的签发前复核拒绝：同一提交的快速层运行集合多出 40117662412；sign 跳过 |
+| 前置 | 引用失败的演练（40117626588） | 40122919119 | `dry run 40117626588 attempt 1 is completed/failure` |
+| 前置 | 引用其他提交的演练（B2 引用 B0 上的 40111344765） | 40122978131 | `dry run 40111344765 is for e624323…, not c55c22e…` |
+| 构建 | 构建失败 | 40123088263 | build (linux-x86_64) 的“构建”步骤 |
+| 构建 | 未跟踪的构建输入 | 40123831091 | `untracked build input crates/core/src/injected_untracked.rs` |
+| 装配 | 正式 wheel 缺失 | 40124927840 | `formal set differs`，列表缺 x86_64 Linux wheel |
+| 装配 | 正式集合多出文件 | 40125885515 | `formal set differs`，列表多出 cp311 wheel |
+| 装配 | 构建记录之后修改正式 wheel | 40126580385 | `build-linux-x86_64/formal/…x86_64.whl does not match its build record` |
+| 验收 | FI wheel 混入正式集合（覆盖同名正式 wheel） | 40127752551 | 装配按文件名核对无法区分（FI wheel 与正式 wheel 同名）；tests (linux-x86_64, static) 与 (python) 的发行物检查均报 `formal/FI artifact mismatch` |
+| 验收 | 差分环境装入同名的其他构建（FI wheel） | 40133677393 | tests (linux-x86_64, compare)：`environment loads native module 0c21…, wheel contains 3d6e…` |
+| 验收 | 正式模式下测试失败（期望计数加 1） | 40138739844 | tests (linux-x86_64, python) 在分片计划的收集数核对处失败（`--expect 474`）；失败记录因下文第 2 项缺陷未上传，本地以同一命令复现为 `收集数量 473 与预期 474 不符` |
+
+- **作为引用的演练**：B0 上的演练 40111344765 全部 33 个 job 成功（81.5 分钟），两个 PID 1 job 成功；签发前复核通过，sign 跳过，25 个产物摘要均无证明。构建、装配与验收层的正式运行都引用它。
+- **未消费核实**：以 [runs.py](../../tests/release/runs.py) 的 `consumed_versions` 检查全部 15 次标题为 `release v0.0.1rc909` 的运行的每个 attempt，结论为未消费。
+- **只由自检覆盖**：台账格式错误或同一版本重复（台账按 `main` 读取，临时分支无法注入）；结论为成功却缺少成功 PID 1 job 的演练（现有工作流中成功的演练必然包含成功的 PID 1 job，只能来自改过的工作流），自检覆盖只有一个、没有与其中一个失败三种情形。纯文档运行被拒已由 40102059658 实测（见 [0020 试点记录](0020-ci-pilot.md#纯文档跳过)）。
+
+### 发现
+
+1. **jobs 接口的步骤数据滞后**：演练 40111344765 的 attest 于 17:45:07 完成，17:50 查询时步骤列表为空，17:52 只有两个步骤且其中一个仍显示进行中，约 17:57 才完整（sign 为 `completed/skipped`）；演练 40117626588 的 attest 完成后 16 秒内步骤数据即完整，运行中未执行的步骤状态为 `pending`。前置检查的签发判据遇到已分配执行机而步骤为空或不全，以及状态为 `pending` 的 sign，都按已开始处理，误判只会偏向拒绝：紧接在一次正式运行之后的同版本前置检查可能把未签发的版本判为已消费，数据补全后恢复；未观察到放行方向的误判。B 阶段在步骤数据补全后再触发依赖该判据的运行。
+2. **Linux 容器 job 的失败记录从未上传**：tests 与 linux-system 的“保存运行记录”使用多行 `path`，在容器 job 中只有第一行被换算成容器内路径（`/__w/_temp/…`），其余行仍是宿主机路径，结果为 `No files were found … No artifacts will be uploaded`；`if-no-files-found: ignore` 使该步骤显示成功。0021 第 21 条“只在失败时上传的诊断记录保留 14 天”在 Linux 容器 job 上因此不成立。修复见下一节。
+
+## 容器诊断修复
+
+### 提交
+
+- `f66bd15`：失败时由 [collect_records.sh](../../.github/ci/collect_records.sh) 把运行记录按相对路径复制到 `$RUNNER_TEMP/failure-records`，上传只给这一个路径；全部工作流中容器 job 的 artifact 步骤只有上述两处多行路径。[test_workflow_paths.py](../../tests/ci/test_workflow_paths.py) 检查容器 job 的 artifact 步骤只用单行路径，在改动前的 `release.yml` 上检出这两处。
+- `b880fdd`：发行工作流中运行产品或测试代码的容器 job（tests、linux-system、sdist、上一版本读取）接入崩溃现场采集，做法与边界见 [0020](../decisions/0020-continuous-integration.md) 公共约定 10；容器分支的自检 3 项。两个提交使工具自检由 43 项变为 48 项，按负责人确定的范围在 `b880fdd` 上计数（见 [0020 试点记录](0020-ci-pilot.md#发行工作流容器诊断修复的计数)）。
+
+### 托管机器的事实
+
+只用于诊断的工作流（运行 40166358454、40166490001）在 `ubuntu-24.04` 与 `ubuntu-24.04-arm` 上，分别以宿主机、固定 manylinux_2_28 镜像中的 UID 1001 与 root 执行：
+
+- 宿主机 `kernel.core_pattern` 为 `|/usr/lib/systemd/systemd-coredump …`，`systemd-coredump.socket` 为 active；容器内该文件只读，core 大小限制已为 unlimited；镜像自带 gdb 8.2（`8.2-20.1.el8_10`），镜像中没有 `zstd` 命令，CPython 3.14 的 `compression.zstd` 可用。
+- 把宿主机 `/var/lib/systemd/coredump` 只读挂入容器后，四种组合中 `ctypes.string_at(0)` 的 SIGSEGV 与 `os.abort()` 的 SIGABRT 各在约 1 秒内留下一个 `.zst` core；UID 1001 的 core 带 `user:1001:r--` ACL，可直接读取；core 中记录的是容器内路径，解压后 gdb 打出 `strlen`（或 `__strlen_evex`）与 `raise` → `abort` 的原生栈。
+
+### 定向验证
+
+验证分支 `verify/container-diag` 的 `a7a6e60` 在 `b880fdd` 上增加不合入的脚手架：A 阶段相同的签发闩（演练不签发任何文件），以及 `inject=crash` 输入：在 4 个平台 tests 的 python 部分完成第一组验收后、linux-system 完成 LOCK 检查后、sdist 与上一版本读取的测试步骤中，让进程先 SIGSEGV 再 SIGABRT（tests、linux-system 与上一版本读取在已加载 `milvus_lite._native` 的 SDK 解释器中执行），随后使该步骤失败。版本保持 `0.3.0rc2`，演练模式。该提交推送触发的快速层 40167058332 与对照层 40167058348 全部成功。
+
+| 项 | 运行 | 结果 |
+| --- | --- | --- |
+| 干净演练 | 40168269949 | 33 个 job 全部成功（81.6 分钟），新增的采集与报告步骤不改变结论；没有失败记录产物；25 个产物摘要均无证明，sign 跳过，只有未签名的演练候选结果 |
+| 注入演练 | 40173299185 | 失败的正是 8 个注入 job，失败步骤均为原测试步骤，“崩溃现场”步骤本身成功、不改变 job 结论；其余 23 个 job 成功；候选结果 job 失败，attest 跳过；18 个产物摘要均无证明，没有候选结果产物 |
+
+注入演练逐项：
+
+- **失败记录**：产生 6 个 artifact。tests python 的 4 个平台各含 `acc-3.10-2.6.17/` 下 8 个非空日志（每个 artifact 合计 2.2–2.7 KB）；linux-system 两个架构各含 `lock/` 下 4 个文件，均为 0 字节（LOCK 文件本身为空、锁检查成功时 stderr 为空，strace 目录在注入时尚未生成），证明上传链路有效，但不提供日志内容。
+- **Linux 容器的原生栈**：tests python（x86_64、arm64，UID 1001）、linux-system（x86_64、arm64，root）、sdist（UID 1001）与上一版本读取（UID 1001）各取得 2 个 core，SIGSEGV 与 SIGABRT 都由 gdb 打出收到信号线程的原生栈（`__strlen_evex` / `strlen` → `_ctypes` → `ffi_call`；`raise` → `abort`）。tests 的 SDK 解释器是指向 `/opt/python` 的软链，gdb 提示 `core file may not match specified executable file`，栈仍可读。
+- **macOS**：两个平台走系统崩溃报告路径，不受 `CRASH_CORE_DIR` 影响。macos-15 读到 SIGSEGV 与 SIGABRT 两份报告；macos-15-intel 只读到 SIGSEGV 一份：报告步骤在当时已有的报告都可解析时即结束等待，第二份报告之后才写出。这是 `dd86a57` 的 macOS 等待条件本来的局限，快速层与对照层相同，本次未修改。
+- **未覆盖**：PID 1 job 的进程运行在探针另起的容器中，core 交给宿主机，但宿主机上没有对应镜像的文件；只编译、不运行产品的 build 与 orjson job 不接入。
+
 ## 尚未执行
 
-- **失败注入**：0021「实施与试点」第 3 条的各项注入与反证尚未在临时分支上执行。本次只完成了上面两项发布准备工具的拒绝；涉及正式签发的注入会真实消费版本，须先选定专用的未发布测试版本号并登记台账。
-- **七主体正式签发**：按 0021「实施与试点」第 2 条，只在首个真实候选时执行，届时以发布准备工具与公开下载检查核实。
+- **涉及正式签发的失败注入（B 阶段）**：用测试版本 `0.0.1rc901` 依次验证签发开始后失败即消费版本、较早 attempt 已开始签发、同版本的其他运行被拒与台账登记后被拒，`0.0.1rc902` 留空；正式签发逐次经负责人授权。反证中的公开下载检查随 C 阶段执行。
+- **七主体正式签发**：负责人决定以测试版本 `0.0.1rc903` 在修复后的工作流上执行一次，作为公开下载工作流的输入，经逐次授权；此后发行工作流冻结，再有问题换用新的测试版本。
 - **公开下载工作流**：核对逻辑已在 [release_set.py](../../tests/release/release_set.py) 中实现，手动触发的工作流文件尚未建立。
+- **macOS 多份崩溃报告的等待**：[crash_report.py](../../.github/ci/crash_report.py) 在当时已有的报告都可解析时即结束等待，之后才写出的报告会被漏掉（`dd86a57` 引入，快速层、对照层与发行工作流相同；注入演练 40173299185 的 macos-15-intel 只读到两次崩溃中的第一份）。不改变 job 结论，单次崩溃仍能取得第一份报告的原生栈。须修复等待逻辑，并以连续两次崩溃验证两份报告都不丢；最迟在首个真实正式候选前关闭。
 - **停服路径段错误**：`09653c2` 对照层计数中出现一次停服路径 SIGSEGV，根因未查明，已按显式风险接受处理（见 [0020 试点记录](0020-ci-pilot.md#失败与根因-1)）；首个正式候选前须取得根因与修复，或再次明确做发布级风险接受。
 - **最终采纳**：0021「实施与试点」第 4 条要求修订的 0013、证据说明、AGENTS 索引与常用命令，以及 README 与发行说明的支持矩阵，都尚未修改；在此之前，0013 的现行流程仍然有效。下一个正式候选须使用新版本号，并引用同一冻结提交上一次包含 PID 1 的成功演练。
