@@ -2,7 +2,7 @@
 
 - 状态：合入前计数与第一次演练完成；0021「实施与试点」第 3 条中不签发正式证明的失败注入（A 阶段）已执行，发现的两个问题之一（容器 job 失败记录从未上传）已修复并补齐容器 job 的崩溃现场采集；涉及正式签发的注入（B 阶段）以测试版本 `0.0.1rc901` 完成，并发现整体重跑会删除已签发 attempt 的产物，据此在 0021 第 20 条补充签发后产物保全的操作禁令；七主体正式签发与公开下载核验（C 阶段）以测试版本 `0.0.1rc903` 与拒绝测试版本 `0.0.1rc902` 完成，新建的公开下载核验工作流正向、负向各运行一次；最终采纳与首个真实候选前的事项见「尚未执行」。
 - 依据：[0021](../decisions/0021-release-build-in-ci.md)「实施与试点」第 2–4 条；合入计数按当时的 [0020](../decisions/0020-continuous-integration.md)「判定与流程」第 2 条。
-- 范围：工作分支 `ci/pilot`、`test/lib-fork-lock-guard`、`ci/release` 与受保护的 `main`，发行工作流 [release.yml](../../.github/workflows/release.yml)，2026-10-22 至 2026-10-23；A 阶段失败注入的临时分支 `test/fi-a`、`test/fi-a-sha2`，容器诊断的诊断分支 `diag/container-core`、工作分支 `ci/container-diagnostics` 与验证分支 `verify/container-diag`，2026-10-24 至 2026-10-25（除工作分支外均在使用后删除）；B 阶段的临时分支 `test/fi-b1` 与台账分支 `ledger/rc901`，2026-10-25；C 阶段的临时分支 `test/fi-b3`（保留至记录合入后单独删除）、台账分支 `ledger/rc903` 与工作分支 `ci/public-check`，公开检查工作流 [public-check.yml](../../.github/workflows/public-check.yml)，两个公开测试 Release，2026-10-25 至 2026-10-26。
+- 范围：工作分支 `ci/pilot`、`test/lib-fork-lock-guard`、`ci/release` 与受保护的 `main`，发行工作流 [release.yml](../../.github/workflows/release.yml)，2026-10-22 至 2026-10-23；A 阶段失败注入的临时分支 `test/fi-a`、`test/fi-a-sha2`，容器诊断的诊断分支 `diag/container-core`、工作分支 `ci/container-diagnostics` 与验证分支 `verify/container-diag`，2026-10-24 至 2026-10-25（除工作分支外均在使用后删除）；B 阶段的临时分支 `test/fi-b1` 与台账分支 `ledger/rc901`，2026-10-25；C 阶段的临时分支 `test/fi-b3`（记录合入后已删除，删除前生成的 git bundle 已完成恢复验证）、台账分支 `ledger/rc903` 与工作分支 `ci/public-check`，公开检查工作流 [public-check.yml](../../.github/workflows/public-check.yml)，两个公开测试 Release，2026-10-25 至 2026-10-26。
 - 证据：按[证据的存放与复核范围](README.md)，GitHub Actions 运行日志公开、有保留期限，下文引用运行 ID 与提交号；工作流产物需要仓库访问权限，各运行的产物自创建起保留 30 天（例如第一次演练 39907086903 的产物保留至 2026-11-22），rc901 正式运行 40189116947 attempt 1 的产物（原显示保留至 2026-11-24）已因整体重跑删除；rc903 正式运行 40215032490 的产物保留至 2026-11-24；演练的来源证明与 rc901、rc903 的透明日志记录都在公开透明日志中；两个公开测试 Release 是公开且不可变的产物。
 
 ## 结论
@@ -169,7 +169,7 @@
 
 - **失败记录**：产生 6 个 artifact。tests python 的 4 个平台各含 `acc-3.10-2.6.17/` 下 8 个非空日志（每个 artifact 合计 2.2–2.7 KB）；linux-system 两个架构各含 `lock/` 下 4 个文件，均为 0 字节（LOCK 文件本身为空、锁检查成功时 stderr 为空，strace 目录在注入时尚未生成），证明上传链路有效，但不提供日志内容。
 - **Linux 容器的原生栈**：tests python（x86_64、arm64，UID 1001）、linux-system（x86_64、arm64，root）、sdist（UID 1001）与上一版本读取（UID 1001）各取得 2 个 core，SIGSEGV 与 SIGABRT 都由 gdb 打出收到信号线程的原生栈（`__strlen_evex` / `strlen` → `_ctypes` → `ffi_call`；`raise` → `abort`）。tests 的 SDK 解释器是指向 `/opt/python` 的软链，gdb 提示 `core file may not match specified executable file`，栈仍可读。
-- **macOS**：两个平台走系统崩溃报告路径，不受 `CRASH_CORE_DIR` 影响。macos-15 读到 SIGSEGV 与 SIGABRT 两份报告；macos-15-intel 只读到 SIGSEGV 一份：报告步骤在当时已有的报告都可解析时即结束等待，第二份报告之后才写出。这是 `dd86a57` 的 macOS 等待条件本来的局限，快速层与对照层相同，本次未修改。
+- **macOS**：两个平台走系统崩溃报告路径，不受 `CRASH_CORE_DIR` 影响。macos-15 读到 SIGSEGV 与 SIGABRT 两份报告；macos-15-intel 只读到 SIGSEGV 一份：报告步骤在当时已有的报告都可解析时即结束等待，第二份报告之后才写出。这是 `dd86a57` 的 macOS 等待条件本来的局限，快速层与对照层相同，本次未修改；之后由 `c8349e0` 修复：报告全部可解析且 20 秒内没有新增或改写才读取，最长等 90 秒，没有报告时等满上限；`tests/ci` 新增 8 项自检，本机 macOS 上连续两次真实崩溃在 22 秒内收齐两份报告，两份诊断报告由负责人本地留存。托管机器上没有再做两次崩溃的注入。
 - **未覆盖**：PID 1 job 的进程运行在探针另起的容器中，core 交给宿主机，但宿主机上没有对应镜像的文件；只编译、不运行产品的 build 与 orjson job 不接入。
 
 ## 失败注入 B 阶段（签发开始即消费）
@@ -271,9 +271,7 @@
 
 ## 尚未执行
 
-- **签发后产物保全的技术兜底**：自动保存到独立不可变存储一类的方案，公开下载工作流试点已完成，可以单独设计，不以增加 `contents: write` 或提前公开未验收的候选为代价；须消除当前人工流程无法保证下载先于签发的缺口（见 C 阶段「观察」）。
-- **临时分支 `test/fi-b3`**：本记录合入后经单独授权删除；删除前生成并验证 git bundle，保留到负责人本地留存。
+- **签发后产物保全的技术兜底**：[0022 签发前的候选保全门闩](../decisions/0022-pre-signing-preservation-gate.md)设计已评审通过，实施待授权；用于消除当前人工流程无法保证下载先于签发的缺口（见 C 阶段「观察」）。
 - **测试 Release 正文模板**：rc903 正文的两项非阻断改进（0021 链接改用冻结提交的永久链接、示例证明命令加 `--source-digest <冻结提交>`）留给下一个发行流程测试或自动化模板。
-- **macOS 多份崩溃报告的等待**：[crash_report.py](../../.github/ci/crash_report.py) 在当时已有的报告都可解析时即结束等待，之后才写出的报告会被漏掉（`dd86a57` 引入，快速层、对照层与发行工作流相同；注入演练 40173299185 的 macos-15-intel 只读到两次崩溃中的第一份）。不改变 job 结论，单次崩溃仍能取得第一份报告的原生栈。须修复等待逻辑，并以连续两次崩溃验证两份报告都不丢；最迟在首个真实正式候选前关闭。
-- **停服路径段错误**：`09653c2` 对照层计数中出现一次停服路径 SIGSEGV，根因未查明，已按显式风险接受处理（见 [0020 试点记录](0020-ci-pilot.md#失败与根因-1)）；首个正式候选前须取得根因与修复，或再次明确做发布级风险接受。
+- **停服路径段错误**：`09653c2` 对照层计数中出现一次停服路径 SIGSEGV，根因未查明。valgrind 与停服窗口定向压力均未发现问题，负责人决定对**当前产品源码与依赖谱系显式做发布级风险接受，任何再现即撤回**；适用范围、失效与继承、停止条件见[停服段错误调查「结果与出口」](shutdown-segfault-investigation.md#结果与出口)。首个真实候选须按其中条件判断能否继承，最终 Release 记录须写明「根因未查明、显式风险接受」。
 - **最终采纳**：第 20 条补充的签发后产物保全整理为正式合同（重跑删除产物为采纳阻断项）；第 20 条的公开下载工作流写明实现与判定，判定按行为描述，不以 GitHub 对未展开矩阵的占位 job 数量为条件，引用结果时核对运行元数据：正向要求 verify、四个平台 install 与 public-pass 全部成功，负向要求 verify 在预定步骤失败、install 矩阵未展开且没有任何安装执行、public-pass 失败；0021「实施与试点」第 4 条要求修订的 0013、证据说明、AGENTS 索引与常用命令，以及 README 与发行说明的支持矩阵，都尚未修改；在此之前，0013 的现行流程仍然有效。下一个正式候选须使用新版本号，并引用同一冻结提交上一次包含 PID 1 的成功演练。
