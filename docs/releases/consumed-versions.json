@@ -6,6 +6,12 @@
       "run_id": 40189116947,
       "run_attempt": 1,
       "outcome": "signing-failed"
+    },
+    {
+      "version": "0.0.1rc903",
+      "run_id": 40215032490,
+      "run_attempt": 1,
+      "outcome": "candidate"
     }
   ]
 }
