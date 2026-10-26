@@ -32,6 +32,7 @@ Linux 上的 CPython 3.15 例外：`orjson==3.13.0` 的 cp315 Linux wheel 只有
 - [crash_capture.sh](crash_capture.sh)：测试步骤开头以 source 执行，Linux 打开 core dump 并写到 `$RUNNER_TEMP/cores`、提供恢复 core 限制的 `CRASH_SUDO` 供 root 用例使用，macOS 与发行工作流的容器 job（设置 `CRASH_CORE_DIR`）只留时间标记。
 - [crash_report.py](crash_report.py)：job 失败时打出崩溃进程的原生调用栈（Linux 用 gdb 读 core，先完整打印收到信号的线程；容器 job 从只读挂入的宿主机 systemd-coredump 目录取 core 并解压；macOS 读本 job 内的 ReportCrash 诊断报告），只用于诊断，不改变 job 结论；容器分支的自检在 [tests/ci](../../tests/ci/test_crash_report.py)。
 - [collect_records.sh](collect_records.sh)：发行工作流的 job 失败时把运行记录复制到 `$RUNNER_TEMP/failure-records`，上传步骤只给这一个路径：容器 job 中 upload-artifact 的多行 path 只有第一行会换算成容器内路径，其余行找不到文件；[tests/ci](../../tests/ci/test_workflow_paths.py) 检查容器 job 的 artifact 步骤只用单行路径。
+- [public_release.py](public_release.py)：[公开下载核验工作流](../workflows/public-check.yml)（0021 第 20 条）的默认分支侧工具：输入版本先于任何 API 调用与 checkout 校验；用 token 读取 Release，要求已发布、预发布且不可变，附件名与公开地址合法；下载步骤不拿 token，附件须与 API digest 一致；发行集合由冻结 tag 中的 release_set.py 核对，通过后 tag 须指向候选冻结提交；安装 job 在只装了 `sdk30` 的干净 venv 中（以 pip 的 `--only-binary :all:` 安装，不另装 uv），把冻结 tag README 的安装命令拆成参数、只替换解释器后执行，pip report 须指向本平台的公开 wheel 与核验过的哈希，冒烟输出的版本与 SDK 须为预期值。自检在 [tests/ci](../../tests/ci/test_public_release.py)。
 
 ## 工作流静态检查
 
