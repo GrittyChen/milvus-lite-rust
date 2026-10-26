@@ -4,7 +4,8 @@
 Linux：对 $RUNNER_TEMP/cores 中的 core 临时安装 gdb，先完整打印收到信号的线程，再按线程限额打印其余线程。
 Linux 容器 job（设置 CRASH_CORE_DIR）：从挂入的宿主机 systemd-coredump 目录取本 job 内产生的 core，解压后用镜像自带的
 gdb 同样打印；解压 zstd 需要 Python 3.14 的 compression.zstd。
-macOS：从本 job 内产生的 ReportCrash 诊断报告（.ips）中提取异常、触发线程与其余线程的调用帧。
+macOS：从本 job 内产生的 ReportCrash 诊断报告（.ips）中提取异常、触发线程与其余线程的调用帧；多个进程先后崩溃时，
+报告逐份异步写出，等到报告集合静止一段时间后才读取，避免只读到第一份。
 """
 
 import json
@@ -20,6 +21,7 @@ MAX_REPORTS = 3
 OTHER_THREAD_FRAMES = 25
 MAX_OTHER_LINES = 1500
 REPORT_WAIT = 90
+REPORT_QUIET = 20
 
 
 def quiet(out):
@@ -130,13 +132,49 @@ def frames(thread, images, limit):
 
 
 def parsed(report):
-    """报告完整写出且正文为对象时返回正文，否则返回 None（ReportCrash 可能仍在写）。"""
-    _, _, body = report.read_text(errors="replace").partition("\n")
+    """报告完整写出且正文为对象时返回正文，否则返回 None（ReportCrash 可能仍在写，或报告已被移走）。"""
+    try:
+        _, _, body = report.read_text(errors="replace").partition("\n")
+    except FileNotFoundError:
+        return None
     try:
         data = json.loads(body)
     except ValueError:
         return None
     return data if isinstance(data, dict) else None
+
+
+def wait_reports(listing, parse, clock=time.monotonic, sleep=time.sleep, wait=REPORT_WAIT, quiet=REPORT_QUIET):
+    """等到报告都可解析、且集合在 quiet 秒内没有新增或改写；总等待不超过 wait 秒。
+
+    ReportCrash 逐个进程符号化并写报告，第二份可能在第一份写完之后才出现，只看“当时已有的都可解析”会漏掉它。
+    listing() 返回按时间排序的 [(路径, 签名)]，签名在报告新增或改写时变化。没有报告时等满 wait（与此前相同）。
+    """
+    deadline = clock() + wait
+    seen, settled_since = None, clock()
+    while True:
+        current = listing()
+        if current != seen:
+            seen, settled_since = current, clock()
+        reports = [path for path, _ in current]
+        ready = reports and all(parse(p) is not None for p in reports)
+        if (ready and clock() - settled_since >= quiet) or clock() >= deadline:
+            return reports
+        sleep(min(2, max(0.0, deadline - clock())))
+
+
+def report_listing(folder, since):
+    """时间标记之后的报告，按修改时间排序；签名含大小与修改时间，报告仍在写时会变化。"""
+    found = []
+    for p in folder.glob("*.ips"):
+        try:
+            st = p.stat()
+        except FileNotFoundError:
+            # 列目录与 stat 之间被移走的报告不影响其余报告。
+            continue
+        if st.st_mtime >= since:
+            found.append((st.st_mtime, p, (st.st_size, st.st_mtime_ns)))
+    return [(p, signature) for _, p, signature in sorted(found)]
 
 
 def macos(temp):
@@ -147,13 +185,8 @@ def macos(temp):
         return
     since = marker.stat().st_mtime
     folder = Path.home() / "Library/Logs/DiagnosticReports"
-    # ReportCrash 在进程崩溃后异步符号化并写报告，进程越大越慢；等到有可解析的新报告或超时。
-    deadline = time.monotonic() + REPORT_WAIT
-    while True:
-        reports = sorted((p for p in folder.glob("*.ips") if p.stat().st_mtime >= since), key=lambda p: p.stat().st_mtime)
-        if (reports and all(parsed(p) is not None for p in reports)) or time.monotonic() >= deadline:
-            break
-        time.sleep(2)
+    # ReportCrash 在进程崩溃后异步符号化并写报告，进程越大越慢。
+    reports = wait_reports(lambda: report_listing(folder, since), parsed)
     print(f"{len(reports)} crash report(s) since the marker")
     for report in reports[:MAX_REPORTS]:
         print(f"=== {report.name}")
