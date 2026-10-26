@@ -75,7 +75,7 @@
 | 0.3.0rc2 已不可变预发布（冻结 / tag 为 df6fd30；仅纳入已审 0018 优化；候选独立复审通过，公开安装与发布门槛通过，发布后记录独立复审通过） | [候选及发布验收](docs/testing/0.3.0rc2-acceptance.md)、[候选方案](docs/releases/0.3.0rc2-candidate-plan.md)、[发行说明](docs/releases/0.3.0rc2.md)、[准备核验](docs/testing/0.3.0rc2-preparation.md) |
 | 持续集成：快速层与对照层的范围、零跳过与汇总判定、必须通过检查与推送方式、不纳入 CI 的候选内容（方案评审通过；工作流已实施、试点完成，main 必须通过 ci-pass 与 compare-pass；试点中一次停服路径段错误根因未查明；valgrind 与停服窗口定向压力未发现问题，对当前产品源码与依赖谱系显式做发布级风险接受，任何再现即撤回，范围与停止条件见停服段错误调查） | [0020](docs/decisions/0020-continuous-integration.md)、[试点记录](docs/testing/0020-ci-pilot.md)、[工作流与固定依赖](.github/ci/README.md)、[停服段错误调查](docs/testing/shutdown-segfault-investigation.md) |
 | 在 CI 中构建与验收发行物：前置继承、冻结身份、正式附件上的差分与互通、候选结果、版本消费与最后一道多主体来源证明、演练与平台调整（方案评审通过；工具与发行工作流已实施，第一次演练、不签发的失败注入、rc901 签发即消费验证与 rc903 七主体签发及公开下载核验（含拒绝测试）完成，容器 job 诊断与 macOS 多份崩溃报告的等待已修复；停服段错误为当前谱系显式风险接受；真实候选的 sign 一旦开始，禁止重跑该运行的任何 attempt，受控测试版本注入按 0021 第 20 条执行；最终采纳待修订；采纳前 0013 现行流程有效） | [0021](docs/decisions/0021-release-build-in-ci.md)、[试点记录](docs/testing/0021-release-pilot.md) |
-| 签发前的候选保全门闩：环境审批、本地保全与机器核对的保全回执、失败语义与试点计划（设计提案评审通过、未实施；采纳时修订 0021 第 19、20 条） | [0022](docs/decisions/0022-pre-signing-preservation-gate.md) |
+| 签发前的候选保全门闩：环境审批、本地保全与机器核对的保全回执、目录布局与崩溃恢复、失败语义与试点计划（设计与实施计划评审通过；保全工具、发行工作流改动与自检已实施，环境创建与 rc904 试点待执行；采纳时修订 0021 第 19、20 条） | [0022](docs/decisions/0022-pre-signing-preservation-gate.md) |
 | 验收与调查记录引用的证据分哪几类、谁能复核（仓库内可重跑 / 公开产物 / 本地留存），以及验收与调查记录的写法约定 | [证据的存放与复核范围](docs/testing/README.md) |
 | 性能基线怎么测 / 口径 / 注意事项 | [benchmarks/baseline/README.md](benchmarks/baseline/README.md) |
 | 代码审查 / 修复复审（冻结合同、完整调用链、同类全域清扫、分级与证据门槛、二三阶影响矩阵） | [code-review-rules](.agents/skills/code-review-rules/SKILL.md)（Claude Code 经 `.claude/skills` 软链读取同一份） |
@@ -178,6 +178,7 @@ pymilvus ──server_manager──▶ adapter/grpc ──▶ db（多 collectio
 | 发行物与安装验收（根配置；工作目录在仓库外） | `.venv/bin/python tests/packaging/run_acceptance.py --work-dir <work_dir> --constraints <constraints.txt> --suite --suite-expect 473`；约束文件与完整步骤见 [打包验收](tests/packaging/README.md) |
 | 发行物/平台脚本自检 | `.venv/bin/python -m pytest tests/packaging tests/platform` |
 | CI 纯文档分类与汇总判定自检 | `.venv/bin/python -m pytest tests/ci` |
+| 签发前保全：本机保存候选证据集并输出审批行 / 复核已保存目录（0022；在冻结提交的干净 worktree 中运行，演练用 `--mode dry-run`） | `python3 <worktree>/tests/release/preserve.py save --mode release --repo <owner/repo> --run <运行 ID>.<attempt> --version <版本> --root <本地留存根目录>`；`python3 tests/release/preserve.py verify <保存目录>` |
 | 候选测试的确定性分片（plan / run / verify，合同见 0019）及自检 | 用法见 [tests/sharding/README.md](tests/sharding/README.md)；自检：`.venv/bin/python -m pytest tests/sharding` |
 | Linux PID 1、命名卷 LOCK 与强杀恢复 | `.venv/bin/python tests/platform/linux_pid1_probe.py --formal-wheel <linux-wheel> --fi-wheel <linux-fi-wheel> --image <image-id> --constraints .github/ci/requirements/sdk30.txt --output <work_dir>`；见 [平台流程](tests/platform/README.md) |
 | Windows 准备检查（无运行证据） | `pwsh -NoProfile -File tests/platform/windows_run.ps1 -WorkDirectory <work_dir>`（PowerShell ≥7.2）；见 [平台流程](tests/platform/README.md) |

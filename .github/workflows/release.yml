@@ -68,14 +68,17 @@ jobs:
         env:
           INPUT_COMMIT: ${{ inputs.commit }}
         run: test "$GITHUB_SHA" = "$INPUT_COMMIT"
-      - name: 日常门槛、版本与 PID 1 演练
+      - name: 日常门槛、版本、PID 1 演练与签发环境
+        # 正式运行在构建之前核对 release-signing 的保护规则（0022 第 1 节）：环境被删除或写错时 GitHub 会自动建出
+        # 无保护的同名环境。环境名是字面量，不来自输入。
         env:
           GH_TOKEN: ${{ github.token }}
           PID1_DRY_RUN: ${{ inputs.pid1_dry_run }}
+          OWNER_ID: ${{ github.repository_owner_id }}
         run: |
           python3 tests/release/runs.py --repo "$GITHUB_REPOSITORY" precheck --sha "$GITHUB_SHA" --version "$VERSION" \
             --mode "$MODE" --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT" --pid1-dry-run "$PID1_DRY_RUN" \
-            --out "$RUNNER_TEMP/meta.json"
+            --signing-environment release-signing --owner-id "$OWNER_ID" --out "$RUNNER_TEMP/meta.json"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: meta
@@ -880,11 +883,44 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+  preserve-digests:
+    # 签发前保全（0022 第 3 节）：只读地以本运行的 fi 产物重算四个 FI wheel 的摘要，与候选结果交叉核对后交给 attest，
+    # 供「保全回执」独立计算回执；attest 仍只接收待签发的七个文件。
+    needs: candidate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      fi: ${{ steps.digests.outputs.fi }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ env.MODE }}-candidate-v${{ inputs.version }}
+          path: ${{ runner.temp }}/candidate
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: fi
+          path: ${{ runner.temp }}/fi-artifact
+      - name: FI 摘要
+        id: digests
+        run: |
+          # 先赋值再写出：命令替换直接作为 echo 的参数时，工具失败不会使步骤失败。
+          fi=$(python3 tests/release/preserve.py digests --mode "$MODE" --version "$VERSION" \
+            --candidate-dir "$RUNNER_TEMP/candidate" --fi-dir "$RUNNER_TEMP/fi-artifact" \
+            --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT")
+          echo "fi=$fi" >> "$GITHUB_OUTPUT"
+
   attest:
     # 最后一个 job：签发前复核，然后一次多主体签发（0021 第 13 条）。job 与步骤名是版本消费判定的固定键
     # （tests/release/runs.py 的 ATTEST_JOB / SIGN_STEP），不能改。
-    needs: candidate
+    # 正式运行经 release-signing 审批放行，审批前不分配执行机；演练用不设保护的 dry-run-signing（0022 第 1 节）。
+    needs: [candidate, preserve-digests]
     name: attest
+    environment: ${{ inputs.dry_run && 'dry-run-signing' || 'release-signing' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -926,6 +962,17 @@ jobs:
             while read -r name; do echo "$RUNNER_TEMP/candidate/$name"; done <<< "$subjects"
             echo "SUBJECTS"
           } >> "$GITHUB_OUTPUT"
+      - name: 保全回执
+        # 正式运行：release-signing 的保护规则未变，且本 attempt 恰有一条所有者批准，备注逐字等于
+        # 「preserved <候选 ID> <回执>」，否则失败并跳过 sign（0022 第 3 节）。演练直接通过。没有 if，不得跳过。
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FI_DIGESTS: ${{ needs.preserve-digests.outputs.fi }}
+          OWNER_ID: ${{ github.repository_owner_id }}
+        run: |
+          python3 tests/release/preserve.py gate --mode "$MODE" --environment release-signing --owner-id "$OWNER_ID" \
+            --repo "$GITHUB_REPOSITORY" --version "$VERSION" --candidate-dir "$RUNNER_TEMP/candidate" \
+            --fi-digests "$FI_DIGESTS" --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT"
       - name: sign
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:

@@ -1,0 +1,22 @@
+[
+  {
+    "comment": "preserved 0.0.1rc999@ef51df8db1549f30789ecc3a98545599d5b6315b#40281637463.2 939cb35f214a8f1d90618e9e6a0a54224caac87086065d1856a831ba836f0a49",
+    "environments": [
+      {
+        "can_admins_bypass": true,
+        "created_at": "2026-10-26T06:44:12Z",
+        "id": 25324199449,
+        "name": "gate-probe",
+        "updated_at": "2026-10-26T06:44:12Z"
+      }
+    ],
+    "state": "approved",
+    "user": {
+      "id": 11266581,
+      "login": "GrittyChen",
+      "site_admin": false,
+      "type": "User",
+      "user_view_type": "public"
+    }
+  }
+]

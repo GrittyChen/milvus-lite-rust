@@ -1,4 +1,4 @@
-"""发行工作流的前置检查与签发前复核（0021 第 2、3、10 条）。
+"""发行工作流的前置检查与签发前复核（0021 第 2、3、10 条），以及签发环境的保护规则检查（0022）。
 
 判定逻辑是纯函数，输入为 GitHub REST API 返回的运行与 job 对象；`Gh` 只负责经 gh api 取数。
 """
@@ -167,6 +167,31 @@ def consumed_versions(gh, version, current):
     return None
 
 
+def check_signing_environment(gh, name, owner_id):
+    """签发环境须恰有一条必需审批人规则：审批人只有仓库所有者、允许自审、管理员不能绕过、部署分支不限。
+
+    引用不存在的环境时 GitHub 会自动建出无保护的同名环境（0022 第 1 节），因此缺失与任何偏差都拒绝。
+    prevent_self_review 只在 required_reviewers 规则对象内，环境对象顶层没有该字段（门闩探针实测）。
+    """
+    env = gh.get(f"environments/{name}")
+    require(isinstance(env, dict) and env.get("name") == name, f"environment {name} was not returned")
+    rules = env.get("protection_rules")
+    require(isinstance(rules, list) and len(rules) == 1 and isinstance(rules[0], dict)
+            and rules[0].get("type") == "required_reviewers",
+            f"environment {name} must have exactly one required reviewers rule: "
+            f"{[r.get('type') if isinstance(r, dict) else r for r in rules] if isinstance(rules, list) else rules!r}")
+    rule = rules[0]
+    require(rule.get("prevent_self_review") is False, f"environment {name} must allow self-review (the owner triggers and approves)")
+    reviewers = rule.get("reviewers")
+    require(isinstance(reviewers, list) and len(reviewers) == 1 and isinstance(reviewers[0], dict)
+            and reviewers[0].get("type") == "User" and isinstance(reviewers[0].get("reviewer"), dict)
+            and type(reviewers[0]["reviewer"].get("id")) is int and reviewers[0]["reviewer"]["id"] == owner_id,
+            f"environment {name} must have the repository owner as its only reviewer")
+    require(env.get("can_admins_bypass") is False, f"environment {name} lets administrators bypass its protection rules")
+    require("deployment_branch_policy" in env and env["deployment_branch_policy"] is None,
+            f"environment {name} must not restrict deployment branches")
+
+
 def precheck(gh, args):
     require(HEX40.fullmatch(args.sha) and VERSION.fullmatch(args.version), "sha and version must be canonical")
     inherited, snapshot = inherited_runs(gh, args.sha)
@@ -174,6 +199,8 @@ def precheck(gh, args):
             "run": {"id": args.run_id, "attempt": args.run_attempt}, "inherited": inherited,
             "inherited_runs": snapshot, "pid1_dry_run": None}
     if args.mode == "release":
+        require(args.signing_environment and args.owner_id, "a release run must name its signing environment and owner")
+        check_signing_environment(gh, args.signing_environment, args.owner_id)
         hit = consumed_versions(gh, args.version, meta["run"])
         require(hit is None, f"version already consumed: {hit}")
         # 每个正式运行都引用同一冻结提交上包含真实 PID 1 的成功演练（0021 第 10 条），不从台账或其他状态推断。
@@ -210,6 +237,8 @@ def main(argv=None):
     p.add_argument("--run-id", type=int, required=True)
     p.add_argument("--run-attempt", type=int, required=True)
     p.add_argument("--pid1-dry-run", default="")
+    p.add_argument("--signing-environment", default="")
+    p.add_argument("--owner-id", type=int, default=0)
     p.add_argument("--out", type=Path, required=True)
     r = sub.add_parser("recheck")
     r.add_argument("--meta", type=Path, required=True)

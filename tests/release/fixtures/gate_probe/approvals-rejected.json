@@ -1,0 +1,22 @@
+[
+  {
+    "comment": "probe reject attempt 1",
+    "environments": [
+      {
+        "can_admins_bypass": true,
+        "created_at": "2026-10-26T06:44:12Z",
+        "id": 25324199449,
+        "name": "gate-probe",
+        "updated_at": "2026-10-26T06:44:12Z"
+      }
+    ],
+    "state": "rejected",
+    "user": {
+      "id": 11266581,
+      "login": "GrittyChen",
+      "site_admin": false,
+      "type": "User",
+      "user_view_type": "public"
+    }
+  }
+]

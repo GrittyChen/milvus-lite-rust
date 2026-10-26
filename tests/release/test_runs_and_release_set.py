@@ -2,6 +2,7 @@
 缺少 PID 1 演练、他次运行的证明、演练结果混入与篡改都必须被拒绝。"""
 
 import json
+from pathlib import Path
 import shutil
 from types import SimpleNamespace
 
@@ -14,6 +15,23 @@ from test_candidate import COMMIT, VERSION, build_env, build_inputs, identity, m
 
 CI = ".github/workflows/ci.yml"
 COMPARE = ".github/workflows/compare.yml"
+PROBE = Path(__file__).parent / "fixtures" / "gate_probe"
+OWNER = 11266581
+SIGNING = "release-signing"
+
+
+def probe(name):
+    return json.loads((PROBE / name).read_text())
+
+
+def signing_environment(name=SIGNING):
+    """以探针的环境响应为基础的正确配置：只保留必需审批人规则，关闭管理员绕过，部署分支不限。"""
+    env = probe("environment.json")
+    env["name"] = name
+    env["protection_rules"] = [r for r in env["protection_rules"] if r["type"] == "required_reviewers"]
+    env["can_admins_bypass"] = False
+    env["deployment_branch_policy"] = None
+    return env
 
 
 def run(id, created, status="completed", conclusion="success", sha=COMMIT, path=CI, attempt=1, title="CI"):
@@ -94,7 +112,7 @@ class FakeGh:
         self.compare = [run(2, "10:00", path=COMPARE, title="Compare")]
         self.release_runs, self.jobs_by_attempt = [], {}
         self.tags, self.releases, self.ledger = set(), [], {"format": 1, "versions": []}
-        self.attempts = {"actions/runs/7/attempts/1": dry_run()}
+        self.attempts = {"actions/runs/7/attempts/1": dry_run(), f"environments/{SIGNING}": signing_environment()}
         self.jobs_by_attempt[(7, 1)] = [job(name) for name in runs.PID1_JOBS]
 
     def workflow_runs(self, path, query=""):
@@ -113,12 +131,14 @@ class FakeGh:
         return json.dumps(self.ledger)
 
     def get(self, path):
+        if path not in self.attempts:
+            raise c.CandidateError(f"gh api {path} failed: gh: Not Found (HTTP 404)")
         return self.attempts[path]
 
 
 def args(**changes):
     return SimpleNamespace(**{**dict(sha=COMMIT, version=VERSION, mode="release", run_id=100, run_attempt=1,
-                                     pid1_dry_run="7.1"), **changes})
+                                     pid1_dry_run="7.1", signing_environment=SIGNING, owner_id=OWNER), **changes})
 
 
 @pytest.fixture
@@ -389,3 +409,104 @@ def test_prepare_checks(gh, mutate, message):
     mutate(gh)
     with pytest.raises(c.CandidateError, match=message):
         release_set.prepare_checks(gh, data)
+
+
+def test_probe_environment_fields():
+    # 探针实测：prevent_self_review 只在必需审批人规则内，环境对象顶层没有该字段。
+    env = probe("environment.json")
+    assert "prevent_self_review" not in env
+    assert [(r["type"], r.get("prevent_self_review")) for r in env["protection_rules"]] == \
+        [("required_reviewers", False), ("branch_policy", None)]
+
+
+def env_gh(env):
+    gh = FakeGh()
+    if env is None:
+        del gh.attempts[f"environments/{SIGNING}"]
+    else:
+        gh.attempts[f"environments/{SIGNING}"] = env
+    return gh
+
+
+def with_rule(**changes):
+    env = signing_environment()
+    env["protection_rules"][0].update(changes)
+    return env
+
+
+def with_reviewers(*reviewers):
+    env = signing_environment()
+    env["protection_rules"][0]["reviewers"] = list(reviewers)
+    return env
+
+
+def reviewer(id=OWNER, type="User"):
+    return {"type": type, "reviewer": {"id": id, "login": "someone"}}
+
+
+def test_signing_environment_accepts_the_required_configuration():
+    runs.check_signing_environment(env_gh(signing_environment()), SIGNING, OWNER)
+
+
+@pytest.mark.parametrize("env, message", [
+    (None, "HTTP 404"),
+    # 探针环境原样（另有部署分支规则）只换名字：仍须拒绝。
+    (dict(probe("environment.json"), name=SIGNING), "exactly one required reviewers rule"),
+    (dict(signing_environment(), protection_rules=[]), "exactly one required reviewers rule"),
+    (dict(signing_environment(), protection_rules=signing_environment()["protection_rules"] * 2), "exactly one"),
+    (dict(signing_environment(), protection_rules=[{"type": "wait_timer", "wait_timer": 5}]), "exactly one"),
+    (dict(signing_environment(), protection_rules=signing_environment()["protection_rules"] + [{"type": "branch_policy"}]), "exactly one"),
+    (dict(signing_environment(), protection_rules=signing_environment()["protection_rules"] + [{"type": "custom_rule"}]), "exactly one"),
+    (with_rule(prevent_self_review=True), "self-review"),
+    ({**signing_environment(), "protection_rules": [{k: v for k, v in signing_environment()["protection_rules"][0].items()
+                                                     if k != "prevent_self_review"}]}, "self-review"),
+    (with_reviewers(), "only reviewer"),
+    (with_reviewers(reviewer(), reviewer(42)), "only reviewer"),
+    (with_reviewers(reviewer(42)), "only reviewer"),
+    (with_reviewers(reviewer(type="Team")), "only reviewer"),
+    (with_reviewers(reviewer(id=str(OWNER))), "only reviewer"),
+    (dict(signing_environment(), can_admins_bypass=True), "bypass"),
+    ({k: v for k, v in signing_environment().items() if k != "can_admins_bypass"}, "bypass"),
+    (dict(signing_environment(), deployment_branch_policy={"protected_branches": False, "custom_branch_policies": True}),
+     "deployment branches"),
+    ({k: v for k, v in signing_environment().items() if k != "deployment_branch_policy"}, "deployment branches"),
+    (signing_environment("other"), "was not returned"),
+])
+def test_signing_environment_rejects(env, message):
+    with pytest.raises(c.CandidateError, match=message):
+        runs.check_signing_environment(env_gh(env), SIGNING, OWNER)
+
+
+def test_precheck_checks_the_signing_environment_only_for_release_runs():
+    gh = env_gh(dict(signing_environment(), can_admins_bypass=True))
+    with pytest.raises(c.CandidateError, match="bypass"):
+        runs.precheck(gh, args())
+    runs.precheck(gh, args(mode="dry-run", pid1_dry_run=""))
+    runs.precheck(env_gh(None), args(mode="dry-run", pid1_dry_run="", signing_environment="", owner_id=0))
+    for missing in (dict(signing_environment=""), dict(owner_id=0)):
+        with pytest.raises(c.CandidateError, match="signing environment and owner"):
+            runs.precheck(env_gh(signing_environment()), args(**missing))
+
+
+def probe_attest(name):
+    """探针中引用环境的 job 名为 gate；改为 attest 后即发行工作流在等待审批或被拒绝时的 jobs 响应。"""
+    jobs = probe(name)["jobs"]
+    for item in jobs:
+        if item["name"] == "gate":
+            item["name"] = runs.ATTEST_JOB
+    return jobs
+
+
+def test_probe_waiting_and_rejected_attest_has_not_started_signing():
+    waiting, rejected = probe_attest("jobs-waiting.json"), probe_attest("jobs-rejected.json")
+    attest = [j for j in waiting if j["name"] == runs.ATTEST_JOB][0]
+    assert (attest["status"], attest["runner_name"], attest["steps"]) == ("waiting", None, [])
+    attest = [j for j in rejected if j["name"] == runs.ATTEST_JOB][0]
+    assert (attest["conclusion"], attest["runner_name"], attest["steps"]) == ("failure", "", [])
+    assert runs.signing_started(waiting) is False and runs.signing_started(rejected) is False
+
+
+def test_release_run_rejected_at_the_gate_does_not_consume(gh):
+    gh.release_runs.append(release_run(50, 1))
+    gh.jobs_by_attempt[(50, 1)] = probe_attest("jobs-rejected.json")
+    runs.precheck(gh, args())
