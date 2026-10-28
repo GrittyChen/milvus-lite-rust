@@ -20,6 +20,8 @@ PROJECT = "https://github.com/GrittyChen/milvus-lite-rust"
 PROJECT_URLS = {"Repository, " + PROJECT, "Issues, " + PROJECT + "/issues"}
 PROJECT_ADDRESS = re.compile(re.escape(PROJECT) + r"(?=[/?#\s<>()\[\]`\"']|$)[^\s<>()\[\]`\"']*")
 LOCAL_HOSTS = {"apache.org", "www.apache.org", "127.0.0.1", "localhost"}
+WHEEL_PLATFORMS = ("manylinux_2_28_x86_64", "manylinux_2_28_aarch64", "macosx_11_0_arm64", "macosx_11_0_x86_64")
+RELEASE_WORKFLOW = ".github/workflows/release.yml"
 
 
 def require(condition, reason):
@@ -60,6 +62,15 @@ def release_install_commands(version):
     }
 
 
+def release_verify_commands(version):
+    # 来源证明的核对命令同样按整行白名单放行：只认本仓库、发行工作流签发与完整的版本化
+    # wheel 文件名，每个平台一条；不接受通配符、额外参数或其它 gh 子命令。公开下载工作流
+    # 只从 release_install_commands 取安装命令，校验命令因此单列，不混入安装命令。
+    repo = PROJECT.removeprefix("https://github.com/")
+    return {f"gh attestation verify milvus_lite_rust-{version}-cp310-abi3-{platform}.whl --repo {repo} "
+            f"--signer-workflow {repo}/{RELEASE_WORKFLOW}" for platform in WHEEL_PLATFORMS}
+
+
 INDEX_INTENT_REFERENCE = "最终标记：`<data_dir>/collections/<collection>/milvus-lite-rust.index-intent.json`。"
 
 def names_this_package(text):
@@ -72,9 +83,10 @@ def names_this_package(text):
 def check_install_commands(body, version):
     # 名称可能被他人在 PyPI 注册（0013 候选阶段决策 6）。检查器防的是按常规写法误写的按名
     # 安装，不解析 shell 或 Markdown：除标题外，引用本包名的行只能是固定的 Release 安装
-    # 命令。`$` 与花括号是最常见的拼接手段且 README 用不到，一律拒绝；其余运行时计算
+    # 命令或来源证明校验命令。`$` 与花括号是最常见的拼接手段且 README 用不到，一律拒绝；其余运行时计算
     # 不在范围，由 README 评审把关。
-    commands = release_install_commands(version)
+    installs, verifies = release_install_commands(version), release_verify_commands(version)
+    commands = installs | verifies
     seen = set()
     for line in re.sub(r"\\\n", "", body).splitlines():
         line = line.strip()
@@ -86,7 +98,8 @@ def check_install_commands(body, version):
         elif line not in {"# milvus-lite-rust", INDEX_INTENT_REFERENCE}:
             for text in (line, html.unescape(line)):
                 require(not names_this_package(text), "install command check: names this package outside the release commands")
-    require(seen == commands, "install command check: missing release install command")
+    require(installs <= seen, "install command check: missing release install command")
+    require(verifies <= seen, "install command check: missing release verify command")
 
 
 def check_description(body, expected, version=VERSION):
@@ -161,8 +174,7 @@ def check(wheel, sdist, repo, version=VERSION, kind="formal"):
         entry.read_string(archive.read(info + "/entry_points.txt").decode())
         require(entry["console_scripts"]["milvus-lite"] == "milvus_lite.cmdline:main", "missing CLI entrypoint")
         tags = [line[5:] for line in archive.read(info + "/WHEEL").decode().splitlines() if line.startswith("Tag: ")]
-        allowed = {"manylinux_2_28_x86_64", "manylinux_2_28_aarch64", "macosx_11_0_arm64", "macosx_11_0_x86_64"}
-        require(tags and all(t.startswith("cp310-abi3-") and t.removeprefix("cp310-abi3-") in allowed for t in tags), "unexpected wheel tag")
+        require(tags and all(t.startswith("cp310-abi3-") and t.removeprefix("cp310-abi3-") in WHEEL_PLATFORMS for t in tags), "unexpected wheel tag")
         native = [n for n in names if n.startswith("milvus_lite/_native") and n.endswith((".so", ".pyd"))]
         require(len(native) == 1, "one native module required")
         data = archive.read(native[0])

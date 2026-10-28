@@ -6,7 +6,7 @@ import tarfile
 import zipfile
 
 import pytest
-from check_artifacts import check, check_binary
+from check_artifacts import VERSION, check, check_binary
 
 
 @pytest.fixture
@@ -313,6 +313,138 @@ def test_release_commands_must_match_this_version(version, change, reason):
         check_description(body, body, version)
 
 
+REPO_ARG = "--repo GrittyChen/milvus-lite-rust"
+WORKFLOW_ARG = "--signer-workflow GrittyChen/milvus-lite-rust/.github/workflows/release.yml"
+X86_WHEEL = f"milvus_lite_rust-{VERSION}-cp310-abi3-manylinux_2_28_x86_64.whl"
+X86_VERIFY = f"gh attestation verify {X86_WHEEL} {REPO_ARG} {WORKFLOW_ARG}"
+
+
+def test_verify_commands_cover_exactly_the_four_wheel_platforms():
+    from check_artifacts import WHEEL_PLATFORMS, release_verify_commands
+    platforms = ["manylinux_2_28_x86_64", "manylinux_2_28_aarch64", "macosx_11_0_arm64", "macosx_11_0_x86_64"]
+    assert list(WHEEL_PLATFORMS) == platforms
+    assert release_verify_commands(VERSION) == {
+        f"gh attestation verify milvus_lite_rust-{VERSION}-cp310-abi3-{p}.whl {REPO_ARG} {WORKFLOW_ARG}" for p in platforms}
+
+
+def verify_lines(text):
+    return [line.strip() for line in text.splitlines() if line.strip().startswith("gh attestation")]
+
+
+def expected_verify_lines():
+    # 正文按平台表的顺序写四条命令；顺序、条数与内容都须一致。
+    from check_artifacts import WHEEL_PLATFORMS
+    return [f"gh attestation verify milvus_lite_rust-{VERSION}-cp310-abi3-{p}.whl {REPO_ARG} {WORKFLOW_ARG}"
+            for p in WHEEL_PLATFORMS]
+
+
+def assert_verify_commands(text, label):
+    # 发行说明不经过长描述检查器；两处的校验命令必须逐字、按序相同，重复或多出的变体同样失败。
+    assert verify_lines(text) == expected_verify_lines(), f"{label}: verify commands differ in content, order or count"
+
+
+def test_readme_and_release_notes_carry_the_same_verify_commands():
+    from check_artifacts import release_verify_commands
+    root = Path(__file__).resolve().parents[2]
+    assert set(expected_verify_lines()) == release_verify_commands(VERSION)
+    for path in [root / "README.md", root / "docs" / "releases" / f"{VERSION}.md"]:
+        assert_verify_commands(path.read_text(), path.name)
+
+
+@pytest.mark.parametrize("document", ["README.md", f"docs/releases/{VERSION}.md"])
+@pytest.mark.parametrize("mutation", ["duplicate", "swap"])
+def test_verify_command_order_and_count_are_enforced(document, mutation):
+    text = (Path(__file__).resolve().parents[2] / document).read_text()
+    first, second = expected_verify_lines()[:2]
+    if mutation == "duplicate":
+        changed = text.replace(first + "\n", first + "\n" + first + "\n", 1)
+    else:
+        changed = text.replace(first + "\n" + second + "\n", second + "\n" + first + "\n", 1)
+    assert changed != text
+    with pytest.raises(AssertionError, match="differ in content, order or count"):
+        assert_verify_commands(changed, document)
+
+
+def test_wheel_platforms_match_the_candidate_result_tags():
+    # 两个模块各自维护平台集合；读取候选结果工具的源码常量，不导入它（避免牵入发行工具的依赖）。
+    import ast
+    from check_artifacts import WHEEL_PLATFORMS
+    source = (Path(__file__).resolve().parents[2] / "tests" / "release" / "candidate.py").read_text()
+    tags, = [ast.literal_eval(node.value) for node in ast.parse(source).body
+             if isinstance(node, ast.Assign) and any(getattr(t, "id", None) == "WHEEL_TAGS" for t in node.targets)]
+    assert set(WHEEL_PLATFORMS) == set(tags) and len(WHEEL_PLATFORMS) == len(tags) == 4
+
+
+@pytest.mark.parametrize("addition", [
+    X86_VERIFY.replace(f"-{VERSION}-", "-0.1.0rc2-"),
+    X86_VERIFY.replace("manylinux_2_28_x86_64", "*"),
+    X86_VERIFY.replace("cp310-abi3-manylinux_2_28_x86_64", "*"),
+    X86_VERIFY.replace("verify milvus", "verify ./milvus"),
+    X86_VERIFY.replace("-cp310-abi3-manylinux_2_28_x86_64.whl", ".tar.gz"),
+    X86_VERIFY.replace("manylinux_2_28_x86_64", "musllinux_1_2_x86_64"),
+    X86_VERIFY.replace("milvus_lite_rust-", "Milvus_Lite_Rust-"),
+    X86_VERIFY.replace(REPO_ARG, REPO_ARG + "-evil"),
+    X86_VERIFY.replace(REPO_ARG, "--repo other/milvus-lite-rust"),
+    X86_VERIFY.replace(REPO_ARG, "--owner GrittyChen"),
+    X86_VERIFY.replace("release.yml", "ci.yml"),
+    f"gh attestation verify {X86_WHEEL} {REPO_ARG}",
+    X86_VERIFY.replace(WORKFLOW_ARG, "--signer-repo GrittyChen/milvus-lite-rust"),
+    X86_VERIFY + " --format json",
+    X86_VERIFY + f" --source-ref refs/tags/v{VERSION}",
+    X86_VERIFY + " --bundle x.jsonl",
+    X86_VERIFY + " --help",
+    f"gh attestation verify {X86_WHEEL} --deny-self-hosted-runners {REPO_ARG} {WORKFLOW_ARG}",
+    f"gh attestation verify {X86_WHEEL} {WORKFLOW_ARG} {REPO_ARG}",
+    X86_VERIFY + " || true",
+    X86_VERIFY + "; pip install milvus-lite-rust",
+    X86_VERIFY + " && pip install milvus-lite-rust",
+    X86_VERIFY + " | tee log",
+    X86_VERIFY + " # 注释",
+    f"gh attestation verify `echo {X86_WHEEL}` {REPO_ARG} {WORKFLOW_ARG}",
+    f"`{X86_VERIFY}`",
+    X86_VERIFY.replace("attestation verify", "attestation download"),
+    f"gh release download v{VERSION} {REPO_ARG}",
+    f"gh attestation verify {X86_WHEEL} \\\n  {REPO_ARG} {WORKFLOW_ARG}",
+    X86_VERIFY.replace(REPO_ARG, "&#45;" + REPO_ARG[1:]),
+])
+def test_verify_command_variants_are_rejected(addition):
+    from check_artifacts import check_description
+    body = described(addition)
+    with pytest.raises(ValueError, match="names this package outside the release commands"):
+        check_description(body, body)
+
+
+def test_verify_command_on_an_oci_image_is_rejected():
+    # 任何带协议的地址先由地址白名单拒绝，早于按名安装的判定。
+    from check_artifacts import check_description
+    body = described(f"gh attestation verify oci://ghcr.io/grittychen/milvus-lite-rust {REPO_ARG} {WORKFLOW_ARG}")
+    with pytest.raises(ValueError, match="unconfirmed external address"):
+        check_description(body, body)
+
+
+@pytest.mark.parametrize("addition", [
+    f"gh attestation verify $WHEEL {REPO_ARG} {WORKFLOW_ARG}",
+    f"gh attestation verify $(ls *.whl) {REPO_ARG} {WORKFLOW_ARG}",
+    X86_VERIFY.replace(VERSION, "${VERSION}"),
+])
+def test_verify_command_expansion_is_rejected(addition):
+    from check_artifacts import check_description
+    body = described(addition)
+    with pytest.raises(ValueError, match="shell expansion"):
+        check_description(body, body)
+
+
+@pytest.mark.parametrize("platform", ["manylinux_2_28_x86_64", "manylinux_2_28_aarch64", "macosx_11_0_arm64", "macosx_11_0_x86_64"])
+def test_each_verify_command_is_required(platform):
+    from check_artifacts import check_description
+    readme = (Path(__file__).resolve().parents[2] / "README.md").read_text()
+    command = X86_VERIFY.replace("manylinux_2_28_x86_64", platform)
+    assert readme.count(command + "\n") == 1
+    body = readme.replace(command + "\n", "")
+    with pytest.raises(ValueError, match="missing release verify command"):
+        check_description(body, body)
+
+
 @pytest.mark.parametrize("addition", [
     "`pip install https://github.com/GrittyChen/milvus-lite-rust/releases/download/v0.3.0rc3/milvus_lite_rust-0.3.0rc3-cp310-abi3-macosx_11_0_arm64.whl`",
     "`pip install .`",
@@ -379,12 +511,13 @@ def test_exact_intent_reference_is_allowed_with_release_commands():
     from check_artifacts import (
         check_install_commands,
         release_install_commands,
+        release_verify_commands,
         INDEX_INTENT_REFERENCE,
         VERSION,
     )
 
     body = (
-        "\n".join(sorted(release_install_commands(VERSION)))
+        "\n".join(sorted(release_install_commands(VERSION) | release_verify_commands(VERSION)))
         + "\n"
         + INDEX_INTENT_REFERENCE
     )

@@ -31,6 +31,17 @@ shasum -a 256 -c --ignore-missing SHA256SUMS && python -m pip install --no-index
 
 核对失败时不会执行安装。Linux 上也可以用 `sha256sum -c --ignore-missing SHA256SUMS` 代替 `shasum -a 256 -c --ignore-missing SHA256SUMS`。
 
+Release 附件共七个：四个平台的 wheel、sdist、候选结果 JSON，以及 `SHA256SUMS`。它们由本仓库的发行工作流在 GitHub 托管机器上从同一冻结提交构建与验收，在一次签发中取得构建来源证明，证明写入公开的透明日志。候选结果记录冻结提交、五个正式附件（四个 wheel 与 sdist）的哈希与各验收阶段的结果；`SHA256SUMS` 覆盖这五个附件与候选结果。
+
+需要核对来源时，在下载目录用已登录的 GitHub CLI 执行本平台对应的一行（依次为 Linux x86_64、Linux arm64、macOS arm64、macOS x86_64），成功即说明该文件由本仓库的发行工作流签发：
+
+```bash
+gh attestation verify milvus_lite_rust-0.3.0rc3-cp310-abi3-manylinux_2_28_x86_64.whl --repo GrittyChen/milvus-lite-rust --signer-workflow GrittyChen/milvus-lite-rust/.github/workflows/release.yml
+gh attestation verify milvus_lite_rust-0.3.0rc3-cp310-abi3-manylinux_2_28_aarch64.whl --repo GrittyChen/milvus-lite-rust --signer-workflow GrittyChen/milvus-lite-rust/.github/workflows/release.yml
+gh attestation verify milvus_lite_rust-0.3.0rc3-cp310-abi3-macosx_11_0_arm64.whl --repo GrittyChen/milvus-lite-rust --signer-workflow GrittyChen/milvus-lite-rust/.github/workflows/release.yml
+gh attestation verify milvus_lite_rust-0.3.0rc3-cp310-abi3-macosx_11_0_x86_64.whl --repo GrittyChen/milvus-lite-rust --signer-workflow GrittyChen/milvus-lite-rust/.github/workflows/release.yml
+```
+
 **不要使用 `pymilvus[milvus-lite]`**：该 extra 会引入官方发行包。若两个发行包已经同时存在，应卸载二者后只重新安装本包。绑定层会拒绝检测到的共存，但官方包后装覆盖本模块的情况无法由本包检测；pymilvus 的导入错误提示也可能把用户引向官方包。
 
 开发者可在当前源码根目录构建安装：

@@ -193,6 +193,15 @@ def test_readme_must_contain_install_command(tmp_path):
         pr.readme_install_command(frozen_tree(tmp_path, readme="pip install something-else"), VERSION)
 
 
+def test_repository_readme_and_checker_yield_exactly_one_install_command():
+    # 公开下载工作流加载冻结 tag 中真实的检查器与 README；来源证明校验命令不得混入它取用的安装命令。
+    root = Path(__file__).resolve().parents[2]
+    version = pr.load_module(root / "tests" / "packaging" / "check_artifacts.py", "repository_check_artifacts").VERSION
+    command = pr.readme_install_command(root, version)
+    assert command.startswith("python -m pip install ") and command.endswith(f" milvus-lite-rust=={version}")
+    assert pr.install_argv(command, "/venv/bin/python", "/r.json")[:4] == ["/venv/bin/python", "-m", "pip", "install"]
+
+
 @pytest.mark.parametrize("command", ["pip install x", "python -m pip download x", "sh -c 'python -m pip install x'"])
 def test_install_argv_rejects_other_commands(command):
     with pytest.raises(pr.PublicCheckError, match="unexpected install command"):
