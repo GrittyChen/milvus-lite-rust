@@ -2,7 +2,7 @@
 
 以 Rust 实现的非官方 milvus-lite，与 Milvus / Zilliz 无隶属关系。目标是让 `pymilvus` 用户继续使用 `MilvusClient("./demo.db")`，并读取官方 3.x 的数据目录。
 
-**`0.3.0rc2` 为预发布试用版本，不建议用于生产。** 本文对应该版本的源码与发行候选，下方安装命令在对应 GitHub Release 发布后使用。已发布版本以仓库 Releases 页面为准；本项目目前未发布到 PyPI，PyPI 上若出现同名包，并非本项目发布。平台表沿用已确认的验收范围，各行实际达到的证据层级以 Release 说明为准。
+**`0.3.0rc3` 为预发布试用版本，不建议用于生产。** 本文对应该版本的源码与发行候选，下方安装命令在对应 GitHub Release 发布后使用。已发布版本以仓库 Releases 页面为准；本项目目前未发布到 PyPI，PyPI 上若出现同名包，并非本项目发布。下方四个平台按同一标准验收层执行，实际结果以 Release 附件中的候选结果与 Release 正文链接的验收记录为准。
 
 源码：<https://github.com/GrittyChen/milvus-lite-rust>；问题反馈：<https://github.com/GrittyChen/milvus-lite-rust/issues>。设计决策与验收记录在源码树的 docs 目录中维护。
 
@@ -20,13 +20,13 @@ pymilvus 从 PyPI 安装；本包只从 GitHub Release 的附件安装，`--no-i
 
 ```bash
 python -m pip install pymilvus
-python -m pip install --no-index --only-binary :all: --find-links https://github.com/GrittyChen/milvus-lite-rust/releases/expanded_assets/v0.3.0rc2 milvus-lite-rust==0.3.0rc2
+python -m pip install --no-index --only-binary :all: --find-links https://github.com/GrittyChen/milvus-lite-rust/releases/expanded_assets/v0.3.0rc3 milvus-lite-rust==0.3.0rc3
 ```
 
-需要先核对文件时，从 [v0.3.0rc2 Release](https://github.com/GrittyChen/milvus-lite-rust/releases/tag/v0.3.0rc2) 下载本平台的 wheel 与 `SHA256SUMS`，在同一目录核对后安装本地文件：
+需要先核对文件时，从 [v0.3.0rc3 Release](https://github.com/GrittyChen/milvus-lite-rust/releases/tag/v0.3.0rc3) 下载本平台的 wheel 与 `SHA256SUMS`，在同一目录核对后安装本地文件：
 
 ```bash
-shasum -a 256 -c --ignore-missing SHA256SUMS && python -m pip install --no-index ./milvus_lite_rust-0.3.0rc2-*.whl
+shasum -a 256 -c --ignore-missing SHA256SUMS && python -m pip install --no-index ./milvus_lite_rust-0.3.0rc3-*.whl
 ```
 
 核对失败时不会执行安装。Linux 上也可以用 `sha256sum -c --ignore-missing SHA256SUMS` 代替 `shasum -a 256 -c --ignore-missing SHA256SUMS`。
@@ -43,20 +43,22 @@ python -m pip install .
 
 ## 平台与 Python 边界
 
-| 首发候选 | 系统下限 | 证据层级 |
+| 平台 | 系统下限 | 候选验收 |
 | --- | --- | --- |
-| Linux x86_64 | glibc 2.28 | 完整验收目标；已在原生 x86_64 的 glibc 2.28 环境实跑 |
-| Linux arm64 | glibc 2.28 | 完整验收目标；较新 Linux 容器的结果不等于最低 glibc 已验证 |
-| macOS arm64 | macOS 11 | 完整验收目标 |
-| macOS x86_64 | macOS 11 | 构建与安装/读写恢复冒烟；实际原生或 Rosetta 方式单独记录，证据弱于完整验收 |
+| Linux x86_64 | glibc 2.28 | 标准层：GitHub 托管 `ubuntu-24.04` 上固定的 manylinux_2_28 容器 |
+| Linux arm64 | glibc 2.28 | 标准层：GitHub 托管 `ubuntu-24.04-arm` 上固定的 manylinux_2_28 容器 |
+| macOS arm64 | macOS 11 | 标准层：GitHub 托管 `macos-15` |
+| macOS x86_64（Intel Mac） | macOS 11 | 标准层：GitHub 托管 `macos-15-intel`，原生执行 |
 
-Intel Mac 采用分层验收，不宣称已有完整原生验证。
+四个平台执行相同的适用门槛：正式 wheel 的归档与二进制检查，Rust 默认与故障注入构建的单测，CPython 3.10 与 3.15 上两条 SDK 的端到端全套，3.11–3.14 的联合冒烟，正式 wheel 上与官方 3.x 的差分及 Arrow 15/25 数据互通，以及故障注入测试包的恢复专项；Linux 另验 LOCK、strace 与容器 PID 1。Linux 在 glibc 2.28 的容器中运行，宿主内核是托管机器的较新版本；托管机器没有 macOS 11，最低系统字段由二进制检查核对，未在 macOS 11 真机运行。真实断电不在验收范围内。
 
 Python 元数据保持 `>=3.10`，不预先封顶；首发验证窗口是 **GIL CPython 3.10–3.15**，未来未测版本不据此宣称通过。3.10 保留为兼容下限，不以此承诺解释器的安全维护。
 
+Linux 上使用 CPython 3.15 时，pymilvus 依赖的 orjson 目前只为 glibc 2.39 及以上提供预编译 wheel；在更低的 glibc 上安装 pymilvus 时可能需要从源码构建 orjson，因此需要 Rust 工具链。本包自身的 wheel 不受影响。
+
 继续提供 sdist：矩阵内纳入验收；musl、其它架构及较低 glibc 的自行构建仅为实验性尝试，无支持承诺。**Windows、free-threaded 与非 CPython 在构建时明确拒绝**；Windows 当前仍有目录/句柄同步缺陷，首发既无 Windows wheel，也不允许 pip 从 sdist 安装出该已知不可用版本。Windows 未安装 Rust 时会先得到 cargo 缺失错误，本项目的拒绝检查可能尚未执行。
 
-abi3 wheel 供普通 GIL CPython 使用。正式包没有维护暂停/故障注入接口，FI 测试包单独构建，不用于发行。
+abi3 wheel 供普通 GIL CPython 使用。正式包没有维护暂停/故障注入接口，FI 测试包单独构建，只用于验收，不随发行分发。
 
 ## `.db` 使用示例
 
@@ -76,9 +78,9 @@ finally:
 
 `.db` 的父目录必须存在。同路径服务复用，`MilvusClient.close()` 关闭客户端而非本地服务；正常脚本退出会收尾服务并排空已接受的后台合并。
 
-本候选继承 0.3.0rc1 的能力与已登记差异，仅增加已审的 JSON 写入优化：复用首轮已校验、规范化的 JSON 文本构造 WAL，避免重复编码；原校验、错误优先级、分桶预构造及持久化保证保持。范围与验收依据见源码树中的 0015–0018 决策。本版实际验收结果以对应 Release 链接的记录为准，开发验收不替代最终产物验收。
+本候选的产品运行源码与依赖继承 0.3.0rc2，能力与已登记差异全部继承，不新增功能、RPC、数据格式或依赖；`crates/` 中相对 0.3.0rc2 的变化全部位于 `cfg(test)`，发行二进制不编译。仓库另包含持续集成、测试工具、发行工作流与文档改动，这些不进入运行时二进制或产品依赖。本版起候选改由发行工作流构建、验收并签发来源证明，范围与依据见源码树中的 0015–0018、0021 与 0022 决策。本版实际验收结果以对应 Release 链接的记录为准，开发验收不替代最终产物验收。
 
-`0.3.0rc2` 的范围包括基本 CRUD、Upsert/Delete、Flush/关闭重开、FLAT 的 L2/IP/COSINE、标量与动态字段比较、and/or/not、in/not in、LIKE、is null/exists、JSON 与动态字段路径、json_contains/array_contains 系列及 array_length、后台 compaction 与 tombstone 回收，以及下述已有能力。过滤按官方 3.x 的整条表达式路线执行，各路线对缺失值、短路和类型错误的处理不同；范围与参照缺陷见 0014。算术运算、text_match、几何与时间谓词、alias/rename、BM25/function chain、稀疏向量等范围外能力保持明确的 UNIMPLEMENTED，不静默忽略条件。官方 3.x 数据互通仍受类型、索引与已登记历史目录限制约束，不宣称兼容它的全部功能。
+`0.3.0rc3` 的范围包括基本 CRUD、Upsert/Delete、Flush/关闭重开、FLAT 的 L2/IP/COSINE、标量与动态字段比较、and/or/not、in/not in、LIKE、is null/exists、JSON 与动态字段路径、json_contains/array_contains 系列及 array_length、后台 compaction 与 tombstone 回收，以及下述已有能力。过滤按官方 3.x 的整条表达式路线执行，各路线对缺失值、短路和类型错误的处理不同；范围与参照缺陷见 0014。算术运算、text_match、几何与时间谓词、alias/rename、BM25/function chain、稀疏向量等范围外能力保持明确的 UNIMPLEMENTED，不静默忽略条件。官方 3.x 数据互通仍受类型、索引与已登记历史目录限制约束，不宣称兼容它的全部功能。
 
 - 显式分区支持 Create / Drop / Has / Show / statistics，以及写入和读取的分区选择；LoadPartitions / ReleasePartitions 仍未实现。读取先选分区再判版本，删除按主键全局生效；Drop 保留其它分区仍需的全局删除记录，避免重开后已删除行复活。目录安全拒绝和参照差异见 0017。
 - partition key 支持非主键 INT64 / VARCHAR，按参照固定哈希路由至 16 桶，另保留 `_default`。生成 auto_id 取分桶后的行序号，返回顺序仍对应原请求，可能得到 `[1,3,2]`；确定性校验 / 转换失败在追加任何 WAL 前整批拒绝，自动 ID 会覆盖可读旧行时整批拒绝。真实 I/O 故障仍按已校验前缀恢复，不保证整批原子写入。
@@ -90,7 +92,7 @@ finally:
 
 数据目录沿用 3.x 的 schema.json、Arrow WAL、Parquet 和 manifest format 2 编码，不增加私有数据格式。回退到已发布 0.2.0rc1 时，非默认分区 manifest 或 partition key schema 会使相应 collection 被明确拒绝，不能降级后继续读写这些集合；拒绝不应改坏目录，健康 collection 仍可打开。删除全部非默认分区且不含 key 等旧版不支持属性后，仅剩 `_default` 的目录可能回到旧版能力范围，具体见 0017。更早的 0.1.0rc1–rc3 还会拒绝 nullable / ARRAY 等新 schema 属性，见 0015。
 
-JSON 写入优化的收益限于 0018 已审的同机工作负载，不外推为任意 JSON、并发吞吐或全部写入路径的性能保证。进程峰值资源差距尚未解决，继续单独跟进。
+0.3.0rc2 起提供的 JSON 写入优化，收益限于 0018 已审的同机工作负载，不外推为任意 JSON、并发吞吐或全部写入路径的性能保证。进程峰值资源差距尚未解决，继续单独跟进。
 
 向量检索只有 FLAT（精确暴力检索）。新建索引时，FLAT 与 BRUTE_FORCE 原生支持；AUTOINDEX（pymilvus 快速建表使用）、HNSW、HNSW_SQ、IVF_FLAT、IVF_SQ8 可创建并原样保存定义，向量仍按 FLAT 执行，召回不低于 ANN 但数据量大时更慢。标量字段上的 INVERTED 可创建，过滤仍按扫描执行，结果可能与官方在已建索引数据上的结果不同。新建稠密向量索引时，AUTOINDEX、HNSW、HNSW_SQ、IVF_FLAT、IVF_SQ8 只接受 COSINE / L2 / IP；BM25 / NONE 返回 UNIMPLEMENTED，避免写出官方 3.x 无法 load 的定义。FLAT / BRUTE_FORCE 保持原度量校验。
 
