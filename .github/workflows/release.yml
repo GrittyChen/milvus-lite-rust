@@ -301,7 +301,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        part: [static, python, compare, fi]
+        # 差分两条线与互通各占一个 job（与对照层相同），使最慢的 Intel Mac 上三段并行；
+        # 这三段排在前面，只是倾向于先领到 macOS 执行机，GitHub 不保证按此顺序分配。
+        part: [diff-3.0.2, diff-2.6.17, interop, python, static, fi]
         platform:
           - scope: linux-x86_64
             os: ubuntu-24.04
@@ -344,7 +346,7 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - name: 取得参照实现
-        if: matrix.part == 'compare'
+        if: startsWith(matrix.part, 'diff-') || matrix.part == 'interop'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: milvus-io/milvus-lite
@@ -376,7 +378,8 @@ jobs:
           name: orjson-${{ matrix.platform.arch }}
           path: ${{ runner.temp }}/orjson
       - name: 环境
-        run: bash .github/ci/release_env.sh ${{ (matrix.part == 'static' || matrix.part == 'compare') && 'rust' || '' }}
+        # 差分本身不调用 cargo，但阶段文件按环境键记录 rustc（stage.py）；装上工具链，差分阶段记录实际版本而不是 absent。
+        run: bash .github/ci/release_env.sh ${{ (matrix.part != 'python' && matrix.part != 'fi') && 'rust' || '' }}
       - name: 产物
         run: |
           "$DEV_PY" tests/release/sums.py check "$RUNNER_TEMP/artifacts/formal.sha256" "$RUNNER_TEMP/artifacts/formal"
@@ -438,11 +441,12 @@ jobs:
             record --stage "smoke-$python"
           done
       - name: 正式 wheel 上的差分与互通
-        if: matrix.part == 'compare'
+        if: startsWith(matrix.part, 'diff-') || matrix.part == 'interop'
         env:
           MILVUS_LITE_3X_PYTHON: ${{ runner.temp }}/ref25/bin/python
           MILVUS_LITE_ARROW25_PYTHON: ${{ runner.temp }}/ref25/bin/python
           MILVUS_LITE_ARROW15_PYTHON: ${{ runner.temp }}/ref15/bin/python
+        # 三个 part 共用一个步骤：崩溃采集的 ulimit 与 record 只在同一个 shell 内有效；参照核对拆成多步后须逐步重复，漏写不会让 job 失败。
         run: |
           . .github/ci/crash_capture.sh
           record() { "$DEV_PY" tests/release/stage.py --dir "$STAGES" --scope "$SCOPE" "$@"; }
@@ -453,15 +457,24 @@ jobs:
             uv pip install -q --python "$RUNNER_TEMP/ref$arrow/bin/python" --no-build -r "$req/ref$arrow.txt"
             uv pip install -q --python "$RUNNER_TEMP/ref$arrow/bin/python" --no-deps --build-constraint "$req/build.txt" -e references/milvus-lite
           done
-          # 与对照层相同的两条线，Python 侧改为装配交出的正式 wheel，并核对实际加载的原生模块。
-          uv venv -q -p "$PY312" "$RUNNER_TEMP/w30"
-          uv pip install -q --python "$RUNNER_TEMP/w30/bin/python" --no-build -r "$req/sdk30.txt" && uv pip install -q --python "$RUNNER_TEMP/w30/bin/python" --no-deps "$WHEEL"
-          uv venv -q -p "$PY310" "$RUNNER_TEMP/w26"
-          uv pip install -q --python "$RUNNER_TEMP/w26/bin/python" --no-build -r "$req/sdk26.txt" && uv pip install -q --python "$RUNNER_TEMP/w26/bin/python" --no-deps "$WHEEL"
+          case "${{ matrix.part }}" in
+            diff-3.0.2|interop) sdk=3.0.2 ;;
+            diff-2.6.17) sdk=2.6.17 ;;
+            *) exit 1 ;;
+          esac
+          # 与对照层相同的两条线，Python 侧改为装配交出的正式 wheel，并核对实际加载的原生模块；互通用 3.0.2 线的环境，同样核对。
+          if [ "$sdk" = 3.0.2 ]; then
+            uv venv -q -p "$PY312" "$RUNNER_TEMP/w30"
+            uv pip install -q --python "$RUNNER_TEMP/w30/bin/python" --no-build -r "$req/sdk30.txt" && uv pip install -q --python "$RUNNER_TEMP/w30/bin/python" --no-deps "$WHEEL"
+            py="$RUNNER_TEMP/w30/bin/python"
+          else
+            uv venv -q -p "$PY310" "$RUNNER_TEMP/w26"
+            uv pip install -q --python "$RUNNER_TEMP/w26/bin/python" --no-build -r "$req/sdk26.txt" && uv pip install -q --python "$RUNNER_TEMP/w26/bin/python" --no-deps "$WHEEL"
+            py="$RUNNER_TEMP/w26/bin/python"
+          fi
           mkdir "$RUNNER_TEMP/outside"
-          for sdk in 3.0.2 2.6.17; do
-            py="$RUNNER_TEMP/w30/bin/python"; [ "$sdk" = 2.6.17 ] && py="$RUNNER_TEMP/w26/bin/python"
-            (cd "$RUNNER_TEMP/outside" && "$DEV_PY" "$GITHUB_WORKSPACE/tests/release/native_check.py" --python "$py" --wheel "$WHEEL")
+          (cd "$RUNNER_TEMP/outside" && "$DEV_PY" "$GITHUB_WORKSPACE/tests/release/native_check.py" --python "$py" --wheel "$WHEEL")
+          if [ "${{ matrix.part }}" != interop ]; then
             collected=$("$DEV_PY" tests/release/scorecard.py expect "$SCOPE" "differential-$sdk" collected)
             group=$("$DEV_PY" tests/release/scorecard.py expect "$SCOPE" "differential-$sdk" group)
             "$DEV_PY" tests/sharding/shard.py plan --python "$py" --suite "$PWD/tests/differential" --cwd "$RUNNER_TEMP/outside" \
@@ -469,25 +482,26 @@ jobs:
               --group-fixture diff --group-fixture rust_uri --group-fixture ref_uri --expect "$collected" --expect-group "$group"
             "$DEV_PY" tests/sharding/shard.py run --plan "$RUNNER_TEMP/diff-$sdk-plan/plan.json" --out "$RUNNER_TEMP/diff-$sdk-run"
             record --stage "differential-$sdk" --summary "$RUNNER_TEMP/diff-$sdk-run/summary.json"
-          done
-          # 互通用例另行调用的 Rust 示例与 FI 测试程序从冻结提交构建，属源码级组件（0021 第 9 条）。
-          export PYO3_PYTHON="$PY312"
-          # 先构建并核对 fresh，避免分片同时编译（0019 P0 第 3 条，与对照层相同）。
-          i=0
-          for command in "build -p milvus-lite-core --example storage_interop" \
-                         "test -p milvus-lite-core --features fault-injection --test crash_recovery --no-run" \
-                         "build -p milvus-lite-core --features fault-injection --example index_change_fault"; do
-            read -ra args <<< "$command"
-            cargo "${args[@]}" --locked
-            cargo "${args[@]}" --locked --message-format=json > "$RUNNER_TEMP/fresh-$i.json"
-            "$DEV_PY" .github/ci/cargo_fresh.py "$RUNNER_TEMP/fresh-$i.json"
-            i=$((i + 1))
-          done
-          expect=$("$DEV_PY" tests/release/scorecard.py expect "$SCOPE" interop collected)
-          "$DEV_PY" tests/sharding/shard.py plan --python "$RUNNER_TEMP/w30/bin/python" --suite tests/storage_interop \
-            --out "$RUNNER_TEMP/interop-plan" --shards ${{ matrix.platform.shards }} --expect "$expect" --expect-group 0
-          "$DEV_PY" tests/sharding/shard.py run --plan "$RUNNER_TEMP/interop-plan/plan.json" --out "$RUNNER_TEMP/interop-run"
-          record --stage interop --summary "$RUNNER_TEMP/interop-run/summary.json"
+          else
+            # 互通用例另行调用的 Rust 示例与 FI 测试程序从冻结提交构建，属源码级组件（0021 第 9 条）。
+            export PYO3_PYTHON="$PY312"
+            # 先构建并核对 fresh，避免分片同时编译（0019 P0 第 3 条，与对照层相同）。
+            i=0
+            for command in "build -p milvus-lite-core --example storage_interop" \
+                           "test -p milvus-lite-core --features fault-injection --test crash_recovery --no-run" \
+                           "build -p milvus-lite-core --features fault-injection --example index_change_fault"; do
+              read -ra args <<< "$command"
+              cargo "${args[@]}" --locked
+              cargo "${args[@]}" --locked --message-format=json > "$RUNNER_TEMP/fresh-$i.json"
+              "$DEV_PY" .github/ci/cargo_fresh.py "$RUNNER_TEMP/fresh-$i.json"
+              i=$((i + 1))
+            done
+            expect=$("$DEV_PY" tests/release/scorecard.py expect "$SCOPE" interop collected)
+            "$DEV_PY" tests/sharding/shard.py plan --python "$RUNNER_TEMP/w30/bin/python" --suite tests/storage_interop \
+              --out "$RUNNER_TEMP/interop-plan" --shards ${{ matrix.platform.shards }} --expect "$expect" --expect-group 0
+            "$DEV_PY" tests/sharding/shard.py run --plan "$RUNNER_TEMP/interop-plan/plan.json" --out "$RUNNER_TEMP/interop-run"
+            record --stage interop --summary "$RUNNER_TEMP/interop-run/summary.json"
+          fi
           git diff --exit-code -- Cargo.lock
           dirty=$(git -C references/milvus-lite status --porcelain); test -z "$dirty"
       - name: FI wheel 恢复专项
