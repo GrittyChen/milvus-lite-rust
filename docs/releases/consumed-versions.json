@@ -11,13 +11,13 @@
       "version": "0.0.1rc903",
       "run_id": 40215032490,
       "run_attempt": 1,
-      "outcome": "candidate"
+      "outcome": "released"
     },
     {
       "version": "0.0.1rc904",
       "run_id": 40465396815,
       "run_attempt": 1,
-      "outcome": "candidate"
+      "outcome": "abandoned"
     },
     {
       "version": "0.3.0rc3",
