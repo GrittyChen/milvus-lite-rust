@@ -2,9 +2,11 @@
 # 发行工作流各 job 的公共环境：CPython 3.10–3.15、固定版本的 uv、按 dev.txt 只用 wheel 安装的工具环境，
 # 以及可选的 Rust 工具链（按 rust-toolchain.toml）。manylinux 容器内用镜像自带的 /opt/python，
 # macOS 用 setup-python 装好的解释器。结果写入 GITHUB_ENV / GITHUB_PATH，供后续步骤使用。
+# RELEASE_PYTHONS 列出本 job 要用的次版本号（如 "10 12"），只校验并导出这些；不设时为 3.10–3.15 全部。
 set -euo pipefail
 want_rust=${1:-}
-for v in 10 11 12 13 14 15; do
+read -r -a minors <<< "${RELEASE_PYTHONS:-10 11 12 13 14 15}"
+for v in "${minors[@]}"; do
   if [ -x "/opt/python/cp3$v-cp3$v/bin/python" ]; then
     py="/opt/python/cp3$v-cp3$v/bin/python"
   else

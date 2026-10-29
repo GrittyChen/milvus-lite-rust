@@ -301,46 +301,37 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # 差分两条线与互通各占一个 job（与对照层相同），使最慢的 Intel Mac 上三段并行；
-        # 这三段排在前面，只是倾向于先领到 macOS 执行机，GitHub 不保证按此顺序分配。
+        # 与 tests-mac 用相同的 part 划分（差分两条线与互通各占一个 job），阶段与产物命名一致。
         part: [diff-3.0.2, diff-2.6.17, interop, python, static, fi]
         platform:
           - scope: linux-x86_64
             os: ubuntu-24.04
-            # 映射形式的 container 不接受空 image，因此整体放进矩阵值；macOS 为空字符串即不用容器。
-            container: {image: "quay.io/pypa/manylinux_2_28_x86_64@sha256:4131ddd7acb9c6c966af02fe7e71edc51e078c2d41f475966697676430bfa2ae", options: "--user 1001", volumes: ["/var/lib/systemd/coredump:/__coredump:ro"]}
+            image: quay.io/pypa/manylinux_2_28_x86_64@sha256:4131ddd7acb9c6c966af02fe7e71edc51e078c2d41f475966697676430bfa2ae
             tag: manylinux_2_28_x86_64
             arch: x86_64
             shards: 4
           - scope: linux-aarch64
             os: ubuntu-24.04-arm
-            # 映射形式的 container 不接受空 image，因此整体放进矩阵值；macOS 为空字符串即不用容器。
-            container: {image: "quay.io/pypa/manylinux_2_28_aarch64@sha256:abd1230aa9e4058a74b89d27cd14ba18c0db036d7bfe6e6f219a29ea63c24eb6", options: "--user 1001", volumes: ["/var/lib/systemd/coredump:/__coredump:ro"]}
+            image: quay.io/pypa/manylinux_2_28_aarch64@sha256:abd1230aa9e4058a74b89d27cd14ba18c0db036d7bfe6e6f219a29ea63c24eb6
             tag: manylinux_2_28_aarch64
             arch: aarch64
             shards: 4
-          - scope: macos-arm64
-            os: macos-15
-            container: ""
-            tag: macosx_11_0_arm64
-            arch: ""
-            shards: 3
-          - scope: macos-x86_64
-            os: macos-15-intel
-            container: ""
-            tag: macosx_11_0_x86_64
-            arch: ""
-            shards: 3
     runs-on: ${{ matrix.platform.os }}
-    container: ${{ matrix.platform.container }}
+    container:
+      image: ${{ matrix.platform.image }}
+      options: --user 1001
+      volumes:
+        - /var/lib/systemd/coredump:/__coredump:ro
     timeout-minutes: 120
     env:
       SCOPE: ${{ matrix.platform.scope }}
-      RUNNER_IMAGE: ${{ matrix.platform.container && format('{0} container {1}', matrix.platform.os, matrix.platform.container.image) || '' }}
+      RUNNER_IMAGE: ${{ format('{0} container {1}', matrix.platform.os, matrix.platform.image) }}
       MACOSX_DEPLOYMENT_TARGET: "11.0"
-      # 容器内的崩溃由宿主机的 systemd-coredump 接收，其目录只读挂入容器（见 crash_capture.sh）；macOS 不设。
-      CRASH_CORE_DIR: ${{ matrix.platform.container && '/__coredump' || '' }}
-    steps:
+      # 容器内的崩溃由宿主机的 systemd-coredump 接收，其目录只读挂入容器（见 crash_capture.sh）。
+      CRASH_CORE_DIR: /__coredump
+    # 步骤由 tests-mac 共用：不能引用只有本 job 矩阵才有的字段（如 platform.image），
+    # 也不能依赖只在容器 job 设置的 RUNNER_IMAGE / CRASH_CORE_DIR；后者 actionlint 查不出来。
+    steps: &tests-steps
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
@@ -355,14 +346,16 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        if: matrix.platform.container == ''
+        if: runner.os == 'macOS'
         with:
+          # 3.15 只有 python part 用到，且不是 macOS 执行机自带的，安装 pkg 要 1–3 分钟；其余 part 的这一行为空，
+          # setup-python 读多行输入时丢弃空行。最后一行决定默认解释器，3.12 保持在末尾。
           python-version: |
             3.10
             3.11
             3.13
             3.14
-            3.15
+            ${{ matrix.part == 'python' && '3.15' || '' }}
             3.12
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -379,6 +372,8 @@ jobs:
           path: ${{ runner.temp }}/orjson
       - name: 环境
         # 差分本身不调用 cargo，但阶段文件按环境键记录 rustc（stage.py）；装上工具链，差分阶段记录实际版本而不是 absent。
+        env:
+          RELEASE_PYTHONS: ${{ matrix.part == 'python' && '10 11 12 13 14 15' || '10 11 12 13 14' }}
         run: bash .github/ci/release_env.sh ${{ (matrix.part != 'python' && matrix.part != 'fi') && 'rust' || '' }}
       - name: 产物
         run: |
@@ -547,6 +542,35 @@ jobs:
         run: |
           # 只用于诊断（0020 公共约定 10）：环境步骤之前失败时没有测试步骤运行过，也没有 PY314。
           if [ -n "${PY314:-}" ]; then "$PY314" .github/ci/crash_report.py; else echo "no test step ran"; fi
+
+  tests-mac:
+    # 与 tests 相同的步骤，只是 macOS 两层：12 个 job 争 5 个 macOS 并发位，不限流时由 GitHub 决定谁先领到执行机，
+    # 最长的 Intel 差分可能排到最后。max-parallel 等于该上限，使排队留在矩阵内部，以期按矩阵顺序（part 在外层、
+    # 大致按 Intel 上的时长从长到短，同一 part 内 Intel 在前）放行；GitHub 文档未写明放行顺序。
+    needs: [assemble, orjson]
+    name: tests (${{ matrix.platform.scope }}, ${{ matrix.part }})
+    strategy:
+      fail-fast: false
+      max-parallel: 5
+      matrix:
+        part: [diff-2.6.17, diff-3.0.2, interop, python, static, fi]
+        platform:
+          - scope: macos-x86_64
+            os: macos-15-intel
+            tag: macosx_11_0_x86_64
+            arch: ""
+            shards: 3
+          - scope: macos-arm64
+            os: macos-15
+            tag: macosx_11_0_arm64
+            arch: ""
+            shards: 3
+    runs-on: ${{ matrix.platform.os }}
+    timeout-minutes: 120
+    env:
+      SCOPE: ${{ matrix.platform.scope }}
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+    steps: *tests-steps
 
   linux-system:
     # LOCK 与 strace（第 9 条）：strace 需要容器的 ptrace 权限。
@@ -837,7 +861,7 @@ jobs:
   candidate:
     # 只接受全部前序 job 为 success；随后生成候选结果与最终 SHA256SUMS（0021 第 12 条）。
     if: always()
-    needs: [precheck, identity, orjson, build, assemble, tests, linux-system, pid1, sdist, previous-reader]
+    needs: [precheck, identity, orjson, build, assemble, tests, tests-mac, linux-system, pid1, sdist, previous-reader]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
