@@ -14,6 +14,10 @@ from pymilvus import MilvusClient
 
 from compare import Diff
 
+# 等待子进程启动（含参照实现导入 grpc、pyarrow 等）的上限，只防挂起；本机不到 1 秒，
+# 慢的 Intel Mac 执行机在三个分片并行时实测超过 15 秒。
+STARTUP_TIMEOUT = 60
+
 
 class Cli:
     def __init__(self, python, path):
@@ -37,7 +41,7 @@ class Cli:
         self.reader = threading.Thread(target=read_output, daemon=True)
         self.reader.start()
         try:
-            line = self.output.get(timeout=20)
+            line = self.output.get(timeout=STARTUP_TIMEOUT)
             if isinstance(line, Exception):
                 raise line
             assert line is not None and f"listening on 127.0.0.1:{port}" in line, line
@@ -107,7 +111,7 @@ def test_cli_stop_policy_flushes_or_recovers_the_same_logical_data(tmp_path):
 def test_cli_invalid_worker_rejection_is_registered_before_resource_creation(value, tmp_path):
     for label, python, code, exists in [("rust", sys.executable, 2, False), ("reference", os.environ["MILVUS_LITE_3X_PYTHON"], 1, True)]:
         path = tmp_path / label
-        result = subprocess.run([python, "-m", "milvus_lite", "server", "--data-dir", str(path), "--max-workers", value], capture_output=True, text=True, timeout=15)
+        result = subprocess.run([python, "-m", "milvus_lite", "server", "--data-dir", str(path), "--max-workers", value], capture_output=True, text=True, timeout=STARTUP_TIMEOUT)
         assert result.returncode == code, result.stderr
         assert path.exists() == exists
         assert "listening" not in result.stdout
