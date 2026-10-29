@@ -19,6 +19,24 @@ Linux 上的 CPython 3.15 例外：`orjson==3.13.0` 的 cp315 Linux wheel 只有
 
 更新任一 `.in` 或参照版本后，在仓库根目录按各 `.txt` 文件头记录的命令重新生成，并随同一提交评审。生成使用 CI 固定的 uv 版本，并以 `--exclude-newer` 截止到生成日前两周，避免刚发布的版本进入环境；`--universal` 使同一份结果在三个平台通用，但不保证每个平台都有 wheel：例如参照环境的 faiss-cpu 1.15.1 在三个平台都有 wheel，但 macOS arm64 的最低目标是 macOS 14，更换托管机器或依赖版本时须重新核对。
 
+### uv 的获取
+
+uv 不经 PyPI 索引安装：索引响应可能被截断，而 pip 不重试响应体的解析错误（[0021 试点记录「偶发故障」](../../docs/testing/0021-release-pilot.md#偶发故障)）。[install_uv.sh](install_uv.sh) 由 [fetch.py](fetch.py) 按 [requirements/uv-wheels.txt](requirements/uv-wheels.txt) 的固定地址下载本平台 wheel、核对 sha256，再 `pip install --no-index --no-deps` 本地文件并核对版本；发行工作流（经 [release_env.sh](release_env.sh)）、快速层与对照层共用。清单的版本须与三个工作流的 `UV_VERSION` 一致，四个平台键须齐全，由 [tests/ci](../../tests/ci/test_fetch.py) 核对。
+
+平台映射：Linux x86_64 → `manylinux_2_17_x86_64.manylinux2014_x86_64`；Linux aarch64 → `manylinux_2_28_aarch64`（manylinux_2_28 容器与 ubuntu-24.04-arm 的 glibc 均不低于 2.28，与 pip 按标签优先级的选择相同）；macOS arm64 → `macosx_11_0_arm64`；macOS x86_64 → `macosx_10_12_x86_64`。
+
+更新 `UV_VERSION` 时同一提交重写清单，哈希按三个来源交叉核对后才写入：PyPI JSON（`https://pypi.org/pypi/uv/<版本>/json`）的 `digests.sha256`；本地下载后重算；wheel 中的 `uv` 二进制与 astral-sh/uv 同版本 GitHub Release 的对应压缩包（`uv-<target>.tar.gz`，先核对其 `.sha256` 附件）中的二进制逐字节相同，且该压缩包通过 `gh attestation verify --repo astral-sh/uv`。uv 0.12.23 在 PyPI 上没有 PEP 740 来源证明，因此以 GitHub Release 的证明为第三个来源。
+
+## 传输层有限重试
+
+按 0021 第 11 条，判定层不重试；传输层只对内容固定或只读的操作有限重试，间隔 5 / 15 / 45 秒，每次输出 `transport-retry` 警告注解，用尽即失败：
+
+- [fetch.py](fetch.py) `file`：内容由 sha256 固定的下载（uv wheel、orjson sdist、上一版本 wheel），任何下载失败都重试，哈希不符立即失败；
+- [tests/release/runs.py](../../tests/release/runs.py) 的 `Gh(retry=True)`：只读 GET 只在暂时性传输错误（连接失败、超时、HTTP 500/502/503/504、`stream CANCEL`）或成功响应的 JSON 无法解析时重试，任何 HTTP 4xx 原样失败（429 也不重试：gh api 的错误输出不含 `Retry-After`）；前置检查、签发前复核、演练的证明 404 检查与 `release_set.py --prepare` 使用它，0022 的保全路径（门闩与 save；verify 不访问接口）使用默认的不重试实例；
+- [Dockerfile.pid1](../../tests/platform/Dockerfile.pid1) 的 SDK 安装：完整 constraints 固定版本、只用 wheel，失败时整体重试；镜像构建输出不进入 job 日志，由 [linux_pid1_probe.py](../../tests/platform/linux_pid1_probe.py) 检索重试行后转发为注解，次数写入 `identity.json`。
+
+uv、cargo、rustup 与 `gh attestation verify` 自带的网络重试保持默认，见各自官方文档。
+
 ## 检查脚本
 
 - [rust_results.py](rust_results.py)：cargo test 的汇总须存在，且失败与 ignored 均为 0；可选的第二个参数要求 passed 总数恰为该值，用于按名称筛选的运行。

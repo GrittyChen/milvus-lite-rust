@@ -18,7 +18,7 @@ for v in "${minors[@]}"; do
   export "PY3$v=$py"
 done
 "$PY312" -m venv "$RUNNER_TEMP/uv-tool"
-"$RUNNER_TEMP/uv-tool/bin/python" -m pip install --quiet "uv==$UV_VERSION"
+bash .github/ci/install_uv.sh "$RUNNER_TEMP/uv-tool/bin/python"
 echo "$RUNNER_TEMP/uv-tool/bin" >> "$GITHUB_PATH"
 uv="$RUNNER_TEMP/uv-tool/bin/uv"
 "$uv" venv -q -p "$PY312" "$RUNNER_TEMP/dev"

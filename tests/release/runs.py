@@ -6,8 +6,10 @@
 import argparse
 import json
 from pathlib import Path
+import re
 import subprocess
 import sys
+import time
 
 import ledger
 from candidate import VERSION, HEX40, CandidateError, require
@@ -100,35 +102,79 @@ def parse_ref(text):
     return {"id": run_id, "attempt": attempt}
 
 
+# 只读接口的有限重试（0021 第 11 条传输层）：只对可判定为暂时性的传输错误，以及 HTTP 成功但响应体不是合法 JSON
+# 的情形重试。任何 HTTP 4xx 都是确定的回答，不重试；429 也不重试，因为 gh api 的错误输出不含 Retry-After。
+RETRY_DELAYS = (5, 15, 45)
+# 文本取自 gh 的实际输出：DNS 等连接失败为「error connecting to <host>」，服务端断开为「…: EOF」。
+TRANSIENT = re.compile(r"HTTP 50[0234]|stream error|CANCEL|timeout|timed out|connection reset|connection refused"
+                       r"|unexpected EOF|: EOF$|error connecting to|TLS handshake", re.IGNORECASE | re.MULTILINE)
+DEFINITE = re.compile(r"HTTP 4\d\d")
+
+
+def transient(stderr):
+    return not DEFINITE.search(stderr) and bool(TRANSIENT.search(stderr))
+
+
+def retry_notice(operation, attempt, reason, delay):
+    # 写到 stderr：precheck 把结果打印到 stdout，runner 两路都解析工作流命令。
+    print(f"::warning title=transport-retry::{operation}: attempt {attempt} failed ({reason}); retrying in {delay}s",
+          file=sys.stderr, flush=True)
+
+
 class Gh:
-    def __init__(self, repo):
+    """经 gh api 取数。默认不重试；只读且失败可安全重试的调用方显式传 retry=True。0022 的保全路径（门闩与 save；
+    verify 不访问接口）保持不重试：门闩是放行签发的唯一判据，失败发生在签发前、不消费版本。"""
+
+    def __init__(self, repo, retry=False, sleep=time.sleep):
         self.repo = repo
+        self.retry = retry
+        self.sleep = sleep
 
     def _api(self, path, *extra):
         return subprocess.run(["gh", "api", "-H", "X-GitHub-Api-Version: 2022-11-28", *extra, f"repos/{self.repo}/{path}"],
                               capture_output=True, text=True)
 
+    def _call(self, path, extra=(), parse=None):
+        """返回 (result, value)。失败的 result 交给调用方判定；不重试的实例与逐次调用 _api 相同。"""
+        attempts = len(RETRY_DELAYS) + 1 if self.retry else 1
+        for attempt in range(attempts):
+            result = self._api(path, *extra)
+            if result.returncode != 0:
+                if attempt + 1 == attempts or not transient(result.stderr):
+                    return result, None
+                reason = result.stderr.strip().splitlines()[-1]
+            else:
+                try:
+                    return result, parse(result.stdout) if parse else result.stdout
+                except json.JSONDecodeError as error:
+                    if attempt + 1 == attempts:
+                        raise
+                    reason = f"invalid JSON in a successful response: {error}"
+            retry_notice(f"gh api {path}", attempt + 1, reason, RETRY_DELAYS[attempt])
+            self.sleep(RETRY_DELAYS[attempt])
+
     def get(self, path):
-        result = self._api(path)
+        result, value = self._call(path, parse=json.loads)
         require(result.returncode == 0, f"gh api {path} failed: {result.stderr.strip()}")
-        return json.loads(result.stdout)
+        return value
 
     def items(self, path, key):
-        result = self._api(path, "--paginate", "--jq", f".{key}[]")
+        result, value = self._call(path, ("--paginate", "--jq", f".{key}[]"),
+                                   parse=lambda out: [json.loads(line) for line in out.splitlines() if line])
         require(result.returncode == 0, f"gh api {path} failed: {result.stderr.strip()}")
-        return [json.loads(line) for line in result.stdout.splitlines() if line]
+        return value
 
     def absent(self, path):
-        result = self._api(path)
+        result, _ = self._call(path)
         if result.returncode == 0:
             return False
         require("HTTP 404" in result.stderr, f"gh api {path} failed: {result.stderr.strip()}")
         return True
 
     def raw(self, path):
-        result = self._api(path, "-H", "Accept: application/vnd.github.raw+json")
+        result, value = self._call(path, ("-H", "Accept: application/vnd.github.raw+json"))
         require(result.returncode == 0, f"gh api {path} failed: {result.stderr.strip()}")
-        return result.stdout
+        return value
 
     def workflow_runs(self, path, query=""):
         return self.items(f"actions/workflows/{Path(path).name}/runs?per_page=100{query}", "workflow_runs")
@@ -244,10 +290,17 @@ def main(argv=None):
     r.add_argument("--meta", type=Path, required=True)
     r.add_argument("--run-id", type=int, required=True)
     r.add_argument("--run-attempt", type=int, required=True)
+    a = sub.add_parser("absent", help="exit 0 only when the API answers 404 for the path")
+    a.add_argument("--path", required=True)
     args = parser.parse_args(argv)
-    gh = Gh(args.repo)
+    gh = Gh(args.repo, retry=True)
     try:
-        if args.command == "precheck":
+        if args.command == "absent":
+            if not gh.absent(args.path):
+                print(f"{args.path} exists", file=sys.stderr)
+                return 1
+            print(f"{args.path} is absent")
+        elif args.command == "precheck":
             meta = precheck(gh, args)
             args.out.write_text(json.dumps(meta, sort_keys=True, indent=2) + "\n")
             print(json.dumps(meta, sort_keys=True))

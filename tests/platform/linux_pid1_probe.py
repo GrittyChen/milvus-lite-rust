@@ -3,6 +3,7 @@
 import argparse
 import json
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import tempfile
@@ -22,6 +23,10 @@ def docker(*args, timeout=120):
         return subprocess.check_output(["docker", *map(str, args)], text=True, stderr=subprocess.STDOUT, timeout=timeout).strip()
     except subprocess.CalledProcessError as error:
         raise RuntimeError("Docker command failed: " + str(error.cmd) + "\n" + error.output) from error
+    except subprocess.TimeoutExpired as error:
+        # 超时时保留已有输出：镜像构建中的重试行只在这里可查。
+        output = error.output.decode(errors="replace") if isinstance(error.output, bytes) else (error.output or "")
+        raise RuntimeError("Docker command timed out: " + str(error.cmd) + "\n" + output) from error
 
 
 def state(name):
@@ -75,6 +80,18 @@ def has_supervisor_kill(events, name):
     return any(e.get("Type") == "container" and e.get("Action") == "kill" and e.get("Actor", {}).get("Attributes", {}).get("name") == name and e["Actor"]["Attributes"].get("signal") == "9" for e in map(json.loads, events.splitlines()))
 
 
+# Dockerfile.pid1 每次重试输出的行；BuildKit 也回显 RUN 原文，其中是字面的 $attempt，不会被计入。
+RETRY_LINE = re.compile(r"transport-retry: (pid1 sdk install attempt \d+ failed; retrying in \d+s)")
+
+
+def forward_retries(text):
+    """把构建日志中的重试行转发为 job 日志里的警告注解，返回次数。"""
+    found = RETRY_LINE.findall(text)
+    for line in found:
+        print(f"::warning title=transport-retry::{line}", file=sys.stderr, flush=True)
+    return len(found)
+
+
 def build_image(wheel, tag, base, log, constraints):
     with tempfile.TemporaryDirectory() as temp:
         path = Path(temp)
@@ -82,7 +99,7 @@ def build_image(wheel, tag, base, log, constraints):
         shutil.copy2(constraints, path / "constraints.txt")
         for name in ["Dockerfile.pid1", "pid1_entry.py"]:
             shutil.copy2(Path(__file__).with_name(name), path / name)
-        log.write_text(docker("build", "--build-arg", "BASE_IMAGE=" + base, "-f", path / "Dockerfile.pid1", "-t", tag, path, timeout=900) + "\n")
+        log.write_text(docker("build", "--build-arg", "BASE_IMAGE=" + base, "-f", path / "Dockerfile.pid1", "-t", tag, path, timeout=1500) + "\n")
 
 
 def probe(formal, fi, base, output, constraints):
@@ -99,6 +116,8 @@ def probe(formal, fi, base, output, constraints):
         docker("tag", base, images["base"])
         build_image(formal, images["formal"], images["base"], output / "formal-build.log", constraints)
         build_image(fi, images["fi"], images["base"], output / "fi-build.log", constraints)
+        identity["transport_retries"] = sum(forward_retries((output / name).read_text()) for name in ["formal-build.log", "fi-build.log"])
+        (output / "identity.json").write_text(json.dumps(identity, indent=2) + "\n")
         for mode in ["normal", "drain", "kill"]:
             name = token + "-" + mode
             data, control = name + "-data", name + "-control"

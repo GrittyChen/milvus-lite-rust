@@ -621,13 +621,13 @@ def main(argv=None):
     args = parser.parse_args(argv)
     try:
         if args.command == "save":
-            print(save(Gh(args.repo), args.mode, args.version, runs.parse_ref(args.run), args.root), flush=True)
+            print(save(Gh(args.repo, retry=False), args.mode, args.version, runs.parse_ref(args.run), args.root), flush=True)
         elif args.command == "verify":
             print(output_line(*verify(args.directory)), flush=True)
         elif args.command == "digests":
             print(digests(args.mode, args.version, {"id": args.run_id, "attempt": args.run_attempt}, args.candidate_dir, args.fi_dir))
         else:
-            comment = gate(runs.Gh(args.repo), args.mode, args.environment, args.owner_id, args.version,
+            comment = gate(runs.Gh(args.repo, retry=False), args.mode, args.environment, args.owner_id, args.version,
                            {"id": args.run_id, "attempt": args.run_attempt}, args.candidate_dir, args.fi_digests)
             print("dry run: no approval needed" if comment is None else f"approval matched: {comment}")
     except (c.CandidateError, OSError, ValueError, zipfile.BadZipFile) as error:

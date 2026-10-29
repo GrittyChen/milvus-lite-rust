@@ -2,7 +2,15 @@ ARG BASE_IMAGE=python:3.10-slim-bookworm
 FROM ${BASE_IMAGE}
 COPY constraints.txt /tmp/constraints.txt
 # SDK 及其依赖按固定的完整依赖集合安装，只用 wheel，不在构建镜像时解析最新版本。
-RUN python -m pip install --timeout 120 --only-binary :all: --constraint /tmp/constraints.txt pymilvus==3.0.2 \
+# 版本完全固定，重试只能得到同一组文件或失败，因此失败时整体有限重试（0021 第 11 条传输层）；每次重试输出
+# transport-retry 行，构建输出不进入 job 日志，由 linux_pid1_probe.py 检索后转发。
+RUN attempt=0; for delay in 5 15 45 ""; do \
+      attempt=$((attempt + 1)); \
+      python -m pip install --timeout 120 --only-binary :all: --constraint /tmp/constraints.txt pymilvus==3.0.2 && break; \
+      [ -n "$delay" ] || exit 1; \
+      echo "transport-retry: pid1 sdk install attempt $attempt failed; retrying in ${delay}s"; \
+      sleep "$delay"; \
+    done \
     && useradd --create-home --uid 1000 tester \
     && mkdir /data /control \
     && chown tester:tester /data /control

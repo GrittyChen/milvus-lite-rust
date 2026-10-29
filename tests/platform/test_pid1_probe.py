@@ -34,3 +34,26 @@ def test_supervisor_event_must_identify_the_actual_container(kind, name, signal,
     import json
     event = {"Type": kind, "Action": "kill", "Actor": {"Attributes": {"name": name, "signal": signal}}}
     assert probe.has_supervisor_kill(json.dumps(event), "own") is expected
+
+
+def test_retry_lines_are_forwarded_from_the_build_log(capsys):
+    log = "\n".join([
+        '#7 [3/6] RUN attempt=0; for delay in 5 15 45 ""; do echo "transport-retry: pid1 sdk install attempt $attempt failed; retrying in ${delay}s"',
+        "#7 4.21 ERROR: Could not install packages due to an OSError",
+        "#7 4.30 transport-retry: pid1 sdk install attempt 1 failed; retrying in 5s",
+        "#7 19.9 transport-retry: pid1 sdk install attempt 2 failed; retrying in 15s",
+        "#7 40.1 Successfully installed pymilvus-3.0.2",
+    ])
+    assert probe.forward_retries(log) == 2
+    notices = [line for line in capsys.readouterr().err.splitlines() if line.startswith("::warning title=transport-retry::")]
+    assert notices == ["::warning title=transport-retry::pid1 sdk install attempt 1 failed; retrying in 5s",
+                       "::warning title=transport-retry::pid1 sdk install attempt 2 failed; retrying in 15s"]
+    assert probe.forward_retries("#7 CACHED") == 0
+
+
+def test_docker_timeout_preserves_partial_output(monkeypatch):
+    def slow(*args, **kwargs):
+        raise probe.subprocess.TimeoutExpired(["docker", "build"], 1500, output=b"transport-retry: pid1 sdk install attempt 1 failed")
+    monkeypatch.setattr(probe.subprocess, "check_output", slow)
+    with pytest.raises(RuntimeError, match="timed out.*\n.*attempt 1 failed"):
+        probe.docker("build")

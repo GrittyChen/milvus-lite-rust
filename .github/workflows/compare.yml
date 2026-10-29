@@ -108,7 +108,7 @@ jobs:
           head=$(git -C references/milvus-lite rev-parse HEAD); test "$head" = "$REFERENCE_COMMIT"
           dirty=$(git -C references/milvus-lite status --porcelain); test -z "$dirty"
           rustup toolchain install && rustc --version && df -h .
-          python3.12 -m pip install "uv==$UV_VERSION"
+          bash .github/ci/install_uv.sh python3.12
           req=.github/ci/requirements
           uv venv -p python3.12 .venv
           uv pip install --python .venv/bin/python --no-build -r $req/dev.txt

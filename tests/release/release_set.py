@@ -98,7 +98,7 @@ def main(argv=None):
     parser.add_argument("--prepare", action="store_true", help="also require no tag / Release and no other run in the ledger")
     args = parser.parse_args(argv)
     try:
-        prepare = (lambda data: prepare_checks(Gh(args.repo), data)) if args.prepare else None
+        prepare = (lambda data: prepare_checks(Gh(args.repo, retry=True), data)) if args.prepare else None
         data = verify(args.dir, args.version, args.repo, prepare=prepare)
     except c.CandidateError as error:
         print(f"release set rejected: {error}", file=sys.stderr)

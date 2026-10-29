@@ -134,7 +134,8 @@ jobs:
         run: bash .github/ci/release_env.sh rust
       - name: 构建
         run: |
-          curl -sSfL --retry 3 -o "$RUNNER_TEMP/orjson-3.13.0.tar.gz" "$ORJSON_SDIST_URL"
+          sha=$("$DEV_PY" -c 'import sys; sys.path.insert(0, "tests/release"); import orjson_wheel; print(orjson_wheel.SDIST_SHA256)')
+          "$DEV_PY" .github/ci/fetch.py file --url "$ORJSON_SDIST_URL" --sha256 "$sha" --out "$RUNNER_TEMP/orjson-3.13.0.tar.gz"
           "$DEV_PY" tests/release/orjson_wheel.py build --sdist "$RUNNER_TEMP/orjson-3.13.0.tar.gz" --python "$PY315" \
             --maturin "$(dirname "$DEV_PY")/maturin" --work-dir "$RUNNER_TEMP/orjson-work" --out "$RUNNER_TEMP/orjson" \
             --record "$RUNNER_TEMP/orjson/record.json"
@@ -828,9 +829,8 @@ jobs:
           . .github/ci/crash_capture.sh
           "$DEV_PY" tests/release/sums.py check "$RUNNER_TEMP/artifacts/formal.sha256" "$RUNNER_TEMP/artifacts/formal"
           req=.github/ci/requirements
-          curl -sSfL --retry 3 -o "$RUNNER_TEMP/$PREVIOUS_WHEEL" \
-            "https://github.com/$GITHUB_REPOSITORY/releases/download/v$PREVIOUS_VERSION/$PREVIOUS_WHEEL"
-          test "$("$DEV_PY" tests/release/sums.py digest "$RUNNER_TEMP/$PREVIOUS_WHEEL")" = "$PREVIOUS_WHEEL_SHA256"
+          "$DEV_PY" .github/ci/fetch.py file --sha256 "$PREVIOUS_WHEEL_SHA256" --out "$RUNNER_TEMP/$PREVIOUS_WHEEL" \
+            --url "https://github.com/$GITHUB_REPOSITORY/releases/download/v$PREVIOUS_VERSION/$PREVIOUS_WHEEL"
           for side in new old; do
             uv venv -q -p "$PY312" "$RUNNER_TEMP/$side"
             uv pip install -q --python "$RUNNER_TEMP/$side/bin/python" --no-build -r "$req/sdk30.txt"
@@ -1041,12 +1041,10 @@ jobs:
               assert {s["name"] for s in statement["subject"]} == names, statement["subject"]
           ' "${names[@]}"
             done
-            # 演练不得为正式附件的摘要留下任何证明：要求接口明确返回 404，网络错误不算通过。
+            # 演练不得为正式附件的摘要留下任何证明：要求接口明确返回 404；暂时性传输错误有限重试，其余错误不算通过。
             for file in "$RUNNER_TEMP"/candidate/milvus_lite_rust-*; do
               digest=$(python3 tests/release/sums.py digest "$file")
-              if out=$(gh api "repos/$GITHUB_REPOSITORY/attestations/sha256:$digest" 2>&1); then
-                echo "dry run left an attestation for $(basename "$file")"; exit 1
-              fi
-              grep -q "HTTP 404" <<< "$out" || { echo "cannot confirm absence for $(basename "$file"): $out"; exit 1; }
+              python3 tests/release/runs.py --repo "$GITHUB_REPOSITORY" absent --path "attestations/sha256:$digest" \
+                || { echo "dry run left an attestation for $(basename "$file"), or its absence cannot be confirmed"; exit 1; }
             done
           fi
