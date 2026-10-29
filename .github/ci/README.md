@@ -32,10 +32,10 @@ uv 不经 PyPI 索引安装：索引响应可能被截断，而 pip 不重试响
 按 0021 第 11 条，判定层不重试；传输层只对内容固定或只读的操作有限重试，间隔 5 / 15 / 45 秒，每次输出 `transport-retry` 警告注解，用尽即失败：
 
 - [fetch.py](fetch.py) `file`：内容由 sha256 固定的下载（uv wheel、orjson sdist、上一版本 wheel），任何下载失败都重试，哈希不符立即失败；
-- [tests/release/runs.py](../../tests/release/runs.py) 的 `Gh(retry=True)`：只读 GET 只在暂时性传输错误（连接失败、超时、HTTP 500/502/503/504、`stream CANCEL`）或成功响应的 JSON 无法解析时重试，任何 HTTP 4xx 原样失败（429 也不重试：gh api 的错误输出不含 `Retry-After`）；前置检查、签发前复核、演练的证明 404 检查与 `release_set.py --prepare` 使用它，0022 的保全路径（门闩与 save；verify 不访问接口）使用默认的不重试实例；
+- [tests/release/runs.py](../../tests/release/runs.py) 的 `Gh(retry=True)`：只读 GET 只在暂时性传输错误（连接失败、超时、HTTP 500/502/503/504、HTTP/2 stream 错误如 `stream CANCEL`）或成功响应的 JSON 无法解析时重试，任何 HTTP 4xx 原样失败（429 也不重试：gh api 的错误输出不含 `Retry-After`）；前置检查、签发前复核、演练的证明 404 检查与 `release_set.py --prepare` 使用它，0022 的保全路径（门闩与 save；verify 不访问接口）使用默认的不重试实例；
 - [Dockerfile.pid1](../../tests/platform/Dockerfile.pid1) 的 SDK 安装：完整 constraints 固定版本、只用 wheel，失败时整体重试；镜像构建输出不进入 job 日志，由 [linux_pid1_probe.py](../../tests/platform/linux_pid1_probe.py) 检索重试行后转发为注解，次数写入 `identity.json`。
 
-uv、cargo、rustup 与 `gh attestation verify` 自带的网络重试保持默认，见各自官方文档。
+uv、cargo、rustup 与 `gh attestation verify` 自带的网络重试保持默认，见各自官方文档；[release_env.sh](release_env.sh) 安装 rustup 的 `curl --retry 3` 维持原样。
 
 ## 检查脚本
 
