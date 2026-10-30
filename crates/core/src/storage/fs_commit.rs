@@ -534,4 +534,53 @@ mod tests {
         assert_eq!(error.phase, CommitPhase::BeforeReplace);
         assert_eq!(fs::read(victim).unwrap(), b"unchanged");
     }
+
+    /// 替换之前的三类失败（钩子、临时文件写入、改名）共用同一出口：磁盘上仍是原文件、不留临时文件；
+    /// 只有改名之后的失败才是「已替换、未确认」。清空清理与别名、改名、Alter 的重试语义都依赖这一区分。
+    #[test]
+    fn replace_file_reports_unchanged_before_the_rename_and_unconfirmed_after() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("f.json");
+        fs::write(&target, b"old").unwrap();
+        let leftovers = || {
+            fs::read_dir(root.path())
+                .unwrap()
+                .filter(|e| {
+                    e.as_ref()
+                        .unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .contains(".tmp")
+                })
+                .count()
+        };
+        let hook = replace_file(root.path(), "f.json", b"new", |point| match point {
+            ReplacePoint::BeforeRename => Err(io::Error::other("hook")),
+            ReplacePoint::AfterRename => Ok(()),
+        });
+        assert!(matches!(hook, Err(ReplaceError::Unchanged(_))));
+        assert_eq!(
+            (fs::read(&target).unwrap(), leftovers()),
+            (b"old".to_vec(), 0)
+        );
+
+        // 改名目标是非空目录：写入与同步都成功，改名失败，临时文件被清掉。
+        let blocked = root.path().join("d.json");
+        fs::create_dir(&blocked).unwrap();
+        fs::write(blocked.join("x"), b"x").unwrap();
+        let renamed = replace_file(root.path(), "d.json", b"new", |_| Ok(()));
+        assert!(matches!(renamed, Err(ReplaceError::Unchanged(_))));
+        assert!(blocked.is_dir());
+        assert_eq!(leftovers(), 0);
+
+        let after = replace_file(root.path(), "f.json", b"new", |point| match point {
+            ReplacePoint::BeforeRename => Ok(()),
+            ReplacePoint::AfterRename => Err(io::Error::other("hook")),
+        });
+        assert!(matches!(after, Err(ReplaceError::Unconfirmed(_))));
+        assert_eq!(
+            (fs::read(&target).unwrap(), leftovers()),
+            (b"new".to_vec(), 0)
+        );
+    }
 }

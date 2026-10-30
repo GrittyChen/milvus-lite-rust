@@ -549,6 +549,94 @@ fn directory_change_cancels_prepared_round_without_losing_input_files() {
     db.close();
 }
 
+/// 0023 A 的独占变更（别名、AlterCollection、改名、清空）与创建一样排队在进行中的合并之后：
+/// 已准备的一轮在提交前被取消，输入文件不丢；清空则在取消之后清空数据。
+#[cfg(feature = "fault-injection")]
+#[test]
+fn collection_management_changes_cancel_prepared_round_before_they_run() {
+    use std::sync::mpsc;
+    type Change = Box<dyn FnOnce(&Db) + Send>;
+    let cases: Vec<(&str, &str, Change)> = vec![
+        (
+            "alias",
+            "c",
+            Box::new(|db| db.create_alias("", "c", "a").unwrap()),
+        ),
+        (
+            "alter",
+            "c",
+            Box::new(|db| {
+                db.alter_collection("", "c", &[("k".into(), "v".into())], &[])
+                    .unwrap()
+            }),
+        ),
+        (
+            "rename",
+            "d",
+            Box::new(|db| db.rename_collection("", "c", "d", "").unwrap()),
+        ),
+        (
+            "truncate",
+            "c",
+            Box::new(|db| db.truncate_collection("", "c").unwrap()),
+        ),
+    ];
+    for (label, after, change) in cases {
+        let root = tempfile::tempdir().unwrap();
+        let db = open(root.path());
+        db.create_collection("", "c", schema()).unwrap();
+        drain(&db);
+        let (entered, arrived) = mpsc::channel();
+        let (resume, continued) = mpsc::channel();
+        db.pause_compaction_before_commit_once(entered, continued);
+        for id in 1..=4 {
+            db.insert("", "c", batch(&[id])).unwrap();
+            db.flush_collection("", "c").unwrap();
+        }
+        arrived.recv_timeout(Duration::from_secs(15)).unwrap();
+        let before = std::fs::read(root.path().join("collections/c/manifest.json")).unwrap();
+        let worker = {
+            let db = Arc::clone(&db);
+            std::thread::spawn(move || change(&db))
+        };
+        let until = std::time::Instant::now() + Duration::from_secs(5);
+        while db.pending_namespace_changes() == 0 {
+            assert!(std::time::Instant::now() < until, "{label}");
+            std::thread::yield_now();
+        }
+        resume.send(()).unwrap();
+        worker.join().unwrap();
+        let report = db
+            .wait_for_maintenance("", after, Duration::from_secs(15))
+            .unwrap();
+        assert_eq!(report.failed, 0, "{label}: {report:?}");
+        if label == "truncate" {
+            assert!(report.cancelled >= 1, "{label}: {report:?}");
+            assert_eq!(db.collection("", "c").unwrap().read().count(), 0);
+        } else if label == "rename" {
+            // 新名是新句柄、统计从头计，报告里看不到旧句柄的取消；只断言不失败且四行不丢。
+            assert_eq!(db.collection("", after).unwrap().read().count(), 4);
+        } else {
+            assert!(report.cancelled >= 1, "{label}: {report:?}");
+            assert_eq!(
+                std::fs::read(
+                    root.path()
+                        .join(format!("collections/{after}/manifest.json"))
+                )
+                .unwrap(),
+                before,
+                "{label}"
+            );
+            assert_eq!(
+                db.collection("", after).unwrap().read().count(),
+                4,
+                "{label}"
+            );
+        }
+        db.close();
+    }
+}
+
 #[cfg(feature = "fault-injection")]
 #[test]
 fn disk_snapshot_pins_data_delta_and_index_across_atomic_gc() {

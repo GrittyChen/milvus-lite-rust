@@ -407,3 +407,66 @@ fn alias_write_failures_before_replace_change_nothing_and_after_replace_seal_wri
         }
     }
 }
+
+/// 进程在 `aliases.json` 替换前后退出：重开只见替换之前或之后的完整文件，没有残留临时文件。
+#[cfg(feature = "fault-injection")]
+#[test]
+fn process_exit_around_the_alias_replace_reopens_before_or_after() {
+    use milvus_lite_core::db::{
+        DirectoryFault, DirectoryOperation, DirectoryPoint, inject_directory_fault_once,
+    };
+    use std::process::Command;
+    let test = "process_exit_around_the_alias_replace_reopens_before_or_after";
+    if let Ok(stage) = std::env::var("MILVUS_LITE_ALIAS_CRASH") {
+        let path = std::path::PathBuf::from(std::env::var("MILVUS_LITE_CRASH_DIR").unwrap());
+        let db = open(&path);
+        db.create_collection("", "c", schema()).unwrap();
+        db.create_alias("", "c", "kept").unwrap();
+        let point = if stage == "before" {
+            DirectoryPoint::Aliases
+        } else {
+            DirectoryPoint::AliasesAfterRename
+        };
+        inject_directory_fault_once(DirectoryOperation::Alias, point, DirectoryFault::Exit);
+        db.create_alias("", "c", "new").unwrap();
+        panic!("alias crash injection did not fire");
+    }
+    // 同 crash_recovery：验证过程放在独立父进程中，避免兄弟子进程短暂继承刚关闭的 LOCK。
+    if std::env::var_os("MILVUS_LITE_ALIAS_PARENT").is_none() {
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test, "--nocapture"])
+            .env("MILVUS_LITE_ALIAS_PARENT", "1")
+            .status()
+            .unwrap();
+        assert!(
+            status.success(),
+            "isolated alias recovery parent failed: {status:?}"
+        );
+        return;
+    }
+    for (stage, replaced) in [("before", false), ("after", true)] {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("alias-crash.db");
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test, "--nocapture"])
+            .env("MILVUS_LITE_ALIAS_CRASH", stage)
+            .env("MILVUS_LITE_CRASH_DIR", &path)
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(88), "{stage}");
+        let db = open(&path);
+        assert_eq!(db.describe_alias("", "kept").unwrap(), "c", "{stage}");
+        assert_eq!(db.describe_alias("", "new").is_ok(), replaced, "{stage}");
+        // 重开后别名写入照常。
+        db.create_alias("", "c", "later").unwrap();
+        db.close();
+        assert!(
+            std::fs::read_dir(&path).unwrap().all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".tmp")),
+            "{stage}"
+        );
+    }
+}

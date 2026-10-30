@@ -581,6 +581,8 @@ pub(crate) fn cleanup(
                 Some(id) if id == snap.id => fs::remove_file(&metadata)?,
                 // 同名的新 snapshot（3.x 之后建立）：不是意图所列的那一个。
                 Some(_) => continue,
+                // 元数据已不在（上一轮清理删到一半、或 3.x 先删了它）：视为已删，同名 manifest 副本
+                // 仍按意图清掉；只有 id 不同才说明是别的 snapshot，必须保留。
                 None => {}
             }
             if fs::symlink_metadata(&manifests).is_ok_and(|meta| meta.file_type().is_dir()) {

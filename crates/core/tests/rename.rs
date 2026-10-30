@@ -631,11 +631,66 @@ mod faults {
         }
     }
 
+    /// 启动时（`Db::new` 单线程）按意图收尾遇到故障：启动不失败，改名置为未完成，数据读写照常，
+    /// 下一次受限操作重试成功；没有故障时的收尾结果与重开一致。
+    #[test]
+    fn startup_settle_failures_do_not_fail_startup_and_finish_on_the_next_retry() {
+        for point in [
+            DirectoryPoint::CollectionsSync,
+            DirectoryPoint::Schema,
+            DirectoryPoint::SchemaAfterRename,
+            DirectoryPoint::Aliases,
+            DirectoryPoint::AliasesAfterRename,
+            DirectoryPoint::IntentRemove,
+            DirectoryPoint::IntentRemoveAfter,
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let db = open(root.path());
+            db.create_collection("", "c", schema()).unwrap();
+            db.insert("", "c", batch(&[1, 2])).unwrap();
+            db.create_alias("", "c", "a").unwrap();
+            db.close();
+            std::fs::rename(
+                root.path().join("collections/c"),
+                root.path().join("collections/d"),
+            )
+            .unwrap();
+            write_intent(root.path(), "c", "d");
+
+            inject(point, DirectoryFault::Error);
+            let db = open(root.path());
+            // 故障确实发生在启动收尾中：意图仍在（只有删除之后的目录同步失败时它已不在）。
+            assert_eq!(
+                root.path().join(INTENT).exists(),
+                point != DirectoryPoint::IntentRemoveAfter,
+                "{point:?}"
+            );
+            // 读写照常（数据读写不依赖元数据收尾）。
+            assert_eq!(count(&db, "d"), 2, "{point:?}");
+            db.insert("", "d", batch(&[3])).unwrap();
+            // 下一次受限操作重试收尾并成功。
+            db.create_collection("", "n", schema()).unwrap();
+            assert!(!root.path().join(INTENT).exists(), "{point:?}");
+            assert_eq!(schema_name(root.path(), "d"), "d", "{point:?}");
+            assert_eq!(
+                aliases(root.path()).unwrap(),
+                "{\n  \"a\": \"d\"\n}",
+                "{point:?}"
+            );
+            assert_eq!(count(&db, "a"), 3, "{point:?}");
+            db.close();
+            let db = open(root.path());
+            assert_eq!(count(&db, "d"), 3, "{point:?}");
+            db.close();
+        }
+    }
+
     #[test]
     fn requests_during_rename_wait_for_the_exclusive_permit_and_see_the_result() {
         for point in [RenamePausePoint::Retired, RenamePausePoint::SchemaReplaced] {
             let root = tempfile::tempdir().unwrap();
             let db = seeded(root.path());
+            db.create_collection("", "gone", schema()).unwrap();
             assert_eq!(count(&db, "other"), 0);
             let (entered_tx, entered) = std::sync::mpsc::channel();
             let (resume, resume_rx) = std::sync::mpsc::channel();
@@ -658,6 +713,8 @@ mod faults {
                 }),
                 Box::new(|db: &Db| db.insert("", "other", batch(&[1])).map(|_| ())),
                 Box::new(|db: &Db| db.create_collection("", "n", schema())),
+                Box::new(|db: &Db| db.flush_collection("", "other").map(|_| ())),
+                Box::new(|db: &Db| db.drop_collection("", "gone")),
             ]
             .into_iter()
             .map(|request| {

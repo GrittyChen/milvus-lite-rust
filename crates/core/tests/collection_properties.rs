@@ -326,3 +326,74 @@ fn alter_failures_before_replace_change_nothing_and_after_replace_seal_writes() 
         }
     }
 }
+
+/// 进程在 `schema.json` 替换前后退出：重开只见替换之前或之后的属性，没有残留临时文件。
+#[cfg(feature = "fault-injection")]
+#[test]
+fn process_exit_around_the_alter_replace_reopens_before_or_after() {
+    use milvus_lite_core::db::{
+        DirectoryFault, DirectoryOperation, DirectoryPoint, inject_directory_fault_once,
+    };
+    use std::process::Command;
+    let test = "process_exit_around_the_alter_replace_reopens_before_or_after";
+    if let Ok(stage) = std::env::var("MILVUS_LITE_ALTER_CRASH") {
+        let path = PathBuf::from(std::env::var("MILVUS_LITE_CRASH_DIR").unwrap());
+        let db = open(&path);
+        db.create_collection("", "c", schema()).unwrap();
+        db.alter_collection("", "c", &pairs(&[("kept", "1")]), &[])
+            .unwrap();
+        let point = if stage == "before" {
+            DirectoryPoint::BeforeRename
+        } else {
+            DirectoryPoint::AfterRename
+        };
+        inject_directory_fault_once(DirectoryOperation::Alter, point, DirectoryFault::Exit);
+        db.alter_collection("", "c", &pairs(&[("new", "2")]), &keys(&["kept"]))
+            .unwrap();
+        panic!("alter crash injection did not fire");
+    }
+    // 同 crash_recovery：验证过程放在独立父进程中，避免兄弟子进程短暂继承刚关闭的 LOCK。
+    if std::env::var_os("MILVUS_LITE_ALTER_PARENT").is_none() {
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test, "--nocapture"])
+            .env("MILVUS_LITE_ALTER_PARENT", "1")
+            .status()
+            .unwrap();
+        assert!(
+            status.success(),
+            "isolated alter recovery parent failed: {status:?}"
+        );
+        return;
+    }
+    for (stage, replaced) in [("before", false), ("after", true)] {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("alter-crash.db");
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test, "--nocapture"])
+            .env("MILVUS_LITE_ALTER_CRASH", stage)
+            .env("MILVUS_LITE_CRASH_DIR", &path)
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(88), "{stage}");
+        let db = open(&path);
+        let expected = if replaced {
+            pairs(&[("new", "2")])
+        } else {
+            pairs(&[("kept", "1")])
+        };
+        assert_eq!(properties(&db, "c"), expected, "{stage}");
+        db.alter_collection("", "c", &pairs(&[("later", "3")]), &[])
+            .unwrap();
+        db.close();
+        assert!(
+            std::fs::read_dir(schema_path(&path, "c").parent().unwrap())
+                .unwrap()
+                .all(|entry| !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .contains(".tmp")),
+            "{stage}"
+        );
+    }
+}

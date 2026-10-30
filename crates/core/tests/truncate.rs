@@ -1065,6 +1065,130 @@ mod faults {
         db.close();
     }
 
+    /// 清理做了一半就中断（snapshot 元数据已删而 manifest 副本还在、部分旧文件已删）：重开补完；
+    /// 同名但 id 不同的新 snapshot 不属于意图，必须保留。
+    #[test]
+    fn reopen_finishes_a_partly_done_cleanup_and_keeps_snapshots_it_does_not_own() {
+        for newer in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let db = seeded(root.path());
+            let old = segment_files(root.path(), "c");
+            assert!(!old.is_empty());
+            inject(DirectoryPoint::Files, DirectoryFault::Error);
+            assert!(db.truncate_collection("", "c").is_err());
+            db.close();
+            let base = dir(root.path(), "c");
+            // 上一轮已删元数据与副本之后，当时还剩下的状态：补回副本目录，并手工删掉一个旧文件。
+            let copies = base.join("snapshots/manifests/s");
+            std::fs::create_dir_all(&copies).unwrap();
+            std::fs::write(copies.join("manifest.json"), b"{}").unwrap();
+            assert!(!base.join("snapshots/metadata/s.json").exists());
+            std::fs::remove_file(base.join(&old[0])).unwrap();
+            if newer {
+                // 3.x 在这之后建立的同名新 snapshot，id 不同。
+                snapshot(root.path(), "c", "s", ID_B, &[]);
+            }
+            let db = open(root.path());
+            assert_eq!(count(&db, "c"), 0);
+            assert!(!base.join(INTENT).exists());
+            assert!(staging_is_empty(root.path()));
+            assert!(
+                segment_files(root.path(), "c")
+                    .iter()
+                    .all(|f| !old.contains(f))
+            );
+            assert_eq!(base.join("snapshots/metadata/s.json").exists(), newer);
+            assert_eq!(copies.exists(), newer);
+            db.close();
+        }
+    }
+
+    /// 清理未完成的集合被 drop 或改名：意图随目录走，drop 之后没有残留；改名之后新名首次打开补完清理。
+    #[test]
+    fn dropping_or_renaming_a_collection_with_unfinished_cleanup_leaves_nothing_behind() {
+        for rename in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let db = seeded(root.path());
+            inject(DirectoryPoint::Files, DirectoryFault::Error);
+            assert!(db.truncate_collection("", "c").is_err());
+            if rename {
+                db.rename_collection("", "c", "d", "").unwrap();
+                assert_eq!(count(&db, "d"), 0);
+                db.insert("", "d", batch(&[7])).unwrap();
+                db.flush_collection("", "d").unwrap();
+                assert!(!dir(root.path(), "d").join(INTENT).exists());
+            } else {
+                db.drop_collection("", "c").unwrap();
+                assert!(!dir(root.path(), "c").exists());
+            }
+            db.close();
+            // 暂存目录里移出的 `wal/` 在下次启动清掉；两种情形都不能让旧数据回来。
+            let db = open(root.path());
+            assert!(staging_is_empty(root.path()), "rename={rename}");
+            if rename {
+                assert_eq!(count(&db, "d"), 1);
+                assert!(
+                    !dir(root.path(), "d")
+                        .join("snapshots/metadata/s.json")
+                        .exists()
+                );
+            } else {
+                db.create_collection("", "c", schema()).unwrap();
+                assert_eq!(count(&db, "c"), 0);
+            }
+            db.close();
+        }
+    }
+
+    /// 清理未完成期间不排合并；清理完成后维护恢复，随后的写入照常触发合并。
+    #[test]
+    fn maintenance_resumes_after_the_cleanup_finishes() {
+        let root = tempfile::tempdir().unwrap();
+        let db = seeded(root.path());
+        inject(DirectoryPoint::Files, DirectoryFault::Error);
+        assert!(db.truncate_collection("", "c").is_err());
+        for id in 1..=4 {
+            // 第一次写入先在独占许可下补完清理。
+            db.insert("", "c", batch(&[id])).unwrap();
+            db.flush_collection("", "c").unwrap();
+        }
+        assert!(!dir(root.path(), "c").join(INTENT).exists());
+        let report = db
+            .wait_for_maintenance("", "c", std::time::Duration::from_secs(15))
+            .unwrap();
+        assert_eq!(report.failed, 0, "{report:?}");
+        assert!(report.completed >= 1, "{report:?}");
+        assert_eq!(count(&db, "c"), 4);
+        db.close();
+    }
+
+    /// 继承了上一次运行遗留的已提交 WAL 文件的集合再清空：整个 `wal/` 移走，旧行不会被重放回来。
+    #[test]
+    fn a_collection_that_inherited_committed_wal_files_truncates_without_replay() {
+        use milvus_lite_core::storage::flush::inject_wal_unlink_failure_once;
+        let root = tempfile::tempdir().unwrap();
+        let db = open(root.path());
+        db.create_collection("", "c", schema()).unwrap();
+        db.insert("", "c", batch(&[1])).unwrap();
+        inject_wal_unlink_failure_once();
+        assert!(db.flush_collection("", "c").is_err());
+        db.close_nowait();
+        db.close();
+        drop(db);
+        let wal = dir(root.path(), "c").join("wal/wal_data_000001.arrow");
+        assert!(wal.exists());
+        let db = open(root.path());
+        assert_eq!(count(&db, "c"), 1);
+        db.truncate_collection("", "c").unwrap();
+        assert_eq!(count(&db, "c"), 0);
+        assert_truncated_on_disk(root.path(), "c");
+        db.insert("", "c", batch(&[2])).unwrap();
+        db.close();
+        let db = open(root.path());
+        assert_eq!(count(&db, "c"), 1);
+        db.close();
+    }
+
     #[test]
     fn reads_during_cleanup_see_the_empty_collection_and_writes_wait() {
         let root = tempfile::tempdir().unwrap();

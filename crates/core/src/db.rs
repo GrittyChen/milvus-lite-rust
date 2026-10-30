@@ -137,7 +137,8 @@ struct DatabaseState {
     /// `aliases.json` 的缓存；叶子锁，覆盖完整的读改写（0023 A「别名」）。
     aliases: OrderedMutex<Option<Aliases>, 6>,
     /// 改名未完成（0023 A「改名」）：`Some` 为最近一次收尾失败的原因。此时 create、drop、改名与别名写入
-    /// 先按磁盘上的意图重试收尾，仍失败则拒绝；数据读写照常。只在独占许可下修改。
+    /// 先按磁盘上的意图重试收尾，仍失败则拒绝；数据读写照常。只在独占许可下修改，唯一例外是
+    /// `Db::new` 在服务开始前单线程设置启动收尾的结果。
     rename_pending: OrderedMutex<Option<String>, 6>,
 }
 
@@ -3389,10 +3390,13 @@ impl Db {
                 "collection was renamed, but directory durability is unconfirmed: {error}"
             )));
         }
-        rename_pause(RenamePause::Retired)?;
-
+        // 暂停点只在测试钩子里会失败；此时目录已改名，必须按未完成收尾，不能带着半截状态返回。
+        let finished = match rename_pause(RenamePause::Retired) {
+            Ok(()) => self.finish_rename(state, &intent),
+            Err(error) => Err(RenameFailure::Pending(error.to_string())),
+        };
         // P3、P4
-        match self.finish_rename(state, &intent) {
+        match finished {
             Ok(()) => Ok(()),
             Err(RenameFailure::Pending(reason)) => {
                 *state.rename_pending.lock() = Some(reason.clone());
