@@ -40,16 +40,22 @@ fn read(root: &Path) -> Result<Aliases> {
     Ok(aliases)
 }
 
+/// 与 3.x `_save_aliases` 相同的文件字节。
+pub(crate) fn to_bytes(aliases: &Aliases) -> Vec<u8> {
+    let map = aliases
+        .iter()
+        .map(|(alias, target)| (alias.clone(), serde_json::Value::String(target.clone())))
+        .collect();
+    crate::pyjson::dump_file(&serde_json::Value::Object(map)).into_bytes()
+}
+
 /// 写入 `aliases.json`（[`fs_commit::replace_file`]），同步数据库根目录。
 pub(crate) fn write(
     root: &Path,
     aliases: &Aliases,
     fault: impl Fn(ReplacePoint) -> std::io::Result<()>,
 ) -> std::result::Result<(), ReplaceError> {
-    let value = serde_json::to_value(aliases)
-        .map_err(|error| ReplaceError::Unchanged(std::io::Error::other(error)))?;
-    let bytes = crate::pyjson::dump_file(&value).into_bytes();
-    fs_commit::replace_file(root, "aliases.json", &bytes, fault)
+    fs_commit::replace_file(root, "aliases.json", &to_bytes(aliases), fault)
 }
 
 #[cfg(test)]

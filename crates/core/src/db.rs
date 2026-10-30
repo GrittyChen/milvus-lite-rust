@@ -20,6 +20,7 @@ use crate::filter::ParsedFilter;
 use crate::index::IndexRequest;
 use crate::schema::CollectionSchema;
 use crate::storage::fs_commit::{self, guarded_io};
+use crate::storage::rename_intent::{self, RenameIntent};
 use crate::storage::{recovery, runtime, schema_file::SchemaFile};
 
 #[cfg(feature = "fault-injection")]
@@ -134,6 +135,9 @@ struct DatabaseState {
     root: PathBuf,
     /// `aliases.json` 的缓存；叶子锁，覆盖完整的读改写（0023 A「别名」）。
     aliases: OrderedMutex<Option<Aliases>, 6>,
+    /// 改名未完成（0023 A「改名」）：`Some` 为最近一次收尾失败的原因。此时 create、drop、改名与别名写入
+    /// 先按磁盘上的意图重试收尾，仍失败则拒绝；数据读写照常。只在独占许可下修改。
+    rename_pending: OrderedMutex<Option<String>, 6>,
 }
 
 impl DatabaseState {
@@ -153,10 +157,22 @@ struct NameLease<'a> {
     lock: Option<Arc<NameMutex>>,
 }
 
-impl NameLease<'_> {
+impl<'a> NameLease<'a> {
     #[allow(clippy::expect_used)] // 名字锁守卫的借用先结束，析构才能独占租约并取走强引用。
     fn mutex(&self) -> &Arc<NameMutex> {
         self.lock.as_ref().expect("name lease is live")
+    }
+
+    /// 同时持有两个名字锁（改名的新旧名字）：按（数据库，名字）的字节序先后取得，同层只允许这一种嵌套。
+    fn lock_pair<'g>(
+        a: &'g NameLease<'a>,
+        b: &'g NameLease<'a>,
+    ) -> [crate::lock_order::MutexGuard<'g, ()>; 2] {
+        let (first, second) = if a.key < b.key { (a, b) } else { (b, a) };
+        debug_assert!(first.key < second.key, "a name lock pair needs two names");
+        let held = first.mutex().lock();
+        let next = second.mutex().lock_after(&held);
+        [held, next]
     }
 }
 
@@ -242,6 +258,9 @@ pub enum DirectoryOperation {
     Alias,
     /// AlterCollection 的 `schema.json` 替换，只用 `BeforeRename` 与 `AfterRename`（目录同步之前）两点。
     Alter,
+    /// 改名：`BeforeRename` 为目录改名之前，`CollectionsSync` 为退役旧名后（及重开收尾时）同步 `collections/`，
+    /// `Aliases` / `AliasesAfterRename` 为别名改指，其余为改名专用的点。
+    Rename,
 }
 #[cfg(feature = "fault-injection")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -252,7 +271,36 @@ pub enum DirectoryPoint {
     StagingSync,
     Aliases,
     AliasesAfterRename,
+    /// 改名意图写入的替换之前 / 之后。
+    Intent,
+    IntentAfterRename,
+    /// 改名后的精确名字核对：`Error` 按核对不通过处理。
+    NameVerification,
+    /// 核对不通过后改回旧名之前。
+    Rollback,
+    /// 新目录 `schema.json` 的替换之前 / 之后。
+    Schema,
+    SchemaAfterRename,
+    /// 删除改名意图之前 / 之后（同步数据库根目录之前）。
+    IntentRemove,
+    IntentRemoveAfter,
 }
+
+/// 改名过程中可暂停的位置，供测试在锁内观察其他请求。
+#[cfg(feature = "fault-injection")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RenamePausePoint {
+    /// 旧名已退役、`collections/` 已同步，元数据尚未改写。
+    Retired,
+    /// `schema.json` 已改写，别名尚未改指。
+    SchemaReplaced,
+}
+#[cfg(feature = "fault-injection")]
+type RenamePauseSlot = (
+    RenamePausePoint,
+    std::sync::mpsc::Sender<()>,
+    std::sync::mpsc::Receiver<()>,
+);
 #[cfg(feature = "fault-injection")]
 #[derive(Clone, Copy, Debug)]
 pub enum DirectoryFault {
@@ -263,8 +311,18 @@ pub enum DirectoryFault {
 
 #[cfg(feature = "fault-injection")]
 thread_local! {
-    static DIRECTORY_FAULT: std::cell::Cell<Option<(DirectoryOperation, DirectoryPoint, DirectoryFault)>> = const { std::cell::Cell::new(None) };
+    static DIRECTORY_FAULT: std::cell::RefCell<Vec<(DirectoryOperation, DirectoryPoint, DirectoryFault)>> = const { std::cell::RefCell::new(Vec::new()) };
     static OPEN_CLEANUP_PAUSE: std::cell::RefCell<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>> = const { std::cell::RefCell::new(None) };
+    static RENAME_PAUSE: std::cell::RefCell<Option<RenamePauseSlot>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(feature = "fault-injection")]
+pub fn pause_rename_once(
+    point: RenamePausePoint,
+    entered: std::sync::mpsc::Sender<()>,
+    resume: std::sync::mpsc::Receiver<()>,
+) {
+    RENAME_PAUSE.with(|slot| *slot.borrow_mut() = Some((point, entered, resume)));
 }
 
 #[cfg(feature = "fault-injection")]
@@ -273,7 +331,7 @@ pub fn inject_directory_fault_once(
     point: DirectoryPoint,
     fault: DirectoryFault,
 ) {
-    DIRECTORY_FAULT.with(|slot| slot.set(Some((op, point, fault))));
+    DIRECTORY_FAULT.with(|slot| slot.borrow_mut().push((op, point, fault)));
 }
 
 #[cfg(feature = "fault-injection")]
@@ -286,12 +344,13 @@ pub fn pause_open_cleanup_once(
 
 #[cfg(feature = "fault-injection")]
 fn directory_fault(op: DirectoryOperation, point: DirectoryPoint) -> std::io::Result<()> {
-    let fault = DIRECTORY_FAULT.with(|slot| match slot.get() {
-        Some((wanted_op, wanted_point, fault)) if op == wanted_op && point == wanted_point => {
-            slot.set(None);
-            Some(fault)
-        }
-        _ => None,
+    // 可同时登记多个不同的点，各自只触发一次（例如改名失败之后的意图删除也失败）。
+    let fault = DIRECTORY_FAULT.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let index = slot
+            .iter()
+            .position(|(wanted_op, wanted_point, _)| op == *wanted_op && point == *wanted_point)?;
+        Some(slot.remove(index).2)
     });
     match fault {
         Some(DirectoryFault::Error) => Err(std::io::Error::other(
@@ -300,6 +359,111 @@ fn directory_fault(op: DirectoryOperation, point: DirectoryPoint) -> std::io::Re
         Some(DirectoryFault::Panic) => panic!("injected directory lifecycle panic"),
         Some(DirectoryFault::Exit) => std::process::exit(88),
         None => Ok(()),
+    }
+}
+
+/// 改名各步骤的故障点；非故障注入构建中不做任何事。
+#[derive(Clone, Copy, Debug)]
+enum RenameStep {
+    Intent,
+    IntentAfterRename,
+    Directory,
+    NameVerification,
+    Rollback,
+    CollectionsSync,
+    Schema,
+    SchemaAfterRename,
+    Aliases,
+    AliasesAfterRename,
+    IntentRemove,
+    IntentRemoveAfter,
+}
+
+fn rename_fault(step: RenameStep) -> std::io::Result<()> {
+    #[cfg(feature = "fault-injection")]
+    {
+        let point = match step {
+            RenameStep::Intent => DirectoryPoint::Intent,
+            RenameStep::IntentAfterRename => DirectoryPoint::IntentAfterRename,
+            RenameStep::Directory => DirectoryPoint::BeforeRename,
+            RenameStep::NameVerification => DirectoryPoint::NameVerification,
+            RenameStep::Rollback => DirectoryPoint::Rollback,
+            RenameStep::CollectionsSync => DirectoryPoint::CollectionsSync,
+            RenameStep::Schema => DirectoryPoint::Schema,
+            RenameStep::SchemaAfterRename => DirectoryPoint::SchemaAfterRename,
+            RenameStep::Aliases => DirectoryPoint::Aliases,
+            RenameStep::AliasesAfterRename => DirectoryPoint::AliasesAfterRename,
+            RenameStep::IntentRemove => DirectoryPoint::IntentRemove,
+            RenameStep::IntentRemoveAfter => DirectoryPoint::IntentRemoveAfter,
+        };
+        directory_fault(DirectoryOperation::Rename, point)
+    }
+    #[cfg(not(feature = "fault-injection"))]
+    {
+        let _step = step;
+        Ok(())
+    }
+}
+
+/// 文件替换类步骤的两个故障点。
+fn rename_replace_fault(
+    before: RenameStep,
+    after: RenameStep,
+) -> impl Fn(fs_commit::ReplacePoint) -> std::io::Result<()> {
+    move |point| {
+        rename_fault(match point {
+            fs_commit::ReplacePoint::BeforeRename => before,
+            fs_commit::ReplacePoint::AfterRename => after,
+        })
+    }
+}
+
+#[derive(Clone, Copy)]
+enum RenamePause {
+    Retired,
+    SchemaReplaced,
+}
+
+fn rename_pause(at: RenamePause) -> Result<()> {
+    #[cfg(feature = "fault-injection")]
+    {
+        let point = match at {
+            RenamePause::Retired => RenamePausePoint::Retired,
+            RenamePause::SchemaReplaced => RenamePausePoint::SchemaReplaced,
+        };
+        let pause = RENAME_PAUSE.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            match slot.take() {
+                Some((wanted, entered, resume)) if wanted == point => Some((entered, resume)),
+                other => {
+                    *slot = other;
+                    None
+                }
+            }
+        });
+        if let Some((entered, resume)) = pause {
+            entered.send(()).map_err(storage)?;
+            resume.recv().map_err(storage)?;
+        }
+    }
+    #[cfg(not(feature = "fault-injection"))]
+    let _at = at;
+    Ok(())
+}
+
+/// 改名收尾（P3、P4）失败的两类结果。
+enum RenameFailure {
+    /// 文件替换之前失败或无法判定：改名未完成，可重试。
+    Pending(String),
+    /// 文件已替换、所在目录同步未确认。
+    Unconfirmed(String),
+}
+
+impl RenameFailure {
+    fn reason(self) -> String {
+        match self {
+            Self::Pending(reason) | Self::Unconfirmed(reason) => reason,
+        }
     }
 }
 
@@ -429,6 +593,7 @@ impl Db {
                 Arc::new(DatabaseState {
                     root: path,
                     aliases: OrderedMutex::new(None),
+                    rename_pending: OrderedMutex::new(None),
                 }),
             )]),
             name_locks: OrderedMutex::new(BTreeMap::new()),
@@ -440,6 +605,17 @@ impl Db {
             #[cfg(feature = "fault-injection")]
             partition_pause: Mutex::new(None),
         });
+        // 0023 A「改名 / 启动处理」：LOCK 与 staging 清理之后、开始服务之前；失败不让启动失败。
+        for state in db.databases.values() {
+            if let Err(failure) = db.settle_rename(state, false) {
+                let reason = failure.reason();
+                eprintln!(
+                    "collection rename in {:?} is unfinished: {reason}",
+                    state.root
+                );
+                *state.rename_pending.lock() = Some(reason);
+            }
+        }
         db.maintenance.start(Arc::downgrade(&db))?;
         Ok(db)
     }
@@ -676,6 +852,7 @@ impl Db {
                 "database writes are blocked after an unconfirmed directory change".to_owned(),
             ));
         }
+        self.settle_pending_rename(self.database(&key.database)?, &mut blocked)?;
         let _namespace = self.namespace.lock();
         let lease = self.name_lease(key);
         let _name = lease.mutex().lock();
@@ -814,6 +991,7 @@ impl Db {
                 "database writes are blocked after an unconfirmed directory change",
             ));
         }
+        self.settle_pending_rename(self.database(&key.database)?, &mut blocked)?;
         let _namespace = self.namespace.lock();
         // 经别名删除目标集合及指向它的全部别名（3.x 相同）。独占许可下解析，别名不会在此之后改指。
         let key = self.resolve(key)?;
@@ -2539,6 +2717,364 @@ impl Db {
         Ok(())
     }
 
+    /// 0023 A「改名」：P0 检查 → P1a 同步旧句柄的 WAL → P1b 意图与目录改名 → P2 退役旧名 → P3 改写
+    /// `schema.json` 的名字与别名 → P4 删除意图。判定顺序同 3.x：解析旧名（可以是别名）→ 旧名存在 → 新名合法 →
+    /// 新名冲突；`new_db` 按取舍 4 在旧名判定之前拒绝。持独占许可，因而与 create、drop 及别名写入不交错。
+    pub fn rename_collection(
+        &self,
+        database: &str,
+        old: &str,
+        new: &str,
+        new_db: &str,
+    ) -> Result<()> {
+        let key = self.key(database, old)?;
+        let _intent = NamespaceIntent::new(&self.namespace_waiters);
+        let mut blocked = self.write_gate.write();
+        if *blocked {
+            return Err(storage(
+                "database writes are blocked after an unconfirmed directory change",
+            ));
+        }
+        let state = self.database(&key.database)?;
+        self.settle_pending_rename(state, &mut blocked)?;
+        if !new_db.is_empty() && new_db != key.database {
+            return Err(EngineError::unsupported(
+                "cross-database rename",
+                format!(
+                    "renaming a collection into database {} is not supported",
+                    py_repr(new_db)
+                ),
+            ));
+        }
+        let _namespace = self.namespace.lock();
+        let old_key = self.resolve(key)?;
+        // 与 3.x 的 `has_collection` 相同，非法名字视为不存在。
+        if !self.alias_target_exists(state, &old_key.name)? {
+            return Err(EngineError::CollectionNotFound(old_key.name));
+        }
+        validate_filesystem_name(new, "collection")?;
+        let old_dir = state.collection_path(&old_key.name);
+        let new_dir = state.collection_path(new);
+        // 新名路径存在即「已存在」：含没有 `schema.json` 的残留目录与只差大小写的名字（0023 有意的差异），不覆盖任何目录。
+        let alias_taken = {
+            let mut cache = state.aliases.lock();
+            alias::load(&mut cache, &state.root)?.contains_key(new)
+        };
+        if alias_taken || path_exists(&new_dir)? {
+            return Err(EngineError::CollectionAlreadyExists(new.to_owned()));
+        }
+        let new_key = CollectionKey {
+            database: old_key.database.clone(),
+            name: new.to_owned(),
+        };
+        let leases = [self.name_lease(&old_key), self.name_lease(&new_key)];
+        let _names = NameLease::lock_pair(&leases[0], &leases[1]);
+        let current = fs::read(old_dir.join("schema.json")).map_err(storage)?;
+        SchemaFile::with_name(&current, new).map_err(storage)?;
+
+        // P1a：同 drop，标记已移除后同步全部 WAL；之后的维护在提交边界看到标记即放弃。
+        let handle = self.collections.read().get(&old_key).cloned();
+        let flush_lock = handle
+            .as_ref()
+            .and_then(|h| h.read().persistent().map(|p| p.flush_lock()));
+        let _flush = flush_lock.as_ref().map(|lock| lock.lock());
+        if let Some(handle) = &handle {
+            state_change(&mut handle.write(), |collection| {
+                collection.mark_deleted(true);
+                if let Some(persistent) = collection.persistent_mut()
+                    && let Err(error) = persistent.sync_retained_wal()
+                {
+                    collection.mark_deleted(false);
+                    return Err(storage(error));
+                }
+                Ok(())
+            })?;
+        }
+
+        // P1b
+        let intent = RenameIntent {
+            old: old_key.name.clone(),
+            new: new.to_owned(),
+        };
+        let written = rename_intent::write(
+            &state.root,
+            &intent,
+            rename_replace_fault(RenameStep::Intent, RenameStep::IntentAfterRename),
+        );
+        if let Err(
+            fs_commit::ReplaceError::Unchanged(error) | fs_commit::ReplaceError::Unconfirmed(error),
+        ) = written
+        {
+            return Err(self.abort_rename(
+                state,
+                handle.as_ref(),
+                format!("cannot write rename intent: {error}"),
+            ));
+        }
+        let moved = guarded_io(|| {
+            rename_fault(RenameStep::Directory)?;
+            fs::rename(&old_dir, &new_dir)
+        });
+        if let Err(error) = moved {
+            return Err(self.abort_rename(state, handle.as_ref(), error.to_string()));
+        }
+        let mismatch = match guarded_io(|| rename_fault(RenameStep::NameVerification)) {
+            Err(_) => Some(format!(
+                "renamed collection name {new:?} was normalized by the filesystem"
+            )),
+            Ok(()) => match self.exact_name_in(state, new) {
+                Ok(true) => None,
+                Ok(false) => Some(format!(
+                    "renamed collection name {new:?} was normalized by the filesystem"
+                )),
+                Err(error) => Some(error.to_string()),
+            },
+        };
+        let collections = state.collections_dir();
+        if let Some(reason) = mismatch {
+            let rollback = guarded_io(|| {
+                rename_fault(RenameStep::Rollback)?;
+                fs::rename(&new_dir, &old_dir)?;
+                fs_commit::sync_dir(&collections)
+            });
+            if let Err(error) = rollback {
+                *blocked = true;
+                return Err(storage(format!(
+                    "collection name verification failed ({reason}); rollback durability is unconfirmed: {error}"
+                )));
+            }
+            return Err(self.abort_rename(state, handle.as_ref(), reason));
+        }
+
+        // P2：核对通过后立即退役旧名，新名在第一次访问时按目录重新打开（有索引定义即 released，同 3.x）。
+        {
+            let mut table = self.collections.write();
+            table.remove(&old_key);
+            table.remove(&new_key);
+        }
+        {
+            let mut failures = self.open_failures.write();
+            failures.remove(&old_key);
+            failures.remove(&new_key);
+        }
+        let synced = guarded_io(|| {
+            rename_fault(RenameStep::CollectionsSync)?;
+            fs_commit::sync_dir(&collections)
+        });
+        if let Err(error) = synced {
+            *blocked = true;
+            return Err(storage(format!(
+                "collection was renamed, but directory durability is unconfirmed: {error}"
+            )));
+        }
+        rename_pause(RenamePause::Retired)?;
+
+        // P3、P4
+        match self.finish_rename(state, &intent) {
+            Ok(()) => Ok(()),
+            Err(RenameFailure::Pending(reason)) => {
+                *state.rename_pending.lock() = Some(reason.clone());
+                Err(storage(format!(
+                    "collection was renamed, but metadata maintenance is pending: {reason}"
+                )))
+            }
+            Err(RenameFailure::Unconfirmed(reason)) => {
+                *blocked = true;
+                Err(storage(format!(
+                    "collection was renamed, but metadata durability is unconfirmed: {reason}"
+                )))
+            }
+        }
+    }
+
+    /// P1b 失败：删除意图（不存在也同步根目录），撤销已移除标记并让旧句柄进入编号更大的新代、恢复可写
+    /// （WAL 写者已在 P1a 关闭，同 drop 目录改名失败）。只有删除意图失败时进入改名未完成状态。
+    fn abort_rename(
+        &self,
+        state: &DatabaseState,
+        handle: Option<&CollectionHandle>,
+        reason: String,
+    ) -> EngineError {
+        let mut reason = reason;
+        if let Err(error) = rename_intent::remove(
+            &state.root,
+            rename_replace_fault(RenameStep::IntentRemove, RenameStep::IntentRemoveAfter),
+        ) {
+            *state.rename_pending.lock() = Some(format!("cannot remove rename intent: {error}"));
+            reason = format!("{reason}; rename intent cleanup is pending: {error}");
+        }
+        if let Some(handle) = handle {
+            let reopened = state_change(&mut handle.write(), |collection| {
+                collection.mark_deleted(false);
+                if let Some(persistent) = collection.persistent_mut() {
+                    persistent.freeze_active(true).map_err(storage)?;
+                }
+                Ok(())
+            });
+            if let Err(error) = reopened {
+                reason = format!("{reason}; {error}");
+            }
+        }
+        storage(reason)
+    }
+
+    /// P3、P4：把新目录 `schema.json` 的 `collection_name` 改为新名、把指向旧名的别名改指新名并写出
+    /// `aliases.json`（3.x 改名总会写出它，没有别名时为 `{}`）、删除意图。每一步先比较规范字节，已完成则只
+    /// 同步所在目录，确认上一次未确认的替换；因此当前实例的重试与重开时的收尾都可重入。
+    fn finish_rename(
+        &self,
+        state: &DatabaseState,
+        intent: &RenameIntent,
+    ) -> std::result::Result<(), RenameFailure> {
+        let pending = |error: &dyn std::fmt::Display| RenameFailure::Pending(error.to_string());
+        let replaced = |result: std::result::Result<(), fs_commit::ReplaceError>| match result {
+            Ok(()) => Ok(()),
+            Err(fs_commit::ReplaceError::Unchanged(error)) => Err(pending(&error)),
+            Err(fs_commit::ReplaceError::Unconfirmed(error)) => {
+                Err(RenameFailure::Unconfirmed(error.to_string()))
+            }
+        };
+        let dir = state.collection_path(&intent.new);
+        let current = fs::read(dir.join("schema.json")).map_err(|e| pending(&e))?;
+        let bytes = SchemaFile::with_name(&current, &intent.new).map_err(|e| pending(&e))?;
+        if bytes == current {
+            fs_commit::sync_dir(&dir).map_err(|e| pending(&e))?;
+        } else {
+            replaced(fs_commit::replace_file(
+                &dir,
+                "schema.json",
+                &bytes,
+                rename_replace_fault(RenameStep::Schema, RenameStep::SchemaAfterRename),
+            ))?;
+        }
+        rename_pause(RenamePause::SchemaReplaced).map_err(|e| pending(&e))?;
+        {
+            let mut cache = state.aliases.lock();
+            let aliases = alias::load(&mut cache, &state.root).map_err(|e| pending(&e))?;
+            let mut next = aliases.clone();
+            for target in next.values_mut() {
+                if *target == intent.old {
+                    intent.new.clone_into(target);
+                }
+            }
+            let on_disk = match fs::read(state.root.join("aliases.json")) {
+                Ok(bytes) => Some(bytes),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(pending(&error)),
+            };
+            if on_disk.as_deref() != Some(alias::to_bytes(&next).as_slice()) {
+                let result = alias::write(
+                    &state.root,
+                    &next,
+                    rename_replace_fault(RenameStep::Aliases, RenameStep::AliasesAfterRename),
+                );
+                if !matches!(result, Err(fs_commit::ReplaceError::Unchanged(_))) {
+                    *aliases = next;
+                }
+                replaced(result)?;
+            }
+        }
+        rename_intent::remove(
+            &state.root,
+            rename_replace_fault(RenameStep::IntentRemove, RenameStep::IntentRemoveAfter),
+        )
+        .map_err(|e| pending(&e))
+    }
+
+    /// 重开时与「改名未完成」状态下按磁盘上的意图收尾（0023 A「改名」的重开判定）：先同步 `collections/`，
+    /// 再按精确名字且带 `schema.json` 判定新旧名字。`retry` 时意图已不存在也走一次删除（同步数据库根目录），
+    /// 确认上一次未确认的删除。
+    fn settle_rename(
+        &self,
+        state: &DatabaseState,
+        retry: bool,
+    ) -> std::result::Result<(), RenameFailure> {
+        let pending = |error: &dyn std::fmt::Display| RenameFailure::Pending(error.to_string());
+        let manual = |reason: &dyn std::fmt::Display| {
+            RenameFailure::Pending(format!(
+                "{reason}; stop the service, check the collections directory and aliases.json, then remove {:?} and reopen",
+                state.root.join(rename_intent::INTENT_FILE)
+            ))
+        };
+        let intent = match rename_intent::read(&state.root) {
+            Ok(Some(intent)) => intent,
+            Ok(None) if retry => {
+                return rename_intent::remove(
+                    &state.root,
+                    rename_replace_fault(RenameStep::IntentRemove, RenameStep::IntentRemoveAfter),
+                )
+                .map_err(|e| pending(&e));
+            }
+            Ok(None) => return Ok(()),
+            Err(error @ rename_intent::ReadError::Io(_)) => return Err(pending(&error)),
+            Err(error @ rename_intent::ReadError::Invalid(_)) => return Err(manual(&error)),
+        };
+        let collections = state.collections_dir();
+        let present = match fs::symlink_metadata(&collections) {
+            Ok(meta) if meta.file_type().is_dir() => true,
+            Ok(_) => return Err(pending(&"collections path is not a directory")),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => return Err(pending(&error)),
+        };
+        if present {
+            guarded_io(|| {
+                rename_fault(RenameStep::CollectionsSync)?;
+                fs_commit::sync_dir(&collections)
+            })
+            .map_err(|e| pending(&e))?;
+        }
+        let exists = |name: &str| {
+            self.alias_target_exists(state, name)
+                .map_err(|e| pending(&e))
+        };
+        match (exists(&intent.old)?, exists(&intent.new)?) {
+            (false, true) => return self.finish_rename(state, &intent),
+            (false, false) => {
+                let old_path =
+                    path_exists(&state.collection_path(&intent.old)).map_err(|e| pending(&e))?;
+                let new_path =
+                    path_exists(&state.collection_path(&intent.new)).map_err(|e| pending(&e))?;
+                if old_path || new_path {
+                    return Err(manual(&format!(
+                        "neither {} nor {} exists with that exact name, but a matching path does",
+                        py_repr(&intent.old),
+                        py_repr(&intent.new)
+                    )));
+                }
+            }
+            // 目录改名之前退出，或之后又被其他写入者改动：不改别名与 schema。
+            (true, _) => {}
+        }
+        rename_intent::remove(
+            &state.root,
+            rename_replace_fault(RenameStep::IntentRemove, RenameStep::IntentRemoveAfter),
+        )
+        .map_err(|e| pending(&e))
+    }
+
+    /// 受限操作（create、drop、改名、别名写入）在独占许可下调用：改名未完成时先重试收尾，仍失败则拒绝。
+    fn settle_pending_rename(&self, state: &DatabaseState, blocked: &mut bool) -> Result<()> {
+        if state.rename_pending.lock().is_none() {
+            return Ok(());
+        }
+        match self.settle_rename(state, true) {
+            Ok(()) => {
+                *state.rename_pending.lock() = None;
+                Ok(())
+            }
+            Err(failure) => {
+                if matches!(failure, RenameFailure::Unconfirmed(_)) {
+                    *blocked = true;
+                }
+                let reason = failure.reason();
+                *state.rename_pending.lock() = Some(reason.clone());
+                Err(storage(format!(
+                    "a collection rename is unfinished: {reason}"
+                )))
+            }
+        }
+    }
+
     /// 3.x 的判定顺序：解析目标（可以是别名）→ 别名名字 → 目标存在 → 与集合冲突 → 别名已存在。
     pub fn create_alias(&self, database: &str, collection: &str, alias: &str) -> Result<()> {
         self.change_aliases(database, |state, aliases| {
@@ -2648,6 +3184,7 @@ impl Db {
             ));
         }
         let state = self.database(&scope.database)?;
+        self.settle_pending_rename(state, &mut blocked)?;
         let mut cache = state.aliases.lock();
         let aliases = alias::load(&mut cache, &state.root)?;
         let Some(next) = change(state, aliases)? else {
@@ -2770,6 +3307,15 @@ fn alias_fault_point(point: fs_commit::ReplacePoint) -> DirectoryPoint {
     match point {
         fs_commit::ReplacePoint::BeforeRename => DirectoryPoint::Aliases,
         fs_commit::ReplacePoint::AfterRename => DirectoryPoint::AliasesAfterRename,
+    }
+}
+
+/// 路径（任意类型，含悬空符号链接）是否存在；NotFound 以外的错误上报。
+fn path_exists(path: &std::path::Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(storage(error)),
     }
 }
 
@@ -2901,7 +3447,7 @@ fn cleanup_failed_staging(path: &std::path::Path) {
 
 /// 3.x 的 `_validate_filesystem_name`：以 ValueError 抛出，因此是 InvalidArgument。
 /// 名字按原样区分大小写（0004「决策」）。
-fn validate_filesystem_name(name: &str, kind: &str) -> Result<()> {
+pub(crate) fn validate_filesystem_name(name: &str, kind: &str) -> Result<()> {
     if name.is_empty() {
         return Err(EngineError::invalid(format!(
             "{kind} name must not be empty"
@@ -3710,6 +4256,37 @@ mod tests {
         }
         assert!(db.name_locks.lock().is_empty());
         assert!(db.open_failures.read().is_empty());
+        db.close();
+    }
+
+    #[test]
+    fn name_lock_pairs_take_names_in_byte_order_from_either_side() {
+        let root = tempfile::tempdir().unwrap();
+        let db = test_db(root.path());
+        let (b, a) = (db.name_lease(&key("b")), db.name_lease(&key("a")));
+        for (x, y) in [(&a, &b), (&b, &a)] {
+            let guards = NameLease::lock_pair(x, y);
+            assert!(a.mutex().try_lock().is_none() && b.mutex().try_lock().is_none());
+            drop(guards);
+        }
+        #[cfg(debug_assertions)]
+        {
+            let c = db.name_lease(&key("c"));
+            let guards = NameLease::lock_pair(&a, &b);
+            assert!(
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(c.mutex().lock())))
+                    .is_err()
+            );
+            drop(guards);
+            assert!(
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    drop(NameLease::lock_pair(&a, &a))
+                }))
+                .is_err()
+            );
+        }
+        drop((a, b));
+        assert!(db.name_locks.lock().is_empty());
         db.close();
     }
 

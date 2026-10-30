@@ -242,6 +242,19 @@ impl Service for MilvusService {
         .await
     }
 
+    async fn rename_collection(
+        &self,
+        request: Request<svc::RenameCollectionRequest>,
+    ) -> Result<Response<common::Status>, Status> {
+        let database = database(&request, |r| &r.db_name);
+        let req = request.into_inner();
+        self.run(Branch::Engine, move |db| {
+            db.rename_collection(&database, &req.old_name, &req.new_name, &req.new_db_name)?;
+            Ok(success())
+        })
+        .await
+    }
+
     async fn show_collections(
         &self,
         request: Request<svc::ShowCollectionsRequest>,

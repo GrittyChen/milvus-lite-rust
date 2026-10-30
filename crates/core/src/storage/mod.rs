@@ -10,6 +10,7 @@ pub mod parquet_file;
 pub(crate) mod partition_drop;
 pub(crate) mod partition_paths;
 pub mod recovery;
+pub(crate) mod rename_intent;
 pub mod runtime;
 pub mod schema_file;
 pub mod snapshot;

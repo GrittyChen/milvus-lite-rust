@@ -45,6 +45,13 @@ def test_search_after_release_reports_not_loaded(milvus_client):
 # UNIMPLEMENTED stubs: friendly messages
 # ---------------------------------------------------------------------------
 
+def test_rename_nonexistent_reports_not_found(milvus_client):
+    """Renaming a non-existent collection should report an error."""
+    with pytest.raises(Exception) as exc_info:
+        milvus_client.rename_collection("ghost", "new")
+    assert "not exist" in str(exc_info.value).lower() or "does not exist" in str(exc_info.value).lower()
+
+
 def test_create_alias_nonexistent_collection_reports_not_found(milvus_client):
     with pytest.raises(Exception) as exc_info:
         milvus_client.create_alias("demo", "al")

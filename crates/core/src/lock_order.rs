@@ -23,6 +23,22 @@ impl Order {
         #[cfg(not(debug_assertions))]
         let _ = key;
     }
+    /// 同层第二把锁：只允许已持有 `peer` 这一把同层锁，其余已持有的锁都必须更低。
+    fn before_peer<const R: u8>(key: usize, peer: &Order) {
+        #[cfg(debug_assertions)]
+        HELD.with(|held| {
+            let held = held.borrow();
+            assert!(
+                held.iter().any(|(id, rank)| *id == peer.key && *rank == R)
+                    && !held
+                        .iter()
+                        .any(|(id, rank)| *id == key || (*rank >= R && *id != peer.key)),
+                "lock order violation: acquiring a second rank {R} lock while holding {held:?}"
+            );
+        });
+        #[cfg(not(debug_assertions))]
+        let _ = (key, peer);
+    }
     fn acquired<const R: u8>(key: usize) -> Self {
         #[cfg(debug_assertions)]
         HELD.with(|held| held.borrow_mut().push((key, R)));
@@ -73,6 +89,15 @@ impl<T, const R: u8> Mutex<T, R> {
     pub fn lock(&self) -> MutexGuard<'_, T> {
         let key = self as *const Self as usize;
         Order::before::<R>(key);
+        MutexGuard {
+            guard: self.0.lock(),
+            _order: Order::acquired::<R>(key),
+        }
+    }
+    /// 在已持有的同层锁 `peer` 之后再取本锁；调用方负责两把锁之间的全序（名字锁按名字字节序）。
+    pub(crate) fn lock_after(&self, peer: &MutexGuard<'_, T>) -> MutexGuard<'_, T> {
+        let key = self as *const Self as usize;
+        Order::before_peer::<R>(key, &peer._order);
         MutexGuard {
             guard: self.0.lock(),
             _order: Order::acquired::<R>(key),
@@ -193,6 +218,36 @@ mod tests {
         );
         let _guard = aliases.lock();
         aliases.assert_held();
+    }
+    #[test]
+    fn same_rank_pair_allows_exactly_one_peer_and_still_rejects_other_nesting() {
+        let outer = RwLock::<_, 1>::new(());
+        let first = Mutex::<_, 3>::new(());
+        let second = Mutex::<_, 3>::new(());
+        let third = Mutex::<_, 3>::new(());
+        let leaf = Mutex::<_, 6>::new(());
+        let _outer = outer.read();
+        let a = first.lock();
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| second.lock())).is_err());
+        let b = second.lock_after(&a);
+        for attempt in [
+            &(|| drop(third.lock_after(&a))) as &dyn Fn(),
+            &|| drop(third.lock_after(&b)),
+            &|| drop(first.lock_after(&b)),
+        ] {
+            assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(attempt)).is_err());
+        }
+        drop(leaf.lock());
+        drop(b);
+        drop(a);
+        drop(third.lock());
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let held = leaf.lock();
+                drop(first.lock_after(&held));
+            }))
+            .is_err()
+        );
     }
     #[test]
     fn rejects_reverse_order_reentry_and_leaf_to_parent_without_leaking_state() {

@@ -593,6 +593,93 @@ assert list(client.describe_collection('a')['properties']) == ['alpha', 'beta', 
     assert schema["properties"] == {"alpha": "A", "beta": "b", "zeta": "1"}
 
 
+@pytest.mark.parametrize("first", ["rust", "reference"])
+def test_collections_renamed_by_one_implementation_open_and_rename_in_the_other(tmp_path, interpreters, first):
+    """0023 A 互通：两边交替改名（含经别名），别名改指与 `schema.json` 的名字互相可读；改名后按重开为 released。"""
+    root = tmp_path / "rename.db"
+    steps = [
+        """
+client.create_collection('c', schema=schema, index_params=indexes)
+client.insert('c', [{'id': 1, 'vector': [1.0, 0.0]}])
+client.create_alias('c', 'a')
+client.rename_collection('a', 'd')
+assert client.list_collections() == ['d']
+assert str(client.get_load_state('d')['state']) == 'NotLoad'
+""",
+        """
+assert client.list_collections() == ['d']
+assert client.describe_alias('a')['collection_name'] == 'd'
+assert str(client.get_load_state('d')['state']) == 'NotLoad'
+client.load_collection('a')
+assert client.query('a', filter='', output_fields=['id']) == [{'id': 1}]
+client.insert('d', [{'id': 2, 'vector': [0.0, 1.0]}])
+client.rename_collection('d', 'e')
+""",
+        """
+assert client.list_collections() == ['e']
+assert client.describe_alias('a')['collection_name'] == 'e'
+client.load_collection('e')
+assert client.query('e', filter='', output_fields=['count(*)']) == [{'count(*)': 2}]
+client.create_collection('d', schema=schema)
+""",
+    ]
+    alternate(tmp_path, interpreters, first, root, steps)
+    assert json.loads((root / "collections/e/schema.json").read_text())["collection_name"] == "e"
+    assert json.loads((root / "aliases.json").read_text()) == {"a": "e"}
+
+
+RENAME_INTENT = "milvus-lite-rust.rename-intent.json"
+
+
+@pytest.mark.parametrize("state", ["intent-then-read", "intent-then-rename", "reference-crash"])
+def test_unfinished_renames_cross_open_between_implementations(tmp_path, interpreters, state):
+    """0023 A 互通：本实现改名未完成（目录已改名、`schema.json` 与别名未改写、意图仍在）的目录由 3.x 打开并改动，
+    本实现再打开时按意图收尾或删除意图；3.x 改名中途退出留下的目录（名字与目录不同、别名仍指向旧名）本实现可直接打开。"""
+    root = tmp_path / "unfinished.db"
+    alternate(tmp_path, interpreters, "rust", root, ["""
+client.create_collection('c', schema=schema)
+client.insert('c', [{'id': 1, 'vector': [1.0, 0.0]}])
+client.create_alias('c', 'a')
+"""])
+    (root / "collections/c").rename(root / "collections/d")
+    if state.startswith("intent"):
+        (root / RENAME_INTENT).write_text(
+            json.dumps({"format_version": 1, "operation": "rename_collection", "old": "c", "new": "d"}))
+    reference = {
+        "intent-then-read": "client.insert('d', [{'id': 2, 'vector': [0.0, 1.0]}])",
+        "intent-then-rename": "client.rename_collection('d', 'f')",
+        "reference-crash": "assert client.list_collections() == ['d']",
+    }[state]
+    alternate(tmp_path, interpreters, "reference", root, [reference])
+    rust = {
+        # 新名存在、旧名不存在：补写名字与别名，3.x 的写入仍在。
+        "intent-then-read": """
+assert client.list_collections() == ['d']
+assert client.describe_alias('a')['collection_name'] == 'd'
+assert client.query('a', filter='', output_fields=['count(*)']) == [{'count(*)': 2}]
+""",
+        # 3.x 又改了名：精确名字与路径都不存在，只删除意图，别名保持 3.x 写出的样子。
+        "intent-then-rename": """
+assert client.list_collections() == ['f']
+assert client.describe_alias('a')['collection_name'] == 'c'
+assert client.describe_collection('f')['collection_name'] == 'f'
+""",
+        "reference-crash": """
+assert client.list_collections() == ['d']
+assert client.describe_collection('d')['collection_name'] == 'd'
+assert client.describe_alias('a')['collection_name'] == 'c'
+assert client.query('d', filter='', output_fields=['count(*)']) == [{'count(*)': 1}]
+""",
+    }[state]
+    alternate(tmp_path, interpreters, "rust", root, [rust])
+    assert not (root / RENAME_INTENT).exists()
+    if state == "intent-then-read":
+        assert json.loads((root / "collections/d/schema.json").read_text())["collection_name"] == "d"
+        assert json.loads((root / "aliases.json").read_text()) == {"a": "d"}
+    elif state == "reference-crash":
+        assert json.loads((root / "collections/d/schema.json").read_text())["collection_name"] == "c"
+
+
 def test_real_database_path_recovers_reference_crash_wal(tmp_path, interpreters):
     root = tmp_path / "crashed.db"
     reference_create(interpreters[PYTHONS[0]], root, flush=False)

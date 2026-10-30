@@ -969,7 +969,6 @@ def test_pymilvus_entry_points_remaining_unsupported(env):
         (with_field("ts", DataType.TIMESTAMPTZ), f"TIMESTAMPTZ fields: {feature}"),
         # pymilvus 3.0 先发 AlterCollectionSchema，收到 UNIMPLEMENTED 后回退到 AddCollectionField。
         (lambda: client.add_collection_field("q", "x", DataType.INT64, nullable=True), f"AddCollectionField: {rpc}"),
-        (lambda: client.rename_collection("q", "q2"), f"RenameCollection: {rpc}"),
         (lambda: client.hybrid_search("q", [AnnSearchRequest([[1, 0]], "vector", {}, 2)], RRFRanker(), limit=2),
          f"HybridSearch: {rpc}"),
         (lambda: client.search("q", [[1, 0]], filter="id + 1 > 0"), "filter expressions: arithmetic, temporal literals, text_match, and geometry predicates are not supported"),

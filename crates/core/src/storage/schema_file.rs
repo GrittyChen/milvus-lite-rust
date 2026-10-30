@@ -254,6 +254,28 @@ impl SchemaFile {
         Self::parse(&bytes)
     }
 
+    /// 改名的重写：在原始 JSON 上只替换 `collection_name`，其余键与值原样保留、排序写出。
+    /// 范围外 schema 也能改名（0023 有意的请求语义差异），因此只要求顶层是对象且原 `collection_name` 是字符串。
+    pub(crate) fn with_name(
+        bytes: &[u8],
+        collection_name: &str,
+    ) -> Result<Vec<u8>, SchemaFileError> {
+        let mut raw: Value = serde_json::from_slice(bytes)
+            .map_err(|source| SchemaFileError::Invalid(source.to_string()))?;
+        let object = raw
+            .as_object_mut()
+            .ok_or_else(|| SchemaFileError::Invalid("schema file is not an object".to_owned()))?;
+        match object.get_mut("collection_name") {
+            Some(Value::String(name)) => collection_name.clone_into(name),
+            _ => {
+                return Err(SchemaFileError::Invalid(
+                    "collection_name is not a string".to_owned(),
+                ));
+            }
+        }
+        Ok(crate::pyjson::dump_file(&raw).into_bytes())
+    }
+
     /// AlterCollection 的重写：在原始 JSON 上只替换 `collection_name`（目录名）与 `properties`，
     /// 其余键与值原样保留，按 3.x 的 `save_schema` 排序写出（0023 A「AlterCollection」）。
     pub(crate) fn with_properties(
