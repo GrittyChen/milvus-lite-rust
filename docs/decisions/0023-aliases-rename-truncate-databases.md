@@ -254,3 +254,152 @@
   - [0007](0007-m2-storage-engine.md)：目录变更锁的持有者（新增改名与数据库生命周期）、按数据库的别名叶子锁、同层名字锁规则、悬空别名剔除只在 create / drop。
   - [0011](0011-committed-delete-state.md)：清空重置独立已提交删除表；[0014](0014-index-definitions-and-filter-expressions.md)：清空与删除意图的互斥。
   - README 的支持范围、已知差异与回退前须正常打开一次的要求、AGENTS 的知识索引与架构地图（新增 module）、[tests/python/adapter/INVENTORY.md](../../tests/python/adapter/INVENTORY.md)。
+
+
+## A 实施设计（终稿）
+
+本节把合同「文件与提交协议」落到现有代码上，冻结 A 的模块划分、锁、两种意图的格式、清空与改名的阶段、失败语义和测试矩阵。首轮评审的六项阻断（清空后读视图未重建、改名提交前失败未恢复可写代、清空删除 WAL 中途失败、意图格式粒度不足、JSON 写出未全覆盖且数字规则有误、改名跨提交点的状态未闭合）第二轮的两项阻断（逐个删除 WAL 留下的已提交后缀会被 3.x 重复回放、snapshot 侧车校验拒绝合法的历史 snapshot）第三轮的两项阻断（没有 `wal/` 的集合清空被误判为失败、清空未重写旧版未排序的 `schema.json`）与第四轮的一项阻断（清空中 `schema.json` 目录同步失败未按合同进入整库写入封锁）已在下文对应位置处理。评审通过后才动代码；B 的设计在 A 收口后另写。
+
+### 对合同方向的细化
+
+| 合同中的方向 | 本设计 | 理由 |
+| --- | --- | --- |
+| 别名写入「先取共享许可再解析别名」 | 别名写入（CreateAlias / AlterAlias / DropAlias）与 AlterCollection 持**独占许可**；集合数据写入仍持共享许可 | 合同要求这两类元数据写入在目录同步失败时按 0007 进入整库写入封锁，现有封锁标志只能在独占许可下设置；独占也从结构上排除了与 create / drop / 改名的交错。两者都是低频操作，代价是等待在途写入与合并结束 |
+| 清空意图记录两份 manifest 的「内容摘要」 | 意图保存旧 manifest 的完整内容与候选 manifest 的完整字节，按字节相等判定 | 不新增哈希依赖、不扩大 md5 的用途；字节相等是无碰撞的身份判定。候选只含空分区；旧 manifest 体积与文件数成正比，清空是低频操作 |
+| 清空「持共享许可」，合并在提交边界按「清空代」放弃 | 清空全程持**独占许可**，不设清空代；清理失败后的重试走下述共享到独占的重新入闸 | 清空第 3 步（WAL 目录迁移）与第 6 步（`schema.json` 规范重写）在改名之后目录同步失败时，按持久化合同都要进入整库写入封锁，只能在独占许可下设置。合并全程持共享许可，因此清空期间不会有合并在运行，清空代没有作用，按「能减不加」去掉。代价是清空期间整个数据库的写入，以及其他集合未缓存时的首次懒打开都等待；已经打开集合的纯读不受影响。清空是低频操作，3.x 的清空同样完全串行 |
+| 清空第 1 步「删除 `wal/` 下全部 WAL 文件」 | 在 flush 确认之后把**整个 `wal/` 目录原子改名移入 `.database-staging/`**，同步目录，需要时再建立新的空 `wal/` | 不能逐个删除：中途失败会留下已提交行的 WAL 后缀，3.x 打开时会重复回放（实测 3.2.1：已提交的 2 行在残留 WAL 重放后计数为 4、主键为 `1, 2, 1, 2`），本实现虽会过滤，但互通失败。目录级改名只有「仍在原处」与「已移入 staging」两种状态，两边打开时都会清空 staging |
+| 改名第 5–7 步失败「其他读写照常」 | 只在目标文件替换**之前**失败时成立；替换之后的目录同步失败按持久化合同进入整库写入封锁 | 合同的持久化保证一表要求所有共享文件的改名后目录同步失败进入封锁，两处必须一致，以持久化保证为准 |
+
+### 模块与数据结构
+
+- **作用域键**：新增 `CollectionKey { database, name }`，`database` 在入口归一化（空串为 `default`）。`Db` 的 collection 表、名字锁注册表、失败判定缓存都改按 `CollectionKey` 索引；`collection_path(key)` 对默认库返回 `<root>/collections/<name>`，非默认库的分支在 B 接通。
+- **数据库状态**：`Db` 新增 `databases: BTreeMap<String, Arc<DatabaseState>>`，A 中只有 `default`。`DatabaseState` 持有：
+  - 别名表：叶子锁（层级 6）保护的 `Option<BTreeMap<String, String>>`，首次使用时从 `aliases.json` 加载；读或解析失败不缓存，下次重试。数据目录由 LOCK 独占，只有本进程写这个文件，缓存与磁盘一致；写入的文件替换成功后才更新缓存。
+  - 改名未完成状态：`Option<RenameIntent>`，见「改名」。
+- **新模块**：
+  - `alias`：别名表的加载、解析、写入与判定（取代 db.rs 中现有的 `read_aliases*` / `save_aliases*`）；
+  - `storage::rename_intent`、`storage::truncate_intent`：两种意图的读写、校验与故障点，结构仿照 [index_intent](../../crates/core/src/storage/index_intent.rs)；
+  - `pyjson::dump_file`：与 Python `json.dump(obj, indent=2, sort_keys=True, ensure_ascii=False)` 逐字节相同的输出。键按码点递归排序；数字沿用 [pyjson.rs](../../crates/core/src/pyjson.rs) 现有的 Python 导入导出语义——整数保留精确十进制值，浮点按 Python `repr` 重新格式化（`1E2` 写为 `100.0`，整数 `-0` 写为 `0`），与 Python `json.load` 后再 `json.dump` 的结果相同。
+- **全部共享 JSON 文件改用 `dump_file`**：[schema_file.rs](../../crates/core/src/storage/schema_file.rs) 的 `to_bytes`（CreateCollection、AlterCollection、改名）、`aliases.json`、[manifest.rs](../../crates/core/src/storage/manifest.rs) 的 `to_bytes`（flush、合并、索引与分区变更、清空的当前 manifest，以及清空重写的 `manifest.json.prev`）。3.x 的 manifest 与 snapshot 同样用 `sort_keys=True` 写出。读取不变（保留文件顺序）。
+- **名字检查放宽**（取舍 3）：[recovery.rs](../../crates/core/src/storage/recovery.rs) 的 `load_committed` 与 [db.rs](../../crates/core/src/db.rs) 的 `unopened_load_state` 删除名字相等检查；`collection_name` 缺失或不是字符串仍由 `SchemaFile::read` 拒绝。集合名一律取目录名。
+- **已有非默认库**：`require_database` 改为 `Db` 的方法：非默认库且 `databases/<db>` 是目录时返回 Unsupported（UNIMPLEMENTED，写明数据库尚未支持），否则保持 DatabaseNotFound。
+- **错误**：`EngineError` 新增 `AliasAlreadyExists`（1/1，`alias 'a1' already exists`）、`AliasConflictsWithCollection`（1/1，`alias 'c2' conflicts with an existing collection`）、`AliasNotFound`（100/4，`alias 'zz' does not exist`），名字按现有 `py_repr` 格式化。
+
+### 锁
+
+| 操作 | 取得的锁（按层级顺序） |
+| --- | --- |
+| 读请求（Describe、Query、Search、统计、load 状态等） | 别名叶子锁内取一次解析结果 → 名字锁（仅首次打开）→ 状态读锁 |
+| 集合数据写入（插入、删除、Upsert、Flush、索引与分区操作） | 共享许可 → 解析别名 → 现有链路 |
+| 别名写入 | 独占许可 → 别名叶子锁（读改写全程） |
+| AlterCollection | 独占许可 → 名字锁 → flush 锁 → 状态写锁 |
+| RenameCollection | 独占许可 → 目录变更锁 → 两个名字锁（按精确名字字节序）→ 旧句柄的 flush 锁 → 状态写锁（短暂）→ 别名叶子锁（短暂） |
+| TruncateCollection | 独占许可（第 1–7 步全程）→ 解析别名 → 名字锁 → flush 锁（第 1–7 步全程）→ 状态写锁（第 1–5 步发布新读视图之前全程） |
+
+- **同层名字锁**：新增 `NameLease::lock_pair(a, b)`，内部按字节序先后加锁；[lock_order](../../crates/core/src/lock_order.rs) 增加一种只供该函数使用的同层登记方式，debug 构建断言同层至多两把且后者名字更大。其他同层嵌套仍报错。
+- **不等待维护**：合并全程持共享许可，独占许可的取得自然排在进行中的合并之后；任何操作都不在持有许可时等待维护队列。改名设置的「已移除」标记与现有 drop 相同，合并在提交边界的 `is_deleted` 检查处放弃。清空持独占许可，开始时没有进行中的合并，结束前也不会有新的合并开始；之后开始的合并读取的是清空后的 manifest。
+- **清理重试重新入闸**：普通写请求只允许在共享许可下检查 `truncate_cleanup`，不得在共享许可下执行第 6 步。发现清理未完成时，必须在任何业务变更之前释放名字/状态守卫、flush 锁与共享许可；随后调用 `Db::retry_truncate_cleanup_exclusive(key)`，重新取得独占许可、名字锁与 flush 锁，重新确认意图后执行第 6 步。该函数确认清理成功后释放独占许可，原请求再从最初的写入入口完整重跑，不保留任何已经检查、计算或冻结但尚未提交的中间状态。清理中若出现 `schema.json` 的改名后目录同步失败，仍持独占许可设置整库写入封锁。禁止把共享许可升级为独占许可。
+
+### 别名
+
+- **解析**：`Db::resolve(database, name) -> CollectionKey` 在别名叶子锁内查表，命中返回目标名，否则返回原名。所有带集合名的入口在上表规定的位置调用一次；CreateCollection 不解析（以别名为名报已存在）。
+- **CreateAlias**：按合同顺序判定：解析目标 → `validate_filesystem_name(alias)` → 目标按精确名字且带 `schema.json` 存在 → `collections/<alias>/schema.json` 路径存在即冲突 → 表中已有该别名。写入：新表 → `dump_file` → `aliases.json.tmp.<pid>.<n>`（`create_new`）→ fsync → 改名 → fsync 数据根目录 → 更新缓存。改名之前失败：不变。改名之后目录同步失败：更新缓存（与磁盘一致）、设置整库写入封锁、报「已修改、持久化未确认」，与 0007 相同。
+- **AlterAlias**：别名存在 → 解析目标 → 目标存在；写入同上。**DropAlias**：不校验名字，不存在即成功，存在则写入同上。
+- **DescribeAlias / ListAliases**：只读缓存；ListAliases 按集合时先解析，回填解析后的名字，结果按码点排序。
+- **悬空别名**：别名 RPC 不剔除。现有 `save_aliases_inner` 中的剔除移到 create（改名之前，沿用 0007）与 drop 的调用点，作为显式步骤。
+
+### AlterCollection
+
+1. 独占许可下解析别名、取名字锁并打开集合；打开失败按原错误返回（范围外 schema 的 Unsupported 即合同要求的 UNIMPLEMENTED）。请求的 `properties` 中出现 `timezone` 键时返回 Unsupported，零写入。
+2. 取 flush 锁与状态写锁。在内存副本上先删除 `delete_keys`、再设置 `properties`（新键追加、已有键原位替换），以新副本调用 `CollectionSchema::validate`。
+3. 读取 `schema.json` 的原始 JSON，只替换 `properties` 对象与 `collection_name`（目录名），其余原样，以 `dump_file` 得到规范字节。**只有规范字节与现有文件字节完全相同时才跳过写入**；名字不同或只是键序不同（例如 0.3.0rc3 写出的未排序文件）也要写。写入经 tmp、fsync、改名、fsync 集合目录。
+4. 成功后发布新属性。tmp 改名之前失败：不变，报错。改名之后目录同步失败：发布新属性、设置整库写入封锁并报错。
+
+### 改名
+
+`Db::rename_collection(database, old, new, new_db)`，分为五个阶段：
+
+| 阶段 | 步骤 | 失败处理 | 失败后的状态 |
+| --- | --- | --- | --- |
+| P0 检查 | 独占许可；改名未完成时先重试补完（见 P4），仍失败则拒绝。归一化当前库并 `require_database`；`new_db` 非空且不等于当前库时返回 Unsupported。取目录变更锁；解析旧名，旧名按精确名字且带 `schema.json` 存在，否则 CollectionNotFound；`validate_filesystem_name(new)`；新名是别名或 `collections/<new>` 路径存在（含残留目录与只差大小写的名字）即 CollectionAlreadyExists；`lock_pair` 取两个名字锁；读取旧目录 `schema.json`，不是对象或 `collection_name` 不是字符串则报 Storage 错误 | 直接报错 | 操作前，无任何变更 |
+| P1a 同步 WAL | 有句柄时在其 flush 锁与状态写锁下 `mark_deleted(true)`、`sync_retained_wal` | `sync_retained_wal` 失败（data、delta 文件或 `wal/` 目录同步）：只撤销已移除标记，WAL 写者保持原样，与 drop 相同 | 操作前，旧集合可继续读写 |
+| P1b 意图与目录改名 | 写改名意图（tmp、fsync、改名、fsync 数据库根目录）；`rename(collections/old, collections/new)`；以目录列表核对 `new` 的精确名字 | 已写的意图删除；目录已改名而核对失败时先改回旧名并 fsync；在 `state_change` 内撤销已移除标记并 `freeze_active(true)`，使旧句柄进入编号严格更大的新代、恢复可写（WAL 写者已在 P1a 关闭，与 drop 目录改名失败后的处理相同）；代推进失败按 `state_change` 的现有处理使该集合不可用。改回失败则设置整库写入封锁、意图保留；只有删除意图失败时进入改名未完成状态 | 操作前，旧集合可继续读写；删除意图失败时该库受限、可重试，重开时按「旧名存在、新名不存在」删除意图 |
+| P2 退役旧名 | 核对通过后**立即**从 collection 表移除旧句柄，清除新旧两个名字的失败判定缓存；然后 fsync `collections/` | 目录同步失败：设置整库写入封锁，报「已改名、目录持久化未确认」，意图保留 | 旧名报不存在；新名在封锁期间首次打开按现有规则报封锁错误；重开后按意图收尾 |
+| P3 元数据 | 改写新目录 `schema.json` 的 `collection_name`（原始 JSON、`dump_file`、tmp、fsync、改名、fsync 集合目录）；别名叶子锁内把指向旧名的条目改指新名并写入 `aliases.json` | 文件替换**之前**失败：意图记入改名未完成状态，报「已改名、元数据维护未完成」。替换**之后**目录同步失败：设置整库写入封锁并报错，意图保留 | 前者：数据读写照常，create、drop、改名与别名写入先重试补完、仍失败则拒绝；后者：整库写入封锁，重开后按意图收尾 |
+| P4 删除意图 | 删除意图并 fsync 数据库根目录 | 记入改名未完成状态并报错 | 数据读写照常；下次受限操作先重试删除；断电后意图若重现，重开时按「新名存在、旧名不存在」幂等收尾 |
+
+- **补完的可重入性**：P3、P4 的每一步先判断是否已完成再执行：`schema.json` 的字节等于按新名得到的规范字节；`aliases.json` 存在、没有指向旧名的条目且字节等于当前表的规范输出（3.x 改名总会写出该文件，没有别名时为 `{}`）；意图已不存在。
+- **启动处理**：`Db::new` 在 LOCK 与 staging 清理之后、开始服务之前，对默认库执行合同中的重开判定（先 fsync `collections/`，再按精确名字列表且带 `schema.json` 判定）。处理失败或需人工处理时不让启动失败，而是把该库置为改名未完成状态并在日志中给出诊断。
+- **意图格式**（`format_version` 1，`deny_unknown_fields`）：`{"format_version": 1, "operation": "rename_collection", "old": <名字>, "new": <名字>}`。`operation` 必须为该字面值；`old`、`new` 都通过 `validate_filesystem_name` 且不相等；任何字段缺失、类型不符、取值不合法或有未知字段都视为损坏。
+- **人工恢复**（意图损坏、版本未知，或精确名字都不存在而路径存在）：停止持有该数据目录的服务，核对 `collections/` 中的实际目录与 `aliases.json`，按需修正后删除数据库根目录的 `milvus-lite-rust.rename-intent.json`，再启动。只处理这个文件，不删除集合目录。
+
+### 清空
+
+`Db::truncate_collection(database, name)`：
+
+1. 独占许可（写入封锁中则拒绝）；解析别名，取名字锁并打开集合（范围外 schema 返回 Unsupported）。存在未处理的 0014 删除意图时按 0014 的封锁报错。取 flush 锁与状态写锁。有上一次清空的清理未完成时先重试，仍失败则报错。
+2. 在状态写锁内 flush：新增 `flush_locked`，复用现有冻结、写文件与提交的函数，只是磁盘阶段不放开状态锁；之后要求 `!needs_retry()`（manifest 提交与目录同步都已确认），否则报错、不做后续步骤。
+3. 以 `symlink_metadata` 检查 `collections/<name>/wal`：
+   - 不存在（从未写入、只建了 schema、上一次清空后尚未写入）：视为已经没有 WAL，跳过本步其余部分；
+   - 是文件、符号链接或其他非目录类型：报错，零写入；
+   - 是普通目录：要求当前活跃代没有 WAL 文件，且其编号严格大于 `wal/` 中所有规范 WAL 的编号（flush 之后全部 WAL 行都已在 manifest 中），否则报错；以 `create_dir_synced` 确认 `.database-staging/` 是普通目录，并确认目标 `.database-staging/truncate-wal-<pid>-<n>` 不存在（`symlink_metadata` 为 NotFound），否则报错、零写入。然后关闭 `data_wal` / `delta_wal`，把 `wal/` 整个改名为该目标，再同步集合目录与 staging 目录。空的 `wal/` 目录同样迁移。
+   - 改名之前或改名失败：WAL 仍在原处（全部是已提交行，与操作前相同）；在 `state_change` 内 `freeze_active(true)`，使后续写入进入编号严格更大的新代，然后报错。
+   - 改名成功而目录同步失败：设置整库写入封锁、`freeze_active(true)` 并报错，不继续提交。残余：断电可能使改名回退，已提交的 WAL 回到原处，3.x 打开时会重复回放这些行；这与本实现现有 flush「提交 manifest 之后、清理 WAL 之前」的崩溃窗口属于同一类，本实现自身恢复时会过滤。
+   - 成功后 `wal/` 不存在；后续写入创建 WAL 时按需以 `create_dir_synced` 建立。两边打开时都会清空 staging，因此之后任何时刻退出都不会再回放这些 WAL；staging 中的目录在第 6 步清理时删除，删除失败只记日志。
+   - 已迁移 WAL 而第 4、5 步在 manifest 替换之前失败（不再继续提交）时，尽力删除该 staging 目录并同步 staging 根目录，失败只记日志、留待下次打开清理，避免长时间运行的进程中多次失败累积磁盘占用。
+4. 构造候选 manifest：复制当前 manifest，清空各分区的 data / delta 列表，`version` 加 1，`current_seq` 置 0，`active_wal_number` 置空，其余字段原样。写清空意图（见下文格式；tmp、fsync、改名、fsync 集合目录）。意图写入失败：删除残留 tmp，报错，状态为操作前。
+5. `prepare_manifest` + `replace`。`BeforeReplace` 失败：删除意图、报错，状态为操作前。替换成功（含 `AfterReplace` 的目录同步失败）后**按重开的路径重建读视图**：
+   - 调用 `recovery::load_committed(集合目录)`：此时 `schema.json` 仍是清空开始时的磁盘内容（规范重写在第 6 步），因此同一进程内的属性顺序与 3.x 相同——3.x 清空时从磁盘读回 schema 并以它重建集合，同一进程沿用读入的顺序；分区与索引定义的顺序来自候选 manifest，manifest 是候选，`wal/` 已移入 staging（缺失的 `wal/` 按无 WAL 处理），因此得到空的 `RecoveredCollection`（`next_seq` 为 1，auto_id 从 1 开始）；
+   - 以 `Collection::from_recovered` 构造新的 `Collection`，再覆盖：load 状态取原值；`generation` 与 SourceId 计数取「原值递增」与恢复结果中的较大者；沿用原 `flush_lock` 与 `maintenance_status` 两个 `Arc`；
+   - 在同一个状态写锁临界区内以 `*collection = rebuilt` 原地替换，句柄身份不变；读者此后看到空集合（count、get、query、search 均为空），进行中的读请求仍使用其已取得的不可变快照；
+   - 重建失败（例如 `schema.json` 此刻无法读取）：使旧句柄不可用并从 collection 表移除，报 Storage 错误；下次访问按重开路径处理意图。
+   - 目录同步失败时，新读视图仍发布，`retry_manifest = true`（沿用现有重试路径），意图保留，清理不开始。
+   发布后释放状态写锁，继续持 flush 锁执行第 6 步。
+6. 目录同步确认后清理（持独占许可与 flush 锁、不持状态写锁）：先以 `dump_file` 把 `schema.json` 重写为规范字节（`collection_name` 写目录名，其余字段与值不变；tmp、fsync、改名、fsync 集合目录；字节已相同时跳过写入，但仍 fsync 集合目录，保证上一次未确认的替换落盘），使磁盘与重开后的顺序与 3.x 清空后相同（3.x 清空总会重写 `schema.json`）→ 逐个删除名字与 id 都匹配的 snapshot 元数据文件并 fsync 其目录 → 删除这些 snapshot 的 manifest 副本目录 → 删除意图中待删且不被当前 manifest 与剩余 snapshot 引用的文件，每个目录删除后 fsync → 以候选字节原子重写 `manifest.json.prev` → 删除意图并 fsync 集合目录 → 按剩余 snapshot 重新读取 `pinned_files`（通常为空）→ 清除 `truncate_cleanup` 标记、恢复 `can_compact` 与后台维护 → 删除第 3 步移入 staging 的 WAL 目录（失败只记日志）。删除幂等（不存在视为已删除），不触碰新的 `wal/`。期间新读请求看到空集合；任何写入都在清空返回、释放独占许可之后才进行。
+7. `schema.json` 规范重写在改名之后目录同步失败：按持久化合同设置整库写入封锁并报错，意图保留，重开时按意图补做（与 AlterCollection、改名一致）。其他清理失败（包括 `schema.json` 的 tmp 写入、文件同步与改名失败）：当次报「已清空、清理未完成」；`PersistentCollection::truncate_cleanup` 记录意图，`can_compact` 返回 false。之后的 Insert、Delete、Upsert、Flush、索引与分区操作在共享许可下只做“是否待清理”的检查；若待清理，立即释放共享许可并按上节“清理重试重新入闸”调用独占重试。独占重试成功后原请求从头重新执行；重试仍失败时原请求返回错误。`retry_manifest` 与清理重试仍保持提交顺序：先完成 manifest 重试，再执行第 6 步。
+- **意图格式**（`format_version` 1，所有层级 `deny_unknown_fields`）：
+
+  | 字段 | 内容与校验 |
+  | --- | --- |
+  | `format_version` | 整数 1 |
+  | `operation` | 字面值 `truncate_collection` |
+  | `old_manifest` | null（集合从未写出 `manifest.json`）或旧 `manifest.json` 的完整内容（字符串）；非 null 时必须能按 `Manifest::parse` 解析 |
+  | `candidate_manifest` | 候选 manifest 的完整序列化字节（字符串）；必须能解析，且与由 `old_manifest`（null 时为默认 manifest）按第 4 步推导的结果在结构上完全相等：分区名集合相同且文件列表全空、`current_seq` 为 0、`active_wal_number` 为 null、`version` 为旧值加 1、索引定义与 `schema_version` 相同 |
+  | `snapshots` | `[{name, id, files}]`：`name` 匹配 3.x 的 `^[A-Za-z0-9_.-]+$` 且不为 `.`、`..`；`id` 为 32 位小写十六进制（3.x `uuid4().hex`）；名字在意图内不重复；`files` 为该 snapshot 元数据引用的 data、delta 与索引侧车 |
+  | `index_files` | 当前（旧）manifest 中 data 文件对应的索引侧车 |
+  | 路径 | `snapshots[].files` 与 `index_files` 中每一项都必须是 `partitions/<合法分区名>/data/<data 文件名>`、`partitions/<合法分区名>/delta/<delta 文件名>` 或 `partitions/<合法分区名>/indexes/<侧车文件名>`：分区名用 [partition_paths](../../crates/core/src/storage/partition_paths.rs) 的 `valid_name`，文件名为单一路径段并分别符合 data、delta 的 `<kind>_<数字>_<数字>.parquet` 形态与 0014 的侧车解析（同 index_intent 的 `valid_sidecar_path`）；`index_files` 中侧车的 stem 必须对应旧 manifest 同一分区的某个 data 文件；`snapshots[].files` 中侧车的 stem 必须对应**同一 snapshot** 同一分区的某个 data 文件（snapshot 可以钉住已被合并移出 manifest 或所在分区已被 Drop 的历史文件，分区名只校验合法性，不要求仍在 manifest 中）；重复只在同一列表内禁止，不同 snapshot 之间、snapshot 与 `index_files` 之间可以引用同一路径 |
+
+  待删文件集合不单独存储，由意图推导：旧 manifest 引用的 data / delta、`index_files` 与 `snapshots[].files` 的并集（去重），减去当前 manifest 与剩余 snapshot 引用的文件。任何校验失败即视为损坏：该集合 fail-closed，不删除任何文件。
+- **重开处理**：`collection_inner` 在 `load_committed` 之前处理清空意图：读取并校验意图 → 读取 `schema.json`（必须可解析）与 `manifest.json` 的字节 → 等于 `candidate_manifest` 时先 fsync `manifest.json` 与集合目录，再执行第 6 步（含 `schema.json` 的规范重写，因此随后读回的顺序与 3.x 重开后相同），失败则本次打开报 Storage 错误、不缓存；否则删除意图、不做其他删除 → 继续现有的 `load_committed` 与孤儿清理（钉住集合按剩余 snapshot 重新读取）。同时存在 0014 删除意图与清空意图时 fail-closed。
+- **人工恢复**（意图损坏或版本未知）：停止服务；若 `manifest.json` 已是空的候选状态，按需手工删除意图所列 snapshot；然后删除集合目录的 `milvus-lite-rust.truncate-intent.json` 并重启，孤儿文件由打开时的现有清理处理。
+
+### gRPC
+
+- [build.rs](../../crates/grpc/build.rs) 的 `IMPLEMENTED_METHODS` 加入 CreateAlias、AlterAlias、DropAlias、DescribeAlias、ListAliases、RenameCollection、TruncateCollection、AlterCollection；处理体只做解码、调用 core 与编码。
+- 数据库沿用现有 `database()`（请求 `db_name` 优先，其次 `dbname` 元数据）。RenameCollection 的 `newDBName` 原样交给 core。AlterCollection 的属性按现有 `schema::properties` 的 Python dict 语义解码。
+- 响应：DescribeAlias 填 `alias` 与 `collection`，`db_name` 留空（与 3.x 相同）；ListAliases 填 `collection_name` 与 `aliases`；TruncateCollection 只有 status。
+
+### 测试矩阵
+
+| 层 | 内容 | 位置 |
+| --- | --- | --- |
+| 单元 | 别名表加载与解析失败不缓存；`dump_file` 与真实 Python `json.dump` 逐字节对照（schema、alias、manifest、`.prev`；默认值、分区、`index_specs`、非 ASCII、`1E2`、`-0`、宽整数、默认浮点值）；两种意图逐字段篡改（路径穿越、snapshot 名穿越、同一列表内重复、未知字段、候选 manifest 与旧 manifest 关系不符、侧车 stem 不属于对应 data 集合）均 fail-closed 且 unlink 次数为零；合法意图的三类正例：snapshot 之后经合并移出 manifest 再清空、两个 snapshot 共享同一 data 与侧车、snapshot 钉住已 Drop 分区的数据，校验通过且清空后无遗留文件；`lock_pair` 的顺序与同层断言；放宽名字检查的边界 | core 模块内 |
+| 故障与崩溃（fault-injection） | 合同「验收方向 / 故障」列出的每个点，加：别名写入与 AlterCollection 的 tmp 改名前后与目录同步失败；0.3.0rc3 写出的未排序 `schema.json` 上的无操作 Alter 会重写；改名 P1a 的 data、delta 与 `wal/` 目录同步失败，以及 P1b 每个出口（意图写失败、目录改名失败、核对失败并改回、删除意图失败）之后执行插入、Flush、重开，新旧数据都不丢；改名 P2、P3 各暂停点上旧名 / 新名的 Describe、统计、Query、Insert、Flush 与 create / drop 的确定结果及写入闸门状态；清空第 3 步对五种 `wal/` 状态（从未写入、只建 schema、上一次清空后未写入、存在空 `wal/`、`wal/` 不存在）均成功，`wal/` 为文件或符号链接以及 staging 目标已存在时零写入失败；WAL 目录改名之前、之后与目录同步之后退出，分别用本实现与 3.x 重开，计数与主键不重复、不丢失，后续写入与下一次 flush 成功；改名失败与目录同步失败之后的插入、Flush 与重开；清空第 4–7 步每步之后进程退出、I/O 错误与 panic；重开处理中的 fsync 失败；清理失败后由 Insert、Delete、Upsert、Flush、索引和分区操作分别触发“释放共享许可 → 独占重试 → 成功则从头重跑”的完整路径，并在独占重试的 schema 目录同步失败时断言整库写入封锁、无并发写入越过封锁 | [db_persistence.rs](../../crates/core/tests/db_persistence.rs)、[crash_recovery.rs](../../crates/core/tests/crash_recovery.rs) |
+| 同一进程的读视图 | 清空后立即 count / get / query / search 为空，auto_id 从 1 开始，属性、分区与索引顺序与重开及 3.x 相同；清空后重开 auto_id 继续递增；以 0.3.0rc3 写出的未排序 `schema.json` 直接清空，比较清空前、清空后同一进程、清空后重开三种状态的属性顺序，并比较磁盘字节，均与 3.x 相同；第 4、5 步失败后 staging 中迁移的 WAL 目录被删除；第 6 步成功后 `pinned_files` 为空、`truncate_cleanup` 已清除、后台合并恢复；清空第 5 步发布之后、第 6 步完成之前用暂停钩子发起读写与 Flush：读看到空集合，写入与 Flush 在清空返回后才执行；清空中 `schema.json` 规范重写的 tmp 写入、文件同步、改名、集合目录同步分别注入失败，断言写入闸门状态（只有目录同步失败时整库封锁），成功重试或重开后磁盘为规范字节、重开属性顺序与 3.x 相同 | [db_persistence.rs](../../crates/core/tests/db_persistence.rs) |
+| 并发 | 合同「并发」各组合；独占许可（别名写入、AlterCollection、改名、清空）与进行中合并的先后，清空期间整个数据库的写入等待，已打开集合的纯读不受影响，未打开集合的首次懒打开等待；清理重试完成共享到独占的重新入闸后，原请求从头执行且不能重复应用任何变更 | [concurrency_faults.rs](../../crates/core/tests/concurrency_faults.rs) |
+| 差分 | 「参照实测」每一行的 raw gRPC 与 MilvusClient 对照，两条 SDK 线；预期差异单独断言 | `tests/differential/` 新增文件 |
+| 互通 | 合同「互通」各项，含 3.x 中途退出的目录与本实现意图未完成时由 3.x 打开；Arrow 15 / 25 两个参照环境 | [tests/storage_interop/](../../tests/storage_interop/) |
+| 端到端 | 参照 adapter 用例中范围内的条目复制或启用，更新 INVENTORY | [tests/python/adapter/](../../tests/python/adapter/) |
+| 统计 | 760 / 90 / 49 三组按同一方法重跑，逐条核对合同预期 | 仓库外，记录写入验收文档 |
+
+### 实施顺序与验收记录
+
+1. `pyjson::dump_file`，schema、alias、manifest 全部改为排序写出；放宽名字检查；`require_database` 对已有非默认库返回 UNIMPLEMENTED；
+2. `CollectionKey` 与 `DatabaseState` 重构（行为不变，全部现有测试通过）；
+3. 别名表、全入口解析与五个别名 RPC；
+4. AlterCollection；
+5. 改名与改名意图；
+6. 清空与清空意图；
+7. 文档同步（合同「文档同步」清单）与三组统计。
+
+每一步按「改了什么就跑什么」跑齐对应套件；第 2 步之后每步单独评审。实施验收另写 `docs/testing/0023-a-acceptance.md`，记录测试、差分、互通、统计与残余风险，不在本文追加证据。
