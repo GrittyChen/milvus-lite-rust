@@ -1694,6 +1694,11 @@ impl Collection {
         &self.schema
     }
 
+    /// AlterCollection 在 `schema.json` 替换之后发布；已取得的读快照保留各自的副本。
+    pub(crate) fn set_properties(&mut self, properties: Vec<(String, String)>) {
+        self.schema.properties = properties;
+    }
+
     /// 去重后的存活行数。不检查 load 状态（3.x 的 `num_entities`）。
     pub fn count(&self) -> usize {
         self.pk_index.len()

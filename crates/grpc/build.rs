@@ -17,6 +17,7 @@ const IMPLEMENTED_METHODS: &[&str] = &[
     "DropCollection",
     "DescribeCollection",
     "ShowCollections",
+    "AlterCollection",
     "GetCollectionStatistics",
     "CreatePartition",
     "DropPartition",

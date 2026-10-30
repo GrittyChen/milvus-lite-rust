@@ -224,6 +224,24 @@ impl Service for MilvusService {
         .await
     }
 
+    async fn alter_collection(
+        &self,
+        request: Request<svc::AlterCollectionRequest>,
+    ) -> Result<Response<common::Status>, Status> {
+        let database = database(&request, |r| &r.db_name);
+        let req = request.into_inner();
+        self.run(Branch::Engine, move |db| {
+            db.alter_collection(
+                &database,
+                &req.collection_name,
+                &schema::properties(&req.properties),
+                &req.delete_keys,
+            )?;
+            Ok(success())
+        })
+        .await
+    }
+
     async fn show_collections(
         &self,
         request: Request<svc::ShowCollectionsRequest>,

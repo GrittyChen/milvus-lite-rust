@@ -3,6 +3,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::storage::manifest::Manifest;
 
@@ -162,6 +163,74 @@ impl CommitError {
             phase: CommitPhase::AfterReplace,
             source,
         }
+    }
+}
+
+/// 把 panic 转成 I/O 错误，让调用方按所在阶段（替换之前 / 之后）收尾。
+pub(crate) fn guarded_io<T>(action: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(action)).unwrap_or_else(|payload| {
+        Err(io::Error::other(format!(
+            "directory operation panicked: {}",
+            crate::error::panic_description(payload.as_ref())
+        )))
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReplacePoint {
+    BeforeRename,
+    AfterRename,
+}
+
+#[derive(Debug)]
+pub(crate) enum ReplaceError {
+    /// 替换之前失败：磁盘上仍是原文件。
+    Unchanged(io::Error),
+    /// 文件已替换，所在目录的同步未确认（含 panic）。
+    Unconfirmed(io::Error),
+}
+
+static REPLACE_TMP_NUMBER: AtomicU64 = AtomicU64::new(1);
+
+/// 共享 JSON 文件（`aliases.json`、`schema.json`）的替换：写 tmp、fsync、改名、fsync 所在目录。
+/// 两段分别兜住 panic：改名之后的失败必须让调用方按「已替换」收尾，不能与替换之前的失败混为一谈。
+pub(crate) fn replace_file(
+    dir: &Path,
+    name: &str,
+    bytes: &[u8],
+    fault: impl Fn(ReplacePoint) -> io::Result<()>,
+) -> Result<(), ReplaceError> {
+    guarded_io(|| {
+        fault(ReplacePoint::BeforeRename)?;
+        let tmp = dir.join(format!(
+            "{name}.tmp.{}.{}",
+            std::process::id(),
+            REPLACE_TMP_NUMBER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut file = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+        if let Err(error) = file.write_all(bytes).and_then(|()| sync_file(&file, &tmp)) {
+            drop(file);
+            remove_tmp(&tmp);
+            return Err(error);
+        }
+        drop(file);
+        if let Err(error) = fs::rename(&tmp, dir.join(name)) {
+            remove_tmp(&tmp);
+            return Err(error);
+        }
+        Ok(())
+    })
+    .map_err(ReplaceError::Unchanged)?;
+    guarded_io(|| {
+        fault(ReplacePoint::AfterRename)?;
+        sync_dir(dir)
+    })
+    .map_err(ReplaceError::Unconfirmed)
+}
+
+fn remove_tmp(tmp: &Path) {
+    if let Err(cleanup) = fs::remove_file(tmp) {
+        eprintln!("cannot clean failed temp file {tmp:?}: {cleanup}");
     }
 }
 

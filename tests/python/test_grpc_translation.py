@@ -967,7 +967,6 @@ def test_pymilvus_entry_points_remaining_unsupported(env):
         (with_field("s", DataType.SPARSE_FLOAT_VECTOR), f"SPARSE_FLOAT_VECTOR fields: {feature}"),
         (with_field("g", DataType.GEOMETRY), f"GEOMETRY fields: {feature}"),
         (with_field("ts", DataType.TIMESTAMPTZ), f"TIMESTAMPTZ fields: {feature}"),
-        (lambda: client.alter_collection_properties("q", {"mmap.enabled": True}), f"AlterCollection: {rpc}"),
         # pymilvus 3.0 先发 AlterCollectionSchema，收到 UNIMPLEMENTED 后回退到 AddCollectionField。
         (lambda: client.add_collection_field("q", "x", DataType.INT64, nullable=True), f"AddCollectionField: {rpc}"),
         (lambda: client.rename_collection("q", "q2"), f"RenameCollection: {rpc}"),

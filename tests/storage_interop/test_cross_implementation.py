@@ -482,6 +482,34 @@ db.close()
     run([interpreters[PYTHONS[0]], "-c", code, str(root)], cwd=tmp_path)
 
 
+ALTERNATING_PRELUDE = """
+import sys
+from pymilvus import DataType, MilvusClient
+from milvus_lite.server_manager import server_manager_instance as manager
+path = sys.argv[1]
+client = MilvusClient(path, dedicated=True)
+schema = MilvusClient.create_schema()
+schema.add_field('id', DataType.INT64, is_primary=True)
+schema.add_field('vector', DataType.FLOAT_VECTOR, dim=2)
+indexes = client.prepare_index_params()
+indexes.add_index('vector', index_type='FLAT', metric_type='L2')
+try:
+{body}
+finally:
+    client.close()
+    manager.release_server(path)
+"""
+
+
+def alternate(tmp_path, interpreters, first, root, steps):
+    """两个实现轮流各开一个进程执行一步，`first` 先行。"""
+    pythons = {"rust": sys.executable, "reference": interpreters[PYTHONS[0]]}
+    order = [first, "reference" if first == "rust" else "rust"] * len(steps)
+    for who, step in zip(order, steps):
+        body = "\n".join("    " + line for line in step.strip().splitlines())
+        run([pythons[who], "-c", ALTERNATING_PRELUDE.format(body=body), str(root)], cwd=tmp_path)
+
+
 @pytest.mark.parametrize("first", ["rust", "reference"])
 def test_aliases_written_by_one_implementation_resolve_and_change_in_the_other(tmp_path, interpreters, first):
     """0023 A 互通：别名的创建、改指、解析与经别名删除在两边交替执行，`aliases.json` 互相读写。"""
@@ -523,29 +551,46 @@ assert client.describe_alias('b')['collection_name'] == 'c1'
 assert client.list_collections() == ['c1']
 """,
     ]
-    prelude = """
-import sys
-from pymilvus import DataType, MilvusClient
-from milvus_lite.server_manager import server_manager_instance as manager
-path = sys.argv[1]
-client = MilvusClient(path, dedicated=True)
-schema = MilvusClient.create_schema()
-schema.add_field('id', DataType.INT64, is_primary=True)
-schema.add_field('vector', DataType.FLOAT_VECTOR, dim=2)
-indexes = client.prepare_index_params()
-indexes.add_index('vector', index_type='FLAT', metric_type='L2')
-try:
-{body}
-finally:
-    client.close()
-    manager.release_server(path)
-"""
-    pythons = {"rust": sys.executable, "reference": interpreters[PYTHONS[0]]}
-    order = [first, "reference" if first == "rust" else "rust"] * 2
-    for who, step in zip(order, steps):
-        body = "\n".join("    " + line for line in step.strip().splitlines())
-        run([pythons[who], "-c", prelude.format(body=body), str(root)], cwd=tmp_path)
+    alternate(tmp_path, interpreters, first, root, steps)
     assert json.loads((root / "aliases.json").read_text()) == {"b": "c1"}
+
+
+@pytest.mark.parametrize("first", ["rust", "reference"])
+def test_collection_properties_altered_by_one_implementation_are_read_and_changed_by_the_other(
+    tmp_path, interpreters, first
+):
+    """0023 A 互通：两边交替修改集合属性；进程内为插入顺序，对方重开后按文件中的（排序）顺序读回。"""
+    root = tmp_path / "properties.db"
+    steps = [
+        """
+client.create_collection('c', schema=schema, index_params=indexes)
+client.insert('c', [{'id': 1, 'vector': [1.0, 0.0]}])
+client.create_alias('c', 'a')
+client.alter_collection_properties('a', {'zeta': 1, 'alpha': '中文', 'mid': 'x'})
+assert list(client.describe_collection('c')['properties']) == ['zeta', 'alpha', 'mid']
+""",
+        """
+assert client.describe_collection('c')['properties'] == {'alpha': '中文', 'mid': 'x', 'zeta': '1'}
+assert list(client.describe_collection('c')['properties']) == ['alpha', 'mid', 'zeta']
+client.drop_collection_properties('c', ['mid'])
+client.alter_collection_properties('a', {'beta': 'b', 'alpha': 'A'})
+client.load_collection('c')
+assert client.query('c', filter='', output_fields=['id']) == [{'id': 1}]
+""",
+        """
+assert list(client.describe_collection('c')['properties'].items()) == [('alpha', 'A'), ('beta', 'b'), ('zeta', '1')]
+client.insert('c', [{'id': 2, 'vector': [0.0, 1.0]}])
+""",
+        """
+client.load_collection('c')
+assert client.query('c', filter='', output_fields=['count(*)']) == [{'count(*)': 2}]
+assert list(client.describe_collection('a')['properties']) == ['alpha', 'beta', 'zeta']
+""",
+    ]
+    alternate(tmp_path, interpreters, first, root, steps)
+    schema = json.loads((root / "collections/c/schema.json").read_text())
+    assert schema["collection_name"] == "c"
+    assert schema["properties"] == {"alpha": "A", "beta": "b", "zeta": "1"}
 
 
 def test_real_database_path_recovers_reference_crash_wal(tmp_path, interpreters):

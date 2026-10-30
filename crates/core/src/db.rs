@@ -19,7 +19,8 @@ use crate::error::{EngineError, Result, py_repr};
 use crate::filter::ParsedFilter;
 use crate::index::IndexRequest;
 use crate::schema::CollectionSchema;
-use crate::storage::{fs_commit, recovery, runtime, schema_file::SchemaFile};
+use crate::storage::fs_commit::{self, guarded_io};
+use crate::storage::{recovery, runtime, schema_file::SchemaFile};
 
 #[cfg(feature = "fault-injection")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -239,6 +240,8 @@ pub enum DirectoryOperation {
     Drop,
     /// 别名 RPC 的 `aliases.json` 写入，只用 `Aliases` 与 `AliasesAfterRename` 两点。
     Alias,
+    /// AlterCollection 的 `schema.json` 替换，只用 `BeforeRename` 与 `AfterRename`（目录同步之前）两点。
+    Alter,
 }
 #[cfg(feature = "fault-injection")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2459,6 +2462,83 @@ impl Db {
         Ok(result)
     }
 
+    /// 3.x `alter_collection_properties`：先删 `delete_keys` 再设 `properties`（新键追加、已有键原位替换），
+    /// 值为字符串。持独占许可（0023 A「对合同方向的细化」）；集合须能按本实现打开，范围外 schema 返回
+    /// Unsupported。请求中的 `timezone` 由 schema 校验拒绝，因而先判集合存在、零写入（取舍 1）。
+    pub fn alter_collection(
+        &self,
+        database: &str,
+        name: &str,
+        properties: &[(String, String)],
+        delete_keys: &[String],
+    ) -> Result<()> {
+        let key = self.key(database, name)?;
+        let _intent = NamespaceIntent::new(&self.namespace_waiters);
+        let mut blocked = self.write_gate.write();
+        if *blocked {
+            return Err(storage(
+                "database writes are blocked after an unconfirmed directory change",
+            ));
+        }
+        let key = self.resolve(key)?;
+        let handle = checked_read_handle(self.collection_inner(&key)?)?;
+        let lock = handle
+            .read()
+            .persistent()
+            .ok_or_else(|| storage("persistent state missing"))?
+            .flush_lock();
+        let _flush = lock.lock();
+        let (dir, mut schema) = {
+            let collection = handle.read();
+            let p = collection
+                .persistent()
+                .ok_or_else(|| storage("persistent state missing"))?;
+            (p.dir.clone(), collection.schema().clone())
+        };
+        schema
+            .properties
+            .retain(|(key, _)| !delete_keys.contains(key));
+        for (key, value) in properties {
+            match schema.properties.iter_mut().find(|(k, _)| k == key) {
+                Some(entry) => entry.1.clone_from(value),
+                None => schema.properties.push((key.clone(), value.clone())),
+            }
+        }
+        schema.validate()?;
+        let current = fs::read(dir.join("schema.json")).map_err(storage)?;
+        let bytes = SchemaFile::with_properties(&current, &key.name, &schema.properties)
+            .map_err(storage)?;
+        // 已是规范字节时不写；只差键序（0.3.0rc3 写出的文件）或名字时照常重写。
+        if bytes != current {
+            let fault = |point| {
+                #[cfg(feature = "fault-injection")]
+                directory_fault(
+                    DirectoryOperation::Alter,
+                    match point {
+                        fs_commit::ReplacePoint::BeforeRename => DirectoryPoint::BeforeRename,
+                        fs_commit::ReplacePoint::AfterRename => DirectoryPoint::AfterRename,
+                    },
+                )?;
+                #[cfg(not(feature = "fault-injection"))]
+                let _point: fs_commit::ReplacePoint = point;
+                Ok(())
+            };
+            match fs_commit::replace_file(&dir, "schema.json", &bytes, fault) {
+                Ok(()) => {}
+                Err(fs_commit::ReplaceError::Unchanged(error)) => return Err(storage(error)),
+                Err(fs_commit::ReplaceError::Unconfirmed(error)) => {
+                    handle.write().set_properties(schema.properties);
+                    *blocked = true;
+                    return Err(storage(format!(
+                        "collection properties were changed, but schema.json durability is unconfirmed: {error}"
+                    )));
+                }
+            }
+        }
+        handle.write().set_properties(schema.properties);
+        Ok(())
+    }
+
     /// 3.x 的判定顺序：解析目标（可以是别名）→ 别名名字 → 目标存在 → 与集合冲突 → 别名已存在。
     pub fn create_alias(&self, database: &str, collection: &str, alias: &str) -> Result<()> {
         self.change_aliases(database, |state, aliases| {
@@ -2577,7 +2657,7 @@ impl Db {
             #[cfg(feature = "fault-injection")]
             directory_fault(DirectoryOperation::Alias, alias_fault_point(point))?;
             #[cfg(not(feature = "fault-injection"))]
-            let _point: alias::WritePoint = point;
+            let _point: fs_commit::ReplacePoint = point;
             Ok(())
         };
         match alias::write(&state.root, &next, fault) {
@@ -2585,8 +2665,8 @@ impl Db {
                 *aliases = next;
                 Ok(())
             }
-            Err(alias::WriteError::Unchanged(error)) => Err(storage(error)),
-            Err(alias::WriteError::Unconfirmed(error)) => {
+            Err(fs_commit::ReplaceError::Unchanged(error)) => Err(storage(error)),
+            Err(fs_commit::ReplaceError::Unconfirmed(error)) => {
                 *aliases = next;
                 *blocked = true;
                 Err(storage(format!(
@@ -2667,7 +2747,7 @@ fn save_lifecycle_aliases(
             alias_fault_point(point),
         )?;
         #[cfg(not(feature = "fault-injection"))]
-        let _point: alias::WritePoint = point;
+        let _point: fs_commit::ReplacePoint = point;
         Ok(())
     };
     #[cfg(not(feature = "fault-injection"))]
@@ -2677,8 +2757,8 @@ fn save_lifecycle_aliases(
             *cache = next;
             Ok(())
         }
-        Err(alias::WriteError::Unchanged(error)) => Err(storage(error)),
-        Err(alias::WriteError::Unconfirmed(error)) => {
+        Err(fs_commit::ReplaceError::Unchanged(error)) => Err(storage(error)),
+        Err(fs_commit::ReplaceError::Unconfirmed(error)) => {
             *cache = next;
             Err(storage(error))
         }
@@ -2686,10 +2766,10 @@ fn save_lifecycle_aliases(
 }
 
 #[cfg(feature = "fault-injection")]
-fn alias_fault_point(point: alias::WritePoint) -> DirectoryPoint {
+fn alias_fault_point(point: fs_commit::ReplacePoint) -> DirectoryPoint {
     match point {
-        alias::WritePoint::BeforeRename => DirectoryPoint::Aliases,
-        alias::WritePoint::AfterRename => DirectoryPoint::AliasesAfterRename,
+        fs_commit::ReplacePoint::BeforeRename => DirectoryPoint::Aliases,
+        fs_commit::ReplacePoint::AfterRename => DirectoryPoint::AliasesAfterRename,
     }
 }
 
@@ -2706,15 +2786,6 @@ fn checked_read_handle(handle: CollectionHandle) -> Result<CollectionHandle> {
 
 fn storage(error: impl std::fmt::Display) -> EngineError {
     EngineError::Storage(error.to_string())
-}
-
-pub(crate) fn guarded_io<T>(action: impl FnOnce() -> std::io::Result<T>) -> std::io::Result<T> {
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(action)).unwrap_or_else(|payload| {
-        Err(std::io::Error::other(format!(
-            "directory operation panicked: {}",
-            crate::error::panic_description(payload.as_ref())
-        )))
-    })
 }
 
 // parking_lot 不会中毒；必须在状态锁放开之前封锁可能已被部分更新的 collection。
@@ -4487,67 +4558,87 @@ mod tests {
     }
     #[cfg(feature = "fault-injection")]
     #[test]
-    fn alias_writes_wait_for_an_in_flight_writer_and_hold_the_exclusive_permit() {
+    fn metadata_writes_wait_for_an_in_flight_writer_and_hold_the_exclusive_permit() {
         use std::sync::mpsc;
         use std::time::{Duration, Instant};
-        let root = tempfile::tempdir().unwrap();
-        let db = Db::new(
-            DataDir::open(root.path()).unwrap(),
-            Compute::new(std::num::NonZeroUsize::MIN).unwrap(),
-        )
-        .unwrap();
-        db.create_collection("", "writer", basic_schema()).unwrap();
-        db.wait_for_maintenance("", "writer", Duration::from_secs(5))
-            .unwrap();
-        let handle = db.collection("", "writer").unwrap();
-        let state = handle.write();
-        let writer = Arc::clone(&db);
-        let writing = std::thread::spawn(move || {
-            writer.insert(
-                "",
-                "writer",
-                InsertBatch {
-                    num_rows: 1,
-                    columns: vec![
-                        ("id".into(), InputValues::Int(vec![1])),
-                        (
-                            "v".into(),
-                            InputValues::FloatVector {
-                                dim: 2,
-                                values: vec![1.0, 0.0],
-                            },
-                        ),
-                    ],
+        type Change = fn(&Db) -> Result<()>;
+        let changes: [(Change, Change); 2] = [
+            (
+                |db| db.create_alias("", "writer", "a"),
+                |db| {
+                    assert_eq!(db.describe_alias("", "a").unwrap(), "writer");
+                    assert_eq!(db.collection("", "a").unwrap().read().count(), 1);
+                    Ok(())
                 },
+            ),
+            (
+                |db| db.alter_collection("", "writer", &[("k".into(), "v".into())], &[]),
+                |db| {
+                    let handle = db.collection("", "writer").unwrap();
+                    let collection = handle.read();
+                    assert_eq!(collection.schema().properties, [("k".into(), "v".into())]);
+                    assert_eq!(collection.count(), 1);
+                    Ok(())
+                },
+            ),
+        ];
+        for (change, check) in changes {
+            let root = tempfile::tempdir().unwrap();
+            let db = Db::new(
+                DataDir::open(root.path()).unwrap(),
+                Compute::new(std::num::NonZeroUsize::MIN).unwrap(),
             )
-        });
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while db.write_gate.available() {
-            assert!(Instant::now() < deadline);
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        let changer = Arc::clone(&db);
-        let (done_tx, done_rx) = mpsc::channel();
-        let changing = std::thread::spawn(move || {
-            done_tx
-                .send(changer.create_alias("", "writer", "a"))
-                .unwrap();
-        });
-        // 写入者持共享许可期间别名写入不能开始，叶子锁也未被占住，读请求照常解析。
-        assert!(matches!(
-            done_rx.recv_timeout(Duration::from_millis(100)),
-            Err(mpsc::RecvTimeoutError::Timeout)
-        ));
-        assert!(db.databases[DEFAULT_DATABASE].aliases.available());
-        drop(state);
-        writing.join().unwrap().unwrap();
-        done_rx
-            .recv_timeout(Duration::from_secs(5))
-            .unwrap()
             .unwrap();
-        changing.join().unwrap();
-        assert_eq!(db.describe_alias("", "a").unwrap(), "writer");
-        assert_eq!(db.collection("", "a").unwrap().read().count(), 1);
-        db.close();
+            db.create_collection("", "writer", basic_schema()).unwrap();
+            db.wait_for_maintenance("", "writer", Duration::from_secs(5))
+                .unwrap();
+            let handle = db.collection("", "writer").unwrap();
+            let state = handle.write();
+            let writer = Arc::clone(&db);
+            let writing = std::thread::spawn(move || {
+                writer.insert(
+                    "",
+                    "writer",
+                    InsertBatch {
+                        num_rows: 1,
+                        columns: vec![
+                            ("id".into(), InputValues::Int(vec![1])),
+                            (
+                                "v".into(),
+                                InputValues::FloatVector {
+                                    dim: 2,
+                                    values: vec![1.0, 0.0],
+                                },
+                            ),
+                        ],
+                    },
+                )
+            });
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while db.write_gate.available() {
+                assert!(Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let changer = Arc::clone(&db);
+            let (done_tx, done_rx) = mpsc::channel();
+            let changing = std::thread::spawn(move || {
+                done_tx.send(change(&changer)).unwrap();
+            });
+            // 写入者持共享许可期间元数据写入不能开始，叶子锁也未被占住，读请求照常解析。
+            assert!(matches!(
+                done_rx.recv_timeout(Duration::from_millis(100)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ));
+            assert!(db.databases[DEFAULT_DATABASE].aliases.available());
+            drop(state);
+            writing.join().unwrap().unwrap();
+            done_rx
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .unwrap();
+            changing.join().unwrap();
+            check(&db).unwrap();
+            db.close();
+        }
     }
 }

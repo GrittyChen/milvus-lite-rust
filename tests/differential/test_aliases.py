@@ -35,7 +35,7 @@ def call(uri, method, **fields):
     elif method == "ListAliases":
         out += (reply.db_name, reply.collection_name, list(reply.aliases))
     elif method == "DescribeCollection":
-        out += (reply.collection_name, list(reply.aliases))
+        out += (reply.collection_name, list(reply.aliases), [(kv.key, kv.value) for kv in reply.properties])
     elif method == "ShowCollections":
         out += (list(reply.collection_names),)
     elif method == "GetCollectionStatistics":
