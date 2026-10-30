@@ -110,6 +110,9 @@ impl Drop for FlushRetryWindowGuard {
     }
 }
 
+const TRUNCATE_CLEANUP_PENDING: &str =
+    "the collection was truncated, but its cleanup must finish before another write";
+
 pub struct FrozenGeneration {
     pub number: u64,
     pub table: FrozenMemTable,
@@ -190,6 +193,8 @@ pub struct PersistentCollection {
     last_failure: Option<(Instant, String)>,
     inherited_synced: bool,
     pub(crate) index_intent: super::index_intent::IntentState,
+    /// 清空已提交、清理未完成（0023 A「清空」第 7 步）：期间拒绝改写 manifest 的写入，暂停后台维护。
+    pub(crate) truncate_cleanup: Option<super::truncate_intent::Pending>,
     poisoned: bool,
     /// 与状态写锁分开：Parquet 写入、fsync 和 manifest 提交不阻塞读者。
     flush_lock: Arc<crate::lock_order::Mutex<(), 4>>,
@@ -243,6 +248,7 @@ impl PersistentCollection {
             last_failure: None,
             inherited_synced: false,
             index_intent: Default::default(),
+            truncate_cleanup: None,
             poisoned: false,
             flush_lock: Arc::new(crate::lock_order::Mutex::new(())),
         })
@@ -278,6 +284,7 @@ impl PersistentCollection {
             last_failure: None,
             inherited_synced: false,
             index_intent: Default::default(),
+            truncate_cleanup: None,
             poisoned: false,
             flush_lock: Arc::new(crate::lock_order::Mutex::new(())),
         }
@@ -290,6 +297,7 @@ impl PersistentCollection {
     pub(crate) fn can_compact(&self) -> Result<bool, String> {
         Ok(!self.poisoned
             && !self.needs_retry()
+            && self.truncate_cleanup.is_none()
             && !self.retained_old_wal
             && !self.active.has_legacy_operations(self.manifest.current_seq)
             && !self
@@ -504,6 +512,9 @@ impl PersistentCollection {
         if self.needs_retry() {
             return Err("a failed flush must complete before another write".to_owned());
         }
+        if self.truncate_cleanup.is_some() {
+            return Err(TRUNCATE_CLEANUP_PENDING.to_owned());
+        }
         let name = self
             .partitions
             .name(partition)
@@ -527,6 +538,9 @@ impl PersistentCollection {
         }
         if self.needs_retry() {
             return Err("a failed flush must complete before another write".to_owned());
+        }
+        if self.truncate_cleanup.is_some() {
+            return Err(TRUNCATE_CLEANUP_PENDING.to_owned());
         }
         if self.data_wal.is_none() {
             let wal_dir = self.dir.join("wal");
@@ -582,6 +596,9 @@ impl PersistentCollection {
         }
         if self.needs_retry() {
             return Err("a failed flush must complete before another write".to_owned());
+        }
+        if self.truncate_cleanup.is_some() {
+            return Err(TRUNCATE_CLEANUP_PENDING.to_owned());
         }
         let seqs = vec![seq; pks.len()];
         let name = if let Some(part) = target {
@@ -719,11 +736,51 @@ impl PersistentCollection {
         self.inherited_synced = true;
     }
 
+    /// 清空第 3 步的前提：flush 之后没有冻结代与打开的 WAL 写者，当前代编号严格大于 `wal/` 中所有规范 WAL，
+    /// 因而 `wal/` 中的行全部已在 manifest 中。
+    pub(crate) fn truncate_wal_ready(&self) -> Result<(), String> {
+        if !self.pending.is_empty() || self.data_wal.is_some() || self.delta_wal.is_some() {
+            return Err("collection still has unflushed WAL generations".to_owned());
+        }
+        let wal = crate::storage::recovery::scan_wal(&self.dir.join("wal")).map_err(err)?;
+        match wal.keys().next_back() {
+            Some(&last) if last >= self.generation => Err(format!(
+                "WAL generation {last} is not older than the active generation {}",
+                self.generation
+            )),
+            _ => Ok(()),
+        }
+    }
+
+    /// 清空第 5 步按重开路径重建之后，接续原实例：WAL 代编号与 SourceId 计数在进程内继续单调递增，
+    /// flush 锁与维护状态沿用原来的 `Arc`（等待者与维护队列持有的是它们）。
+    pub(crate) fn continue_from(&mut self, old: &Self) -> Result<(), String> {
+        self.generation = self.generation.max(
+            old.generation
+                .checked_add(1)
+                .ok_or("WAL number space exhausted")?,
+        );
+        self.next_source = self.next_source.max(
+            old.next_source
+                .checked_add(1)
+                .ok_or("source ID space exhausted")?,
+        );
+        self.flush_lock = Arc::clone(&old.flush_lock);
+        self.maintenance_status = Arc::clone(&old.maintenance_status);
+        Ok(())
+    }
+
+    /// manifest 已替换、集合目录同步未确认：沿用 flush 的重新提交路径。
+    pub(crate) fn mark_manifest_unconfirmed(&mut self, reason: String) {
+        self.retry_manifest = true;
+        self.record_failure(reason);
+    }
+
     pub(crate) fn index_manifest(
         &self,
         change: &crate::index::IndexChange,
     ) -> Result<Manifest, String> {
-        if self.poisoned || self.needs_retry() {
+        if self.poisoned || self.needs_retry() || self.truncate_cleanup.is_some() {
             return Err("collection has unfinished storage work".to_owned());
         }
         let mut candidate = self.manifest.clone();
@@ -785,7 +842,7 @@ impl PersistentCollection {
     }
 
     pub(crate) fn validate_partition_commit(&self) -> Result<(), String> {
-        if self.poisoned || self.needs_retry() {
+        if self.poisoned || self.needs_retry() || self.truncate_cleanup.is_some() {
             return Err("collection has unfinished storage work".into());
         }
         Ok(())

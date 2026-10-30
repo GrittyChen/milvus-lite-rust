@@ -46,6 +46,25 @@ def test_alias_lifecycle_and_alias_reads(milvus_client):
     assert "current_alias" not in milvus_client.list_aliases()["aliases"]
 
 
+def test_truncate_collection_preserves_schema(milvus_client):
+    _create_basic_collection(milvus_client, "to_truncate")
+    milvus_client.insert("to_truncate", [
+        {"id": 1, "vec": [1.0, 0.0, 0.0, 0.0], "tag": "old"},
+    ])
+    assert milvus_client.get_collection_stats("to_truncate")["row_count"] == 1
+
+    milvus_client.truncate_collection("to_truncate")
+    assert milvus_client.get_collection_stats("to_truncate")["row_count"] == 0
+
+    milvus_client.insert("to_truncate", [
+        {"id": 2, "vec": [0.0, 1.0, 0.0, 0.0], "tag": "new"},
+    ])
+    rows = milvus_client.query(
+        "to_truncate", filter="id == 2", output_fields=["tag"]
+    )
+    assert rows == [{"id": 2, "tag": "new"}]
+
+
 def test_list_indexes_returns_index_names(milvus_client):
     _create_basic_collection(milvus_client, "idx_names")
     idx = milvus_client.prepare_index_params()
@@ -58,3 +77,110 @@ def test_list_indexes_returns_index_names(milvus_client):
     milvus_client.create_index("idx_names", idx)
 
     assert milvus_client.list_indexes("idx_names") == ["vec"]
+
+
+def test_truncate_preserves_metadata_and_clears_mutation_history(milvus_client):
+    _create_basic_collection(milvus_client, "truncate_history")
+    milvus_client.create_partition("truncate_history", "archive")
+    milvus_client.create_alias("truncate_history", "truncate_alias")
+    idx = milvus_client.prepare_index_params()
+    idx.add_index(
+        field_name="vec",
+        index_type="BRUTE_FORCE",
+        metric_type="COSINE",
+        params={},
+    )
+    milvus_client.create_index("truncate_history", idx)
+    milvus_client.alter_collection_properties(
+        "truncate_history", {"custom.keep": "yes"}
+    )
+    milvus_client.insert(
+        "truncate_history",
+        [
+            {"id": 1, "vec": [1.0, 0.0, 0.0, 0.0], "tag": "delete"},
+            {"id": 2, "vec": [0.0, 1.0, 0.0, 0.0], "tag": "upsert"},
+        ],
+    )
+    milvus_client.upsert(
+        "truncate_history",
+        [
+            {"id": 2, "vec": [0.0, 0.0, 1.0, 0.0], "tag": "updated"},
+            {"id": 3, "vec": [0.0, 0.0, 0.0, 1.0], "tag": "new"},
+        ],
+    )
+    milvus_client.delete("truncate_history", ids=[1])
+
+    milvus_client.truncate_collection("truncate_alias")
+
+    assert int(
+        milvus_client.get_collection_stats("truncate_history")["row_count"]
+    ) == 0
+    assert milvus_client.query(
+        "truncate_history", filter="id >= 0", output_fields=["id"]
+    ) == []
+    assert milvus_client.list_indexes("truncate_history") == ["vec"]
+    assert "archive" in milvus_client.list_partitions("truncate_history")
+    assert (
+        milvus_client.describe_alias("truncate_alias")["collection_name"]
+        == "truncate_history"
+    )
+    assert (
+        milvus_client.describe_collection("truncate_history")["properties"][
+            "custom.keep"
+        ]
+        == "yes"
+    )
+
+
+
+def test_truncate_released_collection_then_flush(milvus_client):
+    _create_basic_collection(milvus_client, "truncate_released")
+    milvus_client.insert(
+        "truncate_released",
+        [{"id": 1, "vec": [1.0, 0.0, 0.0, 0.0], "tag": "old"}],
+    )
+    milvus_client.release_collection("truncate_released")
+
+    milvus_client.truncate_collection("truncate_released")
+    milvus_client.flush("truncate_released")
+
+    assert int(
+        milvus_client.get_collection_stats("truncate_released")["row_count"]
+    ) == 0
+
+
+
+def test_collection_stats_follow_upsert_delete_flush_and_truncate(milvus_client):
+    _create_basic_collection(milvus_client, "collection_stats")
+    assert int(
+        milvus_client.get_collection_stats("collection_stats")["row_count"]
+    ) == 0
+    milvus_client.insert(
+        "collection_stats",
+        [
+            {"id": 1, "vec": [1.0, 0.0, 0.0, 0.0], "tag": "one"},
+            {"id": 2, "vec": [0.0, 1.0, 0.0, 0.0], "tag": "two"},
+        ],
+    )
+    milvus_client.upsert(
+        "collection_stats",
+        [
+            {"id": 2, "vec": [0.0, 0.0, 1.0, 0.0], "tag": "updated"},
+            {"id": 3, "vec": [0.0, 0.0, 0.0, 1.0], "tag": "three"},
+        ],
+    )
+    assert int(
+        milvus_client.get_collection_stats("collection_stats")["row_count"]
+    ) == 3
+    milvus_client.delete("collection_stats", ids=[1, 999])
+    assert int(
+        milvus_client.get_collection_stats("collection_stats")["row_count"]
+    ) == 2
+    milvus_client.flush("collection_stats")
+    assert int(
+        milvus_client.get_collection_stats("collection_stats")["row_count"]
+    ) == 2
+    milvus_client.truncate_collection("collection_stats")
+    assert int(
+        milvus_client.get_collection_stats("collection_stats")["row_count"]
+    ) == 0

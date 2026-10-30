@@ -255,6 +255,21 @@ impl Service for MilvusService {
         .await
     }
 
+    async fn truncate_collection(
+        &self,
+        request: Request<svc::TruncateCollectionRequest>,
+    ) -> Result<Response<svc::TruncateCollectionResponse>, Status> {
+        let database = database(&request, |r| &r.db_name);
+        let req = request.into_inner();
+        self.run(Branch::Engine, move |db| {
+            db.truncate_collection(&database, &req.collection_name)?;
+            Ok(svc::TruncateCollectionResponse {
+                status: Some(success()),
+            })
+        })
+        .await
+    }
+
     async fn show_collections(
         &self,
         request: Request<svc::ShowCollectionsRequest>,

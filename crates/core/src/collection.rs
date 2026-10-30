@@ -782,6 +782,18 @@ impl Collection {
         self.deleted
     }
 
+    /// 清空后按重开路径重建的实例接续原实例：load 状态取原值（3.x 清空后原来 loaded 则重新 load），
+    /// 持久化状态的计数与共享句柄见 [`PersistentCollection::continue_from`]。
+    pub(crate) fn continue_after_truncate(&mut self, old: &Self) -> Result<()> {
+        self.load_state = old.load_state;
+        let missing = || EngineError::Storage("persistent state missing".to_owned());
+        self.persistent
+            .as_mut()
+            .ok_or_else(missing)?
+            .continue_from(old.persistent.as_ref().ok_or_else(missing)?)
+            .map_err(EngineError::Storage)
+    }
+
     pub(crate) fn from_recovered(
         name: &str,
         mut recovered: RecoveredCollection,

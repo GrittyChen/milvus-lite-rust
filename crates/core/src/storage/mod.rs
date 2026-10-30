@@ -14,6 +14,7 @@ pub(crate) mod rename_intent;
 pub mod runtime;
 pub mod schema_file;
 pub mod snapshot;
+pub(crate) mod truncate_intent;
 pub mod visibility;
 pub mod wal;
 

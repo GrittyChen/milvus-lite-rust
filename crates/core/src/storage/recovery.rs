@@ -704,9 +704,9 @@ pub fn load_committed(collection_dir: &Path) -> Result<RecoveredCollection, Reco
     })
 }
 
-type WalPaths = (Option<PathBuf>, Option<PathBuf>);
+pub(crate) type WalPaths = (Option<PathBuf>, Option<PathBuf>);
 
-fn scan_wal(wal_dir: &Path) -> Result<BTreeMap<u64, WalPaths>, RecoveryError> {
+pub(crate) fn scan_wal(wal_dir: &Path) -> Result<BTreeMap<u64, WalPaths>, RecoveryError> {
     let entries = match fs::read_dir(wal_dir) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),

@@ -113,6 +113,15 @@ reply_with_status_field!(
     crate::pb::service::ListAliasesResponse,
 );
 
+// 只有 status 一个字段，宏中的 `..Default::default()` 无效。
+impl Reply for crate::pb::service::TruncateCollectionResponse {
+    fn with_status(status: common::Status) -> Self {
+        Self {
+            status: Some(status),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

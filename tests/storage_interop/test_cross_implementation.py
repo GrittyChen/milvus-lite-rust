@@ -680,6 +680,125 @@ assert client.query('d', filter='', output_fields=['count(*)']) == [{'count(*)':
         assert json.loads((root / "collections/d/schema.json").read_text())["collection_name"] == "c"
 
 
+@pytest.mark.parametrize("first", ["rust", "reference"])
+def test_collections_truncated_by_one_implementation_open_and_truncate_in_the_other(tmp_path, interpreters, first):
+    """0023 A 互通：两边交替清空（含经别名）。清空保留的分区、索引定义、别名与 load 状态互相可读，auto_id 从 1
+    重新分配并在对方继续递增，清空前的数据不在对方重新出现。"""
+    root = tmp_path / "truncate.db"
+    auto = """
+auto = MilvusClient.create_schema(auto_id=True)
+auto.add_field('id', DataType.INT64, is_primary=True, auto_id=True)
+auto.add_field('vector', DataType.FLOAT_VECTOR, dim=2)
+"""
+    steps = [
+        auto + """
+client.create_collection('c', schema=schema, index_params=indexes)
+client.create_partition('c', 'p')
+client.insert('c', [{'id': 1, 'vector': [1.0, 0.0]}, {'id': 2, 'vector': [0.0, 1.0]}])
+client.insert('c', [{'id': 10, 'vector': [1.0, 1.0]}], partition_name='p')
+client.flush('c')
+client.delete('c', ids=[1])
+client.insert('c', [{'id': 3, 'vector': [1.0, 0.0]}])
+client.create_alias('c', 'a')
+client.create_collection('auto', schema=auto)
+assert len(client.insert('auto', [{'vector': [1.0, 0.0]}] * 4)['ids']) == 4
+client.flush('auto')
+client.truncate_collection('a')
+client.truncate_collection('auto')
+assert client.query('c', filter='', output_fields=['count(*)']) == [{'count(*)': 0}]
+client.insert('c', [{'id': 5, 'vector': [1.0, 0.0]}])
+assert client.insert('auto', [{'vector': [1.0, 0.0]}] * 2)['ids'] == [1, 2]
+""",
+        """
+assert sorted(client.list_partitions('c')) == ['_default', 'p']
+assert client.describe_alias('a')['collection_name'] == 'c'
+assert client.list_indexes('c') == ['vector']
+client.load_collection('c')
+assert client.query('a', filter='', output_fields=['id']) == [{'id': 5}]
+assert client.query('c', filter='', output_fields=['id'], partition_names=['p']) == []
+assert client.insert('auto', [{'vector': [1.0, 0.0]}])['ids'] == [3]
+client.insert('c', [{'id': 6, 'vector': [0.0, 1.0]}], partition_name='p')
+client.flush('c')
+client.truncate_collection('c')
+client.insert('c', [{'id': 7, 'vector': [1.0, 0.0]}])
+""",
+        """
+client.load_collection('c')
+assert client.query('c', filter='', output_fields=['id']) == [{'id': 7}]
+assert sorted(client.list_partitions('a')) == ['_default', 'p']
+client.load_collection('auto')
+assert sorted(r['id'] for r in client.query('auto', filter='', output_fields=['id'])) == [1, 2, 3]
+""",
+    ]
+    alternate(tmp_path, interpreters, first, root, steps)
+    manifest = json.loads((root / "collections/c/manifest.json").read_text())
+    assert sorted(manifest["partitions"]) == ["_default", "p"]
+    assert not (root / "collections/c" / TRUNCATE_INTENT).exists()
+
+
+TRUNCATE_INTENT = "milvus-lite-rust.truncate-intent.json"
+
+
+@pytest.mark.parametrize("state", ["committed-then-read", "committed-then-write", "reference-crash"])
+def test_unfinished_truncates_cross_open_between_implementations(tmp_path, interpreters, state):
+    """0023 A 互通：本实现清空已提交、清理未完成（manifest 已是候选、旧文件与意图仍在）的目录由 3.x 打开：3.x 看到
+    空集合；只读时本实现再打开按意图补做清理，3.x 改写过 manifest 时只删除意图、保留 3.x 的写入。3.x 清空中途退出
+    留下的没有 `schema.json` 的目录，本实现不当作集合。"""
+    root = tmp_path / "unfinished.db"
+    alternate(tmp_path, interpreters, "rust", root, ["""
+client.create_collection('c', schema=schema)
+client.insert('c', [{'id': 1, 'vector': [1.0, 0.0]}, {'id': 2, 'vector': [0.0, 1.0]}])
+client.flush('c')
+"""])
+    base = root / "collections/c"
+    if state == "reference-crash":
+        for path in sorted(base.rglob("*"), reverse=True):
+            path.rmdir() if path.is_dir() else path.unlink()
+        alternate(tmp_path, interpreters, "rust", root, ["""
+assert client.list_collections() == []
+assert not client.has_collection('c')
+"""])
+        assert base.is_dir()
+        return
+    old = (base / "manifest.json").read_text()
+    candidate = json.loads(old)
+    candidate.update(version=candidate["version"] + 1, current_seq=0, active_wal_number=None)
+    for files in candidate["partitions"].values():
+        files.update(data_files=[], delta_files=[])
+    candidate = json.dumps(candidate, indent=2, sort_keys=True, ensure_ascii=False)
+    (base / TRUNCATE_INTENT).write_text(json.dumps({
+        "format_version": 1, "operation": "truncate_collection", "old_manifest": old,
+        "candidate_manifest": candidate, "snapshots": [], "index_files": [],
+    }))
+    (base / "manifest.json").write_text(candidate)
+    for path in (base / "wal").glob("*"):
+        path.unlink()
+    old_files = sorted(p.relative_to(base) for p in (base / "partitions").rglob("*.parquet"))
+    assert old_files
+    reference = {
+        "committed-then-read": "assert client.query('c', filter='', output_fields=['count(*)']) == [{'count(*)': 0}]",
+        "committed-then-write": """
+assert client.query('c', filter='', output_fields=['count(*)']) == [{'count(*)': 0}]
+client.insert('c', [{'id': 9, 'vector': [1.0, 0.0]}])
+client.flush('c')
+""",
+    }[state]
+    alternate(tmp_path, interpreters, "reference", root, [reference])
+    expected = 0 if state == "committed-then-read" else 1
+    alternate(tmp_path, interpreters, "rust", root, [f"""
+assert client.query('c', filter='', output_fields=['count(*)']) == [{{'count(*)': {expected}}}]
+client.insert('c', [{{'id': 3, 'vector': [1.0, 0.0]}}])
+"""])
+    assert not (base / TRUNCATE_INTENT).exists()
+    remaining = [p for p in old_files if (base / p).exists()]
+    if state == "committed-then-read":
+        assert remaining == []
+        assert (base / "manifest.json.prev").read_text() == candidate
+    alternate(tmp_path, interpreters, "reference", root, [f"""
+assert client.query('c', filter='', output_fields=['count(*)']) == [{{'count(*)': {expected + 1}}}]
+"""])
+
+
 def test_real_database_path_recovers_reference_crash_wal(tmp_path, interpreters):
     root = tmp_path / "crashed.db"
     reference_create(interpreters[PYTHONS[0]], root, flush=False)

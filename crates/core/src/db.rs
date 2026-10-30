@@ -21,6 +21,7 @@ use crate::index::IndexRequest;
 use crate::schema::CollectionSchema;
 use crate::storage::fs_commit::{self, guarded_io};
 use crate::storage::rename_intent::{self, RenameIntent};
+use crate::storage::truncate_intent::{self, TruncateIntent};
 use crate::storage::{recovery, runtime, schema_file::SchemaFile};
 
 #[cfg(feature = "fault-injection")]
@@ -261,6 +262,9 @@ pub enum DirectoryOperation {
     /// 改名：`BeforeRename` 为目录改名之前，`CollectionsSync` 为退役旧名后（及重开收尾时）同步 `collections/`，
     /// `Aliases` / `AliasesAfterRename` 为别名改指，其余为改名专用的点。
     Rename,
+    /// 清空：`Intent` / `IntentAfterRename`、`Schema` / `SchemaAfterRename`、`IntentRemove` / `IntentRemoveAfter`
+    /// 与改名同义，其余为清空专用的点。
+    Truncate,
 }
 #[cfg(feature = "fault-injection")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -284,6 +288,22 @@ pub enum DirectoryPoint {
     /// 删除改名意图之前 / 之后（同步数据库根目录之前）。
     IntentRemove,
     IntentRemoveAfter,
+    /// 清空：`wal/` 移入 staging 之前 / 之后同步集合目录与 staging 之前。
+    Wal,
+    WalSync,
+    /// 清空：准备候选 manifest 之前（替换本身用 fs_commit 的 manifest 故障点）。
+    Manifest,
+    /// 清空：manifest 替换之后按重开路径重建读视图之前。
+    Rebuild,
+    /// 清空清理：删除 snapshot 之前、删除每个待删文件之前、`manifest.json.prev` 替换之前 / 之后。
+    Snapshots,
+    Files,
+    Prev,
+    PrevAfterRename,
+    /// 清空的重开处理：确认 `manifest.json` 与集合目录落盘之前。
+    ManifestSync,
+    /// 清空：删除移入 staging 的 `wal/` 之前。
+    StagingCleanup,
 }
 
 /// 改名过程中可暂停的位置，供测试在锁内观察其他请求。
@@ -314,6 +334,23 @@ thread_local! {
     static DIRECTORY_FAULT: std::cell::RefCell<Vec<(DirectoryOperation, DirectoryPoint, DirectoryFault)>> = const { std::cell::RefCell::new(Vec::new()) };
     static OPEN_CLEANUP_PAUSE: std::cell::RefCell<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>> = const { std::cell::RefCell::new(None) };
     static RENAME_PAUSE: std::cell::RefCell<Option<RenamePauseSlot>> = const { std::cell::RefCell::new(None) };
+    static TRUNCATE_PAUSE: std::cell::RefCell<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>> = const { std::cell::RefCell::new(None) };
+    static TRUNCATE_STAGING_NAME: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// 清空第 5 步发布新读视图、放开状态写锁之后，第 6 步清理之前暂停一次。
+#[cfg(feature = "fault-injection")]
+pub fn pause_truncate_after_publish_once(
+    entered: std::sync::mpsc::Sender<()>,
+    resume: std::sync::mpsc::Receiver<()>,
+) {
+    TRUNCATE_PAUSE.with(|slot| *slot.borrow_mut() = Some((entered, resume)));
+}
+
+/// 下一次清空把 `wal/` 移入 `.database-staging/<name>`，供测试预先占用该目标。
+#[cfg(feature = "fault-injection")]
+pub fn use_truncate_staging_name_once(name: &str) {
+    TRUNCATE_STAGING_NAME.with(|slot| *slot.borrow_mut() = Some(name.to_owned()));
 }
 
 #[cfg(feature = "fault-injection")]
@@ -402,6 +439,119 @@ fn rename_fault(step: RenameStep) -> std::io::Result<()> {
     {
         let _step = step;
         Ok(())
+    }
+}
+
+/// 清空各步骤的故障点；非故障注入构建中不做任何事。
+#[derive(Clone, Copy, Debug)]
+enum TruncateStep {
+    Wal,
+    WalSync,
+    Intent,
+    IntentAfterRename,
+    Manifest,
+    Rebuild,
+    IntentRemove,
+    IntentRemoveAfter,
+    StagingCleanup,
+}
+
+fn truncate_fault(step: TruncateStep) -> std::io::Result<()> {
+    #[cfg(feature = "fault-injection")]
+    {
+        let point = match step {
+            TruncateStep::Wal => DirectoryPoint::Wal,
+            TruncateStep::WalSync => DirectoryPoint::WalSync,
+            TruncateStep::Intent => DirectoryPoint::Intent,
+            TruncateStep::IntentAfterRename => DirectoryPoint::IntentAfterRename,
+            TruncateStep::Manifest => DirectoryPoint::Manifest,
+            TruncateStep::Rebuild => DirectoryPoint::Rebuild,
+            TruncateStep::IntentRemove => DirectoryPoint::IntentRemove,
+            TruncateStep::IntentRemoveAfter => DirectoryPoint::IntentRemoveAfter,
+            TruncateStep::StagingCleanup => DirectoryPoint::StagingCleanup,
+        };
+        directory_fault(DirectoryOperation::Truncate, point)
+    }
+    #[cfg(not(feature = "fault-injection"))]
+    {
+        let _step = step;
+        Ok(())
+    }
+}
+
+fn truncate_replace_fault(
+    before: TruncateStep,
+    after: TruncateStep,
+) -> impl Fn(fs_commit::ReplacePoint) -> std::io::Result<()> {
+    move |point| {
+        truncate_fault(match point {
+            fs_commit::ReplacePoint::BeforeRename => before,
+            fs_commit::ReplacePoint::AfterRename => after,
+        })
+    }
+}
+
+fn truncate_cleanup_fault(step: truncate_intent::Step) -> std::io::Result<()> {
+    #[cfg(feature = "fault-injection")]
+    {
+        use truncate_intent::Step;
+        let point = match step {
+            Step::Schema => DirectoryPoint::Schema,
+            Step::SchemaAfterRename => DirectoryPoint::SchemaAfterRename,
+            Step::Snapshots => DirectoryPoint::Snapshots,
+            Step::Files => DirectoryPoint::Files,
+            Step::Prev => DirectoryPoint::Prev,
+            Step::PrevAfterRename => DirectoryPoint::PrevAfterRename,
+            Step::IntentRemove => DirectoryPoint::IntentRemove,
+            Step::IntentRemoveAfter => DirectoryPoint::IntentRemoveAfter,
+            Step::ManifestSync => DirectoryPoint::ManifestSync,
+        };
+        directory_fault(DirectoryOperation::Truncate, point)
+    }
+    #[cfg(not(feature = "fault-injection"))]
+    {
+        let _step = step;
+        Ok(())
+    }
+}
+
+fn truncate_pause() -> Result<()> {
+    #[cfg(feature = "fault-injection")]
+    {
+        let pause = TRUNCATE_PAUSE.with(|slot| slot.borrow_mut().take());
+        if let Some((entered, resume)) = pause {
+            entered.send(()).map_err(storage)?;
+            resume.recv().map_err(storage)?;
+        }
+    }
+    Ok(())
+}
+
+fn truncate_staging_name() -> String {
+    #[cfg(feature = "fault-injection")]
+    if let Some(name) = TRUNCATE_STAGING_NAME.with(|slot| slot.borrow_mut().take()) {
+        return name;
+    }
+    format!(
+        "truncate-wal-{}-{}",
+        std::process::id(),
+        STAGING_NUMBER.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+/// 尽力删除清空第 3 步移入 staging 的 `wal/`；失败留待下次打开时的 staging 清理。
+fn discard_truncated_wal(path: Option<&std::path::Path>) {
+    let Some(path) = path else { return };
+    let removed = guarded_io(|| {
+        truncate_fault(TruncateStep::StagingCleanup)?;
+        fs::remove_dir_all(path)?;
+        match path.parent() {
+            Some(staging) => fs_commit::sync_dir(staging),
+            None => Ok(()),
+        }
+    });
+    if let Err(error) = removed {
+        eprintln!("truncated WAL cleanup deferred for {path:?}: {error}");
     }
 }
 
@@ -1243,7 +1393,7 @@ impl Db {
     pub fn create_partition(&self, database: &str, name: &str, partition: &str) -> Result<()> {
         let key = self.key(database, name)?;
         let _intent = NamespaceIntent::new(&self.namespace_waiters);
-        let blocked = self.write_gate.write();
+        let mut blocked = self.write_gate.write();
         if *blocked {
             return Err(storage(
                 "database writes are blocked after an unconfirmed directory change",
@@ -1252,6 +1402,7 @@ impl Db {
         let _namespace = self.namespace.lock();
         let key = self.resolve(key)?;
         let handle = checked_read_handle(self.collection_inner(&key)?)?;
+        self.retry_truncate_cleanup_locked(&handle, &mut blocked)?;
         {
             let collection = handle.read();
             if let Some(key) = collection.schema().partition_key() {
@@ -1359,7 +1510,7 @@ impl Db {
     pub fn drop_partition(&self, database: &str, name: &str, partition: &str) -> Result<()> {
         let key = self.key(database, name)?;
         let _intent = NamespaceIntent::new(&self.namespace_waiters);
-        let blocked = self.write_gate.write();
+        let mut blocked = self.write_gate.write();
         if *blocked {
             return Err(storage(
                 "database writes are blocked after an unconfirmed directory change",
@@ -1368,6 +1519,7 @@ impl Db {
         let _namespace = self.namespace.lock();
         let key = self.resolve(key)?;
         let handle = checked_read_handle(self.collection_inner(&key)?)?;
+        self.retry_truncate_cleanup_locked(&handle, &mut blocked)?;
         if let Some(key) = handle.read().schema().partition_key() {
             return Err(EngineError::schema(format!(
                 "cannot drop partitions when partition key is set (partition_key field: {})",
@@ -1611,15 +1763,8 @@ impl Db {
         partition: &str,
     ) -> Result<(Vec<Pk>, bool)> {
         let key = self.key(database, name)?;
-        let blocked = self.write_gate.read();
-        if *blocked {
-            return Err(storage(
-                "database writes are blocked after an unconfirmed directory change",
-            ));
-        }
-        let key = self.resolve(key)?;
+        let (_blocked, key, handle) = self.write_target(&key)?;
         let name = key.name.as_str();
-        let handle = self.collection_inner(&key)?;
         let snapshot = loop {
             let collection = handle.read();
             if collection.is_deleted() {
@@ -1679,15 +1824,35 @@ impl Db {
         apply: impl FnOnce(&mut Collection) -> Result<T>,
     ) -> Result<T> {
         let key = self.key(database, name)?;
-        let blocked = self.write_gate.read();
-        if *blocked {
-            return Err(EngineError::Storage(
-                "database writes are blocked after an unconfirmed directory change".to_owned(),
-            ));
-        }
-        let key = self.resolve(key)?;
-        let handle = self.collection_inner(&key)?;
+        let (_blocked, key, handle) = self.write_target(&key)?;
         self.mutate_handle(&handle, &key.name, apply)
+    }
+
+    /// 集合数据写入的入口：共享许可下解析别名并取得集合。上一次清空的清理未完成时，先放开共享许可、在独占
+    /// 许可下重试清理，成功后从头再来（0023 A「锁 / 清理重试重新入闸」）；不把共享许可升级为独占许可。
+    fn write_target(
+        &self,
+        key: &CollectionKey,
+    ) -> Result<(
+        crate::lock_order::ReadGuard<'_, bool>,
+        CollectionKey,
+        CollectionHandle,
+    )> {
+        loop {
+            let blocked = self.write_gate.read();
+            if *blocked {
+                return Err(storage(
+                    "database writes are blocked after an unconfirmed directory change",
+                ));
+            }
+            let target = self.resolve(key.clone())?;
+            let handle = self.collection_inner(&target)?;
+            if !truncate_cleanup_pending(&handle) {
+                return Ok((blocked, target, handle));
+            }
+            drop(blocked);
+            self.retry_truncate_cleanup_exclusive(&target)?;
+        }
     }
 
     fn mutate_handle<T>(
@@ -1760,14 +1925,7 @@ impl Db {
 
     pub fn flush_collection(&self, database: &str, name: &str) -> Result<()> {
         let key = self.key(database, name)?;
-        let blocked = self.write_gate.read();
-        if *blocked {
-            return Err(storage(
-                "database writes are blocked after an unconfirmed directory change",
-            ));
-        }
-        let key = self.resolve(key)?;
-        let handle = self.collection_inner(&key)?;
+        let (_blocked, _, handle) = self.write_target(&key)?;
         self.flush_handle(&handle, true)
     }
 
@@ -1807,14 +1965,7 @@ impl Db {
         use crate::storage::index_intent;
         use crate::storage::{flush, index_files, index_platform};
         let key = self.key(database, name)?;
-        let blocked = self.write_gate.read();
-        if *blocked {
-            return Err(storage(
-                "database writes are blocked after an unconfirmed directory change",
-            ));
-        }
-        let key = self.resolve(key)?;
-        let handle = self.collection_inner(&key)?;
+        let (_blocked, _, handle) = self.write_target(&key)?;
         self.flush_handle(&handle, true)?;
         let lock = handle
             .read()
@@ -2019,54 +2170,14 @@ impl Db {
             };
             match runtime::flush_one(&dir, &manifest, &work, &schema, sync_inherited_files) {
                 Ok(outcome) => {
-                    let retry_manifest = matches!(
-                        &outcome.post_commit_error,
-                        Some(runtime::PostCommitError::Durability(_))
-                    );
                     let mut collection = handle.write();
-                    state_change(&mut collection, |collection| {
-                        if let Some(partitioned) = outcome.partitioned {
-                            collection.publish_partitioned_generation(
-                                &work,
-                                outcome.manifest,
-                                partitioned,
-                                retry_manifest,
-                            )?;
-                        } else {
-                            collection.publish_generation(
-                                &work,
-                                outcome.manifest,
-                                &outcome.mapping,
-                                outcome.data,
-                                outcome.norms,
-                                retry_manifest,
-                            )?;
-                        }
-                        #[cfg(feature = "fault-injection")]
-                        state_panic(StatePanicPoint::Publish);
-                        Ok(())
-                    })?;
-                    let persistent = collection
-                        .persistent_mut()
-                        .ok_or_else(|| storage("persistent state missing"))?;
-                    if let Some(runtime::PostCommitError::Durability(reason)) =
-                        &outcome.post_commit_error
-                    {
-                        persistent.record_failure(reason.clone());
-                    }
+                    let post_commit = publish_flushed(&mut collection, &work, outcome)?;
                     drop(collection);
                     if work.table.size() > 0 {
                         self.schedule_maintenance(handle);
                     }
-                    if let Some(error) = outcome.post_commit_error {
-                        return Err(storage(match error {
-                            runtime::PostCommitError::Durability(reason) => format!(
-                                "manifest was replaced, but directory durability is unconfirmed: {reason}"
-                            ),
-                            runtime::PostCommitError::WalCleanup(reason) => {
-                                format!("manifest committed, but WAL cleanup failed: {reason}")
-                            }
-                        }));
+                    if let Some(error) = post_commit {
+                        return Err(post_commit_error(error));
                     }
                 }
                 Err(error) => {
@@ -2344,8 +2455,8 @@ impl Db {
                     "collection state is unusable after a storage failure",
                 ));
             }
-            // 后台维护不能绕过前台重试节流，也不能抢先消耗前台故障注入/重新提交边界。
-            if p.needs_retry() {
+            // 后台维护不能绕过前台重试节流，也不能抢先消耗前台故障注入/重新提交边界；清空的清理未完成时暂停。
+            if p.needs_retry() || p.truncate_cleanup.is_some() {
                 return Ok(false);
             }
             let p = collection
@@ -2555,6 +2666,8 @@ impl Db {
         if let Some(failure) = self.open_failures.read().get(key) {
             return Err(failure.error());
         }
+        // 0023 A「清空 / 重开处理」：在读取 WAL 与孤儿清理之前；失败不缓存，下次访问重试。
+        truncate_intent::settle(&path, name, truncate_cleanup_fault).map_err(storage)?;
         // 不区分大小写的文件系统上只接受目录项的实际名字。
         let recovered =
             recovery::load_committed(&path).map_err(|error| self.opening_error(key, error))?;
@@ -2715,6 +2828,415 @@ impl Db {
         }
         handle.write().set_properties(schema.properties);
         Ok(())
+    }
+
+    /// 0023 A「清空」：独占许可下 flush 全部数据、把 `wal/` 整体移入 staging、写清空意图，以一次 manifest 替换为
+    /// 提交点，按重开的路径重建读视图后清理旧文件。判定顺序同 3.x：解析别名 → 集合存在（非法名字视为不存在）。
+    /// 集合须能按本实现打开，范围外 schema 返回 Unsupported、零写入。
+    pub fn truncate_collection(&self, database: &str, name: &str) -> Result<()> {
+        let key = self.key(database, name)?;
+        let _intent = NamespaceIntent::new(&self.namespace_waiters);
+        let mut blocked = self.write_gate.write();
+        if *blocked {
+            return Err(storage(
+                "database writes are blocked after an unconfirmed directory change",
+            ));
+        }
+        let key = self.resolve(key)?;
+        if !self.alias_target_exists(self.database(&key.database)?, &key.name)? {
+            return Err(EngineError::CollectionNotFound(key.name));
+        }
+        let handle = checked_read_handle(self.collection_inner(&key)?)?;
+        let lease = self.name_lease(&key);
+        let _name = lease.mutex().lock();
+        let lock = handle
+            .read()
+            .persistent()
+            .ok_or_else(|| storage("persistent state missing"))?
+            .flush_lock();
+        let _flush = lock.lock();
+        self.check_partition_index_intent(&handle)?;
+        if truncate_cleanup_pending(&handle) {
+            self.cleanup_truncated(&handle, &mut blocked)?;
+        }
+
+        let mut collection = handle.write();
+        // 第 2 步：flush 并确认 manifest 提交与目录同步都已完成。
+        self.flush_locked(&mut collection)?;
+        let dir = {
+            let p = collection
+                .persistent()
+                .ok_or_else(|| storage("persistent state missing"))?;
+            if p.needs_retry() {
+                return Err(storage("a failed flush must complete before truncation"));
+            }
+            p.dir.clone()
+        };
+        // 第 4 步的意图只读取 flush 之后的磁盘状态，先构造并校验，使 snapshot 等不合格时在任何变更之前拒绝。
+        let old_manifest = match fs::read(dir.join("manifest.json")) {
+            Ok(bytes) => Some(bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(storage(error)),
+        };
+        let (intent, candidate) = TruncateIntent::prepare(&dir, old_manifest)
+            .map_err(|reason| storage(format!("cannot prepare truncation: {reason}")))?;
+        // 第 3 步
+        let staging_wal = self.move_truncated_wal(&mut collection, &dir, &mut blocked)?;
+        // 第 4 步：替换之前的任何失败都使集合保持操作前状态；已迁移的 WAL 全是已提交行，尽力删除。
+        let abandon = |reason: String, intent_written: bool| {
+            let mut reason = reason;
+            if intent_written
+                && let Err(error) = truncate_intent::remove(
+                    &dir,
+                    truncate_replace_fault(
+                        TruncateStep::IntentRemove,
+                        TruncateStep::IntentRemoveAfter,
+                    ),
+                )
+            {
+                // 重开时 manifest 不等于候选，照样删除意图。
+                reason = format!("{reason}; truncate intent cleanup deferred: {error}");
+            }
+            discard_truncated_wal(staging_wal.as_deref());
+            storage(reason)
+        };
+        match truncate_intent::write(
+            &dir,
+            &intent,
+            truncate_replace_fault(TruncateStep::Intent, TruncateStep::IntentAfterRename),
+        ) {
+            Ok(()) => {}
+            Err(fs_commit::ReplaceError::Unchanged(error)) => {
+                return Err(abandon(
+                    format!("cannot write truncate intent: {error}"),
+                    false,
+                ));
+            }
+            Err(fs_commit::ReplaceError::Unconfirmed(error)) => {
+                return Err(abandon(
+                    format!("cannot write truncate intent: {error}"),
+                    true,
+                ));
+            }
+        }
+        // 第 5 步：manifest 替换是提交点。
+        let replaced = guarded_io(|| truncate_fault(TruncateStep::Manifest))
+            .map_err(|error| error.to_string())
+            .and_then(|()| {
+                let mut prepared =
+                    fs_commit::prepare_manifest(&dir, &candidate).map_err(|e| e.to_string())?;
+                match prepared.replace() {
+                    Ok(report) => {
+                        if let Some(error) = report.prev_copy_error {
+                            eprintln!("truncate manifest prev copy failed for {dir:?}: {error}");
+                        }
+                        Ok(None)
+                    }
+                    Err(error) if error.phase == fs_commit::CommitPhase::AfterReplace => {
+                        Ok(Some(error.to_string()))
+                    }
+                    Err(error) => Err(error.to_string()),
+                }
+            });
+        let durability = replaced.map_err(|reason| abandon(reason, true))?;
+        let rebuilt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<_> {
+            truncate_fault(TruncateStep::Rebuild).map_err(storage)?;
+            // 此时 `schema.json` 仍是清空开始时的磁盘内容，同一进程内的属性顺序因此与 3.x 相同。
+            let recovered = recovery::load_committed(&dir).map_err(recovery_error)?;
+            let mut rebuilt = Collection::from_recovered(&key.name, recovered, dir.clone())?;
+            rebuilt.continue_after_truncate(&collection)?;
+            Ok(rebuilt)
+        }))
+        .unwrap_or_else(|payload| {
+            Err(storage(format!(
+                "rebuild panicked: {}",
+                crate::error::panic_description(payload.as_ref())
+            )))
+        });
+        let mut rebuilt = match rebuilt {
+            Ok(rebuilt) => rebuilt,
+            Err(error) => {
+                // 下次访问按重开的路径处理意图；迁移的 WAL 已不会再被回放。
+                if let Some(p) = collection.persistent_mut() {
+                    p.poison();
+                }
+                self.collections.write().remove(&key);
+                discard_truncated_wal(staging_wal.as_deref());
+                return Err(storage(format!(
+                    "collection was truncated, but its read view cannot be rebuilt: {error}"
+                )));
+            }
+        };
+        let p = rebuilt
+            .persistent_mut()
+            .ok_or_else(|| storage("persistent state missing"))?;
+        p.truncate_cleanup = Some(truncate_intent::Pending {
+            intent,
+            staging_wal,
+        });
+        if let Some(reason) = &durability {
+            p.mark_manifest_unconfirmed(reason.clone());
+        }
+        // 句柄身份不变；进行中的读请求仍使用其已取得的不可变快照。
+        *collection = rebuilt;
+        drop(collection);
+        if let Some(reason) = durability {
+            return Err(storage(format!(
+                "collection was truncated, but manifest durability is unconfirmed: {reason}"
+            )));
+        }
+        truncate_pause().map_err(|error| {
+            storage(format!(
+                "collection was truncated, but cleanup is pending: {error}"
+            ))
+        })?;
+        // 第 6、7 步
+        self.cleanup_truncated(&handle, &mut blocked)
+    }
+
+    /// 清空第 2 步：调用方持 flush 锁与状态写锁。与 `flush_handle` 相同地重新提交、冻结并逐代提交，只是磁盘阶段
+    /// 不放开状态锁；提交之后的 WAL 清理失败只记日志（第 3 步迁移整个 `wal/`）。
+    fn flush_locked(&self, collection: &mut Collection) -> Result<()> {
+        let p = collection
+            .persistent()
+            .ok_or_else(|| storage("persistent state missing"))?;
+        if p.poisoned() {
+            return Err(storage(
+                "collection state is unusable after a storage failure",
+            ));
+        }
+        if p.retry_manifest() {
+            state_change(collection, |collection| {
+                collection
+                    .persistent_mut()
+                    .ok_or_else(|| storage("persistent state missing"))?
+                    .recommit()
+                    .map_err(storage)
+            })?;
+        }
+        state_change(collection, |collection| {
+            collection
+                .persistent_mut()
+                .ok_or_else(|| storage("persistent state missing"))?
+                .freeze_active(false)
+                .map_err(storage)
+        })?;
+        let partition_cleanup = {
+            let p = collection
+                .persistent()
+                .ok_or_else(|| storage("persistent state missing"))?;
+            (p.partition_cleanup && !p.retry_manifest())
+                .then(|| (p.dir.clone(), p.manifest.clone(), p.pinned_files.clone()))
+        };
+        if let Some((dir, manifest, pins)) = partition_cleanup {
+            let warnings =
+                recovery::cleanup_unreferenced(&dir, &manifest, &pins).map_err(recovery_error)?;
+            let complete = warnings.is_empty();
+            for warning in warnings {
+                eprintln!("{warning}");
+            }
+            collection
+                .persistent_mut()
+                .ok_or_else(|| storage("persistent state missing"))?
+                .partition_cleanup = !complete;
+        }
+        loop {
+            let p = collection
+                .persistent()
+                .ok_or_else(|| storage("persistent state missing"))?;
+            let Some(work) = p.front() else {
+                return Ok(());
+            };
+            let (manifest, dir, sync_inherited_files) =
+                (p.manifest.clone(), p.dir.clone(), !p.inherited_synced());
+            let schema = collection.schema().clone();
+            match runtime::flush_one(&dir, &manifest, &work, &schema, sync_inherited_files) {
+                Ok(outcome) => match publish_flushed(collection, &work, outcome)? {
+                    Some(runtime::PostCommitError::WalCleanup(reason)) => {
+                        eprintln!("WAL cleanup before truncating {dir:?} failed: {reason}");
+                    }
+                    Some(error) => return Err(post_commit_error(error)),
+                    None => {}
+                },
+                Err(error) => {
+                    collection
+                        .persistent_mut()
+                        .ok_or_else(|| storage("persistent state missing"))?
+                        .failed_before_replace(error.to_string());
+                    return Err(storage(error));
+                }
+            }
+        }
+    }
+
+    /// 清空第 3 步：把已全部提交的 `wal/` 整个改名移入 staging，返回移入后的路径（没有 `wal/` 时为 None）。
+    /// 不能逐个删除：中途失败留下的已提交后缀会被 3.x 重复回放。目录改名只有「仍在原处」与「已移入 staging」
+    /// 两种状态，两边打开时都会清空 staging。
+    fn move_truncated_wal(
+        &self,
+        collection: &mut Collection,
+        dir: &std::path::Path,
+        blocked: &mut bool,
+    ) -> Result<Option<PathBuf>> {
+        let wal = dir.join("wal");
+        match fs::symlink_metadata(&wal) {
+            Ok(meta) if meta.file_type().is_dir() => {}
+            Ok(_) => return Err(storage(format!("WAL path {wal:?} is not a directory"))),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(storage(error)),
+        }
+        collection
+            .persistent()
+            .ok_or_else(|| storage("persistent state missing"))?
+            .truncate_wal_ready()
+            .map_err(storage)?;
+        let staging_root = self.path.join(".database-staging");
+        fs_commit::create_dir_synced(&staging_root).map_err(storage)?;
+        let target = staging_root.join(truncate_staging_name());
+        match fs::symlink_metadata(&target) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(_) => return Err(storage(format!("staging path {target:?} already exists"))),
+            Err(error) => return Err(storage(error)),
+        }
+        // 之后的写入须进入编号严格更大的新代；WAL 写者在 flush 之后已全部关闭。
+        let next_generation = |collection: &mut Collection| {
+            state_change(collection, |collection| {
+                collection
+                    .persistent_mut()
+                    .ok_or_else(|| storage("persistent state missing"))?
+                    .freeze_active(true)
+                    .map_err(storage)
+            })
+        };
+        let moved = guarded_io(|| {
+            truncate_fault(TruncateStep::Wal)?;
+            fs::rename(&wal, &target)
+        });
+        if let Err(error) = moved {
+            let reason = format!("cannot move WAL out of the truncated collection: {error}");
+            return Err(match next_generation(collection) {
+                Ok(()) => storage(reason),
+                Err(frozen) => storage(format!("{reason}; {frozen}")),
+            });
+        }
+        let synced = guarded_io(|| {
+            truncate_fault(TruncateStep::WalSync)?;
+            fs_commit::sync_dir(dir)?;
+            fs_commit::sync_dir(&staging_root)
+        });
+        if let Err(error) = synced {
+            *blocked = true;
+            let reason = format!(
+                "WAL was moved out of the collection, but directory durability is unconfirmed: {error}"
+            );
+            return Err(match next_generation(collection) {
+                Ok(()) => storage(reason),
+                Err(frozen) => storage(format!("{reason}; {frozen}")),
+            });
+        }
+        Ok(Some(target))
+    }
+
+    /// 清空第 6、7 步：调用方持独占许可与 flush 锁、不持状态锁。manifest 待重新提交时先完成重新提交。
+    fn cleanup_truncated(&self, handle: &CollectionHandle, blocked: &mut bool) -> Result<()> {
+        let (dir, name, pending, retry_manifest) = {
+            let c = handle.read();
+            if c.is_deleted() {
+                return Ok(());
+            }
+            let p = c
+                .persistent()
+                .ok_or_else(|| storage("persistent state missing"))?;
+            if p.poisoned() {
+                return Err(storage(
+                    "collection state is unusable after a storage failure",
+                ));
+            }
+            let Some(pending) = p.truncate_cleanup.clone() else {
+                return Ok(());
+            };
+            (
+                p.dir.clone(),
+                c.name().to_owned(),
+                pending,
+                p.retry_manifest(),
+            )
+        };
+        if retry_manifest {
+            state_change(&mut handle.write(), |collection| {
+                collection
+                    .persistent_mut()
+                    .ok_or_else(|| storage("persistent state missing"))?
+                    .recommit()
+                    .map_err(storage)
+            })?;
+        }
+        match truncate_intent::cleanup(&dir, &name, &pending.intent, truncate_cleanup_fault) {
+            Ok(()) => {}
+            Err(truncate_intent::CleanupError::SchemaUnconfirmed(reason)) => {
+                *blocked = true;
+                return Err(storage(format!(
+                    "collection was truncated, but schema.json durability is unconfirmed: {reason}"
+                )));
+            }
+            Err(truncate_intent::CleanupError::Pending(reason)) => {
+                return Err(storage(format!(
+                    "collection was truncated, but cleanup is pending: {reason}"
+                )));
+            }
+        }
+        let pins = crate::storage::snapshot::load_pins(&dir).map_err(|error| {
+            storage(format!(
+                "collection was truncated, but cleanup is pending: {error}"
+            ))
+        })?;
+        {
+            let mut c = handle.write();
+            let p = c
+                .persistent_mut()
+                .ok_or_else(|| storage("persistent state missing"))?;
+            p.pinned_files = pins;
+            p.truncate_cleanup = None;
+        }
+        discard_truncated_wal(pending.staging_wal.as_deref());
+        Ok(())
+    }
+
+    /// 写请求发现清空的清理未完成、放开共享许可之后：重新取得独占许可、名字锁与 flush 锁，重新确认后清理。
+    /// 集合已不在表中（之后被删除或改名）时直接返回，由原请求从头重新判定。
+    fn retry_truncate_cleanup_exclusive(&self, key: &CollectionKey) -> Result<()> {
+        let _intent = NamespaceIntent::new(&self.namespace_waiters);
+        let mut blocked = self.write_gate.write();
+        if *blocked {
+            return Err(storage(
+                "database writes are blocked after an unconfirmed directory change",
+            ));
+        }
+        let lease = self.name_lease(key);
+        let _name = lease.mutex().lock();
+        let handle = self.collections.read().get(key).cloned();
+        match handle {
+            Some(handle) => self.retry_truncate_cleanup_locked(&handle, &mut blocked),
+            None => Ok(()),
+        }
+    }
+
+    /// 已持独占许可的操作（分区变更）在改写 manifest 之前补做清空的清理。
+    fn retry_truncate_cleanup_locked(
+        &self,
+        handle: &CollectionHandle,
+        blocked: &mut bool,
+    ) -> Result<()> {
+        if !truncate_cleanup_pending(handle) {
+            return Ok(());
+        }
+        let lock = handle
+            .read()
+            .persistent()
+            .ok_or_else(|| storage("persistent state missing"))?
+            .flush_lock();
+        let _flush = lock.lock();
+        self.cleanup_truncated(handle, blocked)
     }
 
     /// 0023 A「改名」：P0 检查 → P1a 同步旧句柄的 WAL → P1b 意图与目录改名 → P2 退役旧名 → P3 改写
@@ -3317,6 +3839,65 @@ fn path_exists(path: &std::path::Path) -> Result<bool> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(storage(error)),
     }
+}
+
+/// flush 一代的锁内发布；提交之后的故障交给调用方决定如何上报。
+fn publish_flushed(
+    collection: &mut Collection,
+    work: &Arc<runtime::FrozenGeneration>,
+    outcome: runtime::FlushOutcome,
+) -> Result<Option<runtime::PostCommitError>> {
+    let retry_manifest = matches!(
+        &outcome.post_commit_error,
+        Some(runtime::PostCommitError::Durability(_))
+    );
+    state_change(collection, |collection| {
+        if let Some(partitioned) = outcome.partitioned {
+            collection.publish_partitioned_generation(
+                work,
+                outcome.manifest,
+                partitioned,
+                retry_manifest,
+            )?;
+        } else {
+            collection.publish_generation(
+                work,
+                outcome.manifest,
+                &outcome.mapping,
+                outcome.data,
+                outcome.norms,
+                retry_manifest,
+            )?;
+        }
+        #[cfg(feature = "fault-injection")]
+        state_panic(StatePanicPoint::Publish);
+        Ok(())
+    })?;
+    let persistent = collection
+        .persistent_mut()
+        .ok_or_else(|| storage("persistent state missing"))?;
+    if let Some(runtime::PostCommitError::Durability(reason)) = &outcome.post_commit_error {
+        persistent.record_failure(reason.clone());
+    }
+    Ok(outcome.post_commit_error)
+}
+
+fn post_commit_error(error: runtime::PostCommitError) -> EngineError {
+    storage(match error {
+        runtime::PostCommitError::Durability(reason) => {
+            format!("manifest was replaced, but directory durability is unconfirmed: {reason}")
+        }
+        runtime::PostCommitError::WalCleanup(reason) => {
+            format!("manifest committed, but WAL cleanup failed: {reason}")
+        }
+    })
+}
+
+fn truncate_cleanup_pending(handle: &CollectionHandle) -> bool {
+    handle
+        .read()
+        .persistent()
+        .is_some_and(|p| p.truncate_cleanup.is_some())
 }
 
 fn checked_read_handle(handle: CollectionHandle) -> Result<CollectionHandle> {

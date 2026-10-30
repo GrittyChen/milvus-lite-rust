@@ -6,16 +6,16 @@
 
 | 状态 | 含义 | 条数 |
 | --- | --- | --- |
-| 已复制 | 原样复制到本目录 | 188 |
+| 已复制 | 原样复制到本目录 | 192 |
 | 改后复制 | 仅按 0004「验收」第 2 项与 0006 第 25 项授权的条件替换，逐条说明改动 | 0 |
-| 范围外 | 用到当前切片不支持的功能，不复制；未实现能力的代表性入口见「范围外功能的 `UNIMPLEMENTED` 断言」 | 58 |
+| 范围外 | 用到当前切片不支持的功能，不复制；未实现能力的代表性入口见「范围外功能的 `UNIMPLEMENTED` 断言」 | 54 |
 | 待复用 | 原功能阻断已解除，尚未复制到本地默认套件；0015 的条目已通过固定外部套件验收 | 53 |
 | 依赖内部模块 | 导入或使用 3.x 的内部模块、内部对象，换成本实现后无法运行 | 33 |
 | 不运行 | 上游被同名定义覆盖，上游自己也不运行 | 1 |
 
 以上是逐条列出的 24 个文件中的 333 条；其余 23 个文件的 304 条整个文件记一行原因，见「整个文件不复用的文件」。
 
-「已复制」与「改后复制」共 188 个用例函数，参数化展开后 217 条。S1 恢复 [test_grpc_crud.py](test_grpc_crud.py) 中的原过滤表达式，并纳入除 LIKE 外的全部 19 条；它们在本实现与真实 3.x 上的两条客户端线均作为 S1 验收。随后迁移全部 40 条待复用用例，恢复此前为绕过过滤限制而替换的原表达式；顶层动态字段切片另加入原样的 TestDynamicField 用例。0014 已恢复原 HNSW 定义，并新增创建 HNSW、DropIndex 和 describe 参数的原用例；检索仍按 FLAT 执行。
+「已复制」与「改后复制」共 192 个用例函数，参数化展开后 221 条。S1 恢复 [test_grpc_crud.py](test_grpc_crud.py) 中的原过滤表达式，并纳入除 LIKE 外的全部 19 条；它们在本实现与真实 3.x 上的两条客户端线均作为 S1 验收。随后迁移全部 40 条待复用用例，恢复此前为绕过过滤限制而替换的原表达式；顶层动态字段切片另加入原样的 TestDynamicField 用例。0014 已恢复原 HNSW 定义，并新增创建 HNSW、DropIndex 和 describe 参数的原用例；检索仍按 FLAT 执行。
 
 历史的 HNSW→FLAT 授权替换按 0014 恢复原定义；`== N` 换成 `in [N]` 的条件见 0004「验收」第 2 项及 0006 第 25 项。已接通 S1 的 CRUD 副本不再替换表达式或读回方式。其余副本只删去随范围外用例一起不再使用的 import、helper 与空的分节标题；上游用于跳过的 `importorskip` 改为直接导入（本仓不允许因缺依赖静默跳过），上游因 HNSW 需要 faiss 而加的 `skipif` 随 HNSW 一起去掉。起服务的 fixture 与清理见 [conftest.py](conftest.py)。
 
@@ -492,18 +492,18 @@
 
 ### [test_p0_features.py](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_p0_features.py)
 
-10 条：已复制 2，范围外 8。
+10 条：已复制 6，范围外 4。
 
 | 用例 | 状态 | 说明 |
 | --- | --- | --- |
 | [`test_alias_lifecycle_and_alias_reads`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_p0_features.py#L16) | 已复制 |  |
-| [`test_truncate_collection_preserves_schema`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_p0_features.py#L49) | 范围外 | 过滤表达式（`id == 2`）、truncate |
+| [`test_truncate_collection_preserves_schema`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_p0_features.py#L49) | 已复制 |  |
 | [`test_list_indexes_returns_index_names`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_p0_features.py#L68) | 已复制 |  |
 | [`test_get_partition_stats`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_p0_features.py#L82) | 范围外 | 分区 |
-| [`test_truncate_preserves_metadata_and_clears_mutation_history`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_p0_features.py#L103) | 范围外 | 过滤表达式（`id >= 0`）、delete、upsert、分区、alias、修改 collection、truncate |
-| [`test_truncate_released_collection_then_flush`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_p0_features.py#L156) | 范围外 | flush、truncate |
+| [`test_truncate_preserves_metadata_and_clears_mutation_history`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_p0_features.py#L103) | 已复制 |  |
+| [`test_truncate_released_collection_then_flush`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_p0_features.py#L156) | 已复制 |  |
 | [`test_truncate_is_database_isolated`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_p0_features.py#L172) | 范围外 | 多数据库、truncate |
-| [`test_collection_stats_follow_upsert_delete_flush_and_truncate`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_p0_features.py#L195) | 范围外 | delete、upsert、flush、truncate |
+| [`test_collection_stats_follow_upsert_delete_flush_and_truncate`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_p0_features.py#L195) | 已复制 |  |
 | [`test_partition_stats_follow_upsert_delete_and_flush`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_p0_features.py#L231) | 范围外 | delete、upsert、分区、flush |
 | [`test_statistics_missing_resources_raise`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_p0_features.py#L273) | 范围外 | 分区 |
 
