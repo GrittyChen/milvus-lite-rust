@@ -16,6 +16,15 @@ pub enum EngineError {
     /// 3.x `CollectionAlreadyExistsError`。
     #[error("collection {} already exists", py_repr(.0))]
     CollectionAlreadyExists(String),
+    /// 3.x 以 `CollectionAlreadyExistsError` 抛出的别名重名。
+    #[error("alias {} already exists", py_repr(.0))]
+    AliasAlreadyExists(String),
+    /// 3.x 以 `CollectionAlreadyExistsError` 抛出的别名与集合冲突。
+    #[error("alias {} conflicts with an existing collection", py_repr(.0))]
+    AliasConflictsWithCollection(String),
+    /// 3.x 以 `CollectionNotFoundError` 抛出的别名不存在。
+    #[error("alias {} does not exist", py_repr(.0))]
+    AliasNotFound(String),
     /// 3.x `CollectionNotLoadedError`。
     #[error(
         "Collection {} is in state 'released'; call load() before search/get/query",

@@ -13,6 +13,39 @@ def _create_basic_collection(client: MilvusClient, name: str) -> None:
     client.create_collection(name, schema=schema)
 
 
+def test_alias_lifecycle_and_alias_reads(milvus_client):
+    _create_basic_collection(milvus_client, "alias_a")
+    _create_basic_collection(milvus_client, "alias_b")
+    milvus_client.insert("alias_a", [
+        {"id": 1, "vec": [1.0, 0.0, 0.0, 0.0], "tag": "a"},
+    ])
+    milvus_client.insert("alias_b", [
+        {"id": 2, "vec": [0.0, 1.0, 0.0, 0.0], "tag": "b"},
+    ])
+
+    milvus_client.create_alias("alias_a", "current_alias")
+    info = milvus_client.describe_alias("current_alias")
+    assert info["collection_name"] == "alias_a"
+
+    rows = milvus_client.query(
+        "current_alias", filter="id == 1", output_fields=["tag"]
+    )
+    assert rows == [{"id": 1, "tag": "a"}]
+
+    listed = milvus_client.list_aliases("alias_a")
+    assert "current_alias" in listed["aliases"]
+
+    milvus_client.alter_alias("alias_b", "current_alias")
+    assert milvus_client.describe_alias("current_alias")["collection_name"] == "alias_b"
+    rows = milvus_client.query(
+        "current_alias", filter="id == 2", output_fields=["tag"]
+    )
+    assert rows == [{"id": 2, "tag": "b"}]
+
+    milvus_client.drop_alias("current_alias")
+    assert "current_alias" not in milvus_client.list_aliases()["aliases"]
+
+
 def test_list_indexes_returns_index_names(milvus_client):
     _create_basic_collection(milvus_client, "idx_names")
     idx = milvus_client.prepare_index_params()

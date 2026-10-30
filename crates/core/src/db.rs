@@ -2,8 +2,6 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::fs::OpenOptions;
-use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
@@ -12,6 +10,7 @@ use crate::lock_order::{Mutex as OrderedMutex, RwLock};
 use parking_lot::{Condvar, Mutex};
 type NameMutex = OrderedMutex<(), 3>;
 
+use crate::alias::{self, Aliases};
 use crate::collection::{Collection, LoadState};
 use crate::compute::Compute;
 use crate::data::{InsertBatch, Pk};
@@ -132,8 +131,8 @@ pub(crate) struct CollectionKey {
 struct DatabaseState {
     /// 数据库根目录，含 `collections/` 与 `aliases.json`；默认数据库即数据根目录。
     root: PathBuf,
-    /// `aliases.json` 的读改写串行化；叶子锁。
-    aliases: OrderedMutex<(), 6>,
+    /// `aliases.json` 的缓存；叶子锁，覆盖完整的读改写（0023 A「别名」）。
+    aliases: OrderedMutex<Option<Aliases>, 6>,
 }
 
 impl DatabaseState {
@@ -238,6 +237,8 @@ pub fn inject_create_name_verification_failure_once() {
 pub enum DirectoryOperation {
     Create,
     Drop,
+    /// 别名 RPC 的 `aliases.json` 写入，只用 `Aliases` 与 `AliasesAfterRename` 两点。
+    Alias,
 }
 #[cfg(feature = "fault-injection")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -424,7 +425,7 @@ impl Db {
                 DEFAULT_DATABASE.to_owned(),
                 Arc::new(DatabaseState {
                     root: path,
-                    aliases: OrderedMutex::new(()),
+                    aliases: OrderedMutex::new(None),
                 }),
             )]),
             name_locks: OrderedMutex::new(BTreeMap::new()),
@@ -691,15 +692,12 @@ impl Db {
             }
         }
         {
-            let _aliases = database.aliases.lock();
-            let mut aliases = read_aliases_unlocked(database)?;
-            let old_alias_count = aliases.len();
-            aliases.retain(|_, target_name| {
-                validate_filesystem_name(target_name, "collection").is_ok()
-                    && database.collection_path(target_name).exists()
-            });
-            if aliases.len() != old_alias_count {
-                save_aliases(database, &aliases, true)?;
+            let mut cache = database.aliases.lock();
+            let aliases = alias::load(&mut cache, &database.root)?;
+            let mut live = aliases.clone();
+            retain_live_aliases(database, &mut live).map_err(storage)?;
+            if live.len() != aliases.len() {
+                save_lifecycle_aliases(database, aliases, live, true)?;
             }
             if aliases.contains_key(name) {
                 return Err(EngineError::CollectionAlreadyExists(name.to_owned()));
@@ -814,11 +812,14 @@ impl Db {
             ));
         }
         let _namespace = self.namespace.lock();
+        // 经别名删除目标集合及指向它的全部别名（3.x 相同）。独占许可下解析，别名不会在此之后改指。
+        let key = self.resolve(key)?;
+        let name = key.name.as_str();
+        validate_filesystem_name(name, "collection")?;
         let lease = self.name_lease(&key);
         let _name = lease.mutex().lock();
         let database = self.database(&key.database)?;
         let target = database.collection_path(name);
-        read_aliases(database)?;
         let exists = match fs::symlink_metadata(&target) {
             Ok(meta) => meta.file_type().is_dir() && target.join("schema.json").is_file(),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
@@ -964,9 +965,26 @@ impl Db {
             .ok_or_else(|| EngineError::DatabaseNotFound(name.to_owned()))
     }
 
+    /// 0023 必须保留的行为 1：每个集合入口先解析别名，命中即换成目标名。只解析一层，别名指向的总是真实集合名。
+    /// 写入口在许可之后调用，解析结果在许可期间不会被别名写入（独占许可）改变。
+    fn resolve(&self, key: CollectionKey) -> Result<CollectionKey> {
+        let database = self.database(&key.database)?;
+        let mut cache = database.aliases.lock();
+        let target = alias::load(&mut cache, &database.root)?
+            .get(&key.name)
+            .cloned();
+        Ok(match target {
+            Some(name) => CollectionKey { name, ..key },
+            None => key,
+        })
+    }
+
     fn exact_collection_name(&self, key: &CollectionKey) -> Result<bool> {
-        let name = key.name.as_str();
-        let root = self.database(&key.database)?.collections_dir();
+        self.exact_name_in(self.database(&key.database)?, &key.name)
+    }
+
+    fn exact_name_in(&self, database: &DatabaseState, name: &str) -> Result<bool> {
+        let root = database.collections_dir();
         match fs::symlink_metadata(&root) {
             Ok(meta) if meta.file_type().is_dir() => {}
             Ok(_) => return Err(storage("collections path is not a directory")),
@@ -986,8 +1004,9 @@ impl Db {
         Ok(false)
     }
 
+    /// 读请求：别名叶子锁内取一次解析结果，再按目标名查找或懒打开。
     pub fn collection(&self, database: &str, name: &str) -> Result<CollectionHandle> {
-        let key = self.key(database, name)?;
+        let key = self.resolve(self.key(database, name)?)?;
         let cached = self.collections.read().get(&key).cloned();
         if let Some(handle) = cached {
             return checked_read_handle(handle);
@@ -1050,6 +1069,7 @@ impl Db {
             ));
         }
         let _namespace = self.namespace.lock();
+        let key = self.resolve(key)?;
         let handle = checked_read_handle(self.collection_inner(&key)?)?;
         {
             let collection = handle.read();
@@ -1165,6 +1185,7 @@ impl Db {
             ));
         }
         let _namespace = self.namespace.lock();
+        let key = self.resolve(key)?;
         let handle = checked_read_handle(self.collection_inner(&key)?)?;
         if let Some(key) = handle.read().schema().partition_key() {
             return Err(EngineError::schema(format!(
@@ -1415,6 +1436,8 @@ impl Db {
                 "database writes are blocked after an unconfirmed directory change",
             ));
         }
+        let key = self.resolve(key)?;
+        let name = key.name.as_str();
         let handle = self.collection_inner(&key)?;
         let snapshot = loop {
             let collection = handle.read();
@@ -1481,8 +1504,9 @@ impl Db {
                 "database writes are blocked after an unconfirmed directory change".to_owned(),
             ));
         }
+        let key = self.resolve(key)?;
         let handle = self.collection_inner(&key)?;
-        self.mutate_handle(&handle, name, apply)
+        self.mutate_handle(&handle, &key.name, apply)
     }
 
     fn mutate_handle<T>(
@@ -1561,6 +1585,7 @@ impl Db {
                 "database writes are blocked after an unconfirmed directory change",
             ));
         }
+        let key = self.resolve(key)?;
         let handle = self.collection_inner(&key)?;
         self.flush_handle(&handle, true)
     }
@@ -1607,6 +1632,7 @@ impl Db {
                 "database writes are blocked after an unconfirmed directory change",
             ));
         }
+        let key = self.resolve(key)?;
         let handle = self.collection_inner(&key)?;
         self.flush_handle(&handle, true)?;
         let lock = handle
@@ -2432,120 +2458,239 @@ impl Db {
         result.sort_by(|a, b| a.0.cmp(&b.0));
         Ok(result)
     }
-}
 
-fn read_aliases(database: &DatabaseState) -> Result<BTreeMap<String, String>> {
-    let _aliases = database.aliases.lock();
-    read_aliases_unlocked(database)
-}
+    /// 3.x 的判定顺序：解析目标（可以是别名）→ 别名名字 → 目标存在 → 与集合冲突 → 别名已存在。
+    pub fn create_alias(&self, database: &str, collection: &str, alias: &str) -> Result<()> {
+        self.change_aliases(database, |state, aliases| {
+            let target = aliases.get(collection).map_or(collection, String::as_str);
+            validate_filesystem_name(alias, "collection")?;
+            if !self.alias_target_exists(state, target)? {
+                return Err(EngineError::CollectionNotFound(target.to_owned()));
+            }
+            // 与 3.x 相同按路径判定：只差大小写的已有集合构成冲突，没有 schema.json 的残留目录不构成冲突。
+            if state
+                .collection_path(alias)
+                .join("schema.json")
+                .try_exists()
+                .map_err(storage)?
+            {
+                return Err(EngineError::AliasConflictsWithCollection(alias.to_owned()));
+            }
+            if aliases.contains_key(alias) {
+                return Err(EngineError::AliasAlreadyExists(alias.to_owned()));
+            }
+            let mut next = aliases.clone();
+            next.insert(alias.to_owned(), target.to_owned());
+            Ok(Some(next))
+        })
+    }
 
-fn read_aliases_unlocked(database: &DatabaseState) -> Result<BTreeMap<String, String>> {
-    database.aliases.assert_held();
-    let path = database.root.join("aliases.json");
-    let bytes = match fs::read(&path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(BTreeMap::new());
+    /// 3.x 先判别名存在、再判目标存在，不校验别名名字；目标可以是别名。
+    pub fn alter_alias(&self, database: &str, collection: &str, alias: &str) -> Result<()> {
+        self.change_aliases(database, |state, aliases| {
+            let target = aliases.get(collection).map_or(collection, String::as_str);
+            if !aliases.contains_key(alias) {
+                return Err(EngineError::AliasNotFound(alias.to_owned()));
+            }
+            if !self.alias_target_exists(state, target)? {
+                return Err(EngineError::CollectionNotFound(target.to_owned()));
+            }
+            let mut next = aliases.clone();
+            next.insert(alias.to_owned(), target.to_owned());
+            Ok(Some(next))
+        })
+    }
+
+    /// 不校验名字；不存在时成功且不写文件（3.x 相同）。
+    pub fn drop_alias(&self, database: &str, alias: &str) -> Result<()> {
+        self.change_aliases(database, |_, aliases| {
+            if !aliases.contains_key(alias) {
+                return Ok(None);
+            }
+            let mut next = aliases.clone();
+            next.remove(alias);
+            Ok(Some(next))
+        })
+    }
+
+    /// 3.x 的 ShowCollections 对筛选后的每个集合调用 `get_collection`，因而 `aliases.json` 无法解析时失败；
+    /// 列表为空时不读取别名。
+    pub fn check_aliases(&self, database: &str) -> Result<()> {
+        let scope = self.key(database, "")?;
+        let state = self.database(&scope.database)?;
+        let mut cache = state.aliases.lock();
+        alias::load(&mut cache, &state.root).map(|_| ())
+    }
+
+    /// 返回别名指向的集合名；悬空别名照常返回。
+    pub fn describe_alias(&self, database: &str, alias: &str) -> Result<String> {
+        let scope = self.key(database, "")?;
+        let state = self.database(&scope.database)?;
+        let mut cache = state.aliases.lock();
+        alias::load(&mut cache, &state.root)?
+            .get(alias)
+            .cloned()
+            .ok_or_else(|| EngineError::AliasNotFound(alias.to_owned()))
+    }
+
+    /// 全部别名，或指向 `collection`（先解析）的别名，按码点排序；同时返回解析后的集合名，
+    /// `collection` 为空时为空串。集合不存在时返回空列表（3.x 相同）。
+    pub fn list_aliases(&self, database: &str, collection: &str) -> Result<(String, Vec<String>)> {
+        let scope = self.key(database, "")?;
+        let state = self.database(&scope.database)?;
+        let mut cache = state.aliases.lock();
+        let aliases = alias::load(&mut cache, &state.root)?;
+        if collection.is_empty() {
+            return Ok((String::new(), aliases.keys().cloned().collect()));
         }
-        Err(error) => return Err(storage(error)),
-    };
-    let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(storage)?;
-    let mut result = BTreeMap::new();
-    if let serde_json::Value::Object(map) = value {
-        for (alias, target) in map {
-            if let Some(target) = target.as_str() {
-                result.insert(alias, target.to_owned());
+        let target = aliases.get(collection).map_or(collection, String::as_str);
+        let names = aliases
+            .iter()
+            .filter(|(_, to)| to.as_str() == target)
+            .map(|(alias, _)| alias.clone())
+            .collect();
+        Ok((target.to_owned(), names))
+    }
+
+    /// 别名写入持数据库写入闸门的独占许可，读改写全程持别名叶子锁（0023 A「锁」）。文件替换之后
+    /// 目录同步失败时缓存仍随磁盘更新，并按 0007 封锁本服务实例的写入。
+    fn change_aliases(
+        &self,
+        database: &str,
+        change: impl FnOnce(&DatabaseState, &Aliases) -> Result<Option<Aliases>>,
+    ) -> Result<()> {
+        let scope = self.key(database, "")?;
+        let _intent = NamespaceIntent::new(&self.namespace_waiters);
+        let mut blocked = self.write_gate.write();
+        if *blocked {
+            return Err(storage(
+                "database writes are blocked after an unconfirmed directory change",
+            ));
+        }
+        let state = self.database(&scope.database)?;
+        let mut cache = state.aliases.lock();
+        let aliases = alias::load(&mut cache, &state.root)?;
+        let Some(next) = change(state, aliases)? else {
+            return Ok(());
+        };
+        let fault = |point| {
+            #[cfg(feature = "fault-injection")]
+            directory_fault(DirectoryOperation::Alias, alias_fault_point(point))?;
+            #[cfg(not(feature = "fault-injection"))]
+            let _point: alias::WritePoint = point;
+            Ok(())
+        };
+        match alias::write(&state.root, &next, fault) {
+            Ok(()) => {
+                *aliases = next;
+                Ok(())
+            }
+            Err(alias::WriteError::Unchanged(error)) => Err(storage(error)),
+            Err(alias::WriteError::Unconfirmed(error)) => {
+                *aliases = next;
+                *blocked = true;
+                Err(storage(format!(
+                    "aliases were changed, but aliases.json durability is unconfirmed: {error}"
+                )))
             }
         }
     }
-    Ok(result)
-}
 
-fn remove_aliases_for(database: &DatabaseState, name: &str) -> Result<()> {
-    let _aliases = database.aliases.lock();
-    let mut aliases = read_aliases_unlocked(database)?;
-    let len = aliases.len();
-    aliases.retain(|_, target| target != name);
-    if aliases.len() == len {
-        return Ok(());
+    /// 别名目标按精确名字且带 `schema.json` 判定（0023 名字与文件系统）；非法名字视为不存在。
+    fn alias_target_exists(&self, state: &DatabaseState, name: &str) -> Result<bool> {
+        if validate_filesystem_name(name, "collection").is_err() {
+            return Ok(false);
+        }
+        let path = state.collection_path(name);
+        let shaped = match fs::symlink_metadata(&path) {
+            Ok(meta) => meta.file_type().is_dir() && path.join("schema.json").is_file(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => return Err(storage(error)),
+        };
+        Ok(shaped && self.exact_name_in(state, name)?)
     }
-    save_aliases(database, &aliases, false)
 }
 
-fn save_aliases(
-    database: &DatabaseState,
-    aliases: &BTreeMap<String, String>,
-    creating: bool,
-) -> Result<()> {
-    database.aliases.assert_held();
-    guarded_io(|| save_aliases_inner(database, aliases, creating)).map_err(storage)
-}
-
-fn save_aliases_inner(
-    database: &DatabaseState,
-    aliases: &BTreeMap<String, String>,
-    creating: bool,
-) -> std::io::Result<()> {
-    #[cfg(feature = "fault-injection")]
-    directory_fault(
-        if creating {
-            DirectoryOperation::Create
-        } else {
-            DirectoryOperation::Drop
-        },
-        DirectoryPoint::Aliases,
-    )?;
-    #[cfg(not(feature = "fault-injection"))]
-    let _creating = creating;
-    let path = database.root.join("aliases.json");
-    let tmp = database.root.join(format!(
-        "aliases.json.tmp.{}.{}",
-        std::process::id(),
-        STAGING_NUMBER.fetch_add(1, Ordering::Relaxed)
-    ));
-    // 上一次 drop 可能已经改名成功却未能写别名；任意后续别名提交都须清掉悬空目标。
-    let mut live_aliases = BTreeMap::new();
-    for (alias, target) in aliases {
+/// create / drop 沿用 0007 的悬空别名剔除：目标路径不存在即悬空，按路径而非精确名字判定，
+/// 大小写不敏感文件系统上指向只差大小写名字的 3.x 别名不受影响。别名 RPC 不剔除。
+fn retain_live_aliases(database: &DatabaseState, aliases: &mut Aliases) -> std::io::Result<()> {
+    let mut dangling = Vec::new();
+    for (alias, target) in aliases.iter() {
         if validate_filesystem_name(target, "collection").is_err() {
+            dangling.push(alias.clone());
             continue;
         }
         match fs::metadata(database.collection_path(target)) {
-            Ok(_) => {
-                live_aliases.insert(alias, target);
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                dangling.push(alias.clone());
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
         }
     }
-    let bytes = crate::pyjson::dump_file(
-        &serde_json::to_value(&live_aliases).map_err(std::io::Error::other)?,
-    )
-    .into_bytes();
-    let mut file = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
-    if let Err(error) = file.write_all(&bytes).and_then(|()| file.sync_all()) {
-        drop(file);
-        if let Err(cleanup) = fs::remove_file(&tmp) {
-            eprintln!("cannot clean failed aliases temp file {tmp:?}: {cleanup}");
-        }
-        return Err(error);
+    for alias in dangling {
+        aliases.remove(&alias);
     }
-    drop(file);
-    if let Err(error) = fs::rename(&tmp, &path) {
-        if let Err(cleanup) = fs::remove_file(&tmp) {
-            eprintln!("cannot clean failed aliases temp file {tmp:?}: {cleanup}");
-        }
-        return Err(error);
+    Ok(())
+}
+
+/// drop 提交后删除指向 `name` 的别名；上一次 drop 可能已改名却未能写别名，任何一次写入都同时剔除悬空目标。
+fn remove_aliases_for(database: &DatabaseState, name: &str) -> Result<()> {
+    let mut cache = database.aliases.lock();
+    let aliases = alias::load(&mut cache, &database.root)?;
+    if !aliases.values().any(|target| target == name) {
+        return Ok(());
     }
-    #[cfg(feature = "fault-injection")]
-    directory_fault(
-        if creating {
-            DirectoryOperation::Create
-        } else {
-            DirectoryOperation::Drop
-        },
-        DirectoryPoint::AliasesAfterRename,
-    )?;
-    fs_commit::sync_dir(&database.root)
+    let mut next = aliases.clone();
+    next.retain(|_, target| target != name);
+    retain_live_aliases(database, &mut next).map_err(storage)?;
+    save_lifecycle_aliases(database, aliases, next, false)
+}
+
+/// create / drop 的别名写入失败只报错、不封锁（0007）：剔除的都是悬空别名，替换未落盘时至多重新出现。
+/// 文件已替换时缓存随之更新，与磁盘一致。
+fn save_lifecycle_aliases(
+    database: &DatabaseState,
+    cache: &mut Aliases,
+    next: Aliases,
+    creating: bool,
+) -> Result<()> {
+    database.aliases.assert_held();
+    let fault = |point| {
+        #[cfg(feature = "fault-injection")]
+        directory_fault(
+            if creating {
+                DirectoryOperation::Create
+            } else {
+                DirectoryOperation::Drop
+            },
+            alias_fault_point(point),
+        )?;
+        #[cfg(not(feature = "fault-injection"))]
+        let _point: alias::WritePoint = point;
+        Ok(())
+    };
+    #[cfg(not(feature = "fault-injection"))]
+    let _creating = creating;
+    match alias::write(&database.root, &next, fault) {
+        Ok(()) => {
+            *cache = next;
+            Ok(())
+        }
+        Err(alias::WriteError::Unchanged(error)) => Err(storage(error)),
+        Err(alias::WriteError::Unconfirmed(error)) => {
+            *cache = next;
+            Err(storage(error))
+        }
+    }
+}
+
+#[cfg(feature = "fault-injection")]
+fn alias_fault_point(point: alias::WritePoint) -> DirectoryPoint {
+    match point {
+        alias::WritePoint::BeforeRename => DirectoryPoint::Aliases,
+        alias::WritePoint::AfterRename => DirectoryPoint::AliasesAfterRename,
+    }
 }
 
 fn checked_read_handle(handle: CollectionHandle) -> Result<CollectionHandle> {
@@ -2563,7 +2708,7 @@ fn storage(error: impl std::fmt::Display) -> EngineError {
     EngineError::Storage(error.to_string())
 }
 
-fn guarded_io<T>(action: impl FnOnce() -> std::io::Result<T>) -> std::io::Result<T> {
+pub(crate) fn guarded_io<T>(action: impl FnOnce() -> std::io::Result<T>) -> std::io::Result<T> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(action)).unwrap_or_else(|payload| {
         Err(std::io::Error::other(format!(
             "directory operation panicked: {}",
@@ -3216,9 +3361,11 @@ mod tests {
         for name in ["a", "b", "live"] {
             db.create_collection("", name, basic_schema()).unwrap();
         }
+        for (target, alias) in [("a", "aa"), ("b", "bb"), ("live", "keep")] {
+            db.create_alias("", target, alias).unwrap();
+        }
         let path = root.path().join("aliases.json");
-        let bytes = br#"{"aa":"a","bb":"b","keep":"live"}"#;
-        std::fs::write(&path, bytes).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
         let held = db.databases[DEFAULT_DATABASE].aliases.lock();
         let (tx, rx) = mpsc::channel();
         let (done_tx, done_rx) = mpsc::channel();
@@ -4337,5 +4484,70 @@ mod tests {
             );
             db.close();
         }
+    }
+    #[cfg(feature = "fault-injection")]
+    #[test]
+    fn alias_writes_wait_for_an_in_flight_writer_and_hold_the_exclusive_permit() {
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+        let root = tempfile::tempdir().unwrap();
+        let db = Db::new(
+            DataDir::open(root.path()).unwrap(),
+            Compute::new(std::num::NonZeroUsize::MIN).unwrap(),
+        )
+        .unwrap();
+        db.create_collection("", "writer", basic_schema()).unwrap();
+        db.wait_for_maintenance("", "writer", Duration::from_secs(5))
+            .unwrap();
+        let handle = db.collection("", "writer").unwrap();
+        let state = handle.write();
+        let writer = Arc::clone(&db);
+        let writing = std::thread::spawn(move || {
+            writer.insert(
+                "",
+                "writer",
+                InsertBatch {
+                    num_rows: 1,
+                    columns: vec![
+                        ("id".into(), InputValues::Int(vec![1])),
+                        (
+                            "v".into(),
+                            InputValues::FloatVector {
+                                dim: 2,
+                                values: vec![1.0, 0.0],
+                            },
+                        ),
+                    ],
+                },
+            )
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while db.write_gate.available() {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let changer = Arc::clone(&db);
+        let (done_tx, done_rx) = mpsc::channel();
+        let changing = std::thread::spawn(move || {
+            done_tx
+                .send(changer.create_alias("", "writer", "a"))
+                .unwrap();
+        });
+        // 写入者持共享许可期间别名写入不能开始，叶子锁也未被占住，读请求照常解析。
+        assert!(matches!(
+            done_rx.recv_timeout(Duration::from_millis(100)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        assert!(db.databases[DEFAULT_DATABASE].aliases.available());
+        drop(state);
+        writing.join().unwrap().unwrap();
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        changing.join().unwrap();
+        assert_eq!(db.describe_alias("", "a").unwrap(), "writer");
+        assert_eq!(db.collection("", "a").unwrap().read().count(), 1);
+        db.close();
     }
 }

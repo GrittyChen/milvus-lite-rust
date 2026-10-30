@@ -1808,11 +1808,16 @@ impl Collection {
     }
 
     /// 3.x DescribeIndex：collection 没有任何索引时先报错；指定字段时只返回该字段的索引。
-    pub fn describe_indexes(&self, field_name: Option<&str>) -> Result<Vec<&IndexSpec>> {
+    /// 文案中的集合名取请求中的名字（3.x 用 `request.collection_name`，经别名访问时是别名）。
+    pub fn describe_indexes(
+        &self,
+        field_name: Option<&str>,
+        requested_name: &str,
+    ) -> Result<Vec<&IndexSpec>> {
         if self.indexes.is_empty() {
             return Err(EngineError::IndexNotFound(format!(
                 "no index on collection {}",
-                py_repr(&self.name)
+                py_repr(requested_name)
             )));
         }
         match field_name {
@@ -1821,7 +1826,7 @@ impl Collection {
                 EngineError::IndexNotFound(format!(
                     "no index on field {} of collection {}",
                     py_repr(f),
-                    py_repr(&self.name)
+                    py_repr(requested_name)
                 ))
             }),
         }

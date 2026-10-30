@@ -712,11 +712,14 @@ fn create_cleans_dangling_aliases_before_the_new_name_can_reuse_them() {
     let path = root.path().join("aliases.db");
     let db = Db::new(DataDir::open(&path).unwrap(), compute()).unwrap();
     db.create_collection("", "existing", schema()).unwrap();
+    db.close();
+    // 别名表在首次使用后缓存；悬空别名只能来自打开之前的文件（3.x 或上一次进程）。
     std::fs::write(
         path.join("aliases.json"),
         br#"{"stale":"new","live":"existing"}"#,
     )
     .unwrap();
+    let db = Db::new(DataDir::open(&path).unwrap(), compute()).unwrap();
     db.create_collection("", "new", schema()).unwrap();
     let aliases: serde_json::Value =
         serde_json::from_slice(&std::fs::read(path.join("aliases.json")).unwrap()).unwrap();
@@ -1034,13 +1037,13 @@ fn directory_sync_failure_and_panic_seal_all_mutations_but_preserve_open_reads()
                     db.insert("", name, batch(&[1])).unwrap();
                 }
                 db.close();
+                std::fs::write(path.join("aliases.json"), br#"{"old":"victim"}"#).unwrap();
                 let db = Db::new(DataDir::open(&path).unwrap(), compute()).unwrap();
                 let existing = db.collection("", "existing").unwrap();
                 let victim = db.collection("", "victim").unwrap();
                 let orphan = path.join("collections/lazy/partitions/_default/data/orphan");
                 std::fs::write(&orphan, b"orphan").unwrap();
                 db.insert("", "existing", batch(&[2])).unwrap();
-                std::fs::write(path.join("aliases.json"), br#"{"old":"victim"}"#).unwrap();
                 inject_directory_fault_once(op, point, fault);
                 let result = if op == DirectoryOperation::Create {
                     db.create_collection("", "new", schema())
@@ -1176,11 +1179,8 @@ fn committed_drop_alias_error_is_explicit_and_retry_does_not_rebind_old_alias() 
         let db = Db::new(DataDir::open(root.path()).unwrap(), compute()).unwrap();
         db.create_collection("", "c", schema()).unwrap();
         db.create_collection("", "other", schema()).unwrap();
-        std::fs::write(
-            root.path().join("aliases.json"),
-            br#"{"old":"c","keep":"other"}"#,
-        )
-        .unwrap();
+        db.create_alias("", "c", "old").unwrap();
+        db.create_alias("", "other", "keep").unwrap();
         inject_directory_fault_once(
             DirectoryOperation::Drop,
             DirectoryPoint::Aliases,
@@ -1359,8 +1359,9 @@ fn reopen_uses_actual_directory_state_after_unconfirmed_rename() {
                 db.create_collection("", "c", schema()).unwrap();
                 db.insert("", "c", batch(&[1, 2])).unwrap();
                 db.delete("", "c", &[Pk::Int64(1)]).unwrap();
-                std::fs::write(root.path().join("aliases.json"), br#"{"old":"c"}"#).unwrap();
+                db.create_alias("", "c", "old").unwrap();
             }
+            let aliases = std::fs::read(root.path().join("aliases.json")).ok();
             inject_directory_fault_once(op, DirectoryPoint::CollectionsSync, DirectoryFault::Error);
             let result = if op == DirectoryOperation::Create {
                 db.create_collection("", "c", schema())
@@ -1413,9 +1414,10 @@ fn reopen_uses_actual_directory_state_after_unconfirmed_rename() {
                         [Pk::Int64(2)]
                     );
                     assert_eq!(
-                        std::fs::read(root.path().join("aliases.json")).unwrap(),
-                        br#"{"old":"c"}"#
+                        std::fs::read(root.path().join("aliases.json")).ok(),
+                        aliases
                     );
+                    assert_eq!(reopened.describe_alias("", "old").unwrap(), "c");
                 }
             }
             assert!(
@@ -1438,9 +1440,11 @@ fn create_alias_cleanup_fault_fires_before_directory_commit_and_can_retry() {
     let root = tempfile::tempdir().unwrap();
     let db = Db::new(DataDir::open(root.path()).unwrap(), compute()).unwrap();
     db.create_collection("", "existing", schema()).unwrap();
+    db.close();
     let aliases_path = root.path().join("aliases.json");
     let aliases = br#"{"old":"gone","live":"existing"}"#;
     std::fs::write(&aliases_path, aliases).unwrap();
+    let db = Db::new(DataDir::open(root.path()).unwrap(), compute()).unwrap();
     inject_directory_fault_once(
         DirectoryOperation::Create,
         DirectoryPoint::Aliases,
@@ -1742,11 +1746,13 @@ fn shared_json_files_are_written_in_3x_sorted_layout() {
     );
     db.create_collection("", "target", schema()).unwrap();
     db.create_collection("", "victim", schema()).unwrap();
+    db.close();
     std::fs::write(
         path.join("aliases.json"),
         br#"{"z_alias":"target","gone":"victim","m_alias":"target","A_alias":"target"}"#,
     )
     .unwrap();
+    let db = Db::new(DataDir::open(&path).unwrap(), compute()).unwrap();
     db.drop_collection("", "victim").unwrap();
     assert_eq!(
         std::fs::read(path.join("aliases.json")).unwrap(),

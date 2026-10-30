@@ -39,3 +39,14 @@ def test_search_after_release_reports_not_loaded(milvus_client):
     with pytest.raises(Exception) as exc_info:
         milvus_client.search("demo", data=[[1.0, 0.0, 0.0, 0.0]], limit=1)
     assert "load" in str(exc_info.value).lower()
+
+
+# ---------------------------------------------------------------------------
+# UNIMPLEMENTED stubs: friendly messages
+# ---------------------------------------------------------------------------
+
+def test_create_alias_nonexistent_collection_reports_not_found(milvus_client):
+    with pytest.raises(Exception) as exc_info:
+        milvus_client.create_alias("demo", "al")
+    msg = str(exc_info.value).lower()
+    assert "collection" in msg and "not exist" in msg

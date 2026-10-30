@@ -962,7 +962,6 @@ def test_pymilvus_entry_points_remaining_unsupported(env):
         (lambda: client.create_database("d"), f"CreateDatabase: {rpc}"),
         (lambda: client.list_databases(), f"ListDatabases: {rpc}"),
         (lambda: client.using_database("default"), f"DescribeDatabase: {rpc}"),
-        (lambda: client.create_alias("q", "a"), f"CreateAlias: {rpc}"),
         (with_field("n", DataType.FLOAT_VECTOR, dim=2, nullable=True), f"nullable vectors: {feature}"),
         (with_field("v2", DataType.FLOAT_VECTOR, dim=2), "multiple vector fields: "),
         (with_field("s", DataType.SPARSE_FLOAT_VECTOR), f"SPARSE_FLOAT_VECTOR fields: {feature}"),

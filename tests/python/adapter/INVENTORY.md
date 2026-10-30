@@ -6,16 +6,16 @@
 
 | 状态 | 含义 | 条数 |
 | --- | --- | --- |
-| 已复制 | 原样复制到本目录 | 180 |
+| 已复制 | 原样复制到本目录 | 182 |
 | 改后复制 | 仅按 0004「验收」第 2 项与 0006 第 25 项授权的条件替换，逐条说明改动 | 0 |
-| 范围外 | 用到当前切片不支持的功能，不复制；未实现能力的代表性入口见「范围外功能的 `UNIMPLEMENTED` 断言」 | 62 |
+| 范围外 | 用到当前切片不支持的功能，不复制；未实现能力的代表性入口见「范围外功能的 `UNIMPLEMENTED` 断言」 | 60 |
 | 待复用 | 原功能阻断已解除，尚未复制到本地默认套件；0015 的条目已通过固定外部套件验收 | 53 |
 | 依赖内部模块 | 导入或使用 3.x 的内部模块、内部对象，换成本实现后无法运行 | 33 |
 | 不运行 | 上游被同名定义覆盖，上游自己也不运行 | 1 |
 
 以上是逐条列出的 23 个文件中的 329 条；其余 24 个文件的 308 条整个文件记一行原因，见「整个文件不复用的文件」。
 
-「已复制」与「改后复制」共 180 个用例函数，参数化展开后 209 条。S1 恢复 [test_grpc_crud.py](test_grpc_crud.py) 中的原过滤表达式，并纳入除 LIKE 外的全部 19 条；它们在本实现与真实 3.x 上的两条客户端线均作为 S1 验收。随后迁移全部 40 条待复用用例，恢复此前为绕过过滤限制而替换的原表达式；顶层动态字段切片另加入原样的 TestDynamicField 用例。0014 已恢复原 HNSW 定义，并新增创建 HNSW、DropIndex 和 describe 参数的原用例；检索仍按 FLAT 执行。
+「已复制」与「改后复制」共 182 个用例函数，参数化展开后 211 条。S1 恢复 [test_grpc_crud.py](test_grpc_crud.py) 中的原过滤表达式，并纳入除 LIKE 外的全部 19 条；它们在本实现与真实 3.x 上的两条客户端线均作为 S1 验收。随后迁移全部 40 条待复用用例，恢复此前为绕过过滤限制而替换的原表达式；顶层动态字段切片另加入原样的 TestDynamicField 用例。0014 已恢复原 HNSW 定义，并新增创建 HNSW、DropIndex 和 describe 参数的原用例；检索仍按 FLAT 执行。
 
 历史的 HNSW→FLAT 授权替换按 0014 恢复原定义；`== N` 换成 `in [N]` 的条件见 0004「验收」第 2 项及 0006 第 25 项。已接通 S1 的 CRUD 副本不再替换表达式或读回方式。其余副本只删去随范围外用例一起不再使用的 import、helper 与空的分节标题；上游用于跳过的 `importorskip` 改为直接导入（本仓不允许因缺依赖静默跳过），上游因 HNSW 需要 faiss 而加的 `skipif` 随 HNSW 一起去掉。起服务的 fixture 与清理见 [conftest.py](conftest.py)。
 
@@ -143,7 +143,7 @@
 
 ### [test_grpc_error_mapping.py](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_error_mapping.py)（0004 候选文件）
 
-9 条：已复制 2，范围外 2，依赖内部模块 5。
+9 条：已复制 3，范围外 1，依赖内部模块 5。
 
 | 用例 | 状态 | 说明 |
 | --- | --- | --- |
@@ -155,7 +155,7 @@
 | [`test_search_after_release_reports_not_loaded`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_error_mapping.py#L70) | 已复制 |  |
 | [`test_rename_nonexistent_reports_not_found`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_error_mapping.py#L92) | 范围外 | rename |
 | [`test_hybrid_search_unimplemented`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_error_mapping.py#L99) | 依赖内部模块 | 导入内部模块（[L104](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_error_mapping.py#L104)） |
-| [`test_create_alias_nonexistent_collection_reports_not_found`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_error_mapping.py#L108) | 范围外 | alias |
+| [`test_create_alias_nonexistent_collection_reports_not_found`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_error_mapping.py#L108) | 已复制 |  |
 
 ### [test_crud_alignment.py](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_crud_alignment.py)
 
@@ -492,11 +492,11 @@
 
 ### [test_p0_features.py](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_p0_features.py)
 
-12 条：已复制 3，范围外 9。
+10 条：已复制 2，范围外 8。
 
 | 用例 | 状态 | 说明 |
 | --- | --- | --- |
-| [`test_alias_lifecycle_and_alias_reads`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_p0_features.py#L16) | 范围外 | 过滤表达式（`id == 1`）、alias |
+| [`test_alias_lifecycle_and_alias_reads`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_p0_features.py#L16) | 已复制 |  |
 | [`test_truncate_collection_preserves_schema`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_p0_features.py#L49) | 范围外 | 过滤表达式（`id == 2`）、truncate |
 | [`test_list_indexes_returns_index_names`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_p0_features.py#L68) | 已复制 |  |
 | [`test_get_partition_stats`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_p0_features.py#L82) | 范围外 | 分区 |
@@ -524,7 +524,7 @@
 | 0014 之外的过滤构造（算术、时间、text_match 与几何） | [test_grpc_translation.py](../test_grpc_translation.py) 的 `test_search_m1_unsupported`、`test_query_m1_unsupported`、`test_pymilvus_entry_points_remaining_unsupported` |
 | Query / search iterator V1 | 0016 A / B 接续；V2 不增加服务端实现 |
 | 分区 RPC；写入、检索、查询指定 `_default` 以外的分区；partition key | `test_insert_m1_unsupported`、`test_search_m1_unsupported`、`test_query_m1_unsupported`、`test_pymilvus_entry_points_remaining_unsupported` |
-| 数据库 RPC、alias | `test_pymilvus_entry_points_remaining_unsupported` |
+| 数据库 RPC | `test_pymilvus_entry_points_remaining_unsupported` |
 | schema：GEOMETRY、TIMESTAMPTZ、稀疏向量、nullable 向量、向量默认值、JSON/嵌套 ARRAY 元素、function、多向量字段、analyzer，properties 中的 `timezone` | `test_create_collection_remaining_unsupported`、`test_pymilvus_entry_points_remaining_unsupported` |
 | 写入 null 值 | `test_insert_m1_unsupported` |
 | 修改 schema 与 collection properties、rename | `test_pymilvus_entry_points_remaining_unsupported` |

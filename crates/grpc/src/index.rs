@@ -62,7 +62,7 @@ pub(crate) fn describe(
     };
     let rows = i64::try_from(c.count()).unwrap_or(i64::MAX);
     let index_descriptions = c
-        .describe_indexes(field)?
+        .describe_indexes(field, &req.collection_name)?
         .into_iter()
         .map(|spec| svc::IndexDescription {
             index_name: spec.field_name.clone(),

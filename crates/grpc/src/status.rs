@@ -52,8 +52,10 @@ pub(crate) fn from_engine(
         return Ok(unexpected(e.to_string()));
     }
     let (code, error_code) = match e {
-        EngineError::CollectionNotFound(_) => (100, 4),
-        EngineError::CollectionAlreadyExists(_) => (1, 1),
+        EngineError::CollectionNotFound(_) | EngineError::AliasNotFound(_) => (100, 4),
+        EngineError::CollectionAlreadyExists(_)
+        | EngineError::AliasAlreadyExists(_)
+        | EngineError::AliasConflictsWithCollection(_) => (1, 1),
         EngineError::PartitionNotFound(_) => (200, 200),
         EngineError::PartitionAlreadyExists(_) => (1, 1),
         EngineError::SchemaValidation(_) | EngineError::DatabaseNotFound(_) => (6, 6),
@@ -107,6 +109,8 @@ reply_with_status_field!(
     crate::pb::service::GetCompactionStateResponse,
     crate::pb::service::QueryResults,
     crate::pb::service::SearchResults,
+    crate::pb::service::DescribeAliasResponse,
+    crate::pb::service::ListAliasesResponse,
 );
 
 #[cfg(test)]
@@ -124,6 +128,12 @@ mod tests {
         assert_eq!(codes(EngineError::CollectionNotFound("c".into())), (100, 4));
         assert_eq!(
             codes(EngineError::CollectionAlreadyExists("c".into())),
+            (1, 1)
+        );
+        assert_eq!(codes(EngineError::AliasNotFound("a".into())), (100, 4));
+        assert_eq!(codes(EngineError::AliasAlreadyExists("a".into())), (1, 1));
+        assert_eq!(
+            codes(EngineError::AliasConflictsWithCollection("a".into())),
             (1, 1)
         );
         assert_eq!(codes(EngineError::SchemaValidation("x".into())), (6, 6));

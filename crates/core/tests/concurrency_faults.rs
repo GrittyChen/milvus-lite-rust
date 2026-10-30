@@ -410,11 +410,9 @@ fn parallel_drops_preserve_live_aliases_and_remove_both_deleted_targets() {
     for name in ["a", "b", "live"] {
         db.create_collection("", name, schema()).unwrap();
     }
-    std::fs::write(
-        root.path().join("aliases.json"),
-        br#"{"aa":"a","bb":"b","keep":"live"}"#,
-    )
-    .unwrap();
+    for (target, alias) in [("a", "aa"), ("b", "bb"), ("live", "keep")] {
+        db.create_alias("", target, alias).unwrap();
+    }
     let mut workers = vec![];
     for name in ["a", "b"] {
         let db = Arc::clone(&db);
@@ -442,15 +440,17 @@ fn directory_panics_before_commit_roll_back_and_alias_panics_after_commit_stay_r
             DirectoryPoint::AliasesAfterRename,
         ] {
             let root = tempfile::tempdir().unwrap();
-            let db = open(root.path());
+            let mut db = open(root.path());
             db.create_collection("", "c", schema()).unwrap();
             db.insert("", "c", batch(1, 1)).unwrap();
-            let alias = if creating {
-                br#"{"old":"new"}"#.as_slice()
+            if creating {
+                // 悬空别名只能来自打开之前的文件；别名表在首次使用后缓存。
+                db.close();
+                std::fs::write(root.path().join("aliases.json"), br#"{"old":"new"}"#).unwrap();
+                db = open(root.path());
             } else {
-                br#"{"old":"c"}"#.as_slice()
-            };
-            std::fs::write(root.path().join("aliases.json"), alias).unwrap();
+                db.create_alias("", "c", "old").unwrap();
+            }
             inject_directory_fault_once(
                 if creating {
                     DirectoryOperation::Create
@@ -1225,7 +1225,8 @@ fn alias_rename_then_panic_preserves_the_real_file_change_and_can_retry() {
         db.create_collection("", name, schema()).unwrap();
     }
     let path = root.path().join("aliases.json");
-    std::fs::write(&path, br#"{"old":"c","keep":"live"}"#).unwrap();
+    db.create_alias("", "c", "old").unwrap();
+    db.create_alias("", "live", "keep").unwrap();
     inject_directory_fault_once(
         DirectoryOperation::Drop,
         DirectoryPoint::AliasesAfterRename,
@@ -1301,4 +1302,127 @@ fn drop_sync_and_recommit_panics_seal_state_before_unlocking() {
         }
         db.close();
     }
+}
+
+#[test]
+fn alias_and_same_name_collection_creates_never_both_succeed() {
+    let _case = CASE_LOCK.lock();
+    let root = tempfile::tempdir().unwrap();
+    let db = open(root.path());
+    db.create_collection("", "c", schema()).unwrap();
+    for round in 0..20 {
+        let name = format!("x{round}");
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let alias = {
+            let (db, barrier, name) = (Arc::clone(&db), Arc::clone(&barrier), name.clone());
+            std::thread::spawn(move || {
+                barrier.wait();
+                db.create_alias("", "c", &name)
+            })
+        };
+        barrier.wait();
+        let created = db.create_collection("", &name, schema());
+        let alias = alias.join().unwrap();
+        match (&created, &alias) {
+            (Ok(()), Err(milvus_lite_core::EngineError::AliasConflictsWithCollection(n)))
+            | (Err(milvus_lite_core::EngineError::CollectionAlreadyExists(n)), Ok(())) => {
+                assert_eq!(n, &name)
+            }
+            _ => panic!("round {round}: {created:?} / {alias:?}"),
+        }
+        assert_eq!(db.describe_alias("", &name).is_ok(), alias.is_ok());
+        assert_eq!(
+            root.path().join("collections").join(&name).exists(),
+            created.is_ok()
+        );
+    }
+    db.close();
+}
+
+#[test]
+fn alias_create_racing_target_drop_never_leaves_an_alias_to_the_dropped_target() {
+    let _case = CASE_LOCK.lock();
+    let root = tempfile::tempdir().unwrap();
+    let db = open(root.path());
+    for round in 0..20 {
+        let target = format!("t{round}");
+        db.create_collection("", &target, schema()).unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let alias = {
+            let (db, barrier, target) = (Arc::clone(&db), Arc::clone(&barrier), target.clone());
+            std::thread::spawn(move || {
+                barrier.wait();
+                db.create_alias("", &target, "a")
+            })
+        };
+        barrier.wait();
+        db.drop_collection("", &target).unwrap();
+        match alias.join().unwrap() {
+            Ok(()) | Err(milvus_lite_core::EngineError::CollectionNotFound(_)) => {}
+            other => panic!("round {round}: {other:?}"),
+        }
+        // 别名先建成则随目标一起删除，后到则报目标不存在；两种顺序都不留下指向已删目标的别名。
+        assert!(
+            db.list_aliases("", "").unwrap().1.is_empty(),
+            "round {round}"
+        );
+    }
+    db.close();
+}
+
+#[test]
+fn reads_and_writes_through_an_alias_follow_concurrent_repointing() {
+    let _case = CASE_LOCK.lock();
+    let root = tempfile::tempdir().unwrap();
+    let db = open(root.path());
+    db.create_collection("", "c1", schema()).unwrap();
+    db.create_collection("", "c2", schema()).unwrap();
+    db.insert("", "c1", batch(1, 1)).unwrap();
+    db.insert("", "c2", batch(2, 2)).unwrap();
+    db.insert("", "c2", batch(3, 3)).unwrap();
+    db.create_alias("", "c1", "a").unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let readers: Vec<_> = (0..3)
+        .map(|_| {
+            let (db, stop) = (Arc::clone(&db), Arc::clone(&stop));
+            std::thread::spawn(move || {
+                let mut seen = std::collections::BTreeSet::new();
+                while !stop.load(Ordering::Acquire) {
+                    let handle = db.collection("", "a").unwrap();
+                    let collection = handle.read();
+                    seen.insert((collection.name().to_owned(), collection.count()));
+                }
+                seen
+            })
+        })
+        .collect();
+    let writer = {
+        let (db, stop) = (Arc::clone(&db), Arc::clone(&stop));
+        std::thread::spawn(move || {
+            let mut id = 100;
+            while !stop.load(Ordering::Acquire) {
+                // 每条写入只落到解析当时的一个目标；两边合计不丢。
+                db.insert("", "a", batch(id, id)).unwrap();
+                id += 1;
+            }
+            id - 100
+        })
+    };
+    for round in 0..40 {
+        db.alter_alias("", if round % 2 == 0 { "c2" } else { "c1" }, "a")
+            .unwrap();
+    }
+    stop.store(true, Ordering::Release);
+    for reader in readers {
+        for (name, _) in reader.join().unwrap() {
+            assert!(name == "c1" || name == "c2", "{name}");
+        }
+    }
+    let written = writer.join().unwrap();
+    let total: usize = ["c1", "c2"]
+        .iter()
+        .map(|name| db.collection("", name).unwrap().read().count())
+        .sum();
+    assert_eq!(total, 3 + usize::try_from(written).unwrap());
+    db.close();
 }

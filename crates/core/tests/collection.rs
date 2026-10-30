@@ -1017,16 +1017,28 @@ fn sparse_and_text_queries_fail_where_3x_fails() {
 #[test]
 fn describe_indexes_matches_3x() {
     let mut c = basic(false, false);
-    let e = c.describe_indexes(Some("v")).unwrap_err();
+    let e = c.describe_indexes(Some("v"), "c").unwrap_err();
     assert!(matches!(e, EngineError::IndexNotFound(_)));
     assert_eq!(e.to_string(), "no index on collection 'c'");
-    assert!(c.describe_indexes(None).is_err());
-    flat_index(&mut c, "IP");
-    assert_eq!(c.describe_indexes(None).unwrap().len(), 1);
-    assert_eq!(c.describe_indexes(Some("v")).unwrap()[0].metric_type, "IP");
+    assert!(c.describe_indexes(None, "c").is_err());
+    // 经别名访问时 3.x 的文案用请求中的名字。
     assert_eq!(
-        c.describe_indexes(Some("t")).unwrap_err().to_string(),
+        c.describe_indexes(None, "a1").unwrap_err().to_string(),
+        "no index on collection 'a1'"
+    );
+    flat_index(&mut c, "IP");
+    assert_eq!(c.describe_indexes(None, "c").unwrap().len(), 1);
+    assert_eq!(
+        c.describe_indexes(Some("v"), "c").unwrap()[0].metric_type,
+        "IP"
+    );
+    assert_eq!(
+        c.describe_indexes(Some("t"), "c").unwrap_err().to_string(),
         "no index on field 't' of collection 'c'"
+    );
+    assert_eq!(
+        c.describe_indexes(Some("t"), "a1").unwrap_err().to_string(),
+        "no index on field 't' of collection 'a1'"
     );
 }
 

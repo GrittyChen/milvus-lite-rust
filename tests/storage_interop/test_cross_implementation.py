@@ -482,6 +482,72 @@ db.close()
     run([interpreters[PYTHONS[0]], "-c", code, str(root)], cwd=tmp_path)
 
 
+@pytest.mark.parametrize("first", ["rust", "reference"])
+def test_aliases_written_by_one_implementation_resolve_and_change_in_the_other(tmp_path, interpreters, first):
+    """0023 A 互通：别名的创建、改指、解析与经别名删除在两边交替执行，`aliases.json` 互相读写。"""
+    root = tmp_path / "aliases.db"
+    steps = [
+        # 第一方：两个集合与两个别名，其中一个以别名为目标（保存解析后的名字）。
+        """
+for name, pk in [('c1', 1), ('c2', 2)]:
+    client.create_collection(name, schema=schema, index_params=indexes)
+    client.insert(name, [{'id': pk, 'vector': [1.0, 0.0]}])
+client.create_alias('c1', 'a')
+client.create_alias('a', 'b')
+""",
+        # 第二方：读取对方写的别名，经别名读写，再改指。
+        """
+assert client.describe_alias('b')['collection_name'] == 'c1'
+assert sorted(client.list_aliases('c1')['aliases']) == ['a', 'b']
+client.load_collection('a')
+assert client.query('a', filter='', output_fields=['id']) == [{'id': 1}]
+client.insert('b', [{'id': 3, 'vector': [0.0, 1.0]}])
+client.alter_alias('c2', 'a')
+client.create_alias('a', 'z')
+""",
+        # 第一方：看到对方的改动，经别名删除目标集合及其全部别名。
+        """
+assert client.describe_alias('a')['collection_name'] == 'c2'
+assert client.describe_alias('z')['collection_name'] == 'c2'
+client.load_collection('c1')
+client.load_collection('a')
+assert client.query('c1', filter='', output_fields=['count(*)']) == [{'count(*)': 2}]
+assert client.query('a', filter='', output_fields=['id']) == [{'id': 2}]
+client.drop_collection('z')
+assert client.list_collections() == ['c1']
+""",
+        # 第二方：只剩指向 c1 的别名。
+        """
+assert client.list_aliases()['aliases'] == ['b']
+assert client.describe_alias('b')['collection_name'] == 'c1'
+assert client.list_collections() == ['c1']
+""",
+    ]
+    prelude = """
+import sys
+from pymilvus import DataType, MilvusClient
+from milvus_lite.server_manager import server_manager_instance as manager
+path = sys.argv[1]
+client = MilvusClient(path, dedicated=True)
+schema = MilvusClient.create_schema()
+schema.add_field('id', DataType.INT64, is_primary=True)
+schema.add_field('vector', DataType.FLOAT_VECTOR, dim=2)
+indexes = client.prepare_index_params()
+indexes.add_index('vector', index_type='FLAT', metric_type='L2')
+try:
+{body}
+finally:
+    client.close()
+    manager.release_server(path)
+"""
+    pythons = {"rust": sys.executable, "reference": interpreters[PYTHONS[0]]}
+    order = [first, "reference" if first == "rust" else "rust"] * 2
+    for who, step in zip(order, steps):
+        body = "\n".join("    " + line for line in step.strip().splitlines())
+        run([pythons[who], "-c", prelude.format(body=body), str(root)], cwd=tmp_path)
+    assert json.loads((root / "aliases.json").read_text()) == {"b": "c1"}
+
+
 def test_real_database_path_recovers_reference_crash_wal(tmp_path, interpreters):
     root = tmp_path / "crashed.db"
     reference_create(interpreters[PYTHONS[0]], root, flush=False)

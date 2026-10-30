@@ -39,6 +39,11 @@ const IMPLEMENTED_METHODS: &[&str] = &[
     "GetCompactionState",
     "Query",
     "Search",
+    "CreateAlias",
+    "AlterAlias",
+    "DropAlias",
+    "DescribeAlias",
+    "ListAliases",
 ];
 
 fn main() -> Result<(), Box<dyn Error>> {

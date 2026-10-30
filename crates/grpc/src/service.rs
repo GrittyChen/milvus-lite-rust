@@ -237,6 +237,9 @@ impl Service for MilvusService {
             if !req.collection_names.is_empty() {
                 all.retain(|(name, _)| req.collection_names.contains(name));
             }
+            if !all.is_empty() {
+                db.check_aliases(&database)?;
+            }
             let percentages: Vec<i64> = all
                 .iter()
                 .map(|(_, state)| if *state == LoadState::Loaded { 100 } else { 0 })
@@ -630,6 +633,82 @@ impl Service for MilvusService {
                 pause();
             }
             search::search(&snapshot, db.compute(), parsed, req.output_fields)
+        })
+        .await
+    }
+
+    async fn create_alias(
+        &self,
+        request: Request<svc::CreateAliasRequest>,
+    ) -> Result<Response<common::Status>, Status> {
+        let database = database(&request, |r| &r.db_name);
+        let req = request.into_inner();
+        self.run(Branch::Engine, move |db| {
+            db.create_alias(&database, &req.collection_name, &req.alias)?;
+            Ok(success())
+        })
+        .await
+    }
+
+    async fn alter_alias(
+        &self,
+        request: Request<svc::AlterAliasRequest>,
+    ) -> Result<Response<common::Status>, Status> {
+        let database = database(&request, |r| &r.db_name);
+        let req = request.into_inner();
+        self.run(Branch::Engine, move |db| {
+            db.alter_alias(&database, &req.collection_name, &req.alias)?;
+            Ok(success())
+        })
+        .await
+    }
+
+    async fn drop_alias(
+        &self,
+        request: Request<svc::DropAliasRequest>,
+    ) -> Result<Response<common::Status>, Status> {
+        let database = database(&request, |r| &r.db_name);
+        let req = request.into_inner();
+        self.run(Branch::Engine, move |db| {
+            db.drop_alias(&database, &req.alias)?;
+            Ok(success())
+        })
+        .await
+    }
+
+    async fn describe_alias(
+        &self,
+        request: Request<svc::DescribeAliasRequest>,
+    ) -> Result<Response<svc::DescribeAliasResponse>, Status> {
+        let database = database(&request, |r| &r.db_name);
+        let req = request.into_inner();
+        self.run(Branch::Engine, move |db| {
+            // 3.x 只填 alias 与 collection，db_name 留空。
+            let collection = db.describe_alias(&database, &req.alias)?;
+            Ok(svc::DescribeAliasResponse {
+                status: Some(success()),
+                alias: req.alias,
+                collection,
+                ..Default::default()
+            })
+        })
+        .await
+    }
+
+    async fn list_aliases(
+        &self,
+        request: Request<svc::ListAliasesRequest>,
+    ) -> Result<Response<svc::ListAliasesResponse>, Status> {
+        let database = database(&request, |r| &r.db_name);
+        let req = request.into_inner();
+        self.run(Branch::Engine, move |db| {
+            let (collection_name, aliases) = db.list_aliases(&database, &req.collection_name)?;
+            Ok(svc::ListAliasesResponse {
+                status: Some(success()),
+                collection_name,
+                aliases,
+                ..Default::default()
+            })
         })
         .await
     }

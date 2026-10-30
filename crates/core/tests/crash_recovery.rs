@@ -548,11 +548,7 @@ fn collection_directory_rename_crashes_preserve_commit_boundary() {
         if !creating {
             db.create_collection("", "c", schema()).unwrap();
             db.insert("", "c", batch(&[(1, [1.0, 0.0])])).unwrap();
-            std::fs::write(
-                std::path::Path::new(&path).join("aliases.json"),
-                br#"{"old":"c"}"#,
-            )
-            .unwrap();
+            db.create_alias("", "c", "old").unwrap();
         }
         inject_directory_fault_once(
             if creating {
@@ -628,7 +624,7 @@ fn collection_directory_rename_crashes_preserve_commit_boundary() {
                 );
                 assert_eq!(
                     std::fs::read(path.join("aliases.json")).unwrap(),
-                    br#"{"old":"c"}"#
+                    b"{\n  \"old\": \"c\"\n}"
                 );
             }
         } else {
