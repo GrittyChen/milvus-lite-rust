@@ -797,6 +797,25 @@ mod faults {
         std::fs::write(&path, value.to_string()).unwrap();
     }
 
+    /// 意图里旧 manifest 列出的全部 data / delta 文件（含清空第 2 步 flush 新写出的），相对集合目录。
+    fn intent_old_files(base: &Path) -> Vec<String> {
+        let intent: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(base.join(INTENT)).unwrap()).unwrap();
+        let old = Manifest::parse(intent["old_manifest"].as_str().unwrap().as_bytes()).unwrap();
+        let files: Vec<String> = old
+            .partitions
+            .iter()
+            .flat_map(|(partition, f)| {
+                f.data_files
+                    .iter()
+                    .chain(&f.delta_files)
+                    .map(move |file| format!("partitions/{partition}/{file}"))
+            })
+            .collect();
+        assert!(!files.is_empty());
+        files
+    }
+
     fn blocked<T>(result: Result<T, EngineError>) -> bool {
         result.is_err_and(|e| e.to_string().contains("blocked"))
     }
@@ -1072,12 +1091,11 @@ mod faults {
         for newer in [false, true] {
             let root = tempfile::tempdir().unwrap();
             let db = seeded(root.path());
-            let old = segment_files(root.path(), "c");
-            assert!(!old.is_empty());
             inject(DirectoryPoint::Files, DirectoryFault::Error);
             assert!(db.truncate_collection("", "c").is_err());
             db.close();
             let base = dir(root.path(), "c");
+            let old = intent_old_files(&base);
             // 上一轮已删元数据与副本之后，当时还剩下的状态：补回副本目录，并手工删掉一个旧文件。
             let copies = base.join("snapshots/manifests/s");
             std::fs::create_dir_all(&copies).unwrap();
@@ -1111,12 +1129,14 @@ mod faults {
             let db = seeded(root.path());
             inject(DirectoryPoint::Files, DirectoryFault::Error);
             assert!(db.truncate_collection("", "c").is_err());
+            let old = intent_old_files(&dir(root.path(), "c"));
             if rename {
                 db.rename_collection("", "c", "d", "").unwrap();
                 assert_eq!(count(&db, "d"), 0);
                 db.insert("", "d", batch(&[7])).unwrap();
                 db.flush_collection("", "d").unwrap();
                 assert!(!dir(root.path(), "d").join(INTENT).exists());
+                assert!(old.iter().all(|f| !dir(root.path(), "d").join(f).exists()));
             } else {
                 db.drop_collection("", "c").unwrap();
                 assert!(!dir(root.path(), "c").exists());
@@ -1158,6 +1178,7 @@ mod faults {
             .unwrap();
         assert_eq!(report.failed, 0, "{report:?}");
         assert!(report.completed >= 1, "{report:?}");
+        assert_eq!(report.last_input_rows, 4, "{report:?}");
         assert_eq!(count(&db, "c"), 4);
         db.close();
     }

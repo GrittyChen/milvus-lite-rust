@@ -1,6 +1,6 @@
 # 0023 别名、改名、清空、集合属性与多数据库
 
-- 状态：合同终稿；2026-10-29 负责人确认五项取舍（见「已确认的取舍」），独立评审三轮后按意见修订并确认；未改代码
+- 状态：合同终稿；2026-10-29 负责人确认五项取舍（见「已确认的取舍」），独立评审三轮后按意见修订并确认。**A 已按设计分七步实施并逐步评审，验收见 [0023-a-acceptance](../testing/0023-a-acceptance.md)；B（多数据库）未开始**
 - 日期：2026-10-29
 - 参照：milvus-lite v3.2.1 / `43d1257774e629bc9f66873977ab7c320d5bf5a7`；pymilvus 3.0.2 实测，2.6.17 经源码核对：`use_database` 同样先调 DescribeDatabase，改名请求只设 `newDBName`，数据库经 `dbname` 元数据传递，与 3.0.2 一致
 - 基线：已发布 `0.3.0rc3`；仓库基线 `1026c0854886c70e303b725b4fdb00b98e95ff3a`
@@ -269,6 +269,43 @@
 | 清空「持共享许可」，合并在提交边界按「清空代」放弃 | 清空全程持**独占许可**，不设清空代；清理失败后的重试走下述共享到独占的重新入闸 | 清空第 3 步（WAL 目录迁移）与第 6 步（`schema.json` 规范重写）在改名之后目录同步失败时，按持久化合同都要进入整库写入封锁，只能在独占许可下设置。合并全程持共享许可，因此清空期间不会有合并在运行，清空代没有作用，按「能减不加」去掉。代价是清空期间整个数据库的写入，以及其他集合未缓存时的首次懒打开都等待；已经打开集合的纯读不受影响。清空是低频操作，3.x 的清空同样完全串行 |
 | 清空第 1 步「删除 `wal/` 下全部 WAL 文件」 | 在 flush 确认之后把**整个 `wal/` 目录原子改名移入 `.database-staging/`**，同步目录，需要时再建立新的空 `wal/` | 不能逐个删除：中途失败会留下已提交行的 WAL 后缀，3.x 打开时会重复回放（实测 3.2.1：已提交的 2 行在残留 WAL 重放后计数为 4、主键为 `1, 2, 1, 2`），本实现虽会过滤，但互通失败。目录级改名只有「仍在原处」与「已移入 staging」两种状态，两边打开时都会清空 staging |
 | 改名第 5–7 步失败「其他读写照常」 | 只在目标文件替换**之前**失败时成立；替换之后的目录同步失败按持久化合同进入整库写入封锁 | 合同的持久化保证一表要求所有共享文件的改名后目录同步失败进入封锁，两处必须一致，以持久化保证为准 |
+| 清空第 1 步「取名字锁并打开集合 … 取 flush 锁与状态写锁」，锁表中名字锁与 flush 锁「第 1–7 步全程」 | 名字锁只覆盖集合的打开；之后的顺序为：独占许可 → 解析别名 → 打开（名字锁）→ flush 锁（第 1–7 步全程）→ 0014 删除意图检查 → 重试上一次的清理 → 状态写锁（发布新读视图之前） | 名字锁只用来串行化同名首次打开；独占许可已排除其他变更，持有到清空结束只会拉长其他首次打开的等待 |
+| AlterCollection 锁表「独占许可 → 名字锁 → flush 锁 → 状态写锁」 | 名字锁只覆盖打开，状态写锁只覆盖「发布新属性」，两者之间的写文件与 fsync 不持状态写锁；fsync 期间读者看到旧值或新值，都与已写出或将写出的文件一致 | 避免在持状态写锁时做磁盘 I/O；属性读取不依赖文件，二者择一都是合法的线性化 |
+| 清空第 4 步「构造候选 manifest 并写意图」，意图构造在 WAL 迁移之后 | 意图的构造与自校验（读 snapshot 元数据、扫索引目录、解析自身）是只读的，提前到第 2 步 flush 之后、第 3 步 WAL 迁移之前；写入顺序不变。第 3 步及之后的任何写入之前，snapshot 标识不合法等拒绝已经发生 | 否则校验失败时 `wal/` 已移入 staging，「拒绝即零写入」不成立（第 6 步实施中由用例发现） |
+| 清空第 3 步「第 4、5 步在 manifest 替换之前失败时尽力删除 staging 目录」 | 同样适用于第 5 步之后的读视图重建失败：撤表并尽力删除 staging 中的 WAL 目录，失败只记日志 | 重建失败后集合已不可用，留下的 staging 目录只会累积；重开会清空 |
+| 清空第 6 步删除 snapshot：只写「名字与 id 都匹配的元数据文件」 | 元数据文件已不存在（上一轮清理已删、或 3.x 先删了它）视为已删，同名 manifest 副本目录仍删除；同名但 id 不同的是别的 snapshot，整体保留 | 清理要可重入：元数据先删、副本目录后删，中间退出后重开必须能收尾，而不能因元数据缺失停住 |
+| 清空第 6 步「恢复 `can_compact` 与后台维护」 | 清理完成后 `truncate_cleanup` 清除、`can_compact` 恢复；后台维护的暂停随之解除，**下一次调度时生效**，不主动触发一轮 | 维护由写入与 flush 的边界调度，没有「恢复」动作；测试在清理完成后的写入上观察到合并实际完成 |
+| 改名「改名未完成状态」`Option<RenameIntent>` | `rename_pending` 是 `Option<String>`，只存最近一次失败的原因；重试一律按磁盘上的意图重新判定，不依赖内存里保存的意图。除 `Db::new` 在服务开始前单线程设置启动收尾的结果外，只在独占许可下修改 | 磁盘意图是唯一真值；内存里再存一份会在崩溃重开与重试之间出现双源 |
+| 改名 P2 失败状态「新名在封锁期间首次打开按现有规则报封锁错误」 | 封锁期间**旧名与新名**的首次打开都报「写入已封锁」，已打开的其他集合照常读 | 旧名已退役、从表中移除，再次打开同样要取名字锁与做目录判定，与新名走同一条受闸门约束的路径 |
+
+### 实施登记的差异与更严格的出口
+
+以下是第 3–6 步实施与评审中确认、合同「建议登记的差异」未列出的项，同步登记在 [0006 差异表](0006-m2-scope.md#与-3x-的差异)。它们不改变合同正文。
+
+**请求与行为差异**
+
+| 输入 | 3.x | 本实现 | 理由与影响 |
+| --- | --- | --- | --- |
+| 改名的新名是悬空别名 | 成功，但新集合被同名别名遮蔽（DescribeCollection 报目标不存在） | 1/1「已存在」，零写入 | 成功后集合无法访问，与「悬空别名由别名 RPC 保留」不矛盾：别名仍在，只是不接受它作为新名 |
+| 改名的新名路径已被占用（合同「残留目录」行的扩展） | 空目录静默覆盖并成功；非空目录、普通文件、符号链接报 1/0（`ENOTDIR` 等） | 一律 1/1「已存在」，零写入 | 不覆盖、不暴露绝对路径；只影响 3.x 中途退出留下的路径或手工放置的文件 |
+| 清空：snapshot 的 id 不是 32 位小写十六进制，或 `<name>.json` 的 id 与 snapshot 名不符 | 照常清空并删除 | 在任何写入之前返回 Storage 错误 | 清理按（名字，id）精确匹配删除，无法从格式不符的元数据推出安全的待删集合；3.x 自己写出的 snapshot 都符合 |
+| 清空：`wal/` 是符号链接 | 成功（删除链接并重建空 `wal/`，不跟随链接） | 零写入失败 | WAL 迁移要求普通目录，不跟随链接；`wal/` 是普通文件时两边都无法打开集合，不构成差异 |
+| 清空后的 manifest `version` 与 `.prev` | `version` 为 1，没有 `.prev` | `version` 为 flush 之后的旧值加 1，`.prev` 写为候选字节 | 版本单调；清空意图按字节判定提交点 |
+| 清空没有 `manifest.json` 的 partition key 集合 | 重建时写出 16 个桶 | 候选只含磁盘上已有的分区，桶由 partition key 注册表补回；`list_partitions` 与之后的路由、查询结果与 3.x 相同（互通用例逐 id 比较） | 候选 manifest 不凭空创建分区目录 |
+| 清空后的目录形状 | `rmtree` 后重建：空 `wal/`、无 `.prev`、无 `partitions/`（有分区时由 manifest 重建）与 `snapshots/` | 原地保留已有分区目录（含空目录），不建 `wal/`，`.prev` 与 manifest 字节相同，snapshot 目录清空 | 读取不依赖这些空目录；两边互相打开均已用例覆盖 |
+| 清空重开收尾失败（manifest 或目录同步、清理失败） | — | 本次打开报 Storage 错误；不缓存失败、不封锁整库，下次访问重试 | 失败判定缓存只用于确定性的 fail-closed，I/O 故障不缓存（0007） |
+| 非法语法的名字：读类 RPC（含空名、经指向非法名的别名）、DropAlias、AlterCollection | 读类 100/4「不存在」；DropAlias 无操作成功 | 1/0（校验错误） | 名字规则先于存在判定；只影响不合法名字，3.x 无法创建这样的对象 |
+| `aliases.json` 含 `NaN` / `Infinity` 字面量或嵌套超过 128 层 | 不因此失败（Python `json` 接受并忽略） | 解析失败，需要别名的 RPC 返回 1/0，文案与 3.x 不同 | 不放宽解析器；严格 JSON 之外的文件只可能来自手工编辑 |
+
+**只比 3.x 更严格的出口**（成功路径不变）
+
+| 出口 | 3.x | 本实现 |
+| --- | --- | --- |
+| 别名路径上的 I/O 错误：`retain_live_aliases`（create 前后与 drop 后剔除悬空别名）、`create_alias` 的路径检查、`alias_target_exists`、`alias::read` | `os.path.exists` 一类判定把 I/O 错误当作「不存在」继续 | 向上传递；create 可能由成功变为失败，drop 之后清理失败时别名残留到下一次 create / drop |
+| `schema.json` 无法读取或解析时的 AlterCollection 与改名 | 从内存重建，不读文件，继续成功 | 报错，零写入 |
+| AlterCollection 重读 `schema.json` | 内存重写：被删除的文件会被重建；替换之前失败时内存已改、直至重启 | 内存与磁盘一并更新或都不变；非属性键原样保留（只在外部篡改时可达） |
+| 改名：新名路径检查、旧名存在判定、改名前读取旧 `schema.json` | 吞掉 I/O 错误，旧名判定失败报 100/4；读取失败时已改了目录名 | 新名路径与旧名判定的 I/O 失败报 1/0（与 3.x 的 100/4 是码差）；读取失败零写入 |
+| 重开时无法处理的意图（损坏、版本未知；清空意图同时存在 0014 意图） | — | fail-closed 并给出人工恢复步骤，不删除任何文件：改名意图使该库的 create、drop、改名与别名写入被拒绝，数据读写照常；清空意图使该集合打开失败 |
 
 ### 模块与数据结构
 
@@ -292,9 +329,9 @@
 | 读请求（Describe、Query、Search、统计、load 状态等） | 别名叶子锁内取一次解析结果 → 名字锁（仅首次打开）→ 状态读锁 |
 | 集合数据写入（插入、删除、Upsert、Flush、索引与分区操作） | 共享许可 → 解析别名 → 现有链路 |
 | 别名写入 | 独占许可 → 别名叶子锁（读改写全程） |
-| AlterCollection | 独占许可 → 名字锁 → flush 锁 → 状态写锁 |
+| AlterCollection | 独占许可 → 名字锁（仅覆盖打开）→ flush 锁 → 状态写锁（仅覆盖发布） |
 | RenameCollection | 独占许可 → 目录变更锁 → 两个名字锁（按精确名字字节序）→ 旧句柄的 flush 锁 → 状态写锁（短暂）→ 别名叶子锁（短暂） |
-| TruncateCollection | 独占许可（第 1–7 步全程）→ 解析别名 → 名字锁 → flush 锁（第 1–7 步全程）→ 状态写锁（第 1–5 步发布新读视图之前全程） |
+| TruncateCollection | 独占许可（第 1–7 步全程）→ 解析别名 → 名字锁（仅覆盖打开）→ flush 锁（第 1–7 步全程）→ 0014 删除意图检查 → 重试上一次的清理 → 状态写锁（第 2–5 步，发布新读视图之前） |
 
 - **同层名字锁**：新增 `NameLease::lock_pair(a, b)`，内部按字节序先后加锁；[lock_order](../../crates/core/src/lock_order.rs) 增加一种只供该函数使用的同层登记方式，debug 构建断言同层至多两把且后者名字更大。其他同层嵌套仍报错。
 - **不等待维护**：合并全程持共享许可，独占许可的取得自然排在进行中的合并之后；任何操作都不在持有许可时等待维护队列。改名设置的「已移除」标记与现有 drop 相同，合并在提交边界的 `is_deleted` 检查处放弃。清空持独占许可，开始时没有进行中的合并，结束前也不会有新的合并开始；之后开始的合并读取的是清空后的 manifest。
@@ -324,7 +361,7 @@
 | P0 检查 | 独占许可；改名未完成时先重试补完（见 P4），仍失败则拒绝。归一化当前库并 `require_database`；`new_db` 非空且不等于当前库时返回 Unsupported。取目录变更锁；解析旧名，旧名按精确名字且带 `schema.json` 存在，否则 CollectionNotFound；`validate_filesystem_name(new)`；新名是别名或 `collections/<new>` 路径存在（含残留目录与只差大小写的名字）即 CollectionAlreadyExists；`lock_pair` 取两个名字锁；读取旧目录 `schema.json`，不是对象或 `collection_name` 不是字符串则报 Storage 错误 | 直接报错 | 操作前，无任何变更 |
 | P1a 同步 WAL | 有句柄时在其 flush 锁与状态写锁下 `mark_deleted(true)`、`sync_retained_wal` | `sync_retained_wal` 失败（data、delta 文件或 `wal/` 目录同步）：只撤销已移除标记，WAL 写者保持原样，与 drop 相同 | 操作前，旧集合可继续读写 |
 | P1b 意图与目录改名 | 写改名意图（tmp、fsync、改名、fsync 数据库根目录）；`rename(collections/old, collections/new)`；以目录列表核对 `new` 的精确名字 | 已写的意图删除；目录已改名而核对失败时先改回旧名并 fsync；在 `state_change` 内撤销已移除标记并 `freeze_active(true)`，使旧句柄进入编号严格更大的新代、恢复可写（WAL 写者已在 P1a 关闭，与 drop 目录改名失败后的处理相同）；代推进失败按 `state_change` 的现有处理使该集合不可用。改回失败则设置整库写入封锁、意图保留；只有删除意图失败时进入改名未完成状态 | 操作前，旧集合可继续读写；删除意图失败时该库受限、可重试，重开时按「旧名存在、新名不存在」删除意图 |
-| P2 退役旧名 | 核对通过后**立即**从 collection 表移除旧句柄，清除新旧两个名字的失败判定缓存；然后 fsync `collections/` | 目录同步失败：设置整库写入封锁，报「已改名、目录持久化未确认」，意图保留 | 旧名报不存在；新名在封锁期间首次打开按现有规则报封锁错误；重开后按意图收尾 |
+| P2 退役旧名 | 核对通过后**立即**从 collection 表移除旧句柄，清除新旧两个名字的失败判定缓存；然后 fsync `collections/` | 目录同步失败：设置整库写入封锁，报「已改名、目录持久化未确认」，意图保留 | 旧名报不存在；封锁期间旧名与新名的首次打开都报写入已封锁，已打开的其他集合照常读；重开后按意图收尾 |
 | P3 元数据 | 改写新目录 `schema.json` 的 `collection_name`（原始 JSON、`dump_file`、tmp、fsync、改名、fsync 集合目录）；别名叶子锁内把指向旧名的条目改指新名并写入 `aliases.json` | 文件替换**之前**失败：意图记入改名未完成状态，报「已改名、元数据维护未完成」。替换**之后**目录同步失败：设置整库写入封锁并报错，意图保留 | 前者：数据读写照常，create、drop、改名与别名写入先重试补完、仍失败则拒绝；后者：整库写入封锁，重开后按意图收尾 |
 | P4 删除意图 | 删除意图并 fsync 数据库根目录 | 记入改名未完成状态并报错 | 数据读写照常；下次受限操作先重试删除；断电后意图若重现，重开时按「新名存在、旧名不存在」幂等收尾 |
 
@@ -355,7 +392,7 @@
    - 重建失败（例如 `schema.json` 此刻无法读取）：使旧句柄不可用并从 collection 表移除，报 Storage 错误；下次访问按重开路径处理意图。
    - 目录同步失败时，新读视图仍发布，`retry_manifest = true`（沿用现有重试路径），意图保留，清理不开始。
    发布后释放状态写锁，继续持 flush 锁执行第 6 步。
-6. 目录同步确认后清理（持独占许可与 flush 锁、不持状态写锁）：先以 `dump_file` 把 `schema.json` 重写为规范字节（`collection_name` 写目录名，其余字段与值不变；tmp、fsync、改名、fsync 集合目录；字节已相同时跳过写入，但仍 fsync 集合目录，保证上一次未确认的替换落盘），使磁盘与重开后的顺序与 3.x 清空后相同（3.x 清空总会重写 `schema.json`）→ 逐个删除名字与 id 都匹配的 snapshot 元数据文件并 fsync 其目录 → 删除这些 snapshot 的 manifest 副本目录 → 删除意图中待删且不被当前 manifest 与剩余 snapshot 引用的文件，每个目录删除后 fsync → 以候选字节原子重写 `manifest.json.prev` → 删除意图并 fsync 集合目录 → 按剩余 snapshot 重新读取 `pinned_files`（通常为空）→ 清除 `truncate_cleanup` 标记、恢复 `can_compact` 与后台维护 → 删除第 3 步移入 staging 的 WAL 目录（失败只记日志）。删除幂等（不存在视为已删除），不触碰新的 `wal/`。期间新读请求看到空集合；任何写入都在清空返回、释放独占许可之后才进行。
+6. 目录同步确认后清理（持独占许可与 flush 锁、不持状态写锁）：先以 `dump_file` 把 `schema.json` 重写为规范字节（`collection_name` 写目录名，其余字段与值不变；tmp、fsync、改名、fsync 集合目录；字节已相同时跳过写入，但仍 fsync 集合目录，保证上一次未确认的替换落盘），使磁盘与重开后的顺序与 3.x 清空后相同（3.x 清空总会重写 `schema.json`）→ 逐个删除名字与 id 都匹配的 snapshot 元数据文件并 fsync 其目录（元数据文件已不存在视为已删，不同 id 的同名 snapshot 保留，见细化表）→ 删除这些 snapshot 的 manifest 副本目录 → 删除意图中待删且不被当前 manifest 与剩余 snapshot 引用的文件，每个目录删除后 fsync → 以候选字节原子重写 `manifest.json.prev` → 删除意图并 fsync 集合目录 → 按剩余 snapshot 重新读取 `pinned_files`（通常为空）→ 清除 `truncate_cleanup` 标记、恢复 `can_compact`（后台维护的暂停解除，下一次调度时生效）→ 删除第 3 步移入 staging 的 WAL 目录（失败只记日志）。删除幂等（不存在视为已删除），不触碰新的 `wal/`。期间新读请求看到空集合；任何写入都在清空返回、释放独占许可之后才进行。
 7. `schema.json` 规范重写在改名之后目录同步失败：按持久化合同设置整库写入封锁并报错，意图保留，重开时按意图补做（与 AlterCollection、改名一致）。其他清理失败（包括 `schema.json` 的 tmp 写入、文件同步与改名失败）：当次报「已清空、清理未完成」；`PersistentCollection::truncate_cleanup` 记录意图，`can_compact` 返回 false。之后的 Insert、Delete、Upsert、Flush、索引与分区操作在共享许可下只做“是否待清理”的检查；若待清理，立即释放共享许可并按上节“清理重试重新入闸”调用独占重试。独占重试成功后原请求从头重新执行；重试仍失败时原请求返回错误。`retry_manifest` 与清理重试仍保持提交顺序：先完成 manifest 重试，再执行第 6 步。
 - **意图格式**（`format_version` 1，所有层级 `deny_unknown_fields`）：
 
@@ -384,11 +421,11 @@
 | 层 | 内容 | 位置 |
 | --- | --- | --- |
 | 单元 | 别名表加载与解析失败不缓存；`dump_file` 与真实 Python `json.dump` 逐字节对照（schema、alias、manifest、`.prev`；默认值、分区、`index_specs`、非 ASCII、`1E2`、`-0`、宽整数、默认浮点值）；两种意图逐字段篡改（路径穿越、snapshot 名穿越、同一列表内重复、未知字段、候选 manifest 与旧 manifest 关系不符、侧车 stem 不属于对应 data 集合）均 fail-closed 且 unlink 次数为零；合法意图的三类正例：snapshot 之后经合并移出 manifest 再清空、两个 snapshot 共享同一 data 与侧车、snapshot 钉住已 Drop 分区的数据，校验通过且清空后无遗留文件；`lock_pair` 的顺序与同层断言；放宽名字检查的边界 | core 模块内 |
-| 故障与崩溃（fault-injection） | 合同「验收方向 / 故障」列出的每个点，加：别名写入与 AlterCollection 的 tmp 改名前后与目录同步失败；0.3.0rc3 写出的未排序 `schema.json` 上的无操作 Alter 会重写；改名 P1a 的 data、delta 与 `wal/` 目录同步失败，以及 P1b 每个出口（意图写失败、目录改名失败、核对失败并改回、删除意图失败）之后执行插入、Flush、重开，新旧数据都不丢；改名 P2、P3 各暂停点上旧名 / 新名的 Describe、统计、Query、Insert、Flush 与 create / drop 的确定结果及写入闸门状态；清空第 3 步对五种 `wal/` 状态（从未写入、只建 schema、上一次清空后未写入、存在空 `wal/`、`wal/` 不存在）均成功，`wal/` 为文件或符号链接以及 staging 目标已存在时零写入失败；WAL 目录改名之前、之后与目录同步之后退出，分别用本实现与 3.x 重开，计数与主键不重复、不丢失，后续写入与下一次 flush 成功；改名失败与目录同步失败之后的插入、Flush 与重开；清空第 4–7 步每步之后进程退出、I/O 错误与 panic；重开处理中的 fsync 失败；清理失败后由 Insert、Delete、Upsert、Flush、索引和分区操作分别触发“释放共享许可 → 独占重试 → 成功则从头重跑”的完整路径，并在独占重试的 schema 目录同步失败时断言整库写入封锁、无并发写入越过封锁 | [db_persistence.rs](../../crates/core/tests/db_persistence.rs)、[crash_recovery.rs](../../crates/core/tests/crash_recovery.rs) |
-| 同一进程的读视图 | 清空后立即 count / get / query / search 为空，auto_id 从 1 开始，属性、分区与索引顺序与重开及 3.x 相同；清空后重开 auto_id 继续递增；以 0.3.0rc3 写出的未排序 `schema.json` 直接清空，比较清空前、清空后同一进程、清空后重开三种状态的属性顺序，并比较磁盘字节，均与 3.x 相同；第 4、5 步失败后 staging 中迁移的 WAL 目录被删除；第 6 步成功后 `pinned_files` 为空、`truncate_cleanup` 已清除、后台合并恢复；清空第 5 步发布之后、第 6 步完成之前用暂停钩子发起读写与 Flush：读看到空集合，写入与 Flush 在清空返回后才执行；清空中 `schema.json` 规范重写的 tmp 写入、文件同步、改名、集合目录同步分别注入失败，断言写入闸门状态（只有目录同步失败时整库封锁），成功重试或重开后磁盘为规范字节、重开属性顺序与 3.x 相同 | [db_persistence.rs](../../crates/core/tests/db_persistence.rs) |
-| 并发 | 合同「并发」各组合；独占许可（别名写入、AlterCollection、改名、清空）与进行中合并的先后，清空期间整个数据库的写入等待，已打开集合的纯读不受影响，未打开集合的首次懒打开等待；清理重试完成共享到独占的重新入闸后，原请求从头执行且不能重复应用任何变更 | [concurrency_faults.rs](../../crates/core/tests/concurrency_faults.rs) |
-| 差分 | 「参照实测」每一行的 raw gRPC 与 MilvusClient 对照，两条 SDK 线；预期差异单独断言 | `tests/differential/` 新增文件 |
-| 互通 | 合同「互通」各项，含 3.x 中途退出的目录与本实现意图未完成时由 3.x 打开；Arrow 15 / 25 两个参照环境 | [tests/storage_interop/](../../tests/storage_interop/) |
+| 故障与崩溃（fault-injection） | 合同「验收方向 / 故障」列出的每个点，加：别名写入与 AlterCollection 的 tmp 改名前后与目录同步失败；0.3.0rc3 写出的未排序 `schema.json` 上的无操作 Alter 会重写；改名 P1a 的 data、delta 与 `wal/` 目录同步失败，以及 P1b 每个出口（意图写失败、目录改名失败、核对失败并改回、删除意图失败）之后执行插入、Flush、重开，新旧数据都不丢；改名 P2、P3 各暂停点上旧名 / 新名的 Describe、统计、Query、Insert、Flush 与 create / drop 的确定结果及写入闸门状态；清空第 3 步对五种 `wal/` 状态（从未写入、只建 schema、上一次清空后未写入、存在空 `wal/`、`wal/` 不存在）均成功，`wal/` 为文件或符号链接以及 staging 目标已存在时零写入失败；WAL 目录改名之前、之后与目录同步之后退出，分别用本实现与 3.x 重开，计数与主键不重复、不丢失，后续写入与下一次 flush 成功；改名失败与目录同步失败之后的插入、Flush 与重开；清空第 4–7 步每步之后进程退出、I/O 错误与 panic；重开处理中的 fsync 失败；清理失败后由 Insert、Delete、Upsert、Flush、索引和分区操作分别触发“释放共享许可 → 独占重试 → 成功则从头重跑”的完整路径，并在独占重试的 schema 目录同步失败时断言整库写入封锁、无并发写入越过封锁 | [aliases.rs](../../crates/core/tests/aliases.rs)、[collection_properties.rs](../../crates/core/tests/collection_properties.rs)、[rename.rs](../../crates/core/tests/rename.rs)、[truncate.rs](../../crates/core/tests/truncate.rs)（均含 `faults` 子进程退出用例，需 `fault-injection`）、[fs_commit.rs](../../crates/core/src/storage/fs_commit.rs) 的单元测试 |
+| 同一进程的读视图 | 清空后立即 count / get / query / search 为空，auto_id 从 1 开始，属性、分区与索引顺序与重开及 3.x 相同；清空后重开 auto_id 继续递增；以 0.3.0rc3 写出的未排序 `schema.json` 直接清空，比较清空前、清空后同一进程、清空后重开三种状态的属性顺序，并比较磁盘字节，均与 3.x 相同；第 4、5 步失败后 staging 中迁移的 WAL 目录被删除；第 6 步成功后 `pinned_files` 为空、`truncate_cleanup` 已清除、后台合并恢复；清空第 5 步发布之后、第 6 步完成之前用暂停钩子发起读写与 Flush：读看到空集合，写入与 Flush 在清空返回后才执行；清空中 `schema.json` 规范重写的 tmp 写入、文件同步与改名作为 `replace_file` 第一个闭包的同一出口注入失败，替换之后的集合目录同步单独注入失败，断言写入闸门状态（只有目录同步失败时整库封锁），成功重试或重开后磁盘为规范字节、重开属性顺序与 3.x 相同 | [truncate.rs](../../crates/core/tests/truncate.rs)、[collection_properties.rs](../../crates/core/tests/collection_properties.rs) |
+| 并发 | 合同「并发」各组合；独占许可（别名写入、AlterCollection、改名、清空）与进行中合并的先后，清空期间整个数据库的写入等待，已打开集合的纯读不受影响，未打开集合的首次懒打开等待；清理重试完成共享到独占的重新入闸后，原请求从头执行且不能重复应用任何变更 | [rename.rs](../../crates/core/tests/rename.rs) 与 [truncate.rs](../../crates/core/tests/truncate.rs) 的暂停点用例、[compaction.rs](../../crates/core/tests/compaction.rs) 的独占变更与进行中合并用例 |
+| 差分 | 「参照实测」每一行的 raw gRPC 与 MilvusClient 对照，两条 SDK 线；预期差异单独断言 | [tests/differential/](../../tests/differential/) 的 `test_aliases.py`、`test_collection_properties.py`、`test_rename.py`、`test_truncate.py` |
+| 互通 | 合同「互通」各项，含 3.x 中途退出的目录与本实现意图未完成时由 3.x 打开；Arrow 15 / 25 两个参照环境 | [test_cross_implementation.py](../../tests/storage_interop/test_cross_implementation.py) 与 [test_management_crashes.py](../../tests/storage_interop/test_management_crashes.py) |
 | 端到端 | 参照 adapter 用例中范围内的条目复制或启用，更新 INVENTORY | [tests/python/adapter/](../../tests/python/adapter/) |
 | 统计 | 760 / 90 / 49 三组按同一方法重跑，逐条核对合同预期 | 仓库外，记录写入验收文档 |
 

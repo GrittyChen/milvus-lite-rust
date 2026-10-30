@@ -685,6 +685,33 @@ mod faults {
         }
     }
 
+    /// 暂停点的通道失效（测试钩子违约）发生在目录已改名、旧名已退役之后：按「改名未完成」收尾，
+    /// 下一次受限操作按磁盘意图补完。
+    #[test]
+    fn a_failed_pause_after_the_directory_rename_is_an_unfinished_rename() {
+        let root = tempfile::tempdir().unwrap();
+        let db = seeded(root.path());
+        let (entered_tx, entered) = std::sync::mpsc::channel();
+        drop(entered);
+        let (_resume, resume_rx) = std::sync::mpsc::channel();
+        pause_rename_once(RenamePausePoint::Retired, entered_tx, resume_rx);
+        let error = db
+            .rename_collection("", "c", "d", "")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("metadata maintenance is pending"), "{error}");
+        assert!(root.path().join(INTENT).exists());
+        assert_eq!(schema_name(root.path(), "d"), "c");
+        assert_eq!(aliases(root.path()).unwrap(), "{\n  \"a\": \"c\"\n}");
+        db.insert("", "d", batch(&[7])).unwrap();
+        db.create_collection("", "n", schema()).unwrap();
+        assert!(!root.path().join(INTENT).exists());
+        assert_eq!(schema_name(root.path(), "d"), "d");
+        assert_eq!(aliases(root.path()).unwrap(), "{\n  \"a\": \"d\"\n}");
+        assert_eq!(count(&db, "a"), 3);
+        db.close();
+    }
+
     #[test]
     fn requests_during_rename_wait_for_the_exclusive_permit_and_see_the_result() {
         for point in [RenamePausePoint::Retired, RenamePausePoint::SchemaReplaced] {

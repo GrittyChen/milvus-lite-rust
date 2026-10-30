@@ -16,16 +16,16 @@ ENV = {k: "v" for k in scorecard.environment_keys("linux-x86_64")}
 
 
 def test_write_stage_and_merge(tmp_path):
-    stage.write(tmp_path, "linux-x86_64", "interop", {"collected": 211, "executed": 211, "group": 0}, ENV)
+    stage.write(tmp_path, "linux-x86_64", "interop", {"collected": 248, "executed": 248, "group": 0}, ENV)
     stage.write(tmp_path, "sdist", "build-root", {}, ENV)
     merged = c.merge_stages(sorted(tmp_path.iterdir()))
-    assert merged["linux-x86_64"]["interop"]["counts"]["collected"] == 211
+    assert merged["linux-x86_64"]["interop"]["counts"]["collected"] == 248
     assert merged["sdist"]["build-root"] == {"returncode": 0, "counts": {}, "environment": ENV}
 
 
 @pytest.mark.parametrize("scope, name, counts, message", [
-    ("linux-x86_64", "interop", {"collected": 210, "executed": 210, "group": 0}, "do not match"),
-    ("linux-x86_64", "interop", {"collected": 211, "executed": 211}, "do not match"),
+    ("linux-x86_64", "interop", {"collected": 247, "executed": 247, "group": 0}, "do not match"),
+    ("linux-x86_64", "interop", {"collected": 248, "executed": 248}, "do not match"),
     ("macos-arm64", "pid1", {}, "unknown stage"),
     ("nowhere", "x", {}, "unknown stage"),
 ])

@@ -336,7 +336,7 @@ M1 证明了整条链路可行，但数据只在内存中，不发布（[0004](0
         - 理由：pymilvus 的 `has_collection` 经 DescribeCollection 判断，「存在就 drop 再重建」是 Milvus 官方 Quickstart 的写法（[milvus.io/docs/quickstart.md](https://milvus.io/docs/quickstart.md)），也是用户代码里最常见的模式。首次发布时仍会有 ARRAY、nullable、function 这类不支持的内容，DescribeCollection 报错的话，这个差异会一直带到发布。
         - 这只是 schema 的 proto 编码，不增加能力，不违反不变量 15，也与第 11 项中文件错误时「DescribeCollection 照常」一致。
         - 代价：gRPC 层的 schema 编码要覆盖 3.x 的全部字段类型、function 与属性，估计一两百行，并与 3.x 的 DescribeCollection 做差分。fail-closed 的判定本来就要完整解析 schema。
-        - 第 15 项中别名命中的情况不变，仍返回 UNIMPLEMENTED：别名少见。
+        - 第 15 项中别名命中的情况原计划返回 UNIMPLEMENTED（实际未实现：经别名的访问报「collection 不存在」）；[0023](0023-aliases-rename-truncate-databases.md) 的 A 已支持别名，经别名的访问按 3.x 解析。
       - 文件错误：按第 11 项处理。
       - 目录内容不动。
     - 其余 collection 照常使用。
@@ -349,6 +349,7 @@ M1 证明了整条链路可行，但数据只在内存中，不发布（[0004](0
     - 请求的名字命中 `aliases.json`，或 `databases/<db>` 已存在时，返回 UNIMPLEMENTED；
     - 新建 collection 的名字与已有别名相同时，与 3.x 报同样的错误；
     - `.database-staging/` 的残留在打开数据库、拿到 LOCK 之后清空，与 3.x 相同（M1 拒绝打开）。
+    - **后续修订**：别名命中的 UNIMPLEMENTED 从未实现（经别名的访问报「collection 不存在」），由 [0023](0023-aliases-rename-truncate-databases.md) 的 A 改为按 3.x 解析别名并支持别名 RPC；`databases/<db>` 已存在时返回 UNIMPLEMENTED 由 A 的 `require_database` 实现，数据库本身的支持属于 0023 的 B。
 16. **collection 何时打开、按什么顺序打开。** **建议与 3.x 相同，在第一次被访问时打开并恢复，失败只影响这个 collection。**
     - **顺序：先完成全部读取与判定，再做任何删除**：
       - 读取与判定：schema、manifest、snapshot 元数据；manifest 引用的全部文件都读入并校验；读取 WAL。
@@ -565,7 +566,7 @@ M1 证明了整条链路可行，但数据只在内存中，不发布（[0004](0
 | drop 时 flush 失败 | drop 报错 | drop 不 flush，照常完成 | 第 17 项 | 磁盘写满时的 drop |
 | drop 与 create 中途崩溃 | drop 留下半个目录，collection 可能仍可见但数据不全；create 留下没有 schema 的目录，这个名字永久不能再用 | 两者都是原子的 | 第 17 项 | drop、create 时崩溃 |
 | create/drop 改名后目录 fsync 失败 | 3.x 不执行这两处目录 fsync | 返回「目录已变更、持久化未确认」；本服务实例停止所有 collection 的写入、Flush、CreateIndex、create/drop 与可能清理孤儿文件的首次打开，直到重开；已打开 collection 的纯读可继续 | 未确认的目录改名不能靠原样重试 fsync 证明持久化，[0007](0007-m2-storage-engine.md) | 该故障后的无关 collection 写入及首次 Query/Search/Get |
-| create 遇到指向不存在目标的旧别名 | 保留旧别名；目标同名重建后旧别名重新指向新 collection | create 改名前删除悬空别名，后续别名写入也过滤悬空目标 | 避免旧别名静默接到新 collection，见 [0007](0007-m2-storage-engine.md#dropcreate-与关闭) | 3.x 写出 `aliases.json` 后目标消失，再同名建表并由 3.x 读取别名；Rust 别名 RPC 仍不支持 |
+| create 遇到指向不存在目标的旧别名 | 保留旧别名；目标同名重建后旧别名重新指向新 collection | create 改名前删除悬空别名，后续别名写入也过滤悬空目标 | 避免旧别名静默接到新 collection，见 [0007](0007-m2-storage-engine.md#dropcreate-与关闭) | 3.x 写出 `aliases.json` 后目标消失，再同名建表并由 3.x 读取别名；别名 RPC 已由 0023 的 A 支持，它们保留悬空别名，只有 create / drop 剔除 |
 | staging 根路径是目录符号链接 | 跟随链接并清理目标中的残留，可能删除库外文件 | 拒绝打开数据库，不删除链接目标中的文件 | 防止启动期清理穿透托管目录；普通文件占据根路径时两边均拒绝打开 | `.database-staging/` 被软链到库外；互通用例固定两边的打开与删除行为 |
 | staging 单条目的类型读取失败 | `isdir/islink` 把 stat 错误转换为否；后续单条目删除错误被忽略，不阻断打开 | 完整判定期间 `DirEntry::file_type` 报错则拒绝打开，尚未删除任何残留 | 类型不明时保留全部残留，维持先判定后删除；整目录扫描失败两边均向上传递 | 文件系统返回条目类型读取错误；不将外程删除条目必然视为这种错误 |
 | drop 目录已移走而 `aliases.json` 写入失败 | 报错，旧别名可能悬空 | 报错并说明目录已移走；同名 drop 重试、同名 create 或后续写 `aliases.json` 时清理悬空别名；仅重开不清理 | 规则 5、[0007](0007-m2-storage-engine.md) | drop 后立即重试或同名 create |
@@ -578,6 +579,10 @@ M1 证明了整条链路可行，但数据只在内存中，不发布（[0004](0
 | CreateIndex 的 `params` / `search_params` 是严格 JSON，但含超出有限 float64 范围的数字（raw gRPC，如 `{"x": 1e999}`，包括嵌套对象或数组中的值）；以及 0.3.0rc3 已按这种请求写出的存量定义 | 读成 inf 并接受，manifest 中写出非标准 JSON 的 `Infinity`，严格 JSON 的读取方打不开 | 新请求返回 UNIMPLEMENTED，写明这类数字无法持久化，不写入索引定义、不重写 manifest（CreateIndex 既有的先行 flush 与 WAL 清理可能先发生，与其他建索引错误相同）；有限数、宽整数与下溢为 0 的数照常保存，manifest 与 3.x 的 `json.dump` 逐字节相同。存量定义在任何 manifest 重写中保留严格 JSON 的数字文本（如 `1e+999`），不写 `Infinity`，这是共享 JSON 文件与 3.x 字节唯一的不同；3.x 的 `json.load` 同样读成 inf | 与 `NaN` / `Infinity` 字面量的参数已返回 UNIMPLEMENTED 属同一类值，新定义不复制；存量定义若照 3.x 写成 `Infinity`，本实现与 0.3.0rc3 重开即失败，若写出前报错，则因 DropIndex 先 flush 而无法恢复写入，保留数字文本是唯一使三方都能读回的写法 | [db_persistence.rs](../../crates/core/tests/db_persistence.rs) 的拒绝与 manifest 零重写、有限值字节、存量 `1e+999` 两轮重写后重开用例；[test_grpc_translation.py](../../tests/python/test_grpc_translation.py) 的 raw CreateIndex 用例；本地以 3.x 打开重写后目录的核对记录在 0023 A 验收中 |
 | 已提交删除覆盖旧行时的部分 upsert（待 Upsert 接入后验收） | 3.x 在缺陷 a 留下的重复目录上可能仍读旧行并合并字段 | 只合并仍有效的最新行，不读已提交删除覆盖的旧版本 | 缺陷 a；[0007「写入」](0007-m2-storage-engine.md#写入) | 3.x 崩溃后带重复 WAL 的目录 |
 | 检索中距离并列且落在截断位置时，取哪几行 | 由 numpy `argpartition` 决定，每个源取的个数不少于 4 时近似任意 | 取全局顺序中位置最先的 | 第 23 项；复刻要放弃流式 TopK 与并行。M1 起即如此 | 距离大量相同的检索 |
+| 0023 A 的请求语义差异：RenameCollection 的 `newDBName` 指向其他数据库；改名新名为悬空别名或路径已被占用（残留目录、文件、符号链接）；清空时 snapshot 标识不合法或 `wal/` 为符号链接；范围外 schema 上的清空与改属性；写 `timezone`；非法语法名字（读类 RPC、DropAlias、AlterCollection）；`aliases.json` 含 `NaN` / `Infinity` 或嵌套过深 | 忽略 `newDBName`；悬空别名与空目录上改名成功，其他路径 1/0；照常清空；能成功；校验后保存；读类 100/4、DropAlias 无操作成功；解析接受 | 分别为 UNIMPLEMENTED、1/1 零写入、零写入拒绝、UNIMPLEMENTED 零写入、UNIMPLEMENTED 零写入、1/0、解析失败 1/0 | 不静默改变用户请求的对象，不覆盖任何已有路径，不对不理解的内容清空，不放宽解析器；逐项理由与出口见 [0023「实施登记的差异」](0023-aliases-rename-truncate-databases.md#实施登记的差异与更严格的出口) | raw gRPC 与 pymilvus 的预期差异用例 |
+| 0023 A 的清空结果形状：manifest `version`、`.prev`、无 manifest 的 partition key 集合、目录形状 | `version` 为 1，无 `.prev`；无 manifest 的 partition key 集合重建 16 个桶；目录重建 | `version` 为旧值加 1，`.prev` 与 manifest 相同，桶由注册表补回，原地保留空分区目录、不建 `wal/` | 清空以一次 manifest 原子替换为提交点；读取与路由与 3.x 相同 | 互通用例逐 id 比较两边清空后的路由与数据 |
+| 0023 A 的 I/O 与解析出口：别名路径（create / drop 的悬空别名剔除、目标存在判定、别名文件读取）、`schema.json` 无法读取时的 AlterCollection 与改名、改名的新名与旧名判定 | 把 I/O 错误当「不存在」继续；从内存重建；旧名判定失败报 100/4 | 向上传递（1/0 或存储错误），零写入；create 可能由成功变为失败，drop 后清理失败的别名残留到下一次 create / drop | 规则 5：I/O 与校验失败必须向上传递；只比 3.x 更严格 | 见 0023 的更严格出口表 |
+| 清空、改名的崩溃窗口与重开收尾 | 可能留下残缺集合，或名字与目录不一致、别名指向旧名 | 私有意图文件加原子提交点；重开后只有「操作前」或「操作后」，意图无法处理时 fail-closed 并给出人工恢复步骤，I/O 失败的收尾不缓存、不封锁整库 | 0002 约束 1 的例外清单、[0023](0023-aliases-rename-truncate-databases.md) | 两种意图的故障与进程退出用例 |
 
 2026-10-19 修订：撤销原“同批重复主键 Upsert 累计前一行更新”的差异，普通及 partition key 集合均按请求前状态独立合并；最后一行未提供的动态字段恢复为请求前值，新主键不继承前一行新增字段。这是对既有公开行为的主动对齐，理由、回归及独立验收见 [Upsert 修复记录](../testing/0017-non-key-upsert-fix.md)。跨请求写锁、删除可见性及持久化格式不变。
 
@@ -588,7 +593,7 @@ M1 证明了整条链路可行，但数据只在内存中，不发布（[0004](0
 | 差异 | 3.x | M2 | 理由 | 影响的用例 |
 | --- | --- | --- | --- | --- |
 | 含不支持内容的 collection | 能使用 | 列出；DescribeCollection 与 drop 照常，其余返回 UNIMPLEMENTED | 第 14 项 | 用 3.x 的其他功能写过的目录 |
-| 已有的别名与其他数据库 | 能使用 | UNIMPLEMENTED | 第 15 项 | 经别名或 `db_name` 的访问 |
+| 已有的其他数据库 | 能使用 | UNIMPLEMENTED（别名已由 0023 的 A 支持） | 第 15 项 | 经 `db_name` 的访问 |
 | 带 limit 的过滤结果顺序 | 后台 compaction 之后改变 | M2 历史不合并；首发扩展按 [0010](0010-compaction-and-tombstone-gc.md) 的来源序/差异验收 | 第 3 项及后续 0010 | 带 limit 且文件数不少于 4 的过滤 |
 | ManualCompaction 与 GetCompactionState | 返回成功，恒为 Completed | M2 历史 UNIMPLEMENTED；首发扩展成功应答/Completed，不能当成 drain | 第 3 项、0010，不变量 15 | `client.compact()`、`optimize()` |
 | 被覆盖的旧版本与已删除的行 | compaction 回收 | M2 历史不回收；首发按 0010/0011 合并与 GC | 第 3 项、0010/0011 | 长期运行的写入 |

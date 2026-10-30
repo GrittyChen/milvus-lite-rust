@@ -48,7 +48,7 @@ CI 分快速层与对照层，在三个标准平台的托管机器上运行：Li
 每个平台的两条 SDK 差分各为一个 job；互通与固定真值核验同在一个 job，真值核验在互通全部分片结束后执行。真值核验原为独立 job，只需数分钟，并入后少占一个 macOS 执行机。
 
 1. **参照**：以 depth 1 取公开仓库 `milvus-io/milvus-lite` 的固定 commit `43d1257774e629bc9f66873977ab7c320d5bf5a7`（即 tag `v3.2.1`），放到被忽略的 `references/milvus-lite/`，核对 HEAD 与工作树干净；参照只在运行时取得，不入库。差分的 `MILVUS_LITE_3X_PYTHON` 使用参照 Arrow 25 环境：[test_filter_s1.py](../../tests/differential/test_filter_s1.py) 在 arm64 上要求参照的 pyarrow 为 25.0.1，不固定 pyarrow 的环境会在两个 arm64 平台失败。
-2. **差分与互通**：两条 SDK 线的完整差分与 Arrow 15 / 25 互通按 0019 用 tests/sharding 分片执行，`summary.json` 的 `passed` 与各项核对进入判定。`--expect` / `--expect-group` 写在工作流中（当前差分 421 / 118、互通 211 / 0），与增删用例的提交一同修改、一同评审，不从同一次收集取值。互通先按 0019 执行三条预构建命令并核对 `fresh`；同一 job 内 FI 的 cargo test 不与互通同时运行。并发度按托管机器的核数与内存在试点中确定。
+2. **差分与互通**：两条 SDK 线的完整差分与 Arrow 15 / 25 互通按 0019 用 tests/sharding 分片执行，`summary.json` 的 `passed` 与各项核对进入判定。`--expect` / `--expect-group` 写在工作流中（当前差分 431 / 118、互通 248 / 0），与增删用例的提交一同修改、一同评审，不从同一次收集取值。互通先按 0019 的预构建清单（以工作流为准）执行并核对 `fresh`；同一 job 内 FI 的 cargo test 不与互通同时运行。并发度按托管机器的核数与内存在试点中确定。
 3. **固定真值核验**：S1 语法、顶层动态过滤、完整布尔树与 ARRAY 的 `--verify`（后两项 Arrow 15 / 25 各执行），`schema_truth.py --verify-nullable-filter-fixture`（Arrow 15 / 25 各执行），Unicode 分类表核验（CPython 3.12，在仓库内执行以使用固定工具链的 rustfmt），以及 `partition_visibility_probe verify-core`。命令见 AGENTS「常用命令」。
 
 ### 不纳入 CI

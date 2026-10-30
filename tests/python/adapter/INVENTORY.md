@@ -520,7 +520,7 @@
 
 ## [test_grpc_compaction.py](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_compaction.py)
 
-2 条原样复制。自动维护及两个应答 RPC 的合同见 [0010](../../../docs/decisions/0010-compaction-and-tombstone-gc.md)；Completed 是兼容应答，不表示后台维护已排空。
+2 条：已复制 2。自动维护及两个应答 RPC 的合同见 [0010](../../../docs/decisions/0010-compaction-and-tombstone-gc.md)；Completed 是兼容应答，不表示后台维护已排空。
 
 | 用例 | 状态 | 说明 |
 | --- | --- | --- |

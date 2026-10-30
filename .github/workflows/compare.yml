@@ -140,7 +140,7 @@ jobs:
           . .github/ci/crash_capture.sh
           .venv/bin/python tests/sharding/shard.py plan --python .venv/bin/python --suite tests/differential \
             --out "$RUNNER_TEMP/plan" --shards ${{ matrix.shards }} \
-            --group-fixture diff --group-fixture rust_uri --group-fixture ref_uri --expect 421 --expect-group 118
+            --group-fixture diff --group-fixture rust_uri --group-fixture ref_uri --expect 431 --expect-group 118
           .venv/bin/python tests/sharding/shard.py run --plan "$RUNNER_TEMP/plan/plan.json" --out "$RUNNER_TEMP/run"
       - name: 差分（pymilvus 2.6.17，安装 wheel，仓库外运行）
         if: matrix.suite == 'diff-2.6.17'
@@ -151,7 +151,7 @@ jobs:
           mkdir "$RUNNER_TEMP/outside"
           .venv/bin/python tests/sharding/shard.py plan --python "$RUNNER_TEMP/v26/bin/python" --suite "$PWD/tests/differential" \
             --cwd "$RUNNER_TEMP/outside" --out "$RUNNER_TEMP/plan" --shards ${{ matrix.shards }} \
-            --group-fixture diff --group-fixture rust_uri --group-fixture ref_uri --expect 421 --expect-group 118
+            --group-fixture diff --group-fixture rust_uri --group-fixture ref_uri --expect 431 --expect-group 118
           .venv/bin/python tests/sharding/shard.py run --plan "$RUNNER_TEMP/plan/plan.json" --out "$RUNNER_TEMP/run"
       - name: 存储互通
         if: matrix.suite == 'interop'
@@ -161,11 +161,13 @@ jobs:
           MILVUS_LITE_ARROW15_PYTHON: ${{ runner.temp }}/ref15/bin/python
         run: |
           . .github/ci/crash_capture.sh
-          # 用例内部会以同样的环境调用这三条命令；先构建并核对 fresh，避免分片同时编译（0019 P0 第 3 条）。
+          # 用例内部会以同样的环境调用这些命令；先构建并核对 fresh，避免分片同时编译（0019 P0 第 3 条）。
           commands=(
             "build -p milvus-lite-core --example storage_interop"
             "test -p milvus-lite-core --features fault-injection --test crash_recovery --no-run"
             "build -p milvus-lite-core --features fault-injection --example index_change_fault"
+            "test -p milvus-lite-core --features fault-injection --test truncate --no-run"
+            "test -p milvus-lite-core --features fault-injection --test rename --no-run"
           )
           for i in "${!commands[@]}"; do
             read -ra args <<< "${commands[$i]}"
@@ -174,7 +176,7 @@ jobs:
             python3 .github/ci/cargo_fresh.py "$RUNNER_TEMP/fresh-$i.json"
           done
           .venv/bin/python tests/sharding/shard.py plan --python .venv/bin/python --suite tests/storage_interop \
-            --out "$RUNNER_TEMP/plan" --shards ${{ matrix.shards }} --expect 211 --expect-group 0
+            --out "$RUNNER_TEMP/plan" --shards ${{ matrix.shards }} --expect 248 --expect-group 0
           .venv/bin/python tests/sharding/shard.py run --plan "$RUNNER_TEMP/plan/plan.json" --out "$RUNNER_TEMP/run"
       - name: 固定真值核验
         # 在互通之后串行执行，不与互通的分片同时运行。

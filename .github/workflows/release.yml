@@ -485,7 +485,9 @@ jobs:
             i=0
             for command in "build -p milvus-lite-core --example storage_interop" \
                            "test -p milvus-lite-core --features fault-injection --test crash_recovery --no-run" \
-                           "build -p milvus-lite-core --features fault-injection --example index_change_fault"; do
+                           "build -p milvus-lite-core --features fault-injection --example index_change_fault" \
+                           "test -p milvus-lite-core --features fault-injection --test truncate --no-run" \
+                           "test -p milvus-lite-core --features fault-injection --test rename --no-run"; do
               read -ra args <<< "$command"
               cargo "${args[@]}" --locked
               cargo "${args[@]}" --locked --message-format=json > "$RUNNER_TEMP/fresh-$i.json"

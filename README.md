@@ -91,11 +91,12 @@ finally:
 
 本候选的产品运行源码与依赖继承 0.3.0rc2，能力与已登记差异全部继承，不新增功能、RPC、数据格式或依赖；`crates/` 中相对 0.3.0rc2 的变化全部位于 `cfg(test)`，发行二进制不编译。仓库另包含持续集成、测试工具、发行工作流与文档改动，这些不进入运行时二进制或产品依赖。本版起候选改由发行工作流构建、验收并签发来源证明，范围与依据见源码树中的 0015–0018、0021 与 0022 决策。本版实际验收结果以对应 Release 链接的记录为准，开发验收不替代最终产物验收。
 
-`0.3.0rc3` 的范围包括基本 CRUD、Upsert/Delete、Flush/关闭重开、FLAT 的 L2/IP/COSINE、标量与动态字段比较、and/or/not、in/not in、LIKE、is null/exists、JSON 与动态字段路径、json_contains/array_contains 系列及 array_length、后台 compaction 与 tombstone 回收，以及下述已有能力。过滤按官方 3.x 的整条表达式路线执行，各路线对缺失值、短路和类型错误的处理不同；范围与参照缺陷见 0014。算术运算、text_match、几何与时间谓词、alias/rename、BM25/function chain、稀疏向量等范围外能力保持明确的 UNIMPLEMENTED，不静默忽略条件。官方 3.x 数据互通仍受类型、索引与已登记历史目录限制约束，不宣称兼容它的全部功能。
+`0.3.0rc3` 的范围包括基本 CRUD、Upsert/Delete、Flush/关闭重开、FLAT 的 L2/IP/COSINE、标量与动态字段比较、and/or/not、in/not in、LIKE、is null/exists、JSON 与动态字段路径、json_contains/array_contains 系列及 array_length、后台 compaction 与 tombstone 回收，以及下述已有能力。过滤按官方 3.x 的整条表达式路线执行，各路线对缺失值、短路和类型错误的处理不同；范围与参照缺陷见 0014。算术运算、text_match、几何与时间谓词、BM25/function chain、稀疏向量、数据库 RPC 等范围外能力保持明确的 UNIMPLEMENTED（alias、rename、truncate 与集合属性在 0.3.0rc3 同为 UNIMPLEMENTED，开发线见下文「集合管理」一条），不静默忽略条件。官方 3.x 数据互通仍受类型、索引与已登记历史目录限制约束，不宣称兼容它的全部功能。
 
 - 显式分区支持 Create / Drop / Has / Show / statistics，以及写入和读取的分区选择；LoadPartitions / ReleasePartitions 仍未实现。读取先选分区再判版本，删除按主键全局生效；Drop 保留其它分区仍需的全局删除记录，避免重开后已删除行复活。目录安全拒绝和参照差异见 0017。
 - partition key 支持非主键 INT64 / VARCHAR，按参照固定哈希路由至 16 桶，另保留 `_default`。生成 auto_id 取分桶后的行序号，返回顺序仍对应原请求，可能得到 `[1,3,2]`；确定性校验 / 转换失败在追加任何 WAL 前整批拒绝，自动 ID 会覆盖可读旧行时整批拒绝。真实 I/O 故障仍按已校验前缀恢复，不保证整批原子写入。
 - 非 key 同批重复主键 Upsert 的每一行现在都从请求前的旧值独立合并。旧行 `dict(id=1,x=0,y=0)`，同批 partial Upsert `[dict(id=1,x=1),dict(id=1,y=2)]` 的结果从已发布 0.2.0rc1 的 `dict(id=1,x=1,y=2)` 变为 `dict(id=1,x=0,y=2)`，与参照 3.x 一致；分成两个请求时仍依次合并。
+- 集合管理（开发线，尚未随预发布交付）：别名的创建、改指、删除、查询与列表，以及所有集合 RPC 对别名的解析；RenameCollection（改名后按重新打开的状态，不支持跨数据库改名）；TruncateCollection（保留分区、索引定义、别名与 load 状态，auto_id 从 1 重新分配）；AlterCollection 的集合属性（`timezone` 仍为 UNIMPLEMENTED）。只开放默认数据库，已存在的非默认数据库与数据库 RPC 保持 UNIMPLEMENTED。`schema.json`、`aliases.json` 等共享 JSON 改为与 3.x 相同的键排序格式写出；改名与清空各有一个短暂存在的私有意图文件（文件名与格式见 0002），由本实现重开时收尾，因此降级到不含该功能的版本之前须用本实现正常打开并关闭一次。与 3.x 的差异见 0023。
 - nullable / 默认值支持 BOOL、INT8/16/32/64、FLOAT/DOUBLE、VARCHAR、JSON；主键与向量的 nullable 仍不支持。
 - ARRAY 支持 BOOL、INT8/16/32/64、FLOAT/DOUBLE、VARCHAR 元素及父列 null；不支持嵌套、JSON 或向量元素。存量数组中的元素 null 可保留，但经 Query/Search 投影时报错，与参照实现一致。
 - Query iterator 按 INT64 / VARCHAR 主键排序，每个请求取得独立快照；不提供跨请求的一致性快照。

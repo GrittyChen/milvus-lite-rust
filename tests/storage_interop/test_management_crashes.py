@@ -19,7 +19,7 @@ RENAME_INTENT = "milvus-lite-rust.rename-intent.json"
 def build(test):
     output = run([
         "cargo", "test", "-p", "milvus-lite-core", "--features", "fault-injection",
-        "--test", test, "--no-run", "--message-format=json",
+        "--test", test, "--no-run", "--locked", "--message-format=json",
     ])
     artifacts = [json.loads(line) for line in output.splitlines()]
     executables = [
@@ -194,10 +194,13 @@ for p in client.list_partitions('c'):
     ids = [r['id'] for r in client.query('c', filter='', output_fields=['id'], partition_names=[p])]
     if ids:
         per_partition[p] = sorted(ids)
-print(sorted(per_partition.items()))
 assert sum(len(v) for v in per_partition.values()) == 5
+import json
+open(path + '.routes.json', 'w').write(json.dumps(per_partition, sort_keys=True))
 """])
-    # 两边写入后的分区归属相同：逐桶文件集合一致。
+    # 两边写入后每个 id 落入同一个分区。
+    routes = {side: json.loads((path.parent / f"{path.name}.routes.json").read_text()) for side, path in results.items()}
+    assert routes["rust"] == routes["reference"] and len(routes["rust"]) > 1, routes
     layout = {
         side: sorted(
             str(p.relative_to(path / "collections/c"))

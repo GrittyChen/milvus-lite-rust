@@ -50,6 +50,8 @@ x86 差分单轮平均 6.1 秒、中位数 5.4 秒，超过 10 秒的约 30 项�
    - `cargo test -p milvus-lite-core --features fault-injection --test crash_recovery --no-run --message-format=json`（同上）；
    - `cargo build -p milvus-lite-core --features fault-injection --example index_change_fault --message-format=json`（[test_index_storage_interop.py](../../tests/storage_interop/test_index_storage_interop.py)）。
 
+   0023 起互通另有两个用例调用 FI 测试程序，预构建清单随之加入 `cargo test -p milvus-lite-core --features fault-injection --test truncate --no-run` 与 `--test rename --no-run`（[test_management_crashes.py](../../tests/storage_interop/test_management_crashes.py)），同样带 `--locked` 并核对 `fresh`；清单以工作流为准。
+
    FI 特性的 core 构建会覆盖用例直接使用的 example 路径，因此 Rust / FI 阶段不与互通同时运行。
 4. **保持串行**：Python 全套与四组安装阶段保持串行，不与差分 / 互通同时运行，因为其中有按 CPU 速度标定的时序用例（[停服在途请求](../../tests/python/test_server_manager.py)）。串行的范围是同一执行机（CI 中即同一 job）：标定只要求同一执行机上没有其他 Python 全套、差分或互通进程争用 CPU，不同执行机上的 job 可以并行。Rust / FI、构建、PID 1、回退与 LOCK / strace 阶段维持原顺序。
 5. **记录**：候选验收在调度一节写明并行的阶段、并发度与资源条件。本机运行期间持有防睡眠断言，并保留电源日志。各阶段的通过判据不变。

@@ -34,3 +34,7 @@ WAL 故障矩阵另覆盖 data/delta 多批流的每个字节截断位置、中�
 存量 FAISS 度量检查见 `test_index_load_metrics.py`：五种类型 × BM25 / NONE × 侧车全有 / 部分缺失 / 全无 / 全删 / WAL-only，共 50 项；由真实 3.x 写两个非空 segment 与侧车，再分别复制冷重开。直接断言 LoadCollection 的 code / error_code / 原文、load 状态、失败后的三个读取入口 101，以及 DropIndex 后恢复。
 
 0015 B 的 `test_arrays.py` 使用同一环境矩阵，覆盖八种元素的父 null/空数组/元素 null、列表默认值、WAL/segment/实际合并、交替修改、gRPC 投影元素 null 的参照错误，以及真实 snapshot 钉住文件经 Rust 删除/合并后仍可恢复。`storage_interop` example 的 ARRAY 入口仅为测试工具，不进入 Python 正式包。
+
+0023 A 的集合管理互通分两处。`test_cross_implementation.py` 用 `alternate` 让两个实现各开一个进程轮流执行一步：别名的创建、改指、删除与经别名的操作，集合属性（含顺序），改名（含经别名、改名后按重开为 released），清空（含经别名；分区、索引定义、别名与 load 状态保留，auto_id 从 1 重新分配并在对方继续递增）；另有本实现的改名意图、清空意图以人工放置的未完成状态由 3.x 打开并改动、本实现再打开收尾，以及 3.x 清空中途退出留下的没有 `schema.json` 的目录。
+
+`test_management_crashes.py` 把进程退出的位置交给本实现的故障注入子进程：它构建并运行 `crates/core/tests/truncate.rs` 与 `rename.rs` 的测试二进制（`--features fault-injection`，需要 Rust 工具链），由环境变量选择退出点，不复制故障注入逻辑。清空在提交点之前的 6 个退出点由 3.x 打开并继续写入，本实现随后只删除意图；清空已提交、清理未完成的 4 个退出点，3.x 只写 WAL 就被强杀，本实现补做清理并回放；改名的 10 个退出点由 3.x 按目录名打开，本实现随后收尾到改名前或改名后；从未 flush 的 partition key 集合（没有 manifest）清空后，两边的分区、路由与读取一致，并互相可读；改名前后 auto_id 序列在两边延续。这些二进制属于互通用例另行调用的源码级组件，工作流在分片前预构建并核对 `fresh`（见 [0019](../../docs/decisions/0019-test-sharding.md)）。

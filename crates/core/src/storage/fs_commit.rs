@@ -535,8 +535,9 @@ mod tests {
         assert_eq!(fs::read(victim).unwrap(), b"unchanged");
     }
 
-    /// 替换之前的三类失败（钩子、临时文件写入、改名）共用同一出口：磁盘上仍是原文件、不留临时文件；
-    /// 只有改名之后的失败才是「已替换、未确认」。清空清理与别名、改名、Alter 的重试语义都依赖这一区分。
+    /// 替换之前的失败（钩子、改名）共用同一出口：磁盘上仍是原文件、不留临时文件；临时文件的打开、写入与同步
+    /// 失败与改名同在 `replace_file` 的第一个闭包内、走同一分支，没有单独注入。只有改名之后的失败才是
+    /// 「已替换、未确认」。清空清理与别名、改名、Alter 的重试语义都依赖这一区分。
     #[test]
     fn replace_file_reports_unchanged_before_the_rename_and_unconfirmed_after() {
         let root = tempfile::tempdir().unwrap();

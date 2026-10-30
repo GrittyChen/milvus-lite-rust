@@ -3,6 +3,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+#[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
@@ -51,12 +52,13 @@ fn schema_path(root: &Path, name: &str) -> PathBuf {
     root.join("collections").join(name).join("schema.json")
 }
 
-/// 字节与 inode：inode 不变说明没有发生替换。
-fn file_state(path: &Path) -> (Vec<u8>, u64) {
-    (
-        std::fs::read(path).unwrap(),
-        std::fs::metadata(path).unwrap().ino(),
-    )
+/// 字节与 inode：inode 不变说明没有发生替换。非 Unix 平台没有 inode，只比较字节（这些用例只在 Unix 上运行）。
+fn file_state(path: &Path) -> (Vec<u8>, Option<u64>) {
+    #[cfg(unix)]
+    let inode = Some(std::fs::metadata(path).unwrap().ino());
+    #[cfg(not(unix))]
+    let inode = None;
+    (std::fs::read(path).unwrap(), inode)
 }
 
 fn properties(db: &Db, name: &str) -> Vec<(String, String)> {

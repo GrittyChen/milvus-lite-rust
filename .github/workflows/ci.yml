@@ -173,7 +173,7 @@ jobs:
         run: |
           . .github/ci/crash_capture.sh
           .venv/bin/python tests/sharding/shard.py plan --python .venv/bin/python --suite tests/python \
-            --out "$RUNNER_TEMP/py30-plan" --shards 1 --order round-robin --expect 473 --expect-group 0
+            --out "$RUNNER_TEMP/py30-plan" --shards 1 --order round-robin --expect 485 --expect-group 0
           .venv/bin/python tests/sharding/shard.py run --plan "$RUNNER_TEMP/py30-plan/plan.json" --out "$RUNNER_TEMP/py30-run"
       - name: tests/python（pymilvus 2.6.17，安装 wheel，仓库外运行）
         if: matrix.sdk == '2.6.17'
@@ -181,7 +181,7 @@ jobs:
           . .github/ci/crash_capture.sh
           mkdir "$RUNNER_TEMP/outside"
           .venv/bin/python tests/sharding/shard.py plan --python "$RUNNER_TEMP/v26/bin/python" --suite "$PWD/tests/python" \
-            --cwd "$RUNNER_TEMP/outside" --out "$RUNNER_TEMP/py26-plan" --shards 1 --order round-robin --expect 473 --expect-group 0
+            --cwd "$RUNNER_TEMP/outside" --out "$RUNNER_TEMP/py26-plan" --shards 1 --order round-robin --expect 485 --expect-group 0
           .venv/bin/python tests/sharding/shard.py run --plan "$RUNNER_TEMP/py26-plan/plan.json" --out "$RUNNER_TEMP/py26-run"
       - name: 工具自检
         # tests/benchmarks 的部分用例会导入已安装的开发扩展，因此在 3.0.2 线的 job 中、端到端之后串行执行。
