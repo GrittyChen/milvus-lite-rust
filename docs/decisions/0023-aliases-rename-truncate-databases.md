@@ -279,7 +279,7 @@
 - **新模块**：
   - `alias`：别名表的加载、解析、写入与判定（取代 db.rs 中现有的 `read_aliases*` / `save_aliases*`）；
   - `storage::rename_intent`、`storage::truncate_intent`：两种意图的读写、校验与故障点，结构仿照 [index_intent](../../crates/core/src/storage/index_intent.rs)；
-  - `pyjson::dump_file`：与 Python `json.dump(obj, indent=2, sort_keys=True, ensure_ascii=False)` 逐字节相同的输出。键按码点递归排序；数字沿用 [pyjson.rs](../../crates/core/src/pyjson.rs) 现有的 Python 导入导出语义——整数保留精确十进制值，浮点按 Python `repr` 重新格式化（`1E2` 写为 `100.0`，整数 `-0` 写为 `0`），与 Python `json.load` 后再 `json.dump` 的结果相同。
+  - `pyjson::dump_file`：与 Python `json.dump(obj, indent=2, sort_keys=True, ensure_ascii=False)` 逐字节相同的输出。键按码点递归排序；数字沿用 [pyjson.rs](../../crates/core/src/pyjson.rs) 现有的 Python 导入导出语义——整数保留精确十进制值，浮点按 Python `repr` 重新格式化（`1E2` 写为 `100.0`，整数 `-0` 写为 `0`），与 Python `json.load` 后再 `json.dump` 的结果相同。唯一例外：溢出为 inf 的数字保留严格 JSON 文本（如 `1e+999`），不写 `Infinity`，见 [0006 差异表](0006-m2-scope.md#与-3x-的差异)。
 - **全部共享 JSON 文件改用 `dump_file`**：[schema_file.rs](../../crates/core/src/storage/schema_file.rs) 的 `to_bytes`（CreateCollection、AlterCollection、改名）、`aliases.json`、[manifest.rs](../../crates/core/src/storage/manifest.rs) 的 `to_bytes`（flush、合并、索引与分区变更、清空的当前 manifest，以及清空重写的 `manifest.json.prev`）。3.x 的 manifest 与 snapshot 同样用 `sort_keys=True` 写出。读取不变（保留文件顺序）。
 - **名字检查放宽**（取舍 3）：[recovery.rs](../../crates/core/src/storage/recovery.rs) 的 `load_committed` 与 [db.rs](../../crates/core/src/db.rs) 的 `unopened_load_state` 删除名字相等检查；`collection_name` 缺失或不是字符串仍由 `SchemaFile::read` 拒绝。集合名一律取目录名。
 - **已有非默认库**：`require_database` 改为 `Db` 的方法：非默认库且 `databases/<db>` 是目录时返回 Unsupported（UNIMPLEMENTED，写明数据库尚未支持），否则保持 DatabaseNotFound。

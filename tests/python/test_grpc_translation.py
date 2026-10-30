@@ -855,6 +855,12 @@ def test_create_index_unsupported_types_and_json(env):
     unimplemented(stub.CreateIndex, milvus_pb2.CreateIndexRequest(
         collection_name="c", field_name="v", extra_params=kv(index_type="FLAT", metric_type="L2",
                                                              params='{"a": NaN}')))
+    # 严格 JSON 中溢出为 inf 的数字与 NaN 字面量是同一类值：3.x 以 `Infinity` 写进 manifest。
+    for extra in (dict(params='{"x": 1e999}'), dict(search_params='{"a": [-1e999]}')):
+        unimplemented(stub.CreateIndex, milvus_pb2.CreateIndexRequest(
+            collection_name="c", field_name="v",
+            extra_params=kv(index_type="FLAT", metric_type="L2", **extra)))
+    assert status_of(stub.DescribeIndex(milvus_pb2.DescribeIndexRequest(collection_name="c")))[:2] == (700, 11)
 
 
 def test_create_and_describe_index(env):

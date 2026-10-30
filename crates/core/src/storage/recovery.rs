@@ -448,17 +448,8 @@ fn filter_committed_rows(
 pub fn load_committed(collection_dir: &Path) -> Result<RecoveredCollection, RecoveryError> {
     let schema_path = collection_dir.join("schema.json");
     regular_file(&schema_path)?;
+    // 集合名一律取目录名：改名在目录改名之后、`schema.json` 改写之前中断时两者合法地不同（0023 取舍 3）。
     let schema_file = SchemaFile::read(&schema_path)?;
-    let dir_name = collection_dir
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("");
-    if schema_file.collection_name != dir_name {
-        return Err(RecoveryError::Unsupported(format!(
-            "schema collection name {:?} differs from directory {dir_name:?}",
-            schema_file.collection_name
-        )));
-    }
     let schema = schema_file.to_core()?;
     let manifest_path = collection_dir.join("manifest.json");
     let prev_path = collection_dir.join("manifest.json.prev");

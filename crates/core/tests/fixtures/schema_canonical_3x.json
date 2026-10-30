@@ -1,0 +1,134 @@
+{
+  "collection_name": "c",
+  "enable_dynamic_field": true,
+  "fields": [
+    {
+      "auto_id": false,
+      "default_value": null,
+      "dim": null,
+      "dtype": "varchar",
+      "element_type": null,
+      "is_primary": true,
+      "max_capacity": null,
+      "max_length": 16,
+      "name": "id",
+      "nullable": false
+    },
+    {
+      "auto_id": false,
+      "default_value": null,
+      "dim": 2,
+      "dtype": "float_vector",
+      "element_type": null,
+      "is_primary": false,
+      "max_capacity": null,
+      "max_length": null,
+      "name": "vec",
+      "nullable": false
+    },
+    {
+      "auto_id": false,
+      "default_value": 1.5,
+      "dim": null,
+      "dtype": "float",
+      "element_type": null,
+      "is_primary": false,
+      "max_capacity": null,
+      "max_length": null,
+      "name": "f",
+      "nullable": true
+    },
+    {
+      "auto_id": false,
+      "default_value": 1e-05,
+      "dim": null,
+      "dtype": "double",
+      "element_type": null,
+      "is_primary": false,
+      "max_capacity": null,
+      "max_length": null,
+      "name": "d",
+      "nullable": false
+    },
+    {
+      "auto_id": false,
+      "default_value": -9223372036854775808,
+      "dim": null,
+      "dtype": "int64",
+      "element_type": null,
+      "is_primary": false,
+      "max_capacity": null,
+      "max_length": null,
+      "name": "big",
+      "nullable": false
+    },
+    {
+      "auto_id": false,
+      "default_value": "中文\t",
+      "dim": null,
+      "dtype": "varchar",
+      "element_type": null,
+      "is_primary": false,
+      "max_capacity": null,
+      "max_length": 8,
+      "name": "s",
+      "nullable": false
+    },
+    {
+      "auto_id": false,
+      "default_value": true,
+      "dim": null,
+      "dtype": "bool",
+      "element_type": null,
+      "is_primary": false,
+      "max_capacity": null,
+      "max_length": null,
+      "name": "b",
+      "nullable": false
+    },
+    {
+      "auto_id": false,
+      "default_value": null,
+      "dim": null,
+      "dtype": "array",
+      "element_type": "int32",
+      "is_primary": false,
+      "max_capacity": 4,
+      "max_length": null,
+      "name": "arr",
+      "nullable": true
+    },
+    {
+      "auto_id": false,
+      "default_value": null,
+      "dim": null,
+      "dtype": "json",
+      "element_type": null,
+      "is_primary": false,
+      "max_capacity": null,
+      "max_length": null,
+      "name": "j",
+      "nullable": true
+    },
+    {
+      "auto_id": false,
+      "default_value": null,
+      "dim": null,
+      "dtype": "int64",
+      "element_type": null,
+      "is_partition_key": true,
+      "is_primary": false,
+      "max_capacity": null,
+      "max_length": null,
+      "name": "k",
+      "nullable": false
+    }
+  ],
+  "properties": {
+    "Z": "x",
+    "a.key": "值",
+    "z.key": "1"
+  },
+  "schema_format_version": 2,
+  "version": 1
+}

@@ -1,5 +1,7 @@
 //! 按 Python `json.dumps` 的分隔符、浮点与转义规则输出 JSON 文本。
 //! `$meta` 用 `sort_keys=True` / `ensure_ascii=True`，JSON 字段保留键序并用 `ensure_ascii=False`。
+//! 共享 JSON 文件按 `json.dump(indent=2, sort_keys=True, ensure_ascii=False)` 写出，唯一例外是溢出为
+//! inf 的数字保留严格 JSON 文本（见 0006 差异表）。
 
 use serde_json::Value;
 
@@ -31,6 +33,16 @@ pub fn dumps_object<'a>(entries: impl IntoIterator<Item = (&'a str, &'a Value)>)
 pub fn dumps_unicode(value: &Value) -> String {
     let mut out = String::new();
     write_value(&mut out, value, false, false);
+    out
+}
+
+/// 共享 JSON 文件：`json.dump(value, f, indent=2, sort_keys=True, ensure_ascii=False)`。
+/// 3.x 的 schema、manifest、snapshot 与别名文件都这样写出，读回时却保留文件中的键序，
+/// 因此键序本身是互通的可观察状态。
+/// 溢出为 inf 的数字保留严格 JSON 文本（如 `1e+999`）而不写 `Infinity`，见 0006 差异表。
+pub fn dump_file(value: &Value) -> String {
+    let mut out = String::new();
+    write_indented(&mut out, value, 0);
     out
 }
 
@@ -90,6 +102,50 @@ fn write_value(out: &mut String, value: &Value, ensure_ascii: bool, sort_keys: b
             }
             out.push('}');
         }
+    }
+}
+
+/// Python 带 `indent` 的编码：空容器写成 `[]` / `{}`，元素分隔符为 `,` 加换行。
+fn write_indented(out: &mut String, value: &Value, level: usize) {
+    let newline = |out: &mut String, level: usize| {
+        out.push('\n');
+        out.extend(std::iter::repeat_n(' ', level * 2));
+    };
+    match value {
+        Value::Array(items) if !items.is_empty() => {
+            out.push('[');
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                newline(out, level + 1);
+                write_indented(out, item, level + 1);
+            }
+            newline(out, level);
+            out.push(']');
+        }
+        Value::Object(obj) if !obj.is_empty() => {
+            let mut entries: Vec<_> = obj.iter().collect();
+            entries.sort_by_key(|(key, _)| *key);
+            out.push('{');
+            for (i, (key, value)) in entries.into_iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                newline(out, level + 1);
+                write_str(out, key, false);
+                out.push_str(": ");
+                write_indented(out, value, level + 1);
+            }
+            newline(out, level);
+            out.push('}');
+        }
+        // Python 把溢出的浮点写成非标准 JSON 的 `Infinity`，严格 JSON 读取（本实现及 0.3.0rc3）
+        // 打不开这样的共享文件；保留已规范化的数字文本（如 `1e+999`），3.x 的 json.load 同样读成 inf。
+        Value::Number(n) if json_float_text(&n.to_string()).is_some_and(f64::is_infinite) => {
+            out.push_str(&n.to_string());
+        }
+        _ => write_value(out, value, false, true),
     }
 }
 
@@ -161,5 +217,53 @@ mod tests {
             dumps_unicode(&json!({"name":"中文😀"})),
             r#"{"name": "中文😀"}"#
         );
+    }
+
+    #[test]
+    fn dump_file_matches_python_json_dump_indent_sorted() {
+        // 期望值取自 Python 3.12：json.dumps(json.loads(raw), indent=2, sort_keys=True,
+        // ensure_ascii=False)；与 json.dump 写出的文件字节相同，末尾没有换行。
+        let raw = r#"{"z":{"b":[1E2,-0,1e-5,1.10,1e16,184467440737095516160,true,null,[],{}],"a":"中文😀\u0007\"\\\n"},"A":[[1,{"y":[],"x":{}}]],"é":"","_":{}}"#;
+        let value: Value = serde_json::from_str(raw).unwrap();
+        let expected = r#"{
+  "A": [
+    [
+      1,
+      {
+        "x": {},
+        "y": []
+      }
+    ]
+  ],
+  "_": {},
+  "z": {
+    "a": "中文😀\u0007\"\\\n",
+    "b": [
+      100.0,
+      0,
+      1e-05,
+      1.1,
+      1e+16,
+      184467440737095516160,
+      true,
+      null,
+      [],
+      {}
+    ]
+  },
+  "é": ""
+}"#;
+        assert_eq!(dump_file(&value), expected);
+        // 唯一与 Python 字节不同之处：溢出的数保留严格 JSON 文本，读回仍是同一个值。
+        let overflow: Value = serde_json::from_str(r#"{"b": -1E999, "a": [1e999]}"#).unwrap();
+        let written = dump_file(&overflow);
+        assert_eq!(
+            written,
+            "{\n  \"a\": [\n    1e+999\n  ],\n  \"b\": -1e+999\n}"
+        );
+        assert_eq!(serde_json::from_str::<Value>(&written).unwrap(), overflow);
+        assert_eq!(dump_file(&json!({})), "{}");
+        assert_eq!(dump_file(&json!([])), "[]");
+        assert_eq!(dump_file(&json!("x")), r#""x""#);
     }
 }

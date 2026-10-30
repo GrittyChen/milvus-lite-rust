@@ -1,0 +1,42 @@
+{
+  "active_wal_number": 3,
+  "current_seq": 5,
+  "index_specs": {
+    "vec": {
+      "build_params": {
+        "M": 16,
+        "big": 1e+16,
+        "efConstruction": 200,
+        "ratio": 0.25
+      },
+      "field_name": "vec",
+      "index_type": "HNSW",
+      "metric_type": "L2",
+      "search_params": {
+        "ef": 64
+      }
+    }
+  },
+  "manifest_format_version": 2,
+  "partitions": {
+    "_default": {
+      "data_files": [],
+      "delta_files": [
+        "delta/delta_000005_000005.parquet"
+      ]
+    },
+    "a": {
+      "data_files": [],
+      "delta_files": []
+    },
+    "z": {
+      "data_files": [
+        "data/data_000003_000004.parquet",
+        "data/data_000001_000002.parquet"
+      ],
+      "delta_files": []
+    }
+  },
+  "schema_version": 1,
+  "version": 1
+}

@@ -255,7 +255,7 @@ impl SchemaFile {
     }
 
     pub fn to_bytes(&self) -> Result<Vec<u8>, SchemaFileError> {
-        Ok(serde_json::to_vec_pretty(self)?)
+        Ok(crate::pyjson::dump_file(&serde_json::to_value(self)?).into_bytes())
     }
 }
 
@@ -359,6 +359,20 @@ mod tests {
         let bytes =
             br#"{"collection_name":"c","version":1,"fields":[{"name":"x","dtype":"future"}]}"#;
         assert!(SchemaFile::parse(bytes).is_err());
+    }
+
+    #[test]
+    fn writes_the_same_bytes_as_3x_save_schema() {
+        for fixture in [
+            &include_bytes!("../../tests/fixtures/schema_3x.json")[..],
+            &include_bytes!("../../tests/fixtures/schema_canonical_3x.json")[..],
+        ] {
+            let schema = SchemaFile::parse(fixture).unwrap();
+            assert_eq!(schema.to_bytes().unwrap(), fixture);
+            let rebuilt =
+                SchemaFile::from_core(&schema.collection_name, &schema.to_core().unwrap());
+            assert_eq!(rebuilt.to_bytes().unwrap(), fixture);
+        }
     }
 
     #[test]

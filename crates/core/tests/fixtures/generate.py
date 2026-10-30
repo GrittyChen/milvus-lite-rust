@@ -17,6 +17,8 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 import milvus_lite
+from milvus_lite.db import MilvusLite
+from milvus_lite.index.spec import IndexSpec
 from milvus_lite.schema.arrow_builder import (
     build_data_schema,
     build_delta_schema,
@@ -102,6 +104,56 @@ def generate(output: Path):
         {"_default": [data_rel]}, {"_default": [delta_rel]}, {}, 3, manifest.version,
     )
     shutil.copyfile(collection / "snapshots" / "metadata" / "s1.json", output / "snapshot_3x.json")
+    generate_canonical(output)
+
+
+def generate_canonical(output: Path):
+    """排序写出的字节样本：默认值、非 ASCII、多分区与索引参数，按字节比较。"""
+    collection = output / "canonical"
+    collection.mkdir()
+    schema = CollectionSchema(fields=[
+        FieldSchema("id", DataType.VARCHAR, is_primary=True, max_length=16),
+        FieldSchema("vec", DataType.FLOAT_VECTOR, dim=2),
+        FieldSchema("f", DataType.FLOAT, nullable=True, default_value=1.5),
+        FieldSchema("d", DataType.DOUBLE, default_value=1e-05),
+        FieldSchema("big", DataType.INT64, default_value=-9223372036854775808),
+        FieldSchema("s", DataType.VARCHAR, max_length=8, default_value="中文\t"),
+        FieldSchema("b", DataType.BOOL, default_value=True),
+        FieldSchema("arr", DataType.ARRAY, element_type=DataType.INT32, max_capacity=4, nullable=True),
+        FieldSchema("j", DataType.JSON, nullable=True),
+        FieldSchema("k", DataType.INT64, is_partition_key=True),
+    ], enable_dynamic_field=True, properties={"z.key": "1", "a.key": "值", "Z": "x"})
+    save_schema(schema, "c", str(collection / "schema.json"))
+    shutil.copyfile(collection / "schema.json", output / "schema_canonical_3x.json")
+
+    manifest = Manifest(str(collection))
+    for name in ("z", "a"):
+        manifest.add_partition(name)
+    manifest.add_data_file("z", "data/data_000003_000004.parquet")
+    manifest.add_data_file("z", "data/data_000001_000002.parquet")
+    manifest.add_delta_file("_default", "delta/delta_000005_000005.parquet")
+    manifest.set_index_spec(IndexSpec(
+        "vec", "HNSW", "L2",
+        {"efConstruction": 200, "M": 16, "ratio": 0.25, "big": 1e16},
+        {"ef": 64},
+    ))
+    manifest.current_seq = 5
+    manifest.active_wal_number = 3
+    manifest.save()
+    shutil.copyfile(collection / "manifest.json", output / "manifest_canonical_3x.json")
+
+    data_dir = output / "aliases-db"
+    db = MilvusLite(str(data_dir))
+    try:
+        db.create_collection("target", CollectionSchema(fields=[
+            FieldSchema("id", DataType.INT64, is_primary=True),
+            FieldSchema("vector", DataType.FLOAT_VECTOR, dim=2),
+        ]))
+        for alias in ("z_alias", "A_alias", "m_alias"):
+            db.create_alias("target", alias)
+    finally:
+        db.close()
+    shutil.copyfile(data_dir / "aliases.json", output / "aliases_3x.json")
 
 
 def verify(output: Path):
@@ -120,6 +172,8 @@ def verify(output: Path):
         generated.pop(variable)
         checked_in.pop(variable)
     assert generated == checked_in, "snapshot_3x.json"
+    for name in ("schema_canonical_3x.json", "manifest_canonical_3x.json", "aliases_3x.json"):
+        assert (output / name).read_bytes() == (HERE / name).read_bytes(), name
 
 
 def main():

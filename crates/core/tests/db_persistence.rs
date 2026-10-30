@@ -1720,3 +1720,253 @@ fn frozen_wal_pre_sync_failure_stays_before_replace_and_explicit_flush_recovers(
         reopened.close();
     }
 }
+
+#[test]
+fn shared_json_files_are_written_in_3x_sorted_layout() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("sorted.db");
+    let db = Db::new(DataDir::open(&path).unwrap(), compute()).unwrap();
+    let mut pk = FieldSchema::new("id", DataType::Int64);
+    pk.is_primary = true;
+    let mut vector = FieldSchema::new("vector", DataType::FloatVector);
+    vector.dim = Some(2);
+    let fixture_schema = CollectionSchema {
+        fields: vec![pk, vector],
+        enable_dynamic_field: false,
+        properties: Vec::new(),
+    };
+    db.create_collection("", "c", fixture_schema).unwrap();
+    assert_eq!(
+        std::fs::read(path.join("collections/c/schema.json")).unwrap(),
+        include_bytes!("fixtures/schema_3x.json")
+    );
+    db.create_collection("", "target", schema()).unwrap();
+    db.create_collection("", "victim", schema()).unwrap();
+    std::fs::write(
+        path.join("aliases.json"),
+        br#"{"z_alias":"target","gone":"victim","m_alias":"target","A_alias":"target"}"#,
+    )
+    .unwrap();
+    db.drop_collection("", "victim").unwrap();
+    assert_eq!(
+        std::fs::read(path.join("aliases.json")).unwrap(),
+        include_bytes!("fixtures/aliases_3x.json")
+    );
+    db.close();
+}
+
+#[test]
+fn schema_collection_name_differing_from_directory_opens_under_directory_name() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("renamed.db");
+    let schema_path = path.join("collections/c/schema.json");
+    {
+        let db = Db::new(DataDir::open(&path).unwrap(), compute()).unwrap();
+        db.create_collection("", "c", schema()).unwrap();
+        db.insert("", "c", batch(&[1, 2])).unwrap();
+        db.close();
+    }
+    let mut raw: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&schema_path).unwrap()).unwrap();
+    raw["collection_name"] = serde_json::json!("old");
+    std::fs::write(&schema_path, serde_json::to_vec(&raw).unwrap()).unwrap();
+    {
+        let db = Db::new(DataDir::open(&path).unwrap(), compute()).unwrap();
+        assert_eq!(
+            db.list_collections("").unwrap(),
+            [("c".to_owned(), LoadState::Loaded)]
+        );
+        let handle = db.collection("", "c").unwrap();
+        assert_eq!(handle.read().name(), "c");
+        assert_eq!(handle.read().count(), 2);
+        drop(handle);
+        db.close();
+    }
+    // 只放宽「合法但不相等」：缺失或不是字符串仍按损坏拒绝。
+    for broken in [
+        Some(serde_json::json!(7)),
+        Some(serde_json::Value::Null),
+        None,
+    ] {
+        match broken {
+            Some(value) => raw["collection_name"] = value,
+            None => {
+                raw.as_object_mut().unwrap().remove("collection_name");
+            }
+        }
+        std::fs::write(&schema_path, serde_json::to_vec(&raw).unwrap()).unwrap();
+        let db = Db::new(DataDir::open(&path).unwrap(), compute()).unwrap();
+        assert_eq!(
+            db.list_collections("").unwrap(),
+            [("c".to_owned(), LoadState::Released)]
+        );
+        assert!(matches!(
+            db.collection("", "c"),
+            Err(EngineError::Storage(_))
+        ));
+        db.close();
+    }
+}
+
+#[test]
+fn existing_non_default_database_is_unimplemented_not_missing() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("databases.db");
+    let db = Db::new(DataDir::open(&path).unwrap(), compute()).unwrap();
+    let missing = |result: Result<_, EngineError>, name: &str| match result {
+        Err(EngineError::DatabaseNotFound(found)) => assert_eq!(found, name),
+        other => panic!("expected DatabaseNotFound for {name}: {other:?}"),
+    };
+    missing(db.list_collections("d1"), "d1");
+    std::fs::create_dir_all(path.join("databases/d1/collections")).unwrap();
+    std::fs::write(path.join("databases/file"), b"").unwrap();
+    for result in [
+        db.list_collections("d1").map(drop),
+        db.collection("d1", "c").map(drop),
+        db.create_collection("d1", "c", schema()),
+    ] {
+        match result {
+            Err(EngineError::Unsupported { feature, reason }) => {
+                assert_eq!(feature, "database");
+                assert_eq!(
+                    reason,
+                    "database 'd1' exists, but non-default databases are not supported yet"
+                );
+            }
+            other => panic!("expected Unsupported: {other:?}"),
+        }
+    }
+    assert!(!path.join("databases/d1/collections/c").exists());
+    missing(db.list_collections("file"), "file");
+    missing(db.list_collections("d2"), "d2");
+    // 按精确名字判定：只差大小写的名字在大小写不敏感的文件系统上也报不存在。
+    missing(db.list_collections("D1"), "D1");
+    assert!(matches!(
+        db.list_collections("bad/name"),
+        Err(EngineError::InvalidArgument(_))
+    ));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // 3.x 的 isdir 只需要搜索权限；本实现还要列目录核对精确名字，列不了时与 isdir 的
+        // 任何 I/O 错误一样按不存在处理。root 不受目录权限限制，仍能核对到 d1。
+        let databases = path.join("databases");
+        std::fs::set_permissions(&databases, std::fs::Permissions::from_mode(0o300)).unwrap();
+        let listable = std::fs::read_dir(&databases).is_ok();
+        let result = db.list_collections("d1");
+        std::fs::set_permissions(&databases, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if listable {
+            assert!(matches!(result, Err(EngineError::Unsupported { .. })));
+        } else {
+            missing(result, "d1");
+        }
+    }
+    db.close();
+}
+
+#[test]
+fn non_finite_index_params_are_rejected_without_manifest_write() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("index-params.db");
+    let manifest_path = path.join("collections/c/manifest.json");
+    let params = |text: &str| serde_json::from_str::<serde_json::Map<_, _>>(text).unwrap();
+    let request = |params, search_params| IndexRequest {
+        index_type: "HNSW".to_owned(),
+        metric_type: Some("L2".to_owned()),
+        params,
+        search_params,
+    };
+    let db = Db::new(DataDir::open(&path).unwrap(), compute()).unwrap();
+    db.create_collection("", "c", schema()).unwrap();
+    db.insert("", "c", batch(&[1])).unwrap();
+    db.flush_collection("", "c").unwrap();
+    let before = std::fs::read(&manifest_path).unwrap();
+    // 3.x 接受并以非标准 JSON 的 `Infinity` 写出；本实现拒绝，不改写 manifest。
+    for (build, search) in [
+        (r#"{"x": 1e999}"#, "{}"),
+        ("{}", r#"{"nested": {"a": [-1e999]}}"#),
+    ] {
+        match db.create_index("", "c", "v", request(params(build), params(search))) {
+            Err(EngineError::Unsupported { feature, reason }) => {
+                assert_eq!(feature, "index params");
+                assert_eq!(
+                    reason,
+                    "numbers outside the finite float64 range cannot be persisted"
+                );
+            }
+            other => panic!("expected Unsupported: {other:?}"),
+        }
+        assert_eq!(std::fs::read(&manifest_path).unwrap(), before);
+    }
+    // 有限值、宽整数与下溢为 0 的数照常保存，写出与 3.x 的 json.dump 相同。
+    db.create_index(
+        "",
+        "c",
+        "v",
+        request(
+            params(
+                r#"{"wide": 184467440737095516160, "tiny": 1e-400, "ratio": 0.25, "big": 1E16}"#,
+            ),
+            params(r#"{"ef": 64}"#),
+        ),
+    )
+    .unwrap();
+    let text = String::from_utf8(std::fs::read(&manifest_path).unwrap()).unwrap();
+    assert!(text.contains(
+        "\"build_params\": {\n        \"big\": 1e+16,\n        \"ratio\": 0.25,\n        \"tiny\": 0.0,\n        \"wide\": 184467440737095516160\n      }"
+    ));
+    db.close();
+    let reopened = Db::new(DataDir::open(&path).unwrap(), compute()).unwrap();
+    let handle = reopened.collection("", "c").unwrap();
+    assert_eq!(handle.read().index("v").unwrap().index_type, "HNSW");
+    assert_eq!(handle.read().count(), 1);
+    drop(handle);
+    reopened.close();
+}
+
+#[test]
+fn existing_overflowing_index_params_stay_readable_after_manifest_rewrite() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("rc3-index.db");
+    let manifest_path = path.join("collections/c/manifest.json");
+    {
+        let db = Db::new(DataDir::open(&path).unwrap(), compute()).unwrap();
+        db.create_collection("", "c", schema()).unwrap();
+        db.create_index(
+            "",
+            "c",
+            "v",
+            IndexRequest {
+                index_type: "HNSW".to_owned(),
+                metric_type: Some("L2".to_owned()),
+                params: serde_json::from_str(r#"{"M": 16}"#).unwrap(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        db.close();
+    }
+    // 0.3.0rc3 接受 raw gRPC 的 `{"M": 1e999}`，并以合法 JSON 的 `1e+999` 写进 manifest。
+    let text = std::fs::read_to_string(&manifest_path).unwrap();
+    assert!(text.contains("\"M\": 16"));
+    std::fs::write(&manifest_path, text.replace("\"M\": 16", "\"M\": 1e+999")).unwrap();
+    for (round, ids) in [[1_i64], [2]].iter().enumerate() {
+        let db = Db::new(DataDir::open(&path).unwrap(), compute()).unwrap();
+        assert_eq!(db.collection("", "c").unwrap().read().count(), round);
+        db.insert("", "c", batch(ids)).unwrap();
+        db.flush_collection("", "c").unwrap();
+        let rewritten = std::fs::read_to_string(&manifest_path).unwrap();
+        assert!(rewritten.contains("\"M\": 1e+999"), "{rewritten}");
+        assert!(!rewritten.contains("Infinity"), "{rewritten}");
+        db.close();
+    }
+    let db = Db::new(DataDir::open(&path).unwrap(), compute()).unwrap();
+    let handle = db.collection("", "c").unwrap();
+    assert_eq!(handle.read().count(), 2);
+    assert_eq!(
+        handle.read().index("v").unwrap().params["M"].to_string(),
+        "1e+999"
+    );
+    drop(handle);
+    db.close();
+}

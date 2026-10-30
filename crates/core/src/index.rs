@@ -211,6 +211,19 @@ pub(crate) fn build_spec(field: &FieldSchema, req: IndexRequest) -> Result<Index
         ));
     }
 
+    // 3.x 把溢出的浮点文本（如 1e999）读成 inf，并以非标准 JSON 的 `Infinity` 写进 manifest；
+    // 与 gRPC 层拒绝的 `NaN` / `Infinity` 字面量是同一类值，新定义不接受。存量定义的写出见
+    // `pyjson::dump_file`。
+    if [&req.params, &req.search_params]
+        .into_iter()
+        .any(|params| params.values().any(non_finite))
+    {
+        return Err(EngineError::unsupported(
+            "index params",
+            "numbers outside the finite float64 range cannot be persisted",
+        ));
+    }
+
     Ok(IndexSpec {
         field_name: field.name.clone(),
         index_type,
@@ -218,6 +231,17 @@ pub(crate) fn build_spec(field: &FieldSchema, req: IndexRequest) -> Result<Index
         params: req.params,
         search_params: req.search_params,
     })
+}
+
+fn non_finite(value: &Value) -> bool {
+    match value {
+        Value::Number(n) => {
+            crate::pyjson::json_float_text(&n.to_string()).is_some_and(|f| !f.is_finite())
+        }
+        Value::Array(items) => items.iter().any(non_finite),
+        Value::Object(map) => map.values().any(non_finite),
+        _ => false,
+    }
 }
 
 /// 3.x `load()` 为每个有行的已提交 segment 建索引：INVERTED 不论字段类型都走标量倒排，其余类型走

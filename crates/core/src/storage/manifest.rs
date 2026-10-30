@@ -155,7 +155,7 @@ impl Manifest {
     }
 
     pub fn to_bytes(&self) -> Result<Vec<u8>, ManifestError> {
-        Ok(serde_json::to_vec_pretty(self)?)
+        Ok(crate::pyjson::dump_file(&serde_json::to_value(self)?).into_bytes())
     }
 }
 
@@ -201,6 +201,21 @@ mod tests {
             serde_json::json!([])
         );
         assert_eq!(value["index_specs"], serde_json::json!({}));
+    }
+
+    #[test]
+    fn writes_the_same_bytes_as_3x_manifest_save() {
+        let first = include_bytes!("../../tests/fixtures/manifest_3x.json");
+        let manifest = Manifest {
+            version: 1,
+            ..Manifest::default()
+        };
+        assert_eq!(manifest.to_bytes().unwrap(), first);
+        let canonical = include_bytes!("../../tests/fixtures/manifest_canonical_3x.json");
+        assert_eq!(
+            Manifest::parse(canonical).unwrap().to_bytes().unwrap(),
+            canonical
+        );
     }
 
     #[test]

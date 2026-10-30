@@ -634,7 +634,7 @@ impl Db {
         name: &str,
         schema: CollectionSchema,
     ) -> Result<()> {
-        require_database(database)?;
+        self.require_database(database)?;
         validate_filesystem_name(name, "collection")?;
         let mut collection = Collection::new(name, schema)?;
         let _intent = NamespaceIntent::new(&self.namespace_waiters);
@@ -772,7 +772,7 @@ impl Db {
 
     /// drop 的提交点是把目录改名移入 staging；之后才清别名与 staging。
     pub fn drop_collection(&self, database: &str, name: &str) -> Result<()> {
-        require_database(database)?;
+        self.require_database(database)?;
         if name.is_empty() {
             return Ok(());
         }
@@ -889,6 +889,31 @@ impl Db {
         Ok(())
     }
 
+    /// 3.x 的 `_require_database`：空名即 `default`。其他数据库尚未实现：3.x 认为存在的
+    /// （`databases/<db>` 是目录）按 0006 第 15 项返回 UNIMPLEMENTED，而不是谎称不存在；
+    /// 名字须精确出现在目录列表中，只差大小写的名字仍报不存在（0023 名字与文件系统）。
+    /// 3.x 的 `os.path.isdir` 把任何 I/O 错误当作不存在，这里的列目录与 metadata 同样如此。
+    fn require_database(&self, name: &str) -> Result<()> {
+        if name.is_empty() || name == DEFAULT_DATABASE {
+            return Ok(());
+        }
+        validate_filesystem_name(name, "database")?;
+        let root = self.path.join("databases");
+        let exact = fs::read_dir(&root).is_ok_and(|mut entries| {
+            entries.any(|entry| entry.is_ok_and(|entry| entry.file_name() == name))
+        });
+        if exact && fs::metadata(root.join(name)).is_ok_and(|meta| meta.is_dir()) {
+            return Err(EngineError::unsupported(
+                "database",
+                format!(
+                    "database {} exists, but non-default databases are not supported yet",
+                    py_repr(name)
+                ),
+            ));
+        }
+        Err(EngineError::DatabaseNotFound(name.to_owned()))
+    }
+
     fn exact_collection_name(&self, name: &str) -> Result<bool> {
         let root = self.path.join("collections");
         match fs::symlink_metadata(&root) {
@@ -989,7 +1014,10 @@ impl Db {
                 Err(error) => return Err(error),
             }
         }
-        let bytes = serde_json::to_vec_pretty(&live_aliases).map_err(std::io::Error::other)?;
+        let bytes = crate::pyjson::dump_file(
+            &serde_json::to_value(&live_aliases).map_err(std::io::Error::other)?,
+        )
+        .into_bytes();
         let mut file = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
         if let Err(error) = file.write_all(&bytes).and_then(|()| file.sync_all()) {
             drop(file);
@@ -1018,7 +1046,7 @@ impl Db {
     }
 
     pub fn collection(&self, database: &str, name: &str) -> Result<CollectionHandle> {
-        require_database(database)?;
+        self.require_database(database)?;
         let cached = self.collections.read().get(name).cloned();
         if let Some(handle) = cached {
             return checked_read_handle(handle);
@@ -1072,7 +1100,7 @@ impl Db {
     }
 
     pub fn create_partition(&self, database: &str, name: &str, partition: &str) -> Result<()> {
-        require_database(database)?;
+        self.require_database(database)?;
         let _intent = NamespaceIntent::new(&self.namespace_waiters);
         let blocked = self.write_gate.write();
         if *blocked {
@@ -1187,7 +1215,7 @@ impl Db {
     }
 
     pub fn drop_partition(&self, database: &str, name: &str, partition: &str) -> Result<()> {
-        require_database(database)?;
+        self.require_database(database)?;
         let _intent = NamespaceIntent::new(&self.namespace_waiters);
         let blocked = self.write_gate.write();
         if *blocked {
@@ -1439,7 +1467,7 @@ impl Db {
         expr: &str,
         partition: &str,
     ) -> Result<(Vec<Pk>, bool)> {
-        require_database(database)?;
+        self.require_database(database)?;
         let blocked = self.write_gate.read();
         if *blocked {
             return Err(storage(
@@ -1505,7 +1533,7 @@ impl Db {
         name: &str,
         apply: impl FnOnce(&mut Collection) -> Result<T>,
     ) -> Result<T> {
-        require_database(database)?;
+        self.require_database(database)?;
         let blocked = self.write_gate.read();
         if *blocked {
             return Err(EngineError::Storage(
@@ -1585,7 +1613,7 @@ impl Db {
     }
 
     pub fn flush_collection(&self, database: &str, name: &str) -> Result<()> {
-        require_database(database)?;
+        self.require_database(database)?;
         let blocked = self.write_gate.read();
         if *blocked {
             return Err(storage(
@@ -1631,7 +1659,7 @@ impl Db {
         #[cfg(feature = "fault-injection")]
         use crate::storage::index_intent;
         use crate::storage::{flush, index_files, index_platform};
-        require_database(database)?;
+        self.require_database(database)?;
         let blocked = self.write_gate.read();
         if *blocked {
             return Err(storage(
@@ -2248,7 +2276,7 @@ impl Db {
         name: &str,
         timeout: std::time::Duration,
     ) -> Result<crate::MaintenanceReport> {
-        require_database(database)?;
+        self.require_database(database)?;
         validate_filesystem_name(name, "collection")?;
         let cached = self.collections.read().get(name).cloned();
         let handle = match cached {
@@ -2419,7 +2447,7 @@ impl Db {
     /// 等待 collection 锁时若仍持有表锁，排队的写者会让所有 RPC 都停在表锁上。
     /// 取出之后被并发 drop 的 collection 仍会列出，不会报错。
     pub fn list_collections(&self, database: &str) -> Result<Vec<(String, LoadState)>> {
-        require_database(database)?;
+        self.require_database(database)?;
         let root = self.path.join("collections");
         match fs::symlink_metadata(&root) {
             Ok(meta) if meta.file_type().is_dir() => {}
@@ -2517,9 +2545,7 @@ fn unopened_load_state(dir: &std::path::Path) -> LoadState {
         Ok(file) => file,
         Err(_) => return LoadState::Released,
     };
-    if schema_file.collection_name != dir.file_name().and_then(|name| name.to_str()).unwrap_or("")
-        || schema_file.to_core().is_err()
-    {
+    if schema_file.to_core().is_err() {
         return LoadState::Released;
     }
     let manifest_path = dir.join("manifest.json");
@@ -2600,15 +2626,6 @@ fn cleanup_failed_staging(path: &std::path::Path) {
     if let Err(error) = fs::remove_dir_all(path) {
         eprintln!("cannot clean failed create staging {path:?}: {error}");
     }
-}
-
-/// 3.x 的 `_require_database`：空名即 `default`；M1 没有其他数据库。
-fn require_database(name: &str) -> Result<()> {
-    if name.is_empty() || name == DEFAULT_DATABASE {
-        return Ok(());
-    }
-    validate_filesystem_name(name, "database")?;
-    Err(EngineError::DatabaseNotFound(name.to_owned()))
 }
 
 /// 3.x 的 `_validate_filesystem_name`：以 ValueError 抛出，因此是 InvalidArgument。
