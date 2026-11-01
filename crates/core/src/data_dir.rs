@@ -83,6 +83,15 @@ impl DataDir {
             Err(TryLockError::Error(e)) => return Err(io_err(e)),
         }
         cleanup_staging(path).map_err(io_err)?;
+        // 数据库根目录的 `replace_file` 临时文件（0007「文件替换的残留」）。
+        for warning in crate::storage::fs_commit::cleanup_replace_temps(
+            path,
+            &["aliases.json", crate::storage::rename_intent::INTENT_FILE],
+        )
+        .map_err(io_err)?
+        {
+            eprintln!("{warning}");
+        }
         Ok(Self {
             path: path.to_path_buf(),
             lock,
@@ -217,6 +226,33 @@ mod tests {
         }
         File::create(root.path().join(LOCK_FILENAME)).unwrap();
         DataDir::open(root.path()).unwrap();
+    }
+
+    #[test]
+    fn removes_replace_temp_residue_only_after_taking_the_lock() {
+        let root = tmp();
+        let residue = [
+            "aliases.json.tmp.7.1",
+            "milvus-lite-rust.rename-intent.json.tmp.7.2",
+        ];
+        let kept = ["aliases.json.tmp", "aliases.json", "schema.json.tmp.7.3"];
+        for name in residue.iter().chain(&kept) {
+            fs::write(root.path().join(name), b"x").unwrap();
+        }
+        let holder = DataDir::open(root.path()).unwrap();
+        // 第二次打开拿不到锁，不能动对方可能正在写的文件。
+        for name in residue {
+            fs::write(root.path().join(name), b"x").unwrap();
+        }
+        assert!(matches!(
+            DataDir::open(root.path()),
+            Err(DataDirError::Locked { .. })
+        ));
+        assert!(residue.iter().all(|name| root.path().join(name).exists()));
+        drop(holder);
+        DataDir::open(root.path()).unwrap();
+        assert!(residue.iter().all(|name| !root.path().join(name).exists()));
+        assert!(kept.iter().all(|name| root.path().join(name).exists()));
     }
 
     #[test]

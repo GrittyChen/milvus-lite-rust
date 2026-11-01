@@ -1976,3 +1976,53 @@ fn existing_overflowing_index_params_stay_readable_after_manifest_rewrite() {
     drop(handle);
     db.close();
 }
+
+/// 崩溃留在数据库根目录与集合目录里的 `replace_file` 临时文件，在重开时清扫：根目录随数据目录打开，
+/// 集合目录随集合的首次打开。3.x 的固定名与近似名字不属于本实现，保留。
+#[test]
+fn reopen_sweeps_replace_temps_left_by_a_crash() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("sweep.db");
+    let db = Db::new(DataDir::open(&path).unwrap(), compute()).unwrap();
+    db.create_collection("", "c", schema()).unwrap();
+    db.insert("", "c", batch(&[1, 2])).unwrap();
+    db.flush_collection("", "c").unwrap();
+    db.close();
+
+    let collection = path.join("collections/c");
+    let residue = [
+        path.join("aliases.json.tmp.100.1"),
+        path.join("milvus-lite-rust.rename-intent.json.tmp.100.2"),
+        collection.join("schema.json.tmp.100.3"),
+        collection.join("milvus-lite-rust.truncate-intent.json.tmp.100.4"),
+        collection.join("manifest.json.prev.tmp.100.5"),
+    ];
+    let kept = [
+        path.join("aliases.json.tmp"),
+        path.join("aliases.json.tmp.x"),
+        collection.join("schema.json.tmp"),
+        collection.join("manifest.json.tmp.100.6"),
+    ];
+    for file in residue.iter().chain(&kept) {
+        std::fs::write(file, b"leftover").unwrap();
+    }
+
+    let db = Db::new(DataDir::open(&path).unwrap(), compute()).unwrap();
+    assert!(residue[..2].iter().all(|file| !file.exists()));
+    assert!(residue[2..].iter().all(|file| file.exists()));
+    let handle = db.collection("", "c").unwrap();
+    assert!(residue.iter().all(|file| !file.exists()), "{residue:?}");
+    assert!(kept.iter().all(|file| file.exists()), "{kept:?}");
+    assert_eq!(
+        handle
+            .read()
+            .get(&[Pk::Int64(1), Pk::Int64(2)], &[])
+            .unwrap()
+            .rows
+            .pks
+            .len(),
+        2
+    );
+    drop(handle);
+    db.close();
+}

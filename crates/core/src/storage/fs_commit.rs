@@ -192,6 +192,127 @@ pub(crate) enum ReplaceError {
 
 static REPLACE_TMP_NUMBER: AtomicU64 = AtomicU64::new(1);
 
+/// 临时文件已写完并同步、改名之前的故障；按目标文件名触发一次。`Error` 与 `Panic` 同样让临时文件留在磁盘上
+/// （正常失败路径会删除它），用来复现崩溃留下的残留。
+#[cfg(feature = "fault-injection")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplaceTempFault {
+    Exit,
+    Error,
+    Panic,
+}
+#[cfg(feature = "fault-injection")]
+thread_local! { static REPLACE_TEMP_FAULT: std::cell::RefCell<Option<(String, ReplaceTempFault)>> = const { std::cell::RefCell::new(None) }; }
+#[cfg(feature = "fault-injection")]
+pub fn inject_replace_temp_fault_once(name: &str, fault: ReplaceTempFault) {
+    REPLACE_TEMP_FAULT.with(|slot| *slot.borrow_mut() = Some((name.to_owned(), fault)));
+}
+#[cfg(feature = "fault-injection")]
+fn replace_temp_fault(name: &str) -> io::Result<()> {
+    let fault = REPLACE_TEMP_FAULT.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        match slot.as_ref() {
+            Some((wanted, _)) if wanted == name => slot.take().map(|(_, fault)| fault),
+            _ => None,
+        }
+    });
+    match fault {
+        Some(ReplaceTempFault::Exit) => std::process::exit(88),
+        Some(ReplaceTempFault::Error) => Err(io::Error::other("injected replace temp failure")),
+        Some(ReplaceTempFault::Panic) => panic!("injected replace temp panic"),
+        None => Ok(()),
+    }
+}
+
+/// 清扫失败的注入点：每个只触发一次。
+#[cfg(feature = "fault-injection")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplaceTempSweepFault {
+    Remove,
+    Sync,
+}
+#[cfg(feature = "fault-injection")]
+thread_local! { static REPLACE_TEMP_SWEEP_FAULT: std::cell::Cell<Option<ReplaceTempSweepFault>> = const { std::cell::Cell::new(None) }; }
+#[cfg(feature = "fault-injection")]
+pub fn inject_replace_temp_sweep_fault_once(fault: ReplaceTempSweepFault) {
+    REPLACE_TEMP_SWEEP_FAULT.with(|slot| slot.set(Some(fault)));
+}
+#[cfg(feature = "fault-injection")]
+fn replace_temp_sweep_fault(wanted: ReplaceTempSweepFault) -> io::Result<()> {
+    if REPLACE_TEMP_SWEEP_FAULT
+        .with(|slot| (slot.get() == Some(wanted)).then(|| slot.take()))
+        .is_some()
+    {
+        return Err(io::Error::other("injected replace temp sweep failure"));
+    }
+    Ok(())
+}
+
+/// `<base>.tmp.<pid>.<序号>`：[`replace_file`] 的临时文件名，两段都是非空十进制数字。
+fn is_replace_temp(file: &str, bases: &[&str]) -> bool {
+    bases.iter().any(|base| {
+        file.strip_prefix(base)
+            .and_then(|rest| rest.strip_prefix(".tmp."))
+            .and_then(|rest| rest.split_once('.'))
+            .is_some_and(|(pid, number)| {
+                [pid, number]
+                    .iter()
+                    .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
+            })
+    })
+}
+
+/// 清扫 `dir` 中 [`replace_file`] 在崩溃时留下的临时文件，只处理 `bases` 里的目标文件名，不递归。
+/// 调用方必须已排除该目录的替换写者：数据目录在 LOCK 之后、集合句柄发布之前，或集合已打开时持独占许可与 flush 锁。
+///
+/// 目录枚举失败向上传递，逐个文件的检查、删除失败与最后的目录同步失败只记入返回的警告：残留不影响数据，
+/// 不能因它拒绝打开。符号链接、目录与近似名字（3.x 的固定名 `schema.json.tmp` 等）一律不动。
+pub(crate) fn cleanup_replace_temps(dir: &Path, bases: &[&str]) -> io::Result<Vec<String>> {
+    let mut found = Vec::new();
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let Some(file) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if is_replace_temp(&file, bases) {
+            found.push((entry.path(), entry.file_type()));
+        }
+    }
+    found.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut warnings = Vec::new();
+    let mut removed = false;
+    for (path, kind) in found {
+        match kind {
+            Ok(kind) if kind.is_file() => {}
+            Ok(_) => continue,
+            Err(error) => {
+                warnings.push(format!("cannot inspect replace temp {path:?}: {error}"));
+                continue;
+            }
+        }
+        #[cfg(feature = "fault-injection")]
+        let result = replace_temp_sweep_fault(ReplaceTempSweepFault::Remove)
+            .and_then(|()| fs::remove_file(&path));
+        #[cfg(not(feature = "fault-injection"))]
+        let result = fs::remove_file(&path);
+        match result {
+            Ok(()) => removed = true,
+            Err(error) => warnings.push(format!("cannot remove replace temp {path:?}: {error}")),
+        }
+    }
+    if removed {
+        #[cfg(feature = "fault-injection")]
+        let synced =
+            replace_temp_sweep_fault(ReplaceTempSweepFault::Sync).and_then(|()| sync_dir(dir));
+        #[cfg(not(feature = "fault-injection"))]
+        let synced = sync_dir(dir);
+        if let Err(error) = synced {
+            warnings.push(format!("cannot sync replace temp cleanup {dir:?}: {error}"));
+        }
+    }
+    Ok(warnings)
+}
+
 /// 共享 JSON 文件（`aliases.json`、`schema.json`）的替换：写 tmp、fsync、改名、fsync 所在目录。
 /// 两段分别兜住 panic：改名之后的失败必须让调用方按「已替换」收尾，不能与替换之前的失败混为一谈。
 pub(crate) fn replace_file(
@@ -214,6 +335,8 @@ pub(crate) fn replace_file(
             return Err(error);
         }
         drop(file);
+        #[cfg(feature = "fault-injection")]
+        replace_temp_fault(name)?;
         if let Err(error) = fs::rename(&tmp, dir.join(name)) {
             remove_tmp(&tmp);
             return Err(error);
@@ -583,5 +706,168 @@ mod tests {
             (fs::read(&target).unwrap(), leftovers()),
             (b"new".to_vec(), 0)
         );
+    }
+
+    fn names(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn replace_temp_names_match_exactly() {
+        let bases = ["schema.json", "manifest.json.prev"];
+        for name in [
+            "schema.json.tmp.1.2",
+            "schema.json.tmp.123456.0",
+            "manifest.json.prev.tmp.9.9",
+        ] {
+            assert!(is_replace_temp(name, &bases), "{name}");
+        }
+        for name in [
+            "schema.json",
+            "schema.json.tmp",
+            "schema.json.tmp.",
+            "schema.json.tmp.1",
+            "schema.json.tmp.1.",
+            "schema.json.tmp..2",
+            "schema.json.tmp.x.2",
+            "schema.json.tmp.1.2.3",
+            "schema.json.tmp.1.2x",
+            "schema.json.tmp.-1.2",
+            "xschema.json.tmp.1.2",
+            "manifest.json.tmp.1.2",
+            "aliases.json.tmp.1.2",
+        ] {
+            assert!(!is_replace_temp(name, &bases), "{name}");
+        }
+    }
+
+    #[test]
+    fn sweep_removes_only_replace_temps_of_the_listed_files() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path();
+        for name in [
+            "schema.json.tmp.10.1",
+            "schema.json.tmp.10.2",
+            "manifest.json.prev.tmp.10.3",
+            // 不动：3.x 的固定名、近似名、别的目标文件。
+            "schema.json",
+            "schema.json.tmp",
+            "schema.json.tmp.x",
+            "schema.json.tmp.1",
+            "manifest.json.tmp.10.4",
+            "aliases.json.tmp.10.5",
+        ] {
+            fs::write(dir.join(name), b"x").unwrap();
+        }
+        // 目录与符号链接即使名字匹配也不动，且不递归。
+        fs::create_dir(dir.join("schema.json.tmp.10.6")).unwrap();
+        fs::write(dir.join("schema.json.tmp.10.6/schema.json.tmp.10.7"), b"x").unwrap();
+        #[cfg(unix)]
+        {
+            let outside = tempfile::tempdir().unwrap();
+            let victim = outside.path().join("victim");
+            fs::write(&victim, b"keep").unwrap();
+            std::os::unix::fs::symlink(&victim, dir.join("schema.json.tmp.10.8")).unwrap();
+            let warnings =
+                cleanup_replace_temps(dir, &["schema.json", "manifest.json.prev"]).unwrap();
+            assert!(warnings.is_empty(), "{warnings:?}");
+            assert_eq!(fs::read(&victim).unwrap(), b"keep");
+            assert!(dir.join("schema.json.tmp.10.8").symlink_metadata().is_ok());
+            fs::remove_file(dir.join("schema.json.tmp.10.8")).unwrap();
+        }
+        #[cfg(not(unix))]
+        cleanup_replace_temps(dir, &["schema.json", "manifest.json.prev"]).unwrap();
+        assert_eq!(
+            names(dir),
+            [
+                "aliases.json.tmp.10.5",
+                "manifest.json.tmp.10.4",
+                "schema.json",
+                "schema.json.tmp",
+                "schema.json.tmp.1",
+                "schema.json.tmp.10.6",
+                "schema.json.tmp.x",
+            ]
+        );
+        assert_eq!(
+            names(&dir.join("schema.json.tmp.10.6")),
+            ["schema.json.tmp.10.7"]
+        );
+        // 再扫一次没有可删的，也不报警。
+        assert!(
+            cleanup_replace_temps(dir, &["schema.json"])
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn sweep_reports_an_unreadable_directory() {
+        let root = tempfile::tempdir().unwrap();
+        assert!(cleanup_replace_temps(&root.path().join("missing"), &["schema.json"]).is_err());
+        let file = root.path().join("file");
+        fs::write(&file, b"x").unwrap();
+        assert!(cleanup_replace_temps(&file, &["schema.json"]).is_err());
+    }
+
+    #[cfg(feature = "fault-injection")]
+    #[test]
+    fn sweep_failures_are_warnings_and_do_not_stop_the_other_files() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path();
+        fs::write(dir.join("schema.json.tmp.1.1"), b"x").unwrap();
+        fs::write(dir.join("schema.json.tmp.1.2"), b"x").unwrap();
+        inject_replace_temp_sweep_fault_once(ReplaceTempSweepFault::Remove);
+        let warnings = cleanup_replace_temps(dir, &["schema.json"]).unwrap();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("cannot remove replace temp"),
+            "{warnings:?}"
+        );
+        // 排序后第一个失败，第二个照常删除。
+        assert_eq!(names(dir), ["schema.json.tmp.1.1"]);
+
+        inject_replace_temp_sweep_fault_once(ReplaceTempSweepFault::Sync);
+        let warnings = cleanup_replace_temps(dir, &["schema.json"]).unwrap();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("cannot sync replace temp cleanup"),
+            "{warnings:?}"
+        );
+        assert!(names(dir).is_empty());
+    }
+
+    /// 改名之前的注入点（`Error`、`Panic`）故意不清理临时文件，以复现崩溃残留；目标文件保持原样。
+    #[cfg(feature = "fault-injection")]
+    #[test]
+    fn temp_fault_leaves_the_temp_file_and_the_target_unchanged() {
+        for fault in [ReplaceTempFault::Error, ReplaceTempFault::Panic] {
+            let root = tempfile::tempdir().unwrap();
+            let dir = root.path();
+            fs::write(dir.join("f.json"), b"old").unwrap();
+            inject_replace_temp_fault_once("other.json", fault);
+            replace_file(dir, "f.json", b"first", |_| Ok(())).unwrap();
+            assert_eq!(fs::read(dir.join("f.json")).unwrap(), b"first");
+            inject_replace_temp_fault_once("f.json", fault);
+            let result = replace_file(dir, "f.json", b"new", |_| Ok(()));
+            assert!(
+                matches!(result, Err(ReplaceError::Unchanged(_))),
+                "{fault:?}"
+            );
+            assert_eq!(fs::read(dir.join("f.json")).unwrap(), b"first");
+            let left: Vec<_> = names(dir).into_iter().filter(|n| n != "f.json").collect();
+            assert_eq!(left.len(), 1, "{fault:?}: {left:?}");
+            assert!(is_replace_temp(&left[0], &["f.json"]), "{left:?}");
+            assert!(cleanup_replace_temps(dir, &["f.json"]).unwrap().is_empty());
+            assert_eq!(names(dir), ["f.json"]);
+            // 一次性：下一次替换照常。
+            replace_file(dir, "f.json", b"second", |_| Ok(())).unwrap();
+            assert_eq!(fs::read(dir.join("f.json")).unwrap(), b"second");
+        }
     }
 }

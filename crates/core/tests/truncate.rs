@@ -712,12 +712,36 @@ mod faults {
         pause_truncate_after_publish_once, use_truncate_staging_name_once,
     };
     use milvus_lite_core::storage::fs_commit::{
-        CommitPhase, inject_manifest_dir_sync_failure_once, inject_manifest_panic_once,
-        inject_manifest_process_exit_once,
+        CommitPhase, ReplaceTempFault, inject_manifest_dir_sync_failure_once,
+        inject_manifest_panic_once, inject_manifest_process_exit_once,
+        inject_replace_temp_fault_once,
     };
 
     fn inject(point: DirectoryPoint, fault: DirectoryFault) {
         inject_directory_fault_once(DirectoryOperation::Truncate, point, fault);
+    }
+
+    /// 数据目录下没有 `replace_file` 的残留临时文件（`<名>.tmp.<进程号>.<序号>`）。
+    fn assert_no_replace_temps(root: &Path) {
+        fn walk(dir: &Path, found: &mut Vec<PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let entry = entry.unwrap();
+                let path = entry.path();
+                if entry.file_type().unwrap().is_dir() {
+                    walk(&path, found);
+                } else if path
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .contains(".tmp.")
+                {
+                    found.push(path);
+                }
+            }
+        }
+        let mut found = Vec::new();
+        walk(root, &mut found);
+        assert!(found.is_empty(), "{found:?}");
     }
 
     /// 已打开的 `c`：已提交 2 行（其中 1 行随后被删除并提交），WAL 中还有未提交的 1 行插入与 1 行删除；
@@ -745,6 +769,7 @@ mod faults {
         assert_eq!(count(&db, "c"), 2);
         assert!(!dir(root, "c").join(INTENT).exists());
         assert!(staging_is_empty(root));
+        assert_no_replace_temps(root);
         db.insert("", "c", batch(&[5])).unwrap();
         db.flush_collection("", "c").unwrap();
         db.insert("", "c", batch(&[6])).unwrap();
@@ -772,6 +797,7 @@ mod faults {
         assert_eq!(count(db, "c"), 0);
         assert_truncated_on_disk(root, "c");
         assert!(!dir(root, "c").join("snapshots/metadata/s.json").exists());
+        assert_no_replace_temps(root);
         db.insert("", "c", batch(&[7])).unwrap();
         db.flush_collection("", "c").unwrap();
         assert_eq!(count(db, "c"), 1);
@@ -1271,15 +1297,18 @@ mod faults {
             ("wal-sync", false, 88),
             ("intent", false, 88),
             ("intent-after", false, 88),
+            ("intent-tmp", false, 88),
             ("manifest", false, 88),
             ("before-replace", false, 86),
             ("after-replace", true, 86),
             ("rebuild", true, 88),
             ("schema", true, 88),
             ("schema-after", true, 88),
+            ("schema-tmp", true, 88),
             ("snapshots", true, 88),
             ("files", true, 88),
             ("prev", true, 88),
+            ("prev-tmp", true, 88),
             ("intent-remove", true, 88),
             ("intent-remove-after", true, 88),
             ("staging-cleanup", true, 88),
@@ -1303,6 +1332,16 @@ mod faults {
                 "wal-sync" => Some(DirectoryPoint::WalSync),
                 "intent" => Some(DirectoryPoint::Intent),
                 "intent-after" => Some(DirectoryPoint::IntentAfterRename),
+                // 临时文件已写完、改名之前退出：残留的 `<名>.tmp.*` 由重开清扫。
+                "intent-tmp" | "schema-tmp" | "prev-tmp" => {
+                    let name = match stage.as_str() {
+                        "intent-tmp" => INTENT,
+                        "schema-tmp" => "schema.json",
+                        _ => "manifest.json.prev",
+                    };
+                    inject_replace_temp_fault_once(name, ReplaceTempFault::Exit);
+                    None
+                }
                 "manifest" => Some(DirectoryPoint::Manifest),
                 "rebuild" => Some(DirectoryPoint::Rebuild),
                 "schema" => Some(DirectoryPoint::Schema),
@@ -1317,7 +1356,7 @@ mod faults {
             if let Some(point) = point {
                 inject(point, DirectoryFault::Exit);
             }
-            if stage == "schema-after" {
+            if stage == "schema-after" || stage == "schema-tmp" {
                 unsort_schema(&path);
             }
             db.truncate_collection("", "c").unwrap();

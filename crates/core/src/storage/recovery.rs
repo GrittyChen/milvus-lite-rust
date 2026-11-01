@@ -316,6 +316,21 @@ pub(crate) fn cleanup_unreferenced(
             ));
         }
     }
+    // `fs_commit::replace_file` 的临时名带进程号与序号，崩溃留下的不会被后来的写入覆盖；0007「文件替换的残留」。
+    warnings.extend(
+        fs_commit::cleanup_replace_temps(
+            collection_dir,
+            &[
+                "schema.json",
+                super::truncate_intent::INTENT_FILE,
+                "manifest.json.prev",
+            ],
+        )
+        .map_err(|source| RecoveryError::Cleanup {
+            path: collection_dir.to_path_buf(),
+            source,
+        })?,
+    );
     Ok(warnings)
 }
 

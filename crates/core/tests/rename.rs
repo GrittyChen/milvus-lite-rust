@@ -411,12 +411,36 @@ mod faults {
         DirectoryFault, DirectoryOperation, DirectoryPoint, RenamePausePoint,
         inject_directory_fault_once, pause_rename_once,
     };
+    use milvus_lite_core::storage::fs_commit::{ReplaceTempFault, inject_replace_temp_fault_once};
     use milvus_lite_core::storage::runtime::{
         RetainedWalSyncFault, inject_retained_wal_sync_failure_once,
     };
 
     fn inject(point: DirectoryPoint, fault: DirectoryFault) {
         inject_directory_fault_once(DirectoryOperation::Rename, point, fault);
+    }
+
+    /// 数据目录下没有 `replace_file` 的残留临时文件（`<名>.tmp.<进程号>.<序号>`）。
+    fn assert_no_replace_temps(root: &Path) {
+        fn walk(dir: &Path, found: &mut Vec<PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let entry = entry.unwrap();
+                let path = entry.path();
+                if entry.file_type().unwrap().is_dir() {
+                    walk(&path, found);
+                } else if path
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .contains(".tmp.")
+                {
+                    found.push(path);
+                }
+            }
+        }
+        let mut found = Vec::new();
+        walk(root, &mut found);
+        assert!(found.is_empty(), "{found:?}");
     }
 
     /// 已打开、带未落盘 data 与 delta WAL 的 `c`，别名 `a` 指向它。
@@ -441,6 +465,7 @@ mod faults {
         db.flush_collection("", "c").unwrap();
         db.insert("", "c", batch(&[5])).unwrap();
         assert_eq!(count(&db, "c"), 4);
+        assert_no_replace_temps(root);
         db.close();
         let db = open(root);
         assert_eq!(count(&db, "c"), 4);
@@ -455,6 +480,7 @@ mod faults {
         assert_eq!(schema_name(root, "d"), "d");
         assert_eq!(aliases(root).unwrap(), "{\n  \"a\": \"d\"\n}");
         assert_eq!(count(db, "a"), 2);
+        assert_no_replace_temps(root);
     }
 
     #[test]
@@ -775,31 +801,45 @@ mod faults {
         let points = [
             ("intent", false),
             ("intent-after", false),
+            ("intent-tmp", false),
             ("directory", false),
             ("collections-sync", true),
             ("schema", true),
             ("schema-after", true),
+            ("schema-tmp", true),
             ("aliases", true),
             ("aliases-after", true),
+            ("aliases-tmp", true),
             ("intent-remove", true),
             ("intent-remove-after", true),
         ];
         if let Ok(stage) = std::env::var("MILVUS_LITE_RENAME_CRASH") {
             let path = PathBuf::from(std::env::var("MILVUS_LITE_CRASH_DIR").unwrap());
             let db = seeded(&path);
-            let point = match stage.as_str() {
-                "intent" => DirectoryPoint::Intent,
-                "intent-after" => DirectoryPoint::IntentAfterRename,
-                "directory" => DirectoryPoint::BeforeRename,
-                "collections-sync" => DirectoryPoint::CollectionsSync,
-                "schema" => DirectoryPoint::Schema,
-                "schema-after" => DirectoryPoint::SchemaAfterRename,
-                "aliases" => DirectoryPoint::Aliases,
-                "aliases-after" => DirectoryPoint::AliasesAfterRename,
-                "intent-remove" => DirectoryPoint::IntentRemove,
-                _ => DirectoryPoint::IntentRemoveAfter,
+            // 临时文件已写完、改名之前退出：残留的 `<名>.tmp.*` 由重开清扫。
+            let temp = match stage.as_str() {
+                "intent-tmp" => Some("milvus-lite-rust.rename-intent.json"),
+                "schema-tmp" => Some("schema.json"),
+                "aliases-tmp" => Some("aliases.json"),
+                _ => None,
             };
-            inject(point, DirectoryFault::Exit);
+            if let Some(name) = temp {
+                inject_replace_temp_fault_once(name, ReplaceTempFault::Exit);
+            } else {
+                let point = match stage.as_str() {
+                    "intent" => DirectoryPoint::Intent,
+                    "intent-after" => DirectoryPoint::IntentAfterRename,
+                    "directory" => DirectoryPoint::BeforeRename,
+                    "collections-sync" => DirectoryPoint::CollectionsSync,
+                    "schema" => DirectoryPoint::Schema,
+                    "schema-after" => DirectoryPoint::SchemaAfterRename,
+                    "aliases" => DirectoryPoint::Aliases,
+                    "aliases-after" => DirectoryPoint::AliasesAfterRename,
+                    "intent-remove" => DirectoryPoint::IntentRemove,
+                    _ => DirectoryPoint::IntentRemoveAfter,
+                };
+                inject(point, DirectoryFault::Exit);
+            }
             db.rename_collection("", "c", "d", "").unwrap();
             panic!("rename crash injection did not fire");
         }
