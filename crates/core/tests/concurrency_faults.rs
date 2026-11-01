@@ -857,13 +857,28 @@ fn concurrent_writes_reads_and_flush_crash_keep_all_acknowledged_rows() {
                     let id = worker * 100 + i;
                     let age = (seed + i) % 100;
                     for action in 0..4 {
-                        let result = match action {
-                            0 => db.insert("", "c", batch(id, age)).map(|_| ()),
-                            1 => db
-                                .upsert_with_pk_type("", "c", batch(id, age + 1))
-                                .map(|_| ()),
-                            2 => db.delete("", "c", &[Pk::Int64(id)]).map(|_| ()),
-                            _ => db.insert("", "c", batch(id, age + 2)).map(|_| ()),
+                        // 提交者注入的失败之后写入会在节流窗口内被拒绝（没有任何效果）；窗口由提交者线程
+                        // 的下一次提交解除，其调度快慢与写线程无关，所以拒绝的操作在期限内重试到成功，
+                        // 模型才不依赖谁先被调度。
+                        let deadline = Instant::now() + Duration::from_secs(10);
+                        let result = loop {
+                            let result = match action {
+                                0 => db.insert("", "c", batch(id, age)).map(|_| ()),
+                                1 => db
+                                    .upsert_with_pk_type("", "c", batch(id, age + 1))
+                                    .map(|_| ()),
+                                2 => db.delete("", "c", &[Pk::Int64(id)]).map(|_| ()),
+                                _ => db.insert("", "c", batch(id, age + 2)).map(|_| ()),
+                            };
+                            match result {
+                                Err(error)
+                                    if error.to_string().contains("flush retry is throttled")
+                                        && Instant::now() < deadline =>
+                                {
+                                    std::thread::sleep(Duration::from_millis(1));
+                                }
+                                other => break other,
+                            }
                         };
                         match result {
                             Ok(()) => {
@@ -882,10 +897,7 @@ fn concurrent_writes_reads_and_flush_crash_keep_all_acknowledged_rows() {
                                     );
                                 }
                             }
-                            Err(error) => assert!(
-                                error.to_string().contains("flush retry is throttled"),
-                                "{error}"
-                            ),
+                            Err(error) => panic!("write failed for id {id}: {error}"),
                         };
                         std::thread::yield_now();
                     }
