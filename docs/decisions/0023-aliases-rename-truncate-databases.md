@@ -1,6 +1,6 @@
 # 0023 别名、改名、清空、集合属性与多数据库
 
-- 状态：合同终稿；2026-10-29 负责人确认五项取舍（见「已确认的取舍」），独立评审三轮后按意见修订并确认。**A 已按设计分七步实施并逐步评审，验收见 [0023-a-acceptance](../testing/0023-a-acceptance.md)；B（多数据库）未开始**
+- 状态：合同终稿；2026-10-29 负责人确认五项取舍（见「已确认的取舍」），独立评审三轮后按意见修订并确认。**A 已按设计分七步实施并逐步评审，验收见 [0023-a-acceptance](../testing/0023-a-acceptance.md)；B（多数据库）的实施设计评审中，见文末「B 实施设计」**
 - 日期：2026-10-29
 - 参照：milvus-lite v3.2.1 / `43d1257774e629bc9f66873977ab7c320d5bf5a7`；pymilvus 3.0.2 实测，2.6.17 经源码核对：`use_database` 同样先调 DescribeDatabase，改名请求只设 `newDBName`，数据库经 `dbname` 元数据传递，与 3.0.2 一致
 - 基线：已发布 `0.3.0rc3`；仓库基线 `1026c0854886c70e303b725b4fdb00b98e95ff3a`
@@ -444,3 +444,137 @@
 ### 后续项 N2：文件替换的崩溃残留
 
 七步之外的既有问题：`replace_file` 的 `*.tmp.<pid>.<n>` 在崩溃后无人清理。已在重开时清扫，机制、范围与失败语义见 [0007「文件替换的残留」](0007-m2-storage-engine.md#文件替换的残留)；崩溃用例为 `truncate`、`rename` 两组子进程退出用例中的 `*-tmp` 阶段。多数据库（B）的 `databases/<db>/` 根目录须同样清扫。
+
+## B 实施设计（评审稿）
+
+本节把合同「数据库（B）」落到现有代码上，冻结 B 的数据结构、生命周期协议、锁、启动处理、失败语义与测试矩阵。合同正文不改，偏差进下面的细化表与差异表。评审通过后才动代码。
+
+### 调查补充（3.x 实测，合同「参照实测 / 数据库」未覆盖的边界）
+
+被测为 v3.2.1 / `43d1257`，macOS arm64（APFS）、pymilvus 3.0.2，raw gRPC；探针与原始输出由负责人本地留存，实施时随差分用例移入 [tests/compatibility_audit/](../../tests/compatibility_audit/)。
+
+| 输入 | 3.x 结果 |
+| --- | --- |
+| `databases/` 下的条目 | `ListDatabases` 与存在判定都用 `isdir`：普通文件不是数据库（Describe / Drop 报 6/6 不存在）；隐藏目录、指向目录的符号链接是数据库；悬空符号链接不是；手工建立、没有 `collections/` 与属性文件的空目录是数据库，其中 `CreateCollection` 会补建 `collections/` |
+| Create 的目标路径被占用 | 目录（含符号链接指向的目录）：6/6 已存在；普通文件、悬空符号链接：`os.rename` 抛 `OSError`，1/0，文案带 staging 与目标的绝对路径 |
+| Create 的名字 | 空格、冒号、非 ASCII、255 字节都成功；`.` / `..` / NUL 为 1/0 非法名；成功时落盘 `collections/` 与 `database_properties.json`，无属性时文件内容为 `{}` |
+| Create / Alter 的属性解码 | 空 key 丢弃，同名 key 保留首次位置、取最后的值，空字符串值保留；同一进程内 Describe 按此顺序返回，文件按键序写出 |
+| Alter 的合并 | 先删 `delete_keys` 再设 `properties`（同一请求中先删后设同一键，该键移到末尾）；合并结果与现有属性相等（不计顺序）时不写文件，默认数据库的属性文件因此保持不存在；空 key 的设置被丢弃 |
+| 属性文件的内容 | 顶层不是对象按空表处理；无法解析：Describe / Alter / **CreateCollection** 都是 1/0；值不是字符串：Describe 按 Python `str()` 展示（`True`、`None`、`[1]`），Alter 写回时**保留原类型**；`timezone` 取值未知：Describe / Alter / CreateCollection 都是 6/6，但 DropDatabase、ShowCollections、ListAliases 不读属性文件，照常成功；按源码，`get_collection` 打开集合同样读它（未单独实测） |
+| Drop | 目录内有 `schema.json` 的集合即非空（符号链接指向的目录同样计入）；残留目录（无 `schema.json`）、悬空别名、损坏的 `aliases.json` / 属性文件都不阻止删除，整个目录被删除；`databases/` 本身保留；符号链接形式的空数据库：`rmtree` 拒绝，1/0，链接与目标都保留 |
+| 其余 RPC 的数据库路由 | 3.x 的 `Connect`、`GetVersion`、`CheckHealth`、`GetFlushState`、`LoadPartitions`、`ReleasePartitions`、`ManualCompaction`、`GetCompactionState` 不读 `db_name`；其余每个集合 RPC 都经 `_database_name`（请求字段优先，其次元数据）；`CreateDatabase`、`DropDatabase` 只读请求体；`ListDatabases` 无数据库参数 |
+
+### 对合同方向的细化
+
+| 合同中的方向 | 本设计 | 理由 |
+| --- | --- | --- |
+| 「各库的别名叶子锁、改名意图一起冻结」；数据库「按需创建」 | `Db.databases` 改为叶子锁（层级 6）保护的 `BTreeMap<String, Arc<DatabaseState>>`；**打开时枚举 `databases/` 并为每个数据库建立状态**（含启动清扫与改名收尾），运行期只由 Create / Drop 在独占许可下增删 | 数据目录由 LOCK 独占，目录只有本进程会改；一次枚举取代每次请求的目录判定，让存在判定、`ListDatabases` 与「精确名字」规则（只差大小写的名字报不存在）都等价于一次映射查找，也使 N2 的清扫与改名意图的重开处理对每个库同一时机、同一前提。代价：LOCK 持有期间被外部手工创建的数据库在重开前不可见（3.x 每次都读目录） |
+| `Db.path` 与默认库 root 双源（第 2 步评审提醒） | `Db` 只保存数据根 `data_root`；每个库的根由 `DatabaseState::new(data_root, name)` 唯一推导（默认库为数据根，其余为 `databases/<db>`）；staging 根与 `databases/` 目录经 `Db::staging_root()` / `databases_dir()` 取得，不再散落 `self.path.join(..)` | 路径只有一个来源，别名、意图、清扫、staging 都不会指向两个不同的根 |
+| 取得状态用借用 `&DatabaseState` | `Db::database(name)` 返回 `Arc<DatabaseState>`，持有者不依赖注册表的锁 | 注册表是叶子锁，取出即放；Drop 之后迟到的持有者只看到旧状态，而 Drop 需要库内无集合（读路径无法再读到任何集合），写路径在独占许可下与之互斥 |
+| 数据库属性与集合 | 本实现的集合操作**不读** `database_properties.json`：属性只在 Describe / Alter 时读写。3.x 的 CreateCollection 与打开集合都会读它，损坏或 `timezone` 未知时失败 | 属性只影响 TIMESTAMPTZ 的默认时区，已由取舍 1 延后；让无关操作依赖这个文件只会引入新的失败面。登记为差异（下表） |
+| 属性值类型 | 值只接受字符串：文件中出现非字符串值时 Describe / Alter 报 Storage 错误（1/0），零写入 | 3.x 自己只写字符串（请求里的键值都是字符串）；复制 Python `str()` 展示与「Alter 保留原类型」只服务手工编辑的文件。登记为差异 |
+| 数据库 Create 的路径被占用 | `databases/<name>` 路径存在（含普通文件、悬空符号链接、只差大小写的名字）一律 6/6 已存在，零写入 | 与集合 Create 同一做法（不覆盖、不暴露绝对路径）；3.x 对非目录占用抛 `OSError` |
+| 写入封锁的范围 | 仍是整个 Db 一个标志，不按数据库拆分 | 目录同步未确认时全库停写是更保守的一侧；按库拆分要重新证明各库共享的 staging 根与 `databases/` 目录的持久化边界，收益只在多租户故障隔离 |
+
+### 模块与数据结构
+
+- **`DatabaseState`** 增加 `properties: OrderedMutex<Option<Properties>, 6>`（首次使用时加载的缓存，叶子锁，读写同别名表），`Properties` 为保持顺序的 `Vec<(String, String)>`：加载保持文件顺序、Alter 的新键追加、已有键原位替换、删除移除。
+- **新模块 `database_properties`**（仿照 [alias.rs](../../crates/core/src/alias.rs)）：`load`（缓存加载，失败不缓存）、`read`（文件不存在或顶层非对象为空；无法解析、值非字符串报 Storage 错误；`timezone` 取值只原样保留，不校验）、`to_bytes`（经 `pyjson::dump_file`，键按码点排序）、`write`（[`fs_commit::replace_file`](../../crates/core/src/storage/fs_commit.rs)，同步数据库根目录）。
+- **新错误** `DatabaseAlreadyExists`（6/6，`database 'd1' already exists`）、`DatabaseNotEmpty`（6/6，`database 'd1' is not empty`）；「cannot drop default database」为 `InvalidArgument`（1/0，对应 3.x 的 `ValueError`）；名字非法沿用 `validate_filesystem_name(_, "database")`。[status.rs](../../crates/grpc/src/status.rs) 映射两个新变体。
+- **`Db` 入口**：`create_database(name, properties)`、`drop_database(name)`、`list_databases()`、`describe_database(database)`、`alter_database(database, properties, delete_keys)`；`require_database` 保持名字校验后查注册表，不再对存在的非默认库返回 UNIMPLEMENTED（0006 第 15 项的数据库部分由此落实为「按 3.x 使用」）。
+- **启动**（`Db::new`，LOCK 与 staging 清理之后、服务开始之前）：默认库的状态先单独建立，枚举只增加非默认库。归属写死：默认库的根清扫在 [data_dir.rs](../../crates/core/src/data_dir.rs) 的 `DataDir::open`（白名单增加 `database_properties.json`），非默认库的清扫在枚举中；`settle_rename` 对包括默认库在内的每个状态只执行一次。枚举规则：
+  - `databases/` 以跟随符号链接的 `fs::metadata` 判定：不存在为无；存在但不是目录、`read_dir` 失败或迭代失败，启动失败（3.x 在启动时 `makedirs(databases)`，非目录会使打开失败；`databases/` 不可读时 3.x 启动成功、按请求报 1/0，本实现更严格，登记）。`databases/` 是指向目录的符号链接时与 3.x 一样跟随，Create 对 `databases/` 同样用跟随的判定（已是目录就不再创建；staging 根保持 A 的「符号链接即拒绝」）。
+  - 条目按 `fs::metadata().is_dir()` 判定（跟随符号链接，同 3.x 的 `isdir`）；单个条目的 `metadata` 失败按「不是数据库」跳过并记日志，不使启动失败（同 3.x `isdir` 吞错）；名字不是 UTF-8 的条目跳过并记日志；名为 `default` 的条目跳过并记日志（默认库来自数据根；3.x 会在 `ListDatabases` 中给出两个 `default`，本实现不复现，登记）。
+  - 对每个非默认库：先 `cleanup_replace_temps(root, ["aliases.json", rename 意图, "database_properties.json"])`（枚举失败使启动失败，单文件失败为警告，同 N2），再进入 `settle_rename`（失败置改名未完成、不使启动失败，同 A）。
+  - 0007「文件替换的残留」补充：非默认库的清扫发生在 `Db::new`，前提同为「LOCK 之后、无写者」。
+
+### 生命周期协议
+
+沿用 CreateCollection / DropCollection 的 staging 与封锁做法，故障点仿 `DirectoryOperation::Create` / `Drop` 新增数据库两种操作，不引入新的私有持久化文件（本切片无新增格式：`database_properties.json` 与 `databases/<db>/` 布局都是 3.x 已有）。
+
+**CreateDatabase**（名字只取请求体，空串为 `default`）：
+
+1. 校验名字（1/0）；独占许可（封锁中拒绝）→ 目录变更锁。
+2. 名字为 `default`、注册表已有、或 `databases/<name>` 路径存在（`symlink_metadata`）：6/6 已存在。其后 `properties` 含 `timezone` 键：UNIMPLEMENTED，零写入（取舍 1 的位置）。
+3. `create_dir_synced` 确认 `databases/` 与 `.database-staging/`（占用为非目录则报错）。在 staging 建 `create-db-<pid>-<n>`（避开 3.x 的 `database-` 前缀）→ 其中建 `collections/` → 以排序写法的字节经 `write_new_schema` 写 `database_properties.json`（无属性为 `{}`，exclusive 创建、文件同步）→ 同步该目录与 staging 根。任一步失败：尽力删 staging 子目录，状态不变。
+4. `rename(staging 子目录, databases/<name>)`；以 `databases/` 的目录列表核对精确名字，不符（文件系统规范化了名字）则改回并同步，报 Storage 错误；改回失败则设置整库写入封锁。
+5. 发布：置写入封锁后向注册表插入状态（属性缓存即为请求属性，空 key 与重复键已由 gRPC 层按 Python dict 语义处理）并清除该库名下的失败判定缓存，再同步 `databases/` 与 staging 根；同步失败（含 panic）保持封锁并报「已创建、目录持久化未确认」；成功解除封锁。
+
+**DropDatabase**（名字只取请求体）：
+
+1. 校验名字（1/0）；`default`（含空串）为 `InvalidArgument("cannot drop default database")`；独占许可 → 目录变更锁；注册表无该名：6/6 不存在。
+2. 库内有集合（`collections/` 下带 `schema.json` 的目录，跟随符号链接；`collections/` 不存在为无；列目录或 metadata 失败向上报 Storage 错误，3.x 吞掉 `exists` 的错误）：6/6 非空。此判定在独占许可内，与集合 create / drop / 改名互斥；改名未完成的库在有集合时同样为非空，无集合时照常删除。
+3. 要求 `databases/<name>` 是真实目录（`symlink_metadata`），符号链接或其他类型报 Storage 错误、零写入（3.x 为 1/0，文案不同）。
+4. `rename` 为 `.database-staging/drop-db-<pid>-<n>`（提交点，改名失败状态不变）→ 从注册表移除状态，清除该库的失败判定缓存（名字锁条目由租约析构自动回收，与集合 drop 相同；独占许可内该库不会有活租约） → 同步 `databases/` 与 staging 根，失败（含 panic）设置整库写入封锁并报「已删除、目录持久化未确认」→ 删除 staging 子目录，失败只记日志，下次打开清空。
+5. 删除的是整个目录：含 `aliases.json`（悬空别名）、`database_properties.json`、残留目录与 `rename` 意图，与 3.x 的 `rmtree` 一致。
+
+**AlterDatabase**（名字取请求体，其次元数据）：
+
+1. 独占许可（封锁中拒绝）→ `require_database` → `properties` 含 `timezone` 键：UNIMPLEMENTED，零写入（存在性之后，取舍 1）。
+2. 叶子锁内加载属性，先删 `delete_keys`（不存在的键忽略）再设 `properties`；结果与现值相等（不计顺序）则不写、不改缓存。
+3. 否则 `database_properties::write`：替换之前失败，缓存与文件都不变；替换之后目录同步失败，更新缓存、设置整库写入封锁并报「已修改、持久化未确认」，与别名写入相同。默认库首次有效修改时在数据根创建文件，与 3.x 相同。
+
+**DescribeDatabase / ListDatabases**：Describe 取叶子锁内的缓存属性，`db_name` 回填归一化后的请求名；加载失败不缓存。List 返回注册表全部名字（含 `default`，按码点排序）。二者不取许可。
+
+### 锁
+
+| 操作 | 取得的锁（按层级顺序） |
+| --- | --- |
+| CreateDatabase / DropDatabase | 独占许可 → 目录变更锁 →（注册表叶子锁，只在发布时短暂持有） |
+| AlterDatabase | 独占许可 → 属性叶子锁（读改写全程，写文件期间持有） |
+| DescribeDatabase / ListDatabases | 属性叶子锁 / 注册表读锁（取出即放） |
+| 已有各 RPC | 先 `require_database`（注册表读锁，取出 `Arc` 即放），其余不变；取得许可之后的路径重新取数据库状态，不沿用许可之前的 `Arc` |
+
+- 独占许可使数据库生命周期与所有集合写入、首次懒打开、合并互斥；已打开集合的纯读不受影响。生命周期操作低频，等待在途写入与合并结束是 CreateCollection 已有的代价。
+- Drop 要求库内无集合，因此不存在需要排空的句柄、维护任务或意图（`rename_pending` 随状态一起丢弃）。
+- `lock_order` 不新增层级：注册表是第 6 层叶子，持有它时不取其他锁；`Db::new` 的启动枚举在服务开始之前单线程执行。
+
+### gRPC
+
+- [build.rs](../../crates/grpc/build.rs) 的 `IMPLEMENTED_METHODS` 加入 `CreateDatabase`、`DropDatabase`、`ListDatabases`、`DescribeDatabase`、`AlterDatabase`。
+- 路由：`CreateDatabase` / `DropDatabase` 只用请求体 `db_name`；`DescribeDatabase` / `AlterDatabase` 沿用现有 `database()`（请求字段优先、其次元数据）；其余每个集合 RPC 已经走 `database()`，不改。3.x 不读 `db_name` 的 RPC（`GetFlushState`、`ManualCompaction`、`GetCompactionState` 等）保持现状。
+- 属性解码复用 [schema.rs](../../crates/grpc/src/schema.rs) 的 `properties`（空 key 丢弃、同名保留首次位置取最后的值）；`delete_keys` 原样；删除按键精确匹配、不特殊处理空串，属性加载也保留文件中的空键，因此 `delete_keys=[""]` 与 3.x 一样能删掉手工文件里的空键（正常文件没有空键，等价于无操作）。
+- 响应：Describe 填 `db_name` 与 `properties`（键值均为字符串）；List 填 `db_names`；出错时只填 status。分支沿用 Engine（`MilvusLiteError` 子类映射，其余 1/0）。
+
+### 登记的差异（实施时同步写入 [0006 差异表](0006-m2-scope.md#与-3x-的差异)）
+
+| 输入 | 3.x | 本实现 | 理由 |
+| --- | --- | --- | --- |
+| Create 的 `databases/<name>` 被普通文件或悬空符号链接占用 | `OSError`，1/0，文案带绝对路径 | 6/6 已存在，零写入 | 同集合 Create；不覆盖、不暴露路径 |
+| 已有数据库路径是符号链接：Drop | 非空 6/6；空时 `rmtree` 拒绝，1/0 | 非空 6/6；空时 Storage 错误 1/0（文案不同），链接与目标都保留 | 不跟随链接删除库外内容 |
+| 属性文件中的非字符串值 | Describe 按 `str()` 展示，Alter 保留原类型 | Describe / Alter 报 Storage 错误 1/0，零写入 | 只会出现在手工编辑的文件里 |
+| 属性文件无法解析 | Describe、Alter、CreateCollection 与打开集合都是 1/0 | 只有 Describe / Alter 读文件，仍为 1/0（文案不同）；CreateCollection 与打开集合不读，照常成功 | 无关操作不依赖该文件；本实现能打开并写入 3.x 打不开的库，README「已知差异」同样写明 |
+| 属性文件中 `timezone` 取值 3.x 视为未知 | Describe、Alter、CreateCollection 与打开集合都是 6/6 | `timezone` 值不校验，原样展示与保留；CreateCollection 与打开集合不读（取舍 1：校验随 TIMESTAMPTZ 切片） | 校验需要时区库；无关操作不依赖该文件 |
+| 运行期由外部手工创建的 `databases/<db>` | 立即可见 | 重开后可见 | 数据目录由 LOCK 独占，目录只由本进程修改 |
+| `databases/` 下名字不是 UTF-8 的目录 | 参与 `ListDatabases`（surrogateescape） | 跳过并记日志 | 无法在协议字符串中表示，只可能手工产生 |
+| 「更严格」类：Drop 非空判定中的 I/O 错误；`databases/` 不可读 | `exists` / `isdir` 吞错，按「无 `schema.json`」「不是数据库」处理；`os.listdir` 不吞，直接 1/0；启动只做 `makedirs`，`databases/` 不可读时仍启动，按请求失败 | `collections/` 的列目录与条目 metadata 失败向上报 Storage 错误；`databases/` 不可读使启动失败 | 同 A 的 I/O 出口原则 |
+| Drop 的崩溃窗口 | `rmtree` 中途退出留下半个目录 | 改名进 staging 后再删，重开只有「已删除」或「未删除」 | 合同「持久化保证」表已登记，此处补出口 |
+
+### 测试矩阵
+
+| 层 | 内容 | 位置 |
+| --- | --- | --- |
+| 单元 | `database_properties` 读写：文件不存在 / 顶层非对象 / 无法解析 / 值非字符串 / 重复键 / 保持文件顺序 / `timezone` 原样保留；序列化与真实 `json.dump` 逐字节对照（空表、非 ASCII 键、空值、键序）并入 fixtures 生成器；启动枚举：普通文件与悬空链接被忽略、符号链接目录与隐藏目录被登记、非 UTF-8 名跳过、`databases/default` 跳过且列表中只有一个 `default`、`databases/` 不存在 / 不是目录 / 是指向目录的符号链接（登记其中的库，Create 同样跟随）/ 不可读、单个条目 metadata 失败被跳过；`default` 之外同名集合与数据库互不影响 | core 模块内、[crates/core/tests/](../../crates/core/tests/) |
+| 故障与崩溃（fault-injection） | Create：staging 建目录、写属性文件、改名之前 / 之后、精确名字核对失败与改回（含改回失败）、`databases/` 与 staging 同步失败、panic，各点后进程退出并重开：只能是「未创建」或「已创建且完整可用」，staging 残留被清空；Drop：改名之前 / 之后、同步失败、panic，进程退出后「未删除」或「已删除」；Alter：`replace_file` 前后与目录同步失败（封锁与缓存断言）、无变化不写文件；各库根上 N2 清扫（`aliases.json`、改名意图、`database_properties.json` 的 tmp 残留）在 `Db::new` 清除、近似名保留；非默认库内的别名写入、改名与清空各做一遍崩溃退出与重开（意图在 `databases/<db>/` 与集合目录） | 新增 [databases.rs](../../crates/core/tests/databases.rs)，并在 aliases / rename / truncate / db_persistence 的故障模块中参数化数据库 |
+| 并发 | Create / Drop 与同库、他库的 CreateCollection、懒打开、Drop 集合、改名、合并的先后；Drop 与迟到持有旧状态的读；两个 Create 同名只一个成功；Alter 与 Describe；debug 锁序检查 | 同上，加 [compaction.rs](../../crates/core/tests/compaction.rs) 独占变更用例 |
+| 差分 | 合同「参照实测 / 数据库」每一行与本文调查补充，raw gRPC 与 MilvusClient 两条 SDK 线；数据库不存在时每个集合 RPC 的状态码矩阵；`using_database` 与 `MilvusClient(db_name=)` 路由；每个库内别名、改名、清空、属性的隔离；预期差异单独断言 | [tests/differential/](../../tests/differential/) 新增 `test_databases.py` |
+| 互通 | 3.x 与本实现交替创建 / 删除数据库、写属性、在非默认库内建集合与别名后互相打开（比较库列表、属性与顺序、集合、别名、数据、load 状态）；3.x 创建中途退出遗留的 staging；本实现中途退出遗留的 staging 由 3.x 打开；手工建立的空库、符号链接库 | [test_cross_implementation.py](../../tests/storage_interop/test_cross_implementation.py)、[test_management_crashes.py](../../tests/storage_interop/test_management_crashes.py) |
+| 端到端与参照用例 | 参照 `test_grpc_database.py`（23 条，6 条按取舍 1 仍不通过）、`test_database_gaps.py`、各文件中标「范围外 / 多数据库」的用例逐条改状态并更新 INVENTORY；两条 SDK 线 | [tests/python/adapter/](../../tests/python/adapter/) |
+| 统计 | 760 / 90 / 49 按同一方法重跑，逐条核对合同预期 | 仓库外，记录写入验收文档 |
+
+### 实施顺序
+
+1. 注册表重构：`Db.path` 单源化、`DatabaseState::new`、`databases` 改为叶子锁注册表、启动枚举（含非默认库的清扫与改名收尾）、`require_database` 查表；已有的非默认库开始按 3.x 使用（翻转「UNIMPLEMENTED」用例）；用手工建立的目录作测试夹具；
+2. `database_properties` 模块与 `DescribeDatabase` / `ListDatabases` / `AlterDatabase`（含 gRPC 与错误映射）；
+3. `CreateDatabase`（含故障点与互通用例）；
+4. `DropDatabase`；
+5. 文档同步（0002 布局与保证、0006 第 15 项与差异表、0007 清扫与锁表、0023 状态、README 支持范围与回退说明、AGENTS 架构地图与索引、INVENTORY、互通 README）、补测、三组统计与 `docs/testing/0023-b-acceptance.md`。
+
+第 1 步之后每步单独评审。回退到 0.3.0rc3 及更早：旧版对已有的非默认库返回 UNIMPLEMENTED、不触碰其内容，`.database-staging/` 仍在打开时清空；发行说明写明回退后数据库内的集合不可访问但数据保留。
+
+### 待负责人确认
+
+1. **打开时枚举数据库**（细化表第一行）而非按需注册。
+2. **属性值只接受字符串、集合操作不读属性文件**（两处差异）。
+3. **路径被占用的 Create 一律报已存在**。
+4. **写入封锁保持整库一个标志**，不按数据库拆分。
