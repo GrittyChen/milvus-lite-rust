@@ -155,6 +155,17 @@ def generate_canonical(output: Path):
         db.close()
     shutil.copyfile(data_dir / "aliases.json", output / "aliases_3x.json")
 
+    databases_dir = output / "databases-db"
+    db = MilvusLite(str(databases_dir))
+    try:
+        db.create_database("d1", properties={"zz": "2", "aa": "", "键": "值"})
+    finally:
+        db.close()
+    shutil.copyfile(
+        databases_dir / "databases" / "d1" / "database_properties.json",
+        output / "database_properties_3x.json",
+    )
+
 
 def verify(output: Path):
     for name in ("schema_3x.json", "manifest_3x.json"):
@@ -172,7 +183,12 @@ def verify(output: Path):
         generated.pop(variable)
         checked_in.pop(variable)
     assert generated == checked_in, "snapshot_3x.json"
-    for name in ("schema_canonical_3x.json", "manifest_canonical_3x.json", "aliases_3x.json"):
+    for name in (
+        "schema_canonical_3x.json",
+        "manifest_canonical_3x.json",
+        "aliases_3x.json",
+        "database_properties_3x.json",
+    ):
         assert (output / name).read_bytes() == (HERE / name).read_bytes(), name
 
 

@@ -311,7 +311,7 @@ pub struct InsertOutcome {
 
 pub const DEFAULT_DATABASE: &str = "default";
 const DATABASES_DIR: &str = "databases";
-const STAGING_DIR: &str = ".database-staging";
+use crate::data_dir::STAGING_DIR;
 static STAGING_NUMBER: AtomicU64 = AtomicU64::new(1);
 
 #[cfg(feature = "fault-injection")]

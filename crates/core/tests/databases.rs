@@ -1297,3 +1297,208 @@ fn process_exit_around_database_drop_reopens_before_or_after() {
         db.close();
     }
 }
+
+/// 清空、改名与别名写入在非默认库内进程退出：意图文件在 `databases/<db>/` 与集合目录，重开后只有「操作前」或
+/// 「操作后」，意图被收尾（0023 B：每个库各有别名、改名意图与清空意图）。
+#[cfg(feature = "fault-injection")]
+#[test]
+fn process_exit_in_a_non_default_database_settles_management_intents() {
+    use milvus_lite_core::db::{
+        DirectoryFault, DirectoryOperation, DirectoryPoint, inject_directory_fault_once,
+    };
+    use std::process::Command;
+    let test = "process_exit_in_a_non_default_database_settles_management_intents";
+    // （操作:阶段，是否已生效）
+    let stages = [
+        ("rename:directory", false),
+        ("rename:collections-sync", true),
+        ("rename:aliases-after", true),
+        ("truncate:intent-after", false),
+        ("truncate:rebuild", true),
+        ("truncate:files", true),
+        ("alias:before", false),
+        ("alias:after", true),
+    ];
+    if let Ok(stage) = std::env::var("MILVUS_LITE_DB_MGMT_CRASH") {
+        let path = std::path::PathBuf::from(std::env::var("MILVUS_LITE_CRASH_DIR").unwrap());
+        let db = open(&path);
+        db.create_database("d1", &[]).unwrap();
+        db.create_collection("d1", "c", schema()).unwrap();
+        db.insert("d1", "c", batch(&[1, 2])).unwrap();
+        db.create_alias("d1", "c", "a").unwrap();
+        db.flush_collection("d1", "c").unwrap();
+        let (operation, point) = match stage.as_str() {
+            "rename:directory" => (DirectoryOperation::Rename, DirectoryPoint::BeforeRename),
+            "rename:collections-sync" => {
+                (DirectoryOperation::Rename, DirectoryPoint::CollectionsSync)
+            }
+            "rename:aliases-after" => (
+                DirectoryOperation::Rename,
+                DirectoryPoint::AliasesAfterRename,
+            ),
+            "truncate:intent-after" => (
+                DirectoryOperation::Truncate,
+                DirectoryPoint::IntentAfterRename,
+            ),
+            "truncate:rebuild" => (DirectoryOperation::Truncate, DirectoryPoint::Rebuild),
+            "truncate:files" => (DirectoryOperation::Truncate, DirectoryPoint::Files),
+            "alias:before" => (DirectoryOperation::Alias, DirectoryPoint::Aliases),
+            _ => (
+                DirectoryOperation::Alias,
+                DirectoryPoint::AliasesAfterRename,
+            ),
+        };
+        inject_directory_fault_once(operation, point, DirectoryFault::Exit);
+        match stage.split(':').next().unwrap() {
+            "rename" => db.rename_collection("d1", "c", "d", "").unwrap(),
+            "truncate" => db.truncate_collection("d1", "c").unwrap(),
+            _ => db.create_alias("d1", "c", "b").unwrap(),
+        }
+        panic!("management crash injection did not fire");
+    }
+    if std::env::var_os("MILVUS_LITE_DB_MGMT_PARENT").is_none() {
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test, "--nocapture"])
+            .env("MILVUS_LITE_DB_MGMT_PARENT", "1")
+            .status()
+            .unwrap();
+        assert!(
+            status.success(),
+            "isolated recovery parent failed: {status:?}"
+        );
+        return;
+    }
+    for (stage, effective) in stages {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("mgmt-crash.db");
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test, "--nocapture"])
+            .env("MILVUS_LITE_DB_MGMT_CRASH", stage)
+            .env("MILVUS_LITE_CRASH_DIR", &path)
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(88), "{stage}");
+        let db = open(&path);
+        let d1 = path.join("databases/d1");
+        // 数据库根目录上的改名意图在打开时已收尾；默认库不受影响。
+        assert!(
+            !d1.join("milvus-lite-rust.rename-intent.json").exists(),
+            "{stage}"
+        );
+        assert!(names(&db, "").is_empty(), "{stage}");
+        match stage.split(':').next().unwrap() {
+            "rename" => {
+                let expected = if effective { "d" } else { "c" };
+                assert_eq!(names(&db, "d1"), [expected], "{stage}");
+                assert_eq!(db.describe_alias("d1", "a").unwrap(), expected, "{stage}");
+                assert_eq!(
+                    db.collection("d1", "a").unwrap().read().count(),
+                    2,
+                    "{stage}"
+                );
+                let schema_text = std::fs::read_to_string(
+                    d1.join("collections").join(expected).join("schema.json"),
+                )
+                .unwrap();
+                assert!(
+                    schema_text.contains(&format!("\"collection_name\": \"{expected}\"")),
+                    "{stage}"
+                );
+            }
+            "truncate" => {
+                assert_eq!(names(&db, "d1"), ["c"], "{stage}");
+                // 清空意图在集合首次访问时收尾。
+                let count = db.collection("d1", "c").unwrap().read().count();
+                assert_eq!(count, if effective { 0 } else { 2 }, "{stage}");
+                assert!(
+                    !d1.join("collections/c/milvus-lite-rust.truncate-intent.json")
+                        .exists(),
+                    "{stage}"
+                );
+                db.insert("d1", "c", batch(&[9])).unwrap();
+                assert_eq!(db.describe_alias("d1", "a").unwrap(), "c", "{stage}");
+            }
+            _ => {
+                assert_eq!(db.describe_alias("d1", "a").unwrap(), "c", "{stage}");
+                assert_eq!(db.describe_alias("d1", "b").is_ok(), effective, "{stage}");
+                db.create_alias("d1", "c", "later").unwrap();
+            }
+        }
+        assert!(!path.join("aliases.json").exists(), "{stage}");
+        db.close();
+    }
+}
+
+#[test]
+fn concurrent_creates_of_one_name_succeed_exactly_once() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("m.db");
+    let db = open(&path);
+    for round in 0..20 {
+        let name = format!("r{round}");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(4));
+        let workers: Vec<_> = (0..4)
+            .map(|worker| {
+                let (db, name, barrier) = (db.clone(), name.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    db.create_database(&name, &pairs(&[("winner", &worker.to_string())]))
+                })
+            })
+            .collect();
+        let results: Vec<_> = workers.into_iter().map(|w| w.join().unwrap()).collect();
+        assert_eq!(
+            results.iter().filter(|r| r.is_ok()).count(),
+            1,
+            "round {round}"
+        );
+        for result in results.into_iter().filter(Result::is_err) {
+            assert!(matches!(result, Err(EngineError::DatabaseAlreadyExists(_))));
+        }
+        // 缓存与文件都来自同一个胜者。
+        let (_, cached) = describe(&db, &name);
+        let on_disk = properties_file(&path.join("databases").join(&name)).unwrap();
+        assert_eq!(
+            on_disk,
+            format!("{{\n  \"winner\": \"{}\"\n}}", cached[0].1)
+        );
+    }
+    assert!(staging_entries(&path).is_empty());
+    assert_eq!(db.list_databases().len(), 21);
+    db.close();
+}
+
+#[test]
+fn concurrent_alters_are_serialized_and_the_file_matches_the_cache() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("m.db");
+    let db = open(&path);
+    db.create_database("d1", &[]).unwrap();
+    let workers: Vec<_> = (0..8)
+        .map(|worker| {
+            let db = db.clone();
+            std::thread::spawn(move || {
+                for step in 0..5 {
+                    let key = format!("k{worker}-{step}");
+                    db.alter_database("d1", &pairs(&[(&key, "v")]), &[])
+                        .unwrap();
+                    assert!(describe(&db, "d1").1.iter().any(|(k, _)| *k == key));
+                }
+            })
+        })
+        .collect();
+    for worker in workers {
+        worker.join().unwrap();
+    }
+    let (_, cached) = describe(&db, "d1");
+    assert_eq!(cached.len(), 40);
+    db.close();
+    drop(db);
+    let db = open(&path);
+    let mut reread = describe(&db, "d1").1;
+    let mut expected = cached;
+    reread.sort();
+    expected.sort();
+    assert_eq!(reread, expected);
+    db.close();
+}

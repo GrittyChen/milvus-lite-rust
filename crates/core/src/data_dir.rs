@@ -6,6 +6,9 @@ use std::path::{Path, PathBuf};
 
 pub const LOCK_FILENAME: &str = "LOCK";
 
+/// 创建与删除数据库、集合以及清空时使用的 staging 目录，位于数据根；打开时清空。
+pub(crate) const STAGING_DIR: &str = ".database-staging";
+
 /// 数据库根目录中经 `replace_file` 写入的共享文件与私有意图文件；默认库在 `DataDir::open` 清扫，
 /// 其余数据库在 `Db::new` 枚举时清扫（0007「文件替换的残留」）。
 pub(crate) const DATABASE_ROOT_REPLACE_FILES: &[&str] = &[
@@ -127,7 +130,7 @@ impl DataDir {
 }
 
 fn cleanup_staging(data_dir: &Path) -> io::Result<()> {
-    let staging = data_dir.join(".database-staging");
+    let staging = data_dir.join(STAGING_DIR);
     match fs::symlink_metadata(&staging) {
         Ok(meta) if meta.file_type().is_dir() => {}
         Ok(_) => {

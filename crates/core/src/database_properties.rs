@@ -159,6 +159,22 @@ mod tests {
     }
 
     #[test]
+    fn serialization_matches_the_bytes_the_reference_engine_wrote() {
+        // 样本由 3.x 的 `create_database(properties={"zz": "2", "aa": "", "键": "值"})` 写出，见 fixtures/generate.py。
+        let bytes = include_bytes!("../tests/fixtures/database_properties_3x.json");
+        assert_eq!(
+            to_bytes(&props(&[("zz", "2"), ("aa", ""), ("键", "值")])),
+            bytes
+        );
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join(FILE), bytes).unwrap();
+        // 读回为文件的键序；再写出得到相同字节。
+        let read = load(&mut None, root.path()).unwrap().clone();
+        assert_eq!(read, props(&[("aa", ""), ("zz", "2"), ("键", "值")]));
+        assert_eq!(to_bytes(&read), bytes);
+    }
+
+    #[test]
     fn merge_deletes_before_setting_and_skips_no_ops() {
         let current = props(&[("zeta", "1"), ("alpha", "2")]);
         // 新键追加、已有键原位替换。

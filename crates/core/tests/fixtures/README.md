@@ -9,7 +9,7 @@
 - `wal_delta_3x.arrow`：删除主键 10，`_seq=3`，`_partition=_all`。
 - `delta_3x.parquet`：同一次删除落盘后的 delta 文件，列为 `id` 与 `_seq`。
 - `snapshot_3x.json`：对含上述 data 与 delta 文件的 collection 创建的 snapshot 元数据，钉住两份文件。
-- `schema_canonical_3x.json`、`manifest_canonical_3x.json`、`aliases_3x.json`：排序写出的字节样本，分别覆盖带默认值、非 ASCII 字符与 ARRAY / JSON / partition key 字段的 schema，多分区、文件列表与带浮点索引参数的 manifest，以及三个别名；`aliases_3x.json` 经 `milvus_lite/db.py` 的 `create_alias` 写出。
+- `schema_canonical_3x.json`、`manifest_canonical_3x.json`、`aliases_3x.json`、`database_properties_3x.json`：排序写出的字节样本，分别覆盖带默认值、非 ASCII 字符与 ARRAY / JSON / partition key 字段的 schema，多分区、文件列表与带浮点索引参数的 manifest，三个别名，以及带空值与非 ASCII 键的数据库属性；`aliases_3x.json` 经 `milvus_lite/db.py` 的 `create_alias` 写出，`database_properties_3x.json` 经 `create_database` 写出。
 
 只保存格式测试必需的小文件；测试不会修改参照实现的 checkout。
 
