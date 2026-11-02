@@ -111,6 +111,8 @@ reply_with_status_field!(
     crate::pb::service::SearchResults,
     crate::pb::service::DescribeAliasResponse,
     crate::pb::service::ListAliasesResponse,
+    crate::pb::service::ListDatabasesResponse,
+    crate::pb::service::DescribeDatabaseResponse,
 );
 
 // 只有 status 一个字段，宏中的 `..Default::default()` 无效。

@@ -273,3 +273,357 @@ fn open_settles_a_rename_intent_in_a_non_default_database() {
     assert_eq!(names(&db, "d1"), ["a"]);
     db.close();
 }
+
+fn properties_file(root: &Path) -> Option<String> {
+    std::fs::read_to_string(root.join("database_properties.json")).ok()
+}
+
+fn pairs(items: &[(&str, &str)]) -> Vec<(String, String)> {
+    items
+        .iter()
+        .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+        .collect()
+}
+
+fn describe(db: &Db, database: &str) -> (String, Vec<(String, String)>) {
+    db.describe_database(database).unwrap()
+}
+
+#[test]
+fn list_databases_is_the_sorted_registry_including_default() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("m.db");
+    for name in ["d1", "Zdb", ".hidden", "库"] {
+        std::fs::create_dir_all(path.join("databases").join(name)).unwrap();
+    }
+    let db = open(&path);
+    // 码点序：`.` < 大写 < 小写 < 非 ASCII；`default` 与其他库一同排序。
+    assert_eq!(
+        db.list_databases(),
+        [".hidden", "Zdb", "d1", "default", "库"]
+    );
+    db.close();
+}
+
+#[test]
+fn describe_and_alter_follow_the_reference_merge_rules() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("m.db");
+    std::fs::create_dir_all(path.join("databases/d1")).unwrap();
+    let db = open(&path);
+    assert_eq!(describe(&db, ""), ("default".to_owned(), vec![]));
+    assert_eq!(describe(&db, "d1").0, "d1");
+    missing(db.describe_database("dx"), "dx");
+    missing(db.describe_database("D1"), "D1");
+    missing(db.alter_database("dx", &pairs(&[("a", "b")]), &[]), "dx");
+    // 存在性先于 timezone 的判定。
+    missing(
+        db.alter_database("dx", &pairs(&[("timezone", "UTC")]), &[]),
+        "dx",
+    );
+
+    // 没有变化不写文件：默认库的属性文件保持不存在。
+    db.alter_database("", &[], &[]).unwrap();
+    db.alter_database("", &[], &["nokey".to_owned()]).unwrap();
+    assert_eq!(properties_file(&path), None);
+
+    db.alter_database("", &pairs(&[("zeta", "1"), ("alpha", "2")]), &[])
+        .unwrap();
+    assert_eq!(
+        properties_file(&path).unwrap(),
+        "{\n  \"alpha\": \"2\",\n  \"zeta\": \"1\"\n}"
+    );
+    // 进程内按插入顺序，落盘按键序。
+    assert_eq!(describe(&db, "").1, pairs(&[("zeta", "1"), ("alpha", "2")]));
+    // 设为现值、删除后重设为原值：没有变化，不重写、顺序不变。
+    let before = file_state(&path.join("database_properties.json"));
+    db.alter_database("", &pairs(&[("zeta", "1")]), &[])
+        .unwrap();
+    db.alter_database("", &pairs(&[("zeta", "1")]), &["zeta".to_owned()])
+        .unwrap();
+    assert_eq!(file_state(&path.join("database_properties.json")), before);
+    assert_eq!(describe(&db, "").1, pairs(&[("zeta", "1"), ("alpha", "2")]));
+    // 同一请求先删后设同一键且值不同：该键移到末尾。
+    db.alter_database("", &pairs(&[("zeta", "9")]), &["zeta".to_owned()])
+        .unwrap();
+    assert_eq!(describe(&db, "").1, pairs(&[("alpha", "2"), ("zeta", "9")]));
+
+    // 各库的属性互不影响，写在各自的根目录。
+    db.alter_database("d1", &pairs(&[("k", "v")]), &[]).unwrap();
+    assert_eq!(describe(&db, "d1").1, pairs(&[("k", "v")]));
+    assert_eq!(describe(&db, "").1, pairs(&[("alpha", "2"), ("zeta", "9")]));
+    assert_eq!(
+        properties_file(&path.join("databases/d1")).unwrap(),
+        "{\n  \"k\": \"v\"\n}"
+    );
+    db.close();
+    drop(db);
+
+    // 重开后从文件读回，顺序即文件的键序。
+    let db = open(&path);
+    assert_eq!(describe(&db, "").1, pairs(&[("alpha", "2"), ("zeta", "9")]));
+    assert_eq!(describe(&db, "d1").1, pairs(&[("k", "v")]));
+    db.close();
+}
+
+#[test]
+fn timezone_is_rejected_before_any_write_but_existing_values_stay_manageable() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("m.db");
+    std::fs::create_dir_all(path.join("databases/d1")).unwrap();
+    // 3.x 已写入的 timezone：可以读取、展示与删除，值不校验。
+    let file = path.join("databases/d1/database_properties.json");
+    std::fs::write(&file, br#"{"timezone": "Asia/Shanghai", "k": "v"}"#).unwrap();
+    let db = open(&path);
+    assert_eq!(
+        describe(&db, "d1").1,
+        pairs(&[("timezone", "Asia/Shanghai"), ("k", "v")])
+    );
+    let before = std::fs::read(&file).unwrap();
+    for request in [
+        pairs(&[("timezone", "UTC")]),
+        pairs(&[("timezone", "Asia/Shanghai")]),
+        pairs(&[("other", "x"), ("timezone", "Mars/Base")]),
+    ] {
+        match db.alter_database("d1", &request, &[]) {
+            Err(EngineError::Unsupported { .. }) => {}
+            other => panic!("expected Unsupported: {other:?}"),
+        }
+        assert_eq!(std::fs::read(&file).unwrap(), before);
+    }
+    assert_eq!(properties_file(&path), None);
+    db.alter_database("d1", &[], &["timezone".to_owned()])
+        .unwrap();
+    assert_eq!(describe(&db, "d1").1, pairs(&[("k", "v")]));
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        "{\n  \"k\": \"v\"\n}"
+    );
+    db.close();
+}
+
+#[test]
+fn unreadable_property_files_fail_describe_and_alter_only() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("m.db");
+    let databases = path.join("databases");
+    for (name, text) in [
+        ("p_bad", &b"{"[..]),
+        ("p_nonstr", br#"{"a": 1, "b": true}"#),
+        ("p_list", b"[]"),
+        ("p_unsorted", br#"{"z": "1", "a": "2"}"#),
+    ] {
+        std::fs::create_dir_all(databases.join(name)).unwrap();
+        std::fs::write(databases.join(name).join("database_properties.json"), text).unwrap();
+    }
+    let db = open(&path);
+    for name in ["p_bad", "p_nonstr"] {
+        let file = databases.join(name).join("database_properties.json");
+        let before = std::fs::read(&file).unwrap();
+        assert!(matches!(
+            db.describe_database(name),
+            Err(EngineError::Storage(_))
+        ));
+        assert!(matches!(
+            db.alter_database(name, &pairs(&[("n", "v")]), &[]),
+            Err(EngineError::Storage(_))
+        ));
+        assert_eq!(std::fs::read(&file).unwrap(), before, "{name}");
+        // 其余操作不读属性文件：集合照常创建、列出与删除。
+        db.create_collection(name, "c", schema()).unwrap();
+        assert_eq!(names(&db, name), ["c"]);
+        db.drop_collection(name, "c").unwrap();
+    }
+    // 失败不缓存：修好文件后下一次读取成功。
+    std::fs::write(
+        databases.join("p_bad/database_properties.json"),
+        br#"{"a": "1"}"#,
+    )
+    .unwrap();
+    assert_eq!(describe(&db, "p_bad").1, pairs(&[("a", "1")]));
+    // 顶层不是对象按空表处理，Alter 写出新文件；文件中的键序保留到下一次写出。
+    assert!(describe(&db, "p_list").1.is_empty());
+    db.alter_database("p_list", &pairs(&[("n", "v")]), &[])
+        .unwrap();
+    assert_eq!(
+        properties_file(&databases.join("p_list")).unwrap(),
+        "{\n  \"n\": \"v\"\n}"
+    );
+    assert_eq!(
+        describe(&db, "p_unsorted").1,
+        pairs(&[("z", "1"), ("a", "2")])
+    );
+    db.alter_database("p_unsorted", &pairs(&[("new", "v")]), &[])
+        .unwrap();
+    assert_eq!(
+        properties_file(&databases.join("p_unsorted")).unwrap(),
+        "{\n  \"a\": \"2\",\n  \"new\": \"v\",\n  \"z\": \"1\"\n}"
+    );
+    assert_eq!(
+        describe(&db, "p_unsorted").1,
+        pairs(&[("z", "1"), ("a", "2"), ("new", "v")])
+    );
+    db.close();
+}
+
+/// 字节与 inode：inode 不变说明没有发生替换。
+fn file_state(path: &Path) -> (Vec<u8>, Option<u64>) {
+    #[cfg(unix)]
+    let inode = {
+        use std::os::unix::fs::MetadataExt;
+        Some(std::fs::metadata(path).unwrap().ino())
+    };
+    #[cfg(not(unix))]
+    let inode = None;
+    (std::fs::read(path).unwrap(), inode)
+}
+
+#[cfg(feature = "fault-injection")]
+#[test]
+fn property_write_failures_before_replace_change_nothing_and_after_replace_seal_writes() {
+    use milvus_lite_core::db::{
+        DirectoryFault, DirectoryOperation, DirectoryPoint, inject_directory_fault_once,
+    };
+    for database in ["", "d1"] {
+        for point in [DirectoryPoint::BeforeRename, DirectoryPoint::AfterRename] {
+            for fault in [DirectoryFault::Error, DirectoryFault::Panic] {
+                let root = tempfile::tempdir().unwrap();
+                let path = root.path().join("m.db");
+                std::fs::create_dir_all(path.join("databases/d1")).unwrap();
+                let db = open(&path);
+                db.create_collection("", "c", schema()).unwrap();
+                db.alter_database(database, &pairs(&[("kept", "1")]), &[])
+                    .unwrap();
+                let dir = if database.is_empty() {
+                    path.clone()
+                } else {
+                    path.join("databases/d1")
+                };
+                let before = properties_file(&dir);
+                inject_directory_fault_once(DirectoryOperation::DatabaseProperties, point, fault);
+                let error = db
+                    .alter_database(database, &pairs(&[("new", "2")]), &[])
+                    .unwrap_err()
+                    .to_string();
+                let replaced = point == DirectoryPoint::AfterRename;
+                assert!(error.contains("storage error"), "{error}");
+                assert_eq!(error.contains("durability is unconfirmed"), replaced);
+                // 缓存与磁盘一致：替换之前两者都不变，替换之后两者都已更新。
+                assert_eq!(properties_file(&dir) != before, replaced);
+                assert_eq!(
+                    describe(&db, database).1.iter().any(|(k, _)| k == "new"),
+                    replaced
+                );
+                let write = db.insert("", "c", batch(&[1]));
+                if replaced {
+                    // 0007：替换之后目录同步未确认，写入全部封锁，读照常。
+                    assert!(write.unwrap_err().to_string().contains("blocked"));
+                    assert!(
+                        db.alter_database(database, &[], &["kept".to_owned()])
+                            .unwrap_err()
+                            .to_string()
+                            .contains("blocked")
+                    );
+                } else {
+                    write.unwrap();
+                    db.alter_database(database, &pairs(&[("new", "2")]), &[])
+                        .unwrap();
+                }
+                assert!(std::fs::read_dir(&dir).unwrap().all(|entry| {
+                    !entry
+                        .unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .contains(".tmp")
+                }));
+                db.close();
+                drop(db);
+                let db = open(&path);
+                assert!(
+                    describe(&db, database).1.iter().any(|(k, _)| k == "new"),
+                    "the file holds the change after reopen (replaced={replaced}) or the retry"
+                );
+                db.close();
+            }
+        }
+    }
+}
+
+/// 进程在 `database_properties.json` 替换前后退出：重开只见替换之前或之后的完整文件，没有残留临时文件。
+#[cfg(feature = "fault-injection")]
+#[test]
+fn process_exit_around_the_property_replace_reopens_before_or_after() {
+    use milvus_lite_core::db::{
+        DirectoryFault, DirectoryOperation, DirectoryPoint, inject_directory_fault_once,
+    };
+    use std::process::Command;
+    let test = "process_exit_around_the_property_replace_reopens_before_or_after";
+    if let Ok(stage) = std::env::var("MILVUS_LITE_PROPERTY_CRASH") {
+        let path = std::path::PathBuf::from(std::env::var("MILVUS_LITE_CRASH_DIR").unwrap());
+        std::fs::create_dir_all(path.join("databases/d1")).unwrap();
+        let db = open(&path);
+        db.alter_database("d1", &pairs(&[("kept", "1")]), &[])
+            .unwrap();
+        let point = if stage == "before" {
+            DirectoryPoint::BeforeRename
+        } else {
+            DirectoryPoint::AfterRename
+        };
+        inject_directory_fault_once(
+            DirectoryOperation::DatabaseProperties,
+            point,
+            DirectoryFault::Exit,
+        );
+        db.alter_database("d1", &pairs(&[("new", "2")]), &[])
+            .unwrap();
+        panic!("property crash injection did not fire");
+    }
+    // 验证放在独立父进程中，避免兄弟子进程短暂继承刚关闭的 LOCK（同别名的进程退出用例）。
+    if std::env::var_os("MILVUS_LITE_PROPERTY_PARENT").is_none() {
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test, "--nocapture"])
+            .env("MILVUS_LITE_PROPERTY_PARENT", "1")
+            .status()
+            .unwrap();
+        assert!(
+            status.success(),
+            "isolated recovery parent failed: {status:?}"
+        );
+        return;
+    }
+    for (stage, replaced) in [("before", false), ("after", true)] {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("property-crash.db");
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test, "--nocapture"])
+            .env("MILVUS_LITE_PROPERTY_CRASH", stage)
+            .env("MILVUS_LITE_CRASH_DIR", &path)
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(88), "{stage}");
+        let db = open(&path);
+        let (_, properties) = describe(&db, "d1");
+        assert!(
+            properties.contains(&("kept".to_owned(), "1".to_owned())),
+            "{stage}"
+        );
+        assert_eq!(
+            properties.contains(&("new".to_owned(), "2".to_owned())),
+            replaced,
+            "{stage}"
+        );
+        db.alter_database("d1", &pairs(&[("later", "3")]), &[])
+            .unwrap();
+        db.close();
+        assert!(
+            std::fs::read_dir(path.join("databases/d1"))
+                .unwrap()
+                .all(|entry| !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .contains(".tmp")),
+            "{stage}"
+        );
+    }
+}

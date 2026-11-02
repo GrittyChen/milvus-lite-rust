@@ -47,6 +47,9 @@ const IMPLEMENTED_METHODS: &[&str] = &[
     "DropAlias",
     "DescribeAlias",
     "ListAliases",
+    "ListDatabases",
+    "DescribeDatabase",
+    "AlterDatabase",
 ];
 
 fn main() -> Result<(), Box<dyn Error>> {

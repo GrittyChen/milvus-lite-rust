@@ -15,6 +15,7 @@ use crate::collection::{Collection, LoadState};
 use crate::compute::Compute;
 use crate::data::{InsertBatch, Pk};
 use crate::data_dir::DataDir;
+use crate::database_properties::{self, Properties};
 use crate::error::{EngineError, Result, py_repr};
 use crate::filter::ParsedFilter;
 use crate::index::IndexRequest;
@@ -140,6 +141,8 @@ struct DatabaseState {
     /// 先按磁盘上的意图重试收尾，仍失败则拒绝；数据读写照常。只在独占许可下修改，唯一例外是
     /// `Db::new` 在服务开始前单线程设置启动收尾的结果。
     rename_pending: OrderedMutex<Option<String>, 6>,
+    /// `database_properties.json` 的缓存；叶子锁，读改写全程持有（0023 B「锁」）。
+    properties: OrderedMutex<Option<Properties>, 6>,
 }
 
 impl DatabaseState {
@@ -154,6 +157,7 @@ impl DatabaseState {
             root,
             aliases: OrderedMutex::new(None),
             rename_pending: OrderedMutex::new(None),
+            properties: OrderedMutex::new(None),
         }
     }
 
@@ -335,6 +339,8 @@ pub enum DirectoryOperation {
     Alias,
     /// AlterCollection 的 `schema.json` 替换，只用 `BeforeRename` 与 `AfterRename`（目录同步之前）两点。
     Alter,
+    /// AlterDatabase 的 `database_properties.json` 替换，点同 `Alter`。
+    DatabaseProperties,
     /// 改名：`BeforeRename` 为目录改名之前，`CollectionsSync` 为退役旧名后（及重开收尾时）同步 `collections/`，
     /// `Aliases` / `AliasesAfterRename` 为别名改指，其余为改名专用的点。
     Rename,
@@ -3803,6 +3809,78 @@ impl Db {
                 *blocked = true;
                 Err(storage(format!(
                     "aliases were changed, but aliases.json durability is unconfirmed: {error}"
+                )))
+            }
+        }
+    }
+
+    /// 全部数据库的名字（含 `default`），按码点排序；注册表即存在判定的来源（0023 B）。
+    pub fn list_databases(&self) -> Vec<String> {
+        self.databases.read().keys().cloned().collect()
+    }
+
+    /// 3.x `describe_database`：返回归一化后的名字与属性（进程内按插入顺序）。读取失败不缓存。
+    pub fn describe_database(&self, database: &str) -> Result<(String, Properties)> {
+        let scope = self.key(database, "")?;
+        let state = self.database(&scope.database)?;
+        let mut cache = state.properties.lock();
+        let properties = database_properties::load(&mut cache, &state.root)?;
+        Ok((scope.database, properties.clone()))
+    }
+
+    /// 3.x `alter_database_properties`：先判数据库存在，再判 `timezone`（取舍 1，零写入），先删 `delete_keys`
+    /// 再设 `properties`，没有变化时不写。持独占许可（文件替换之后目录同步失败时只能在独占许可下封锁写入），
+    /// 读改写全程持属性叶子锁；写入失败不改变缓存，同步未确认时缓存随磁盘更新（同别名写入）。
+    pub fn alter_database(
+        &self,
+        database: &str,
+        properties: &[(String, String)],
+        delete_keys: &[String],
+    ) -> Result<()> {
+        let scope = self.key(database, "")?;
+        let _intent = NamespaceIntent::new(&self.namespace_waiters);
+        let mut blocked = self.write_gate.write();
+        if *blocked {
+            return Err(storage(
+                "database writes are blocked after an unconfirmed directory change",
+            ));
+        }
+        let state = self.database(&scope.database)?;
+        if properties.iter().any(|(key, _)| key == "timezone") {
+            return Err(EngineError::unsupported(
+                "database timezone property",
+                "database timezone is not supported in this build of milvus-lite-rust yet",
+            ));
+        }
+        let mut cache = state.properties.lock();
+        let current = database_properties::load(&mut cache, &state.root)?;
+        let Some(next) = database_properties::merge(current, properties, delete_keys) else {
+            return Ok(());
+        };
+        let fault = |point| {
+            #[cfg(feature = "fault-injection")]
+            directory_fault(
+                DirectoryOperation::DatabaseProperties,
+                match point {
+                    fs_commit::ReplacePoint::BeforeRename => DirectoryPoint::BeforeRename,
+                    fs_commit::ReplacePoint::AfterRename => DirectoryPoint::AfterRename,
+                },
+            )?;
+            #[cfg(not(feature = "fault-injection"))]
+            let _point: fs_commit::ReplacePoint = point;
+            Ok(())
+        };
+        match database_properties::write(&state.root, &next, fault) {
+            Ok(()) => {
+                *current = next;
+                Ok(())
+            }
+            Err(fs_commit::ReplaceError::Unchanged(error)) => Err(storage(error)),
+            Err(fs_commit::ReplaceError::Unconfirmed(error)) => {
+                *current = next;
+                *blocked = true;
+                Err(storage(format!(
+                    "database properties were changed, but database_properties.json durability is unconfirmed: {error}"
                 )))
             }
         }

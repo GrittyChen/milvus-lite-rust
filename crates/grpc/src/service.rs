@@ -741,6 +741,57 @@ impl Service for MilvusService {
         .await
     }
 
+    async fn list_databases(
+        &self,
+        _request: Request<svc::ListDatabasesRequest>,
+    ) -> Result<Response<svc::ListDatabasesResponse>, Status> {
+        self.run(Branch::Engine, move |db| {
+            Ok(svc::ListDatabasesResponse {
+                status: Some(success()),
+                db_names: db.list_databases(),
+                ..Default::default()
+            })
+        })
+        .await
+    }
+
+    async fn describe_database(
+        &self,
+        request: Request<svc::DescribeDatabaseRequest>,
+    ) -> Result<Response<svc::DescribeDatabaseResponse>, Status> {
+        let database = database(&request, |r| &r.db_name);
+        self.run(Branch::Engine, move |db| {
+            let (db_name, properties) = db.describe_database(&database)?;
+            Ok(svc::DescribeDatabaseResponse {
+                status: Some(success()),
+                db_name,
+                properties: properties
+                    .iter()
+                    .map(|(k, v)| schema::kv(k, v.clone()))
+                    .collect(),
+                ..Default::default()
+            })
+        })
+        .await
+    }
+
+    async fn alter_database(
+        &self,
+        request: Request<svc::AlterDatabaseRequest>,
+    ) -> Result<Response<common::Status>, Status> {
+        let database = database(&request, |r| &r.db_name);
+        let req = request.into_inner();
+        self.run(Branch::Engine, move |db| {
+            db.alter_database(
+                &database,
+                &schema::properties(&req.properties),
+                &req.delete_keys,
+            )?;
+            Ok(success())
+        })
+        .await
+    }
+
     async fn list_aliases(
         &self,
         request: Request<svc::ListAliasesRequest>,

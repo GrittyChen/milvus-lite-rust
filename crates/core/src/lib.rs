@@ -5,6 +5,7 @@ pub mod collection;
 pub mod compute;
 pub mod data;
 pub mod data_dir;
+mod database_properties;
 pub mod db;
 pub mod error;
 pub mod filter;
