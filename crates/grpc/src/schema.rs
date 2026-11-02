@@ -96,7 +96,7 @@ pub(crate) fn unsupported(feature: &'static str) -> EngineError {
 }
 
 /// Python 的真值判断，用于 `json.loads` 的结果。
-fn truthy(v: &Value) -> bool {
+pub(crate) fn truthy(v: &Value) -> bool {
     match v {
         Value::Null => false,
         Value::Bool(b) => *b,

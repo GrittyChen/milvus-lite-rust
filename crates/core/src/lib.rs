@@ -25,8 +25,8 @@ pub mod schema;
 pub mod storage;
 
 pub use collection::{
-    Collection, GetSnapshot, Hits, LoadState, QueryResult, QueryVectors, ReadSnapshot, SearchRange,
-    SearchRequest, SearchResult,
+    Collection, GetSnapshot, GroupBy, Hits, LoadState, QueryResult, QueryVectors, ReadSnapshot,
+    SearchRange, SearchRequest, SearchResult,
 };
 pub use compute::{Compute, ComputeError};
 pub use data::{ColumnData, InputValues, InsertBatch, META_FIELD, Pk, Rows};

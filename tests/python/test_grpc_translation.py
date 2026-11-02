@@ -740,7 +740,6 @@ def test_search_m1_unsupported(env):
     response = stub.Search(search_req(params={"metric_type": '"L2"', "params": '{"radius": 6, "range_filter": 1}'}))
     assert status_of(response)[0] == 0
     assert list(response.results.ids.int_id.data) == [1, 2]
-    unimplemented(stub.Search, search_req(params={"group_by_field": "t"}))
     empty = stub.Search(search_req(partition_names=["p"]))
     assert status_of(empty)[0] == 0 and not empty.results.ids.int_id.data
     unimplemented(stub.Search, search_req(params={"timezone": "UTC"}))
@@ -749,6 +748,65 @@ def test_search_m1_unsupported(env):
     for extra in ["NaN", "Infinity", "-Infinity", '"\\ud800"']:
         unimplemented(stub.Search, search_req(params={"params": '{"radius": 2.5, "x": ' + extra + '}'}))
     assert status_of(stub.Search(search_req(params={"params": '{"radius": 2.5, "x": 1e999}'})))[0] == 0
+
+
+def test_search_group_by_translation(env):
+    """分组检索的参数解析与响应编码；窗口与分组算法的真值见 core 的 group_by 测试和差分。"""
+    _, stub, _ = env
+    basic(stub, "g", dynamic=False)
+    insert(
+        stub, "g",
+        long_fd("id", [1, 2, 3, 4, 5, 6]),
+        vec_fd("v", [[i, 0] for i in range(1, 7)]),
+        str_fd("t", ["a", "a", "b", "b", "c", "c"]),
+    )
+
+    def run(**params):
+        return stub.Search(search_req("g", params={"topk": "2", "metric_type": '"L2"', **params},
+                                      output_fields=["id"]))
+
+    r = run(group_by_field="t", group_size="1")
+    assert status_of(r)[0] == 0
+    assert list(r.results.ids.int_id.data) == [1, 3] and list(r.results.topks) == [2]
+    assert r.results.top_k == 2
+    group = r.results.group_by_field_value
+    assert (group.field_name, group.type) == ("t", DataType.VARCHAR)
+    assert list(group.scalars.string_data.data) == ["a", "b"] and not group.valid_data
+    # 分组字段不在 output_fields 中，命中里不出现，但分组值仍然返回。
+    assert columns(r.results.fields_data) == ["id"]
+
+    r = run(group_by_field="t", group_size="2")
+    assert list(r.results.ids.int_id.data) == [1, 2, 3, 4]
+    assert list(r.results.group_by_field_value.scalars.string_data.data) == ["a", "a", "b", "b"]
+    # group_size 为 0 等同于 1；负数使每组都留不下命中，此时不返回分组值。
+    assert list(run(group_by_field="t", group_size="0").results.ids.int_id.data) == [1, 3]
+    r = run(group_by_field="t", group_size="-1")
+    assert status_of(r)[0] == 0 and not r.results.ids.int_id.data and not r.results.topks[0]
+    assert not r.results.HasField("group_by_field_value")
+    # group_size 先按 Python int() 解析；没有分组字段时同样报错。
+    bad = (1, 0, "invalid literal for int() with base 10: 'abc'")
+    assert status_of(run(group_by_field="t", group_size='"abc"')) == bad
+    assert status_of(run(group_size='"abc"')) == bad
+    # 没有 group_by_field（或空字符串）时不分组，也没有分组值。
+    plain = run(group_size="2")
+    assert list(plain.results.ids.int_id.data) == [1, 2]
+    assert not plain.results.HasField("group_by_field_value")
+
+    # strict_group_size 取 JSON 解析结果的 Python 真值；解析失败的文本按非空字符串为真。
+    for value, strict in [("true", True), ("1", True), ("2", True), ("False", True), ('"x"', True),
+                          ("false", False), ("0", False), ('""', False), ("null", False)]:
+        r = run(group_by_field="t", group_size="3", strict_group_size=value, topk="3")
+        assert status_of(r)[0] == 0
+        assert bool(list(r.results.ids.int_id.data)) is not strict, value
+
+    # 字段校验：不存在、类型不支持。
+    assert status_of(run(group_by_field="nosuch"))[2] == "group_by_field 'nosuch' not found in schema"
+    assert status_of(run(group_by_field="v"))[2] == (
+        "group_by_field 'v' has type FLOAT_VECTOR which is not supported for group_by")
+    # 动态字段的 key 不是 schema 字段。
+    basic(stub, "d", dynamic=True)
+    assert status_of(stub.Search(search_req("d", params={"group_by_field": "zz"})))[2] == (
+        "group_by_field 'zz' not found in schema")
 
 
 def test_search_result_encoding(env):
@@ -970,6 +1028,9 @@ def test_pymilvus_entry_points_remaining_unsupported(env):
          f"HybridSearch: {rpc}"),
         (lambda: client.search("q", [[1, 0]], filter="id + 1 > 0"), "filter expressions: arithmetic, temporal literals, text_match, and geometry predicates are not supported"),
         (lambda: client.search("q", [[1, 0]], ranker=decay), f"rerank and function chains: {feature}"),
+        # 分组检索已实现；与 rerank 同时出现时，rerank 的 UNIMPLEMENTED 不能被分组路径吞掉。
+        (lambda: client.search("q", [[1, 0]], ranker=decay, group_by_field="id"),
+         f"rerank and function chains: {feature}"),
     ]
     for call, details in cases:
         with pytest.raises(grpc.RpcError) as info:

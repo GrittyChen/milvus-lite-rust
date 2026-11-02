@@ -51,6 +51,31 @@ pub(crate) fn fields_data(
     Ok(out)
 }
 
+/// 分组检索的 `group_by_field_value`：各查询的分组值按命中顺序拼接，没有命中时不出现。
+/// 空值以占位值加 `valid_data` 表示，与普通输出列的编码相同。
+pub(crate) fn group_by_field_data(
+    schema: &CollectionSchema,
+    name: &str,
+    columns: &[&ColumnData],
+) -> Result<Option<pb::FieldData>, EngineError> {
+    if columns.iter().all(|c| c.is_empty()) {
+        return Ok(None);
+    }
+    let field = schema
+        .fields
+        .iter()
+        .find(|f| f.name == name)
+        .ok_or_else(|| EngineError::Storage(MISMATCH.into()))?;
+    field_data(
+        &field.name,
+        field.data_type,
+        field.dim,
+        field.element_type,
+        &Column::Data(columns.to_vec()),
+    )
+    .map(Some)
+}
+
 /// 3.x 以 `json.dumps` 输出每行的动态字段：显式请求的 key 按请求顺序，否则按 key 排序
 /// （3.x 保存 `$meta` 时 `sort_keys=True`）。
 fn meta_json(projection: &Projection, meta: &Map<String, Value>) -> String {

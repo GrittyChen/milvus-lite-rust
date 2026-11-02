@@ -6,7 +6,7 @@ use std::collections::HashMap;
 
 use milvus_lite_core::error::py_json_repr;
 use milvus_lite_core::{
-    Compute, EngineError, Metric, QueryVectors, ReadSnapshot, SearchRange, SearchRequest,
+    Compute, EngineError, GroupBy, Metric, QueryVectors, ReadSnapshot, SearchRange, SearchRequest,
 };
 use prost::Message;
 use serde_json::Value;
@@ -16,7 +16,7 @@ use crate::pb::common::PlaceholderGroup;
 use crate::pb::schema as pb;
 use crate::pb::service as svc;
 use crate::pyint::{self, PyError};
-use crate::schema::unsupported;
+use crate::schema::{truthy, unsupported};
 use crate::{insert, status};
 
 const PLACEHOLDER_FLOAT_VECTOR: i32 = 101;
@@ -32,6 +32,7 @@ pub(crate) struct Parsed {
     offset: i64,
     round_decimal: i64,
     range: Option<SearchRange>,
+    group: Option<GroupBy>,
     unsupported: Option<&'static str>,
     expr: String,
 }
@@ -56,7 +57,8 @@ pub(crate) fn search(
         skip = end;
     }
     let limit = usize::try_from(end.saturating_sub(skip).max(0)).unwrap_or(usize::MAX);
-    let result = c.search_filtered_with_range(
+    let group_field = parsed.group.as_ref().map(|g| g.field.clone());
+    let result = c.search_grouped(
         SearchRequest {
             anns_field: parsed.anns_field,
             vectors: parsed.vectors,
@@ -68,6 +70,7 @@ pub(crate) fn search(
         compute,
         &parsed.expr,
         parsed.range,
+        parsed.group,
     )?;
 
     let schema = c.schema();
@@ -104,6 +107,18 @@ pub(crate) fn search(
             topks,
             output_fields: result.projection.output_fields(schema, false),
             primary_field_name: pk.name.clone(),
+            group_by_field_value: match &group_field {
+                Some(name) => output::group_by_field_data(
+                    schema,
+                    name,
+                    &result
+                        .hits
+                        .iter()
+                        .filter_map(|h| h.group_values.as_ref())
+                        .collect::<Vec<_>>(),
+                )?,
+                None => None,
+            },
             ..Default::default()
         }),
         collection_name: c.name().to_owned(),
@@ -193,14 +208,23 @@ pub(crate) fn parse(req: &svc::SearchRequest) -> Result<Parsed, EngineError> {
             );
         }
     }
-    if let Some(Value::String(s)) = raw.get("group_by_field")
-        && !s.is_empty()
-    {
-        note("grouping search");
-    }
+    // 3.x 无论是否分组都解析 group_size；`group_size or 1` 使 0 变为 1，负数则让每组都留不下命中。
+    let mut group_size = 1;
     if let Some(v) = raw.get("group_size").filter(|v| !v.is_null()) {
-        pyint::int(v).map_err(|e| EngineError::InvalidArgument(e.message().to_owned()))?;
+        group_size =
+            pyint::int(v).map_err(|e| EngineError::InvalidArgument(e.message().to_owned()))?;
+        if group_size == 0 {
+            group_size = 1;
+        }
     }
+    let group = match raw.get("group_by_field") {
+        Some(Value::String(field)) if !field.is_empty() => Some(GroupBy {
+            field: field.clone(),
+            size: group_size,
+            strict: raw.get("strict_group_size").is_some_and(truthy),
+        }),
+        _ => None,
+    };
     if let Some(Value::String(s)) = raw.get("timezone")
         && !s.is_empty()
     {
@@ -235,6 +259,7 @@ pub(crate) fn parse(req: &svc::SearchRequest) -> Result<Parsed, EngineError> {
         offset,
         round_decimal,
         range: (range.radius.is_some() || range.range_filter.is_some()).then_some(range),
+        group,
         unsupported: unsupported_feature,
         expr: req.dsl.clone(),
     })

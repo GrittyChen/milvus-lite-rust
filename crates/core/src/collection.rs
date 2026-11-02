@@ -50,6 +50,14 @@ pub struct SearchRequest {
     pub output_fields: Vec<String>,
 }
 
+/// 分组检索参数（0024）；`size` 为 3.x 解析后的 `group_size`（0 已换成 1，负数使每组留不下命中）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupBy {
+    pub field: String,
+    pub size: i64,
+    pub strict: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct SearchRange {
     pub radius: Option<f64>,
@@ -73,6 +81,8 @@ pub struct Hits {
     /// 与 `rows` 逐行对应的对外分数。
     pub scores: Vec<f32>,
     pub rows: Rows,
+    /// 分组检索时与 `rows` 逐行对应的分组字段值（含空值），不依赖 `output_fields`；否则为 None。
+    pub group_values: Option<ColumnData>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -158,8 +168,20 @@ impl ReadSnapshot {
         expr: &str,
         range: Option<SearchRange>,
     ) -> Result<SearchResult> {
+        self.search_grouped(req, compute, expr, range, None)
+    }
+
+    /// 分组检索（0024）：候选窗口、分组与 offset 的顺序沿用 3.x，见 `group_order`。
+    pub fn search_grouped(
+        &self,
+        req: SearchRequest,
+        compute: &Compute,
+        expr: &str,
+        range: Option<SearchRange>,
+        group: Option<GroupBy>,
+    ) -> Result<SearchResult> {
         let rows_per_block = (BLOCK_ELEMS / field_dim(&self.schema.fields[self.vector_pos])).max(1);
-        self.search_filtered_in_blocks(req, compute, rows_per_block, expr, range)
+        self.search_filtered_in_blocks(req, compute, rows_per_block, expr, range, group.as_ref())
     }
 
     fn search_in_blocks(
@@ -168,7 +190,7 @@ impl ReadSnapshot {
         compute: &Compute,
         rows_per_block: usize,
     ) -> Result<SearchResult> {
-        self.search_filtered_in_blocks(req, compute, rows_per_block, "", None)
+        self.search_filtered_in_blocks(req, compute, rows_per_block, "", None, None)
     }
 
     fn search_filtered_in_blocks(
@@ -178,6 +200,7 @@ impl ReadSnapshot {
         rows_per_block: usize,
         expr: &str,
         range: Option<SearchRange>,
+        group: Option<&GroupBy>,
     ) -> Result<SearchResult> {
         let projection = Projection::new(&self.schema, &req.output_fields, ApiKind::Search);
         // 3.x：没有查询向量时在一切检查之前返回空结果。
@@ -189,6 +212,9 @@ impl ReadSnapshot {
             });
         }
         self.require_loaded()?;
+        let group_pos = group
+            .map(|g| self.resolve_group_field(&g.field))
+            .transpose()?;
         let field_pos = self.resolve_anns_field(req.anns_field.as_deref())?;
         let field = &self.schema.fields[field_pos];
         let vectors = match &req.vectors {
@@ -215,10 +241,10 @@ impl ReadSnapshot {
         let range = range.filter(|r| r.radius.is_some() || r.range_filter.is_some());
         let end = req.limit.saturating_add(req.offset);
         // 3.x 只在有限近邻窗口内做范围过滤，不能在扫描时提前筛掉范围外候选。
-        let take = if range.is_some() {
-            end.saturating_mul(5)
-        } else {
-            end
+        let take = match group {
+            Some(g) => group_window(end, g.size, range.is_some()),
+            None if range.is_some() => end.saturating_mul(5),
+            None => end,
         };
         // 3.x 编译过滤后才处理 topk<=0，但此时不会进入数据求值或数值转换。
         let chunks = if take > 0 {
@@ -283,11 +309,30 @@ impl ReadSnapshot {
                     ranked.retain(|(score, _)| range.contains(metric, *score));
                     ranked.truncate(end);
                 }
-                let kept = ranked.get(req.offset..).unwrap_or(&[]);
+                let grouped: Vec<(f32, RankedRow)>;
+                let kept: &[(f32, RankedRow)] = match (group, group_pos) {
+                    (Some(g), Some(pos)) => {
+                        grouped =
+                            group_order(&self.chunks, &ranked, pos, g, end, req.offset, req.limit)
+                                .into_iter()
+                                .map(|i| ranked[i])
+                                .collect();
+                        &grouped
+                    }
+                    _ => ranked.get(req.offset..).unwrap_or(&[]),
+                };
                 let refs: Vec<RowRef> = kept.iter().map(|(_, r)| r.at).collect();
+                let group_values = group_pos.map(|pos| {
+                    let mut column = ColumnData::empty(&self.schema.fields[pos]);
+                    for r in &refs {
+                        column.push_row(&self.chunks[r.chunk].columns[pos], r.row);
+                    }
+                    column
+                });
                 Hits {
                     scores: kept.iter().map(|(s, _)| *s).collect(),
                     rows: self.gather(&refs, &projection),
+                    group_values,
                 }
             })
             .collect();
@@ -490,6 +535,37 @@ impl ReadSnapshot {
     /// 3.x `_require_loaded`：检索与按主键读取之前的 load 状态检查。
     pub fn require_loaded(&self) -> Result<()> {
         check_loaded(&self.name, self.load_state, self.deleted, self.unusable)
+    }
+
+    fn resolve_group_field(&self, name: &str) -> Result<usize> {
+        let pos = self
+            .schema
+            .fields
+            .iter()
+            .position(|f| f.name == name)
+            .ok_or_else(|| {
+                EngineError::schema(format!(
+                    "group_by_field {} not found in schema",
+                    py_repr(name)
+                ))
+            })?;
+        let data_type = self.schema.fields[pos].data_type;
+        if !matches!(
+            data_type,
+            DataType::Int8
+                | DataType::Int16
+                | DataType::Int32
+                | DataType::Int64
+                | DataType::Bool
+                | DataType::VarChar
+        ) {
+            return Err(EngineError::schema(format!(
+                "group_by_field {} has type {} which is not supported for group_by",
+                py_repr(name),
+                data_type.name()
+            )));
+        }
+        Ok(pos)
     }
 
     fn resolve_anns_field(&self, anns_field: Option<&str>) -> Result<usize> {
@@ -3126,6 +3202,89 @@ impl TopK {
         self.candidates.sort_unstable_by(|a, b| order(metric, a, b));
         self.candidates
     }
+}
+
+/// 3.x 的分组候选窗口：`max(end × group_size × 3, end × 10)`，有范围参数时再不小于 `end × 5`。
+/// 窗口属于结果的一部分（排名靠前的候选被少数几组占满时，后面的组取不到）。
+/// 乘法在 i128 上饱和，极大值只是让候选集不设上限；`TopK` 惰性分配，不会按它预留内存。
+fn group_window(end: usize, size: i64, ranged: bool) -> usize {
+    let end = end as i128;
+    let mut window = end
+        .saturating_mul(i128::from(size))
+        .saturating_mul(3)
+        .max(end.saturating_mul(10));
+    if ranged {
+        window = window.max(end.saturating_mul(5));
+    }
+    usize::try_from(window.max(0)).unwrap_or(usize::MAX)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum GroupKey<'a> {
+    Null,
+    Bool(bool),
+    Int(i64),
+    Str(&'a str),
+}
+
+fn group_key(column: &ColumnData, row: usize) -> GroupKey<'_> {
+    if column.is_null(row) {
+        return GroupKey::Null;
+    }
+    match column.values() {
+        ColumnData::Bool(v) => GroupKey::Bool(v[row]),
+        ColumnData::Int8(v) => GroupKey::Int(i64::from(v[row])),
+        ColumnData::Int16(v) => GroupKey::Int(i64::from(v[row])),
+        ColumnData::Int32(v) => GroupKey::Int(i64::from(v[row])),
+        ColumnData::Int64(v) => GroupKey::Int(v[row]),
+        ColumnData::VarChar(v) => GroupKey::Str(&v[row]),
+        _ => unreachable!("group_by_field type was validated"),
+    }
+}
+
+/// 3.x `_apply_group_by` 加 offset 切片：按距离顺序归组，每组保留前 `size` 条，
+/// `strict` 时丢弃条数不等于 `size` 的组，取前 `groups` 个组并按组展平；
+/// offset 为正时在展平后的命中上取 `[offset, offset + limit)`，为 0 时不再截断。
+/// 空值是独立的一组。`size` 不为正时每组都留不下命中，结果为空。
+fn group_order(
+    chunks: &[Chunk],
+    ranked: &[(f32, RankedRow)],
+    pos: usize,
+    group: &GroupBy,
+    groups: usize,
+    offset: usize,
+    limit: usize,
+) -> Vec<usize> {
+    let size = i128::from(group.size);
+    let mut index: HashMap<GroupKey<'_>, usize> = HashMap::new();
+    let mut members: Vec<Vec<usize>> = Vec::new();
+    for (i, (_, ranked_row)) in ranked.iter().enumerate() {
+        let at = ranked_row.at;
+        let key = group_key(&chunks[at.chunk].columns[pos], at.row);
+        let slot = *index.entry(key).or_insert_with(|| {
+            members.push(Vec::new());
+            members.len() - 1
+        });
+        if (members[slot].len() as i128) < size {
+            members[slot].push(i);
+        }
+    }
+    let mut order = Vec::new();
+    let mut kept = 0;
+    for hits in &members {
+        if kept >= groups {
+            break;
+        }
+        if group.strict && hits.len() as i128 != size {
+            continue;
+        }
+        order.extend_from_slice(hits);
+        kept += 1;
+    }
+    if offset > 0 {
+        order = order.into_iter().skip(offset).take(limit).collect();
+    }
+    order
 }
 
 fn order(metric: Metric, a: &(f32, RankedRow), b: &(f32, RankedRow)) -> std::cmp::Ordering {
