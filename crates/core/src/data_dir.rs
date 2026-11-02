@@ -6,6 +6,14 @@ use std::path::{Path, PathBuf};
 
 pub const LOCK_FILENAME: &str = "LOCK";
 
+/// 数据库根目录中经 `replace_file` 写入的共享文件与私有意图文件；默认库在 `DataDir::open` 清扫，
+/// 其余数据库在 `Db::new` 枚举时清扫（0007「文件替换的残留」）。
+pub(crate) const DATABASE_ROOT_REPLACE_FILES: &[&str] = &[
+    "aliases.json",
+    crate::storage::rename_intent::INTENT_FILE,
+    "database_properties.json",
+];
+
 /// 库内单元测试派生子进程时，子进程在 fork 与 exec 之间继承此刻打开的全部描述符。裸 `DataDir` 析构只关闭
 /// 自身描述符，被继承的那份仍持有 flock，紧接着的重开会得到 Locked。派生子进程只在写锁内调用 `spawn()`；
 /// 依赖裸句柄析构释放锁、随后重开的用例，从首次打开到最后一次重开持读锁。见
@@ -84,11 +92,9 @@ impl DataDir {
         }
         cleanup_staging(path).map_err(io_err)?;
         // 数据库根目录的 `replace_file` 临时文件（0007「文件替换的残留」）。
-        for warning in crate::storage::fs_commit::cleanup_replace_temps(
-            path,
-            &["aliases.json", crate::storage::rename_intent::INTENT_FILE],
-        )
-        .map_err(io_err)?
+        for warning in
+            crate::storage::fs_commit::cleanup_replace_temps(path, DATABASE_ROOT_REPLACE_FILES)
+                .map_err(io_err)?
         {
             eprintln!("{warning}");
         }
@@ -234,6 +240,7 @@ mod tests {
         let residue = [
             "aliases.json.tmp.7.1",
             "milvus-lite-rust.rename-intent.json.tmp.7.2",
+            "database_properties.json.tmp.7.4",
         ];
         let kept = ["aliases.json.tmp", "aliases.json", "schema.json.tmp.7.3"];
         for name in residue.iter().chain(&kept) {

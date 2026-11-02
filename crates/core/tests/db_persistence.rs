@@ -1815,62 +1815,6 @@ fn schema_collection_name_differing_from_directory_opens_under_directory_name() 
 }
 
 #[test]
-fn existing_non_default_database_is_unimplemented_not_missing() {
-    let root = tempfile::tempdir().unwrap();
-    let path = root.path().join("databases.db");
-    let db = Db::new(DataDir::open(&path).unwrap(), compute()).unwrap();
-    let missing = |result: Result<_, EngineError>, name: &str| match result {
-        Err(EngineError::DatabaseNotFound(found)) => assert_eq!(found, name),
-        other => panic!("expected DatabaseNotFound for {name}: {other:?}"),
-    };
-    missing(db.list_collections("d1"), "d1");
-    std::fs::create_dir_all(path.join("databases/d1/collections")).unwrap();
-    std::fs::write(path.join("databases/file"), b"").unwrap();
-    for result in [
-        db.list_collections("d1").map(drop),
-        db.collection("d1", "c").map(drop),
-        db.create_collection("d1", "c", schema()),
-    ] {
-        match result {
-            Err(EngineError::Unsupported { feature, reason }) => {
-                assert_eq!(feature, "database");
-                assert_eq!(
-                    reason,
-                    "database 'd1' exists, but non-default databases are not supported yet"
-                );
-            }
-            other => panic!("expected Unsupported: {other:?}"),
-        }
-    }
-    assert!(!path.join("databases/d1/collections/c").exists());
-    missing(db.list_collections("file"), "file");
-    missing(db.list_collections("d2"), "d2");
-    // 按精确名字判定：只差大小写的名字在大小写不敏感的文件系统上也报不存在。
-    missing(db.list_collections("D1"), "D1");
-    assert!(matches!(
-        db.list_collections("bad/name"),
-        Err(EngineError::InvalidArgument(_))
-    ));
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        // 3.x 的 isdir 只需要搜索权限；本实现还要列目录核对精确名字，列不了时与 isdir 的
-        // 任何 I/O 错误一样按不存在处理。root 不受目录权限限制，仍能核对到 d1。
-        let databases = path.join("databases");
-        std::fs::set_permissions(&databases, std::fs::Permissions::from_mode(0o300)).unwrap();
-        let listable = std::fs::read_dir(&databases).is_ok();
-        let result = db.list_collections("d1");
-        std::fs::set_permissions(&databases, std::fs::Permissions::from_mode(0o755)).unwrap();
-        if listable {
-            assert!(matches!(result, Err(EngineError::Unsupported { .. })));
-        } else {
-            missing(result, "d1");
-        }
-    }
-    db.close();
-}
-
-#[test]
 fn non_finite_index_params_are_rejected_without_manifest_write() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("index-params.db");

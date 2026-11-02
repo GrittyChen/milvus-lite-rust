@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 
@@ -129,10 +129,10 @@ pub(crate) struct CollectionKey {
     pub(crate) name: String,
 }
 
-/// 一个数据库的共享状态。A 中只有 `default`（0023 A 实施设计「模块与数据结构」）。
+/// 一个数据库的共享状态（0023 B 实施设计「模块与数据结构」）。
 #[derive(Debug)]
 struct DatabaseState {
-    /// 数据库根目录，含 `collections/` 与 `aliases.json`；默认数据库即数据根目录。
+    /// 数据库根目录，含 `collections/` 与 `aliases.json`；只由 [`DatabaseState::new`] 从数据根推导。
     root: PathBuf,
     /// `aliases.json` 的缓存；叶子锁，覆盖完整的读改写（0023 A「别名」）。
     aliases: OrderedMutex<Option<Aliases>, 6>,
@@ -143,6 +143,20 @@ struct DatabaseState {
 }
 
 impl DatabaseState {
+    /// 路径的唯一来源是数据根：默认数据库即数据根目录，其他为 `databases/<name>`。
+    fn new(data_root: &Path, name: &str) -> Self {
+        let root = if name == DEFAULT_DATABASE {
+            data_root.to_path_buf()
+        } else {
+            data_root.join(DATABASES_DIR).join(name)
+        };
+        Self {
+            root,
+            aliases: OrderedMutex::new(None),
+            rename_pending: OrderedMutex::new(None),
+        }
+    }
+
     fn collections_dir(&self) -> PathBuf {
         self.root.join("collections")
     }
@@ -150,6 +164,65 @@ impl DatabaseState {
     fn collection_path(&self, name: &str) -> PathBuf {
         self.collections_dir().join(name)
     }
+}
+
+/// 打开时枚举 `databases/`（0023 B）：默认库来自数据根，枚举只增加非默认库。前提：已持 LOCK、
+/// 服务尚未开始，因此没有任何写者，可以清扫各库根的 `replace_file` 崩溃残留（0007「文件替换的残留」）。
+/// `databases/` 本身无法枚举使打开失败（3.x 启动时 `makedirs(databases)`）；单个条目无法判定按「不是数据库」
+/// 跳过，与 3.x 的 `isdir` 吞错一致。
+fn open_databases(data_root: &Path) -> Result<BTreeMap<String, Arc<DatabaseState>>> {
+    let mut databases = BTreeMap::from([(
+        DEFAULT_DATABASE.to_owned(),
+        Arc::new(DatabaseState::new(data_root, DEFAULT_DATABASE)),
+    )]);
+    let dir = data_root.join(DATABASES_DIR);
+    // 「不存在」只指路径本身不存在；悬空符号链接与循环链接都是存在但不是目录（3.x 的 `makedirs` 同样失败）。
+    match fs::symlink_metadata(&dir) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(databases),
+        Err(error) => return Err(storage(error)),
+    }
+    let entries = match fs::metadata(&dir) {
+        Ok(meta) if meta.is_dir() => fs::read_dir(&dir).map_err(storage)?,
+        Ok(_) => {
+            return Err(storage(format!(
+                "databases path {dir:?} is not a directory"
+            )));
+        }
+        Err(error) => return Err(storage(error)),
+    };
+    for entry in entries {
+        let entry = entry.map_err(storage)?;
+        let path = entry.path();
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            eprintln!("ignoring database directory with a non-UTF-8 name: {path:?}");
+            continue;
+        };
+        match fs::metadata(&path) {
+            Ok(meta) if meta.is_dir() => {}
+            Ok(_) => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                eprintln!("ignoring database entry {path:?}: {error}");
+                continue;
+            }
+        }
+        if name == DEFAULT_DATABASE {
+            eprintln!("ignoring {path:?}: the default database lives in the data root");
+            continue;
+        }
+        let state = DatabaseState::new(data_root, &name);
+        for warning in fs_commit::cleanup_replace_temps(
+            &state.root,
+            crate::data_dir::DATABASE_ROOT_REPLACE_FILES,
+        )
+        .map_err(storage)?
+        {
+            eprintln!("{warning}");
+        }
+        databases.insert(name, Arc::new(state));
+    }
+    Ok(databases)
 }
 
 // 等待者也持强引用；只有最后一个使用者退出后才移除名字，不能在 drop 时换一把锁。
@@ -233,6 +306,8 @@ pub struct InsertOutcome {
 }
 
 pub const DEFAULT_DATABASE: &str = "default";
+const DATABASES_DIR: &str = "databases";
+const STAGING_DIR: &str = ".database-staging";
 static STAGING_NUMBER: AtomicU64 = AtomicU64::new(1);
 
 #[cfg(feature = "fault-injection")]
@@ -660,9 +735,12 @@ pub struct Db {
     /// 服务的计算池（0005）。服务的运行状态与每个在途的 RPC 都持有 `Arc<Db>`，
     /// 所以它在最后一个在途任务结束之后才析构。
     compute: Compute,
-    path: PathBuf,
+    /// 数据根目录；各数据库的根、staging 根与 `databases/` 都由它推导。
+    data_root: PathBuf,
     namespace: OrderedMutex<(), 2>,
-    databases: BTreeMap<String, Arc<DatabaseState>>,
+    /// 注册表：打开时枚举 `databases/` 建立，运行期只由数据库的 Create / Drop 在独占许可下增删。
+    /// 叶子锁，取出 `Arc` 即放。
+    databases: RwLock<BTreeMap<String, Arc<DatabaseState>>, 6>,
     name_locks: OrderedMutex<BTreeMap<CollectionKey, Weak<NameMutex>>, 6>,
     open_failures: RwLock<BTreeMap<CollectionKey, OpenFailure>, 6>,
     /// create/drop 与 collection 的写入/flush 互斥；目录提交点后失败时封锁后续写入。
@@ -726,7 +804,8 @@ impl Drop for Db {
 
 impl Db {
     pub fn new(data_dir: DataDir, compute: Compute) -> Result<Arc<Self>> {
-        let path = data_dir.path().to_path_buf();
+        let data_root = data_dir.path().to_path_buf();
+        let databases = open_databases(&data_root)?;
         let db = Arc::new(Self {
             collections: RwLock::new(BTreeMap::new()),
             gate: Mutex::new(Gate {
@@ -737,16 +816,9 @@ impl Db {
             }),
             idle: Condvar::new(),
             compute,
-            path: path.clone(),
+            data_root,
             namespace: OrderedMutex::new(()),
-            databases: BTreeMap::from([(
-                DEFAULT_DATABASE.to_owned(),
-                Arc::new(DatabaseState {
-                    root: path,
-                    aliases: OrderedMutex::new(None),
-                    rename_pending: OrderedMutex::new(None),
-                }),
-            )]),
+            databases: RwLock::new(databases),
             name_locks: OrderedMutex::new(BTreeMap::new()),
             open_failures: RwLock::new(BTreeMap::new()),
             write_gate: RwLock::new(false),
@@ -757,8 +829,10 @@ impl Db {
             partition_pause: Mutex::new(None),
         });
         // 0023 A「改名 / 启动处理」：LOCK 与 staging 清理之后、开始服务之前；失败不让启动失败。
-        for state in db.databases.values() {
-            if let Err(failure) = db.settle_rename(state, false) {
+        // 对包括默认库在内的每个数据库只执行一次。
+        let states: Vec<_> = db.databases.read().values().cloned().collect();
+        for state in states {
+            if let Err(failure) = db.settle_rename(&state, false) {
                 let reason = failure.reason();
                 eprintln!(
                     "collection rename in {:?} is unfinished: {reason}",
@@ -1003,7 +1077,7 @@ impl Db {
                 "database writes are blocked after an unconfirmed directory change".to_owned(),
             ));
         }
-        self.settle_pending_rename(self.database(&key.database)?, &mut blocked)?;
+        self.settle_pending_rename(&*self.database(&key.database)?, &mut blocked)?;
         let _namespace = self.namespace.lock();
         let lease = self.name_lease(key);
         let _name = lease.mutex().lock();
@@ -1013,7 +1087,7 @@ impl Db {
             return Err(EngineError::CollectionAlreadyExists(name.to_owned()));
         }
         let root = database.collections_dir();
-        let staging_root = self.path.join(".database-staging");
+        let staging_root = self.staging_root();
         for dir in [&root, &staging_root] {
             match fs::symlink_metadata(dir) {
                 Ok(meta) if meta.file_type().is_dir() => {}
@@ -1026,9 +1100,9 @@ impl Db {
             let mut cache = database.aliases.lock();
             let aliases = alias::load(&mut cache, &database.root)?;
             let mut live = aliases.clone();
-            retain_live_aliases(database, &mut live).map_err(storage)?;
+            retain_live_aliases(&database, &mut live).map_err(storage)?;
             if live.len() != aliases.len() {
-                save_lifecycle_aliases(database, aliases, live, true)?;
+                save_lifecycle_aliases(&database, aliases, live, true)?;
             }
             if aliases.contains_key(name) {
                 return Err(EngineError::CollectionAlreadyExists(name.to_owned()));
@@ -1142,7 +1216,7 @@ impl Db {
                 "database writes are blocked after an unconfirmed directory change",
             ));
         }
-        self.settle_pending_rename(self.database(&key.database)?, &mut blocked)?;
+        self.settle_pending_rename(&*self.database(&key.database)?, &mut blocked)?;
         let _namespace = self.namespace.lock();
         // 经别名删除目标集合及指向它的全部别名（3.x 相同）。独占许可下解析，别名不会在此之后改指。
         let key = self.resolve(key)?;
@@ -1183,11 +1257,11 @@ impl Db {
                 self.collections.write().remove(&key);
             }
             self.open_failures.write().remove(&key);
-            remove_aliases_for(database, name)?;
+            remove_aliases_for(&database, name)?;
             return Ok(());
         }
         let root = database.collections_dir();
-        let staging_root = self.path.join(".database-staging");
+        let staging_root = self.staging_root();
         fs_commit::create_dir_synced(&staging_root).map_err(storage)?;
         let handle = self.collections.read().get(&key).cloned();
         let flush_lock = handle
@@ -1239,7 +1313,7 @@ impl Db {
             )));
         }
         *blocked = false;
-        remove_aliases_for(database, name).map_err(|error| {
+        remove_aliases_for(&database, name).map_err(|error| {
             storage(format!(
                 "collection was removed, but aliases cleanup is pending: {error}"
             ))
@@ -1252,29 +1326,14 @@ impl Db {
         Ok(())
     }
 
-    /// 3.x 的 `_require_database`：空名即 `default`。其他数据库尚未实现：3.x 认为存在的
-    /// （`databases/<db>` 是目录）按 0006 第 15 项返回 UNIMPLEMENTED，而不是谎称不存在；
-    /// 名字须精确出现在目录列表中，只差大小写的名字仍报不存在（0023 名字与文件系统）。
-    /// 3.x 的 `os.path.isdir` 把任何 I/O 错误当作不存在，这里的列目录与 metadata 同样如此。
+    /// 3.x 的 `_require_database`：空名即 `default`；其余先校验名字（1/0），再按精确名字查注册表
+    /// （只差大小写的名字报不存在，0023 名字与文件系统）。
     fn require_database(&self, name: &str) -> Result<()> {
         if name.is_empty() || name == DEFAULT_DATABASE {
             return Ok(());
         }
         validate_filesystem_name(name, "database")?;
-        let root = self.path.join("databases");
-        let exact = fs::read_dir(&root).is_ok_and(|mut entries| {
-            entries.any(|entry| entry.is_ok_and(|entry| entry.file_name() == name))
-        });
-        if exact && fs::metadata(root.join(name)).is_ok_and(|meta| meta.is_dir()) {
-            return Err(EngineError::unsupported(
-                "database",
-                format!(
-                    "database {} exists, but non-default databases are not supported yet",
-                    py_repr(name)
-                ),
-            ));
-        }
-        Err(EngineError::DatabaseNotFound(name.to_owned()))
+        self.database(name).map(|_| ())
     }
 
     /// 归一化数据库名并确认它可用；集合名在各入口按原有顺序另行校验。
@@ -1290,11 +1349,16 @@ impl Db {
         })
     }
 
-    fn database(&self, name: &str) -> Result<&DatabaseState> {
+    fn database(&self, name: &str) -> Result<Arc<DatabaseState>> {
         self.databases
+            .read()
             .get(name)
-            .map(Arc::as_ref)
+            .cloned()
             .ok_or_else(|| EngineError::DatabaseNotFound(name.to_owned()))
+    }
+
+    fn staging_root(&self) -> PathBuf {
+        self.data_root.join(STAGING_DIR)
     }
 
     /// 0023 必须保留的行为 1：每个集合入口先解析别名，命中即换成目标名。只解析一层，别名指向的总是真实集合名。
@@ -1312,7 +1376,7 @@ impl Db {
     }
 
     fn exact_collection_name(&self, key: &CollectionKey) -> Result<bool> {
-        self.exact_name_in(self.database(&key.database)?, &key.name)
+        self.exact_name_in(&*self.database(&key.database)?, &key.name)
     }
 
     fn exact_name_in(&self, database: &DatabaseState, name: &str) -> Result<bool> {
@@ -2844,7 +2908,7 @@ impl Db {
             ));
         }
         let key = self.resolve(key)?;
-        if !self.alias_target_exists(self.database(&key.database)?, &key.name)? {
+        if !self.alias_target_exists(&*self.database(&key.database)?, &key.name)? {
             return Err(EngineError::CollectionNotFound(key.name));
         }
         let handle = checked_read_handle(self.collection_inner(&key)?)?;
@@ -3091,7 +3155,7 @@ impl Db {
             .ok_or_else(|| storage("persistent state missing"))?
             .truncate_wal_ready()
             .map_err(storage)?;
-        let staging_root = self.path.join(".database-staging");
+        let staging_root = self.staging_root();
         fs_commit::create_dir_synced(&staging_root).map_err(storage)?;
         let target = staging_root.join(truncate_staging_name());
         match fs::symlink_metadata(&target) {
@@ -3258,7 +3322,8 @@ impl Db {
                 "database writes are blocked after an unconfirmed directory change",
             ));
         }
-        let state = self.database(&key.database)?;
+        let state_arc = self.database(&key.database)?;
+        let state = &*state_arc;
         self.settle_pending_rename(state, &mut blocked)?;
         if !new_db.is_empty() && new_db != key.database {
             return Err(EngineError::unsupported(
@@ -3659,7 +3724,8 @@ impl Db {
     /// 列表为空时不读取别名。
     pub fn check_aliases(&self, database: &str) -> Result<()> {
         let scope = self.key(database, "")?;
-        let state = self.database(&scope.database)?;
+        let state_arc = self.database(&scope.database)?;
+        let state = &*state_arc;
         let mut cache = state.aliases.lock();
         alias::load(&mut cache, &state.root).map(|_| ())
     }
@@ -3667,7 +3733,8 @@ impl Db {
     /// 返回别名指向的集合名；悬空别名照常返回。
     pub fn describe_alias(&self, database: &str, alias: &str) -> Result<String> {
         let scope = self.key(database, "")?;
-        let state = self.database(&scope.database)?;
+        let state_arc = self.database(&scope.database)?;
+        let state = &*state_arc;
         let mut cache = state.aliases.lock();
         alias::load(&mut cache, &state.root)?
             .get(alias)
@@ -3679,7 +3746,8 @@ impl Db {
     /// `collection` 为空时为空串。集合不存在时返回空列表（3.x 相同）。
     pub fn list_aliases(&self, database: &str, collection: &str) -> Result<(String, Vec<String>)> {
         let scope = self.key(database, "")?;
-        let state = self.database(&scope.database)?;
+        let state_arc = self.database(&scope.database)?;
+        let state = &*state_arc;
         let mut cache = state.aliases.lock();
         let aliases = alias::load(&mut cache, &state.root)?;
         if collection.is_empty() {
@@ -3709,7 +3777,8 @@ impl Db {
                 "database writes are blocked after an unconfirmed directory change",
             ));
         }
-        let state = self.database(&scope.database)?;
+        let state_arc = self.database(&scope.database)?;
+        let state = &*state_arc;
         self.settle_pending_rename(state, &mut blocked)?;
         let mut cache = state.aliases.lock();
         let aliases = alias::load(&mut cache, &state.root)?;
@@ -4568,7 +4637,8 @@ mod tests {
         }
         let path = root.path().join("aliases.json");
         let bytes = std::fs::read(&path).unwrap();
-        let held = db.databases[DEFAULT_DATABASE].aliases.lock();
+        let state = db.database(DEFAULT_DATABASE).unwrap();
+        let held = state.aliases.lock();
         let (tx, rx) = mpsc::channel();
         let (done_tx, done_rx) = mpsc::channel();
         let mut workers = vec![];
@@ -4578,7 +4648,7 @@ mod tests {
             let done = done_tx.clone();
             workers.push(std::thread::spawn(move || {
                 tx.send(()).unwrap();
-                remove_aliases_for(&db.databases[DEFAULT_DATABASE], name).unwrap();
+                remove_aliases_for(&db.database(DEFAULT_DATABASE).unwrap(), name).unwrap();
                 done.send(()).unwrap();
             }));
         }
@@ -5791,7 +5861,7 @@ mod tests {
                 done_rx.recv_timeout(Duration::from_millis(100)),
                 Err(mpsc::RecvTimeoutError::Timeout)
             ));
-            assert!(db.databases[DEFAULT_DATABASE].aliases.available());
+            assert!(db.database(DEFAULT_DATABASE).unwrap().aliases.available());
             drop(state);
             writing.join().unwrap().unwrap();
             done_rx
