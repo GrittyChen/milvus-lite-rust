@@ -1498,3 +1498,151 @@ server_manager_instance.release_server(path)
     assert "recovered only a validated WAL prefix" in result.stderr
     assert "Int type with bit width of 96" in result.stderr
     assert "not supported" in result.stderr
+
+
+TIMESTAMPTZ_SCHEMA = """
+ts_schema = MilvusClient.create_schema(auto_id=False)
+ts_schema.add_field('id', DataType.INT64, is_primary=True)
+ts_schema.add_field('vector', DataType.FLOAT_VECTOR, dim=2)
+ts_schema.add_field('ts', DataType.TIMESTAMPTZ, nullable=True)
+ts_schema.add_field('ts2', DataType.TIMESTAMPTZ, default_value='2025-01-01T08:00:00+08:00')
+"""
+
+
+@pytest.mark.parametrize("first", ["rust", "reference"])
+def test_timestamptz_directories_written_by_one_implementation_open_and_change_in_the_other(
+    tmp_path, interpreters, first
+):
+    """0025 互通：TIMESTAMPTZ 的 schema.json（含默认值）、WAL 与 Parquet 在两边交替写入、读取、更新与删除。"""
+    root = tmp_path / "timestamptz.db"
+    steps = [
+        # 第一方：两个批次（一批刷盘，一批留在 WAL 到关闭时落盘），含空值、默认值与极值。
+        TIMESTAMPTZ_SCHEMA
+        + """
+client.create_collection('c', schema=ts_schema, index_params=indexes)
+client.insert('c', [
+    {'id': 1, 'vector': [0.0, 0.0], 'ts': '2025-01-02T12:30:00.5Z', 'ts2': '0001-01-01T00:00:00Z'},
+    {'id': 2, 'vector': [0.0, 0.0], 'ts': None},
+])
+client.flush('c')
+client.insert('c', [{'id': 3, 'vector': [0.0, 0.0], 'ts': '2024-02-29T00:00:00+03:00', 'ts2': '9999-12-31T23:59:59.999999Z'}])
+""",
+        # 第二方：读取对方的数据（输出为 UTC 的 ISO 字符串），更新、删除后刷盘。
+        """
+client.load_collection('c')
+rows = {r['id']: r for r in client.query('c', filter='id >= 0', output_fields=['ts', 'ts2'])}
+assert rows[1]['ts'] == '2025-01-02T12:30:00.500000Z' and rows[1]['ts2'] == '0001-01-01T00:00:00Z', rows
+assert rows[2]['ts'] is None and rows[2]['ts2'] == '2025-01-01T00:00:00Z', rows
+assert rows[3]['ts'] == '2024-02-28T21:00:00Z' and rows[3]['ts2'] == '9999-12-31T23:59:59.999999Z', rows
+client.upsert('c', [{'id': 2, 'vector': [0.0, 0.0], 'ts': '1969-12-31T23:59:59.999999Z'}])
+client.delete('c', ids=[3])
+client.insert('c', [{'id': 4, 'vector': [0.0, 0.0], 'ts2': '2000-01-01T00:00:00+01:00'}])
+client.flush('c')
+""",
+        # 第一方：看到对方的写入。
+        """
+client.load_collection('c')
+rows = {r['id']: r for r in client.query('c', filter='id >= 0', output_fields=['ts', 'ts2'])}
+assert sorted(rows) == [1, 2, 4], rows
+assert rows[2]['ts'] == '1969-12-31T23:59:59.999999Z' and rows[2]['ts2'] == '2025-01-01T00:00:00Z', rows
+assert rows[4]['ts'] is None and rows[4]['ts2'] == '1999-12-31T23:00:00Z', rows
+""",
+    ]
+    alternate(tmp_path, interpreters, first, root, steps)
+    schema_json = json.loads((root / "collections/c/schema.json").read_text())
+    fields = {f["name"]: f for f in schema_json["fields"]}
+    assert fields["ts"]["dtype"] == fields["ts2"]["dtype"] == "timestamptz"
+    assert fields["ts2"]["default_value"] == 1_735_689_600_000_000 and fields["ts"]["default_value"] is None
+    manifest = json.loads((root / "collections/c/manifest.json").read_text())
+    check = (
+        "import glob,sys,pyarrow.parquet as pq\n"
+        "for p in glob.glob(sys.argv[1]+'/collections/c/partitions/_default/data/*.parquet'):\n"
+        " t=pq.read_table(p);t.validate(full=True)\n"
+        " assert str(t.schema.field('ts').type)=='timestamp[us, tz=UTC]' and str(t.schema.field('ts2').type)=='timestamp[us, tz=UTC]',t.schema\n"
+        " assert t.schema.field('ts').nullable and not t.schema.field('ts2').nullable\n"
+        "print(len(glob.glob(sys.argv[1]+'/collections/c/partitions/_default/data/*.parquet')))\n"
+    )
+    for name in ("MILVUS_LITE_ARROW15_PYTHON", "MILVUS_LITE_ARROW25_PYTHON"):
+        assert int(run([interpreters[name], "-c", check, str(root)])) >= 1
+    assert manifest["partitions"]["_default"]["data_files"]
+
+
+def test_reference_poisoned_timestamps_fail_reads_without_crashing_rust(tmp_path, interpreters):
+    """3.x 对原始 gRPC 的整数微秒不校验，越界值只能留在 WAL（3.x 自己刷盘也会失败）；读到时本实现与 3.x 一样报 1 `date value out of range`，不 panic。
+    3.x 也接受越界的整数默认值，含它的目录本实现必须能打开与描述；使用该默认值的写入报 1（已登记差异），显式给值的写入与读取照常。"""
+    root = tmp_path / "poison.db"
+    poison = """
+import sys
+from pymilvus import DataType, MilvusClient
+from pymilvus.grpc_gen import milvus_pb2, schema_pb2
+from milvus_lite.server_manager import server_manager_instance as manager
+path = sys.argv[1]
+client = MilvusClient(path, dedicated=True)
+try:
+    s = MilvusClient.create_schema(auto_id=False)
+    s.add_field('id', DataType.INT64, is_primary=True)
+    s.add_field('vector', DataType.FLOAT_VECTOR, dim=2)
+    s.add_field('ts', DataType.TIMESTAMPTZ, nullable=True)
+    ip = client.prepare_index_params(); ip.add_index('vector', index_type='FLAT', metric_type='L2')
+    client.create_collection('c', schema=s, index_params=ip)
+    client.insert('c', [{'id': 1, 'vector': [0.0, 0.0], 'ts': '2025-01-01T00:00:00Z'}])
+    d = MilvusClient.create_schema(auto_id=False)
+    d.add_field('id', DataType.INT64, is_primary=True)
+    d.add_field('vector', DataType.FLOAT_VECTOR, dim=2)
+    d.add_field('ts', DataType.TIMESTAMPTZ, default_value=253402300800000000)
+    ip = client.prepare_index_params(); ip.add_index('vector', index_type='FLAT', metric_type='L2')
+    client.create_collection('d', schema=d, index_params=ip)
+    client.insert('d', [{'id': 1, 'vector': [0.0, 0.0], 'ts': '2025-01-01T00:00:00Z'}])
+    ids = schema_pb2.FieldData(type=5, field_name='id'); ids.scalars.long_data.data.extend([2, 3])
+    vec = schema_pb2.FieldData(type=101, field_name='vector'); vec.vectors.dim = 2; vec.vectors.float_vector.data.extend([0.0] * 4)
+    ts = schema_pb2.FieldData(type=26, field_name='ts'); ts.scalars.timestamptz_data.data.extend([2**63 - 1, -(2**62)])
+    reply = client._get_connection()._stub.Insert(milvus_pb2.InsertRequest(collection_name='c', num_rows=2, fields_data=[ids, vec, ts]))
+    assert reply.status.code == 0, reply.status
+    client.flush('d')
+    a = MilvusClient.create_schema(auto_id=False)
+    a.add_field('id', DataType.INT64, is_primary=True)
+    a.add_field('vector', DataType.FLOAT_VECTOR, dim=2)
+    a.add_field('a', DataType.ARRAY, element_type=DataType.TIMESTAMPTZ, max_capacity=2)
+    ip = client.prepare_index_params(); ip.add_index('vector', index_type='FLAT', metric_type='L2')
+    client.create_collection('arr', schema=a, index_params=ip)
+finally:
+    client.close(); manager.release_server(path)
+"""
+    read = """
+import sys
+from pymilvus import MilvusClient
+from pymilvus.exceptions import MilvusException
+from milvus_lite.server_manager import server_manager_instance as manager
+path = sys.argv[1]
+client = MilvusClient(path, dedicated=True)
+try:
+    client.load_collection('c')
+    assert client.query('c', filter='id == 1', output_fields=['ts']) == [{'id': 1, 'ts': '2025-01-01T00:00:00Z'}]
+    for flt in ('id >= 0', 'id == 2', 'id == 3'):
+        try:
+            client.query('c', filter=flt, output_fields=['ts'])
+            raise SystemExit('expected date value out of range for ' + flt)
+        except MilvusException as e:
+            assert (e.code, e.message) == (1, 'date value out of range'), (flt, e.code, e.message)
+    # 3.x 能建 ARRAY<TIMESTAMPTZ>，本实现不支持：访问该集合 fail-closed 为带明确文案的 UNIMPLEMENTED，不影响其他集合。
+    try:
+        client.describe_collection('arr')
+        raise SystemExit('expected UNIMPLEMENTED for ARRAY<TIMESTAMPTZ>')
+    except Exception as e:
+        assert 'ARRAY element type TIMESTAMPTZ is not supported' in str(e), e
+    default = next(f for f in client.describe_collection('d')['fields'] if f['name'] == 'ts')['default_value']
+    assert default.timestamptz_data == 253402300800000000, default
+    client.load_collection('d')
+    assert client.query('d', filter='id >= 0', output_fields=['ts']) == [{'id': 1, 'ts': '2025-01-01T00:00:00Z'}]
+    try:
+        client.insert('d', [{'id': 2, 'vector': [0.0, 0.0]}])
+        raise SystemExit('expected date value out of range for the default')
+    except MilvusException as e:
+        assert (e.code, e.message) == (1, 'date value out of range'), (e.code, e.message)
+    client.insert('d', [{'id': 3, 'vector': [0.0, 0.0], 'ts': '2026-01-01T00:00:00Z'}])
+    assert len(client.query('d', filter='id >= 0', output_fields=['ts'])) == 2
+finally:
+    client.close(); manager.release_server(path)
+"""
+    run([interpreters[PYTHONS[0]], "-c", poison, str(root)], cwd=tmp_path)
+    run([sys.executable, "-c", read, str(root)], cwd=tmp_path)

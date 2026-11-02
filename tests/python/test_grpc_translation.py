@@ -809,6 +809,99 @@ def test_search_group_by_translation(env):
         "group_by_field 'zz' not found in schema")
 
 
+def test_timestamptz_translation(env):
+    """0025 第 1 步：写入形态、输出格式、默认值回显与范围校验；对照 3.x 的取值见 tests/differential。"""
+    client, stub, _ = env
+    schema = MilvusClient.create_schema(auto_id=False)
+    schema.add_field("id", DataType.INT64, is_primary=True)
+    schema.add_field("v", DataType.FLOAT_VECTOR, dim=2)
+    schema.add_field("ts", DataType.TIMESTAMPTZ, nullable=True)
+    schema.add_field("ts2", DataType.TIMESTAMPTZ, default_value="2025-01-01T08:00:00+08:00")
+    index = client.prepare_index_params()
+    index.add_index("v", index_type="FLAT", metric_type="L2")
+    client.create_collection("t", schema=schema, index_params=index)
+    client.load_collection("t")
+
+    def raw(rows, ts, ts_slot="string_data", ts2=None, valid=None, ts_type=26):
+        ids = long_fd("id", list(range(100, 100 + rows)))
+        vector = vec_fd("v", [[0.0, 0.0]] * rows)
+        column = schema_pb2.FieldData(type=ts_type, field_name="ts")
+        getattr(column.scalars, ts_slot).data.extend(ts)
+        column.valid_data.extend(valid or [])
+        fields = [ids, vector, column]
+        if ts2 is not None:
+            second = schema_pb2.FieldData(type=26, field_name="ts2")
+            second.scalars.string_data.data.extend(ts2)
+            fields.append(second)
+        return stub.Insert(milvus_pb2.InsertRequest(collection_name="t", num_rows=rows, fields_data=fields))
+
+    client.insert("t", [
+        {"id": 1, "v": [0.0, 0.0], "ts": "2025-01-02T12:30:00.5+08:00", "ts2": "2024-02-29T00:00:00+03:00"},
+        {"id": 2, "v": [0.0, 0.0], "ts": None},
+        {"id": 3, "v": [0.0, 0.0], "ts": "0001-01-01T00:00:00Z", "ts2": "9999-12-31T23:59:59.999999Z"},
+    ])
+    rows = {r["id"]: r for r in client.query("t", filter="id >= 0", output_fields=["ts", "ts2"])}
+    assert rows[1] == {"id": 1, "ts": "2025-01-02T04:30:00.500000Z", "ts2": "2024-02-28T21:00:00Z"}
+    assert rows[2] == {"id": 2, "ts": None, "ts2": "2025-01-01T00:00:00Z"}
+    assert rows[3]["ts"] == "0001-01-01T00:00:00Z" and rows[3]["ts2"] == "9999-12-31T23:59:59.999999Z"
+    # 响应：类型 26，值放 string_data，空值走 valid_data。
+    reply = stub.Query(milvus_pb2.QueryRequest(collection_name="t", expr="id in [1, 2]", output_fields=["ts"]))
+    ts = next(f for f in reply.fields_data if f.field_name == "ts")
+    assert ts.type == 26 and list(ts.scalars.string_data.data) == ["2025-01-02T04:30:00.500000Z", ""]
+    assert list(ts.valid_data) == [True, False]
+    # 描述集合回显默认值（微秒）。
+    described = stub.DescribeCollection(milvus_pb2.DescribeCollectionRequest(collection_name="t"))
+    default = next(f for f in described.schema.fields if f.name == "ts2").default_value
+    assert default.WhichOneof("data") == "timestamptz_data" and default.timestamptz_data == 1_735_689_600_000_000
+
+    # 原始 gRPC：整数微秒在范围内可写，越界整批拒绝、零写入；long_data 槽被忽略。
+    assert status_of(raw(2, [0, 253_402_300_799_999_999], "timestamptz_data"))[0] == 0
+    before = client.query("t", filter="", output_fields=["count(*)"])
+    for bad in (253_402_300_800_000_000, -62_135_596_800_000_001, 2**63 - 1, -(2**63)):
+        assert status_of(raw(2, [5, bad], "timestamptz_data")) == (1, 0, "date value out of range")
+    assert status_of(raw(1, [5], "long_data")) == (6, 6, "FieldData 'ts' has 0 rows, expected 1")
+    assert client.query("t", filter="", output_fields=["count(*)"]) == before
+    # 字符串：无偏移与格式错误按 3.x 的文案；带偏移的越界是 1。
+    naive = "TIMESTAMPTZ value must include a timezone offset or use a configured timezone"
+    assert status_of(raw(1, ["2025-01-01T00:00:00"]))[0::2] == (6, naive)
+    assert status_of(raw(1, ["nope"]))[0::2] == (6, "TIMESTAMPTZ value 'nope' is not a valid ISO 8601 timestamp")
+    assert status_of(raw(1, ["0001-01-01T00:00:00+01:00"])) == (1, 0, "date value out of range")
+    # 空值行不解析（按完整长度发送时占位串不是合法时间）。
+    assert status_of(raw(2, ["", "2030-01-01T00:00:00Z"], valid=[False, True]))[0] == 0
+    assert status_of(raw(1, ["2030-01-01T00:00:00Z"], valid=[True]))[0] == 0
+
+    # 字符串放进 VARCHAR 槽（type 21）：3.x 由引擎按 schema 解析，越界报 1，其余失败按类型不符报 6。
+    assert status_of(raw(1, ["2025-01-01T08:00:00.1234567+08:00"], ts_type=21))[0] == 0
+    assert status_of(raw(2, ["", "2030-01-01T00:00:00Z"], valid=[False, True], ts_type=21))[0] == 0
+    for text in ("2025-01-01T00:00:00", "nope", ""):
+        assert status_of(raw(1, [text], ts_type=21)) == (
+            6, 6, f"field 'ts' value '{text}' does not match dtype DataType.TIMESTAMPTZ")
+    for text in ("0001-01-01T00:00:00+01:00", "9999-12-31T23:59:59-08:00"):
+        assert status_of(raw(1, [text], ts_type=21)) == (1, 0, "date value out of range")
+    # 过滤暂不支持时间戳字段（0025 第 2 步）：UNIMPLEMENTED，不是类型错误。
+    unimplemented(stub.Query, milvus_pb2.QueryRequest(collection_name="t", expr="ts is null"))
+    # schema 规则。
+    for name, build in {
+        "pk": lambda s: s.add_field("p", DataType.TIMESTAMPTZ, is_primary=True),
+        "iso": lambda s: s.add_field("iso", DataType.TIMESTAMPTZ),
+    }.items():
+        bad = MilvusClient.create_schema(auto_id=False)
+        bad.add_field("id", DataType.INT64, is_primary=True) if name != "pk" else None
+        bad.add_field("v", DataType.FLOAT_VECTOR, dim=2)
+        build(bad)
+        with pytest.raises(Exception) as info:
+            client.create_collection("bad_" + name, schema=bad)
+        assert "iso" in str(info.value) or "Primary key" in str(info.value), info.value
+    arr = MilvusClient.create_schema(auto_id=False)
+    arr.add_field("id", DataType.INT64, is_primary=True)
+    arr.add_field("v", DataType.FLOAT_VECTOR, dim=2)
+    arr.add_field("a", DataType.ARRAY, element_type=DataType.TIMESTAMPTZ, max_capacity=2)
+    with pytest.raises(grpc.RpcError) as info:
+        client.create_collection("bad_arr", schema=arr)
+    assert info.value.code() == grpc.StatusCode.UNIMPLEMENTED
+    assert info.value.details().startswith("MilvusLite does not support ARRAY element type")
+
+
 def test_search_result_encoding(env):
     _, stub, _ = env
     basic(stub)
@@ -1021,7 +1114,6 @@ def test_pymilvus_entry_points_remaining_unsupported(env):
         (with_field("v2", DataType.FLOAT_VECTOR, dim=2), "multiple vector fields: "),
         (with_field("s", DataType.SPARSE_FLOAT_VECTOR), f"SPARSE_FLOAT_VECTOR fields: {feature}"),
         (with_field("g", DataType.GEOMETRY), f"GEOMETRY fields: {feature}"),
-        (with_field("ts", DataType.TIMESTAMPTZ), f"TIMESTAMPTZ fields: {feature}"),
         # pymilvus 3.0 先发 AlterCollectionSchema，收到 UNIMPLEMENTED 后回退到 AddCollectionField。
         (lambda: client.add_collection_field("q", "x", DataType.INT64, nullable=True), f"AddCollectionField: {rpc}"),
         (lambda: client.hybrid_search("q", [AnnSearchRequest([[1, 0]], "vector", {}, 2)], RRFRanker(), limit=2),

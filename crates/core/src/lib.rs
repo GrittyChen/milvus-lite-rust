@@ -23,6 +23,7 @@ pub mod projection;
 pub mod pyjson;
 pub mod schema;
 pub mod storage;
+pub mod timestamptz;
 
 pub use collection::{
     Collection, GetSnapshot, GroupBy, Hits, LoadState, QueryResult, QueryVectors, ReadSnapshot,

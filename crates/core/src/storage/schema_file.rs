@@ -212,6 +212,7 @@ impl SchemaFile {
                     "varchar" => DataType::VarChar,
                     "json" => DataType::Json,
                     "array" => DataType::Array,
+                    "timestamptz" => DataType::Timestamptz,
                     "float_vector" => DataType::FloatVector,
                     _ => {
                         return Err(SchemaFileError::Unsupported(format!(
@@ -321,6 +322,7 @@ fn dtype_name(dtype: DataType) -> &'static str {
         DataType::VarChar => "varchar",
         DataType::Json => "json",
         DataType::Array => "array",
+        DataType::Timestamptz => "timestamptz",
         DataType::FloatVector => "float_vector",
     }
 }
@@ -337,6 +339,7 @@ fn core_dtype(name: &str) -> Option<DataType> {
         "varchar" => DataType::VarChar,
         "json" => DataType::Json,
         "array" => DataType::Array,
+        "timestamptz" => DataType::Timestamptz,
         "float_vector" => DataType::FloatVector,
         _ => return None,
     })

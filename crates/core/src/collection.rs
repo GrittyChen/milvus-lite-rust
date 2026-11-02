@@ -701,6 +701,7 @@ pub struct Collection {
 impl Collection {
     pub fn new(name: impl Into<String>, schema: CollectionSchema) -> Result<Self> {
         schema.validate()?;
+        let schema = schema.normalized()?;
         let pk_pos = schema
             .primary_position()
             .ok_or_else(|| EngineError::schema("schema has no primary key field"))?;
@@ -3537,6 +3538,13 @@ fn check_value(field: &FieldSchema, values: &InputValues, row: usize) -> Result<
                 }
             }
             DataType::Json => true,
+            DataType::Timestamptz => {
+                let micros = integer.and_then(|n| n.as_i64()).ok_or_else(|| {
+                    EngineError::invalid("Python int too large to convert to C long")
+                })?;
+                crate::timestamptz::check_micros(micros)?;
+                true
+            }
             DataType::Array => unreachable!("ARRAY has separate outer validation"),
             DataType::FloatVector => false,
         };
@@ -3570,6 +3578,16 @@ fn check_value(field: &FieldSchema, values: &InputValues, row: usize) -> Result<
         (DataType::Int16, InputValues::Int(v)) => i16::try_from(v[row]).is_ok(),
         (DataType::Int32, InputValues::Int(v)) => i32::try_from(v[row]).is_ok(),
         (DataType::Int64, InputValues::Int(_)) => true,
+        (DataType::Timestamptz, InputValues::Int(v)) => {
+            crate::timestamptz::check_micros(v[row])?;
+            true
+        }
+        // 原始 gRPC 把字符串放进 VARCHAR 槽（type 21）时，3.x 由引擎按 schema 解析：越界报 1，其余解析失败按类型不符报 6。
+        (DataType::Timestamptz, InputValues::Str(v)) => match crate::timestamptz::parse(&v[row]) {
+            Ok(_) => true,
+            Err(error @ EngineError::InvalidArgument(_)) => return Err(error),
+            Err(_) => false,
+        },
         (DataType::Float | DataType::Double, InputValues::Int(_) | InputValues::Float(_)) => true,
         (DataType::VarChar, InputValues::Str(v)) => {
             if let Some(max) = field.max_length {
@@ -3757,6 +3775,16 @@ fn convert_nonnull(field: &FieldSchema, values: &InputValues) -> Result<ColumnDa
             ColumnData::Int32(narrow(v).ok_or_else(mismatch)?)
         }
         (DataType::Int64, InputValues::Int(v)) => ColumnData::Int64(v.clone()),
+        (DataType::Timestamptz, InputValues::Int(v)) => {
+            v.iter()
+                .try_for_each(|&micros| crate::timestamptz::check_micros(micros))?;
+            ColumnData::Int64(v.clone())
+        }
+        (DataType::Timestamptz, InputValues::Str(v)) => ColumnData::Int64(
+            v.iter()
+                .map(|text| crate::timestamptz::parse(text))
+                .collect::<Result<_>>()?,
+        ),
         // 3.x 以 float32 存 FLOAT、float64 存 DOUBLE；整数由 pyarrow 转换，不能精确表示时报错。
         (DataType::Float, InputValues::Int(v)) => ColumnData::Float(
             v.iter()

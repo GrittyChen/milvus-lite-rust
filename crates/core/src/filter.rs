@@ -6,7 +6,7 @@ mod eval;
 mod parser;
 mod python;
 mod python_json;
-mod temporal;
+pub(crate) mod temporal;
 mod tree;
 #[cfg(test)]
 mod tree_tests;

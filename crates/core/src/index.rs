@@ -454,6 +454,7 @@ mod tests {
             DataType::Double,
             DataType::VarChar,
             DataType::Bool,
+            DataType::Timestamptz,
         ] {
             let mut request = req("inverted", Some(""));
             request.params.insert("value".into(), 1.into());

@@ -217,37 +217,68 @@ fn parse_iso_time(time: &str) -> Option<(Clock, Option<i128>)> {
     ))
 }
 
+/// 一个 ISO 时间字符串的解析结果；微秒数相对 `0001-01-01T00:00:00`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IsoValue {
+    /// 带偏移（或 `Z`），已换算成 UTC，且在 `datetime` 的范围内。
+    Aware { utc_micros: i128 },
+    /// 没有偏移的本地时间，需要时区才能换算。
+    Naive { local_micros: i128 },
+}
+
+pub(crate) const NAIVE_MESSAGE: &str =
+    "TIMESTAMPTZ value must include a timezone offset or use a configured timezone";
+/// 自 `0001-01-01` 到 `1970-01-01` 的天数。
+const UNIX_EPOCH_ORDINAL: i128 = 719_162;
+
+impl IsoValue {
+    /// UTC 的 Unix 微秒；仅 `Aware` 有值。
+    pub(crate) fn unix_micros(self) -> Option<i64> {
+        match self {
+            Self::Aware { utc_micros } => {
+                i64::try_from(utc_micros - UNIX_EPOCH_ORDINAL * 86_400_000_000).ok()
+            }
+            Self::Naive { .. } => None,
+        }
+    }
+}
+
+/// 按 CPython 3.12 `datetime.fromisoformat` 解析（前后空白先去掉）；错误文案与 3.x 相同。
+pub(crate) fn parse_iso(s: &str) -> Result<IsoValue, String> {
+    let text = s.trim_matches(|c: char| c.is_whitespace() || matches!(c, '\u{1c}'..='\u{1f}'));
+    let fail = || {
+        format!(
+            "TIMESTAMPTZ value {} is not a valid ISO 8601 timestamp",
+            py_repr(s)
+        )
+    };
+    let (end, ordinal) = date(text).ok_or_else(fail)?;
+    let days = i128::from(ordinal - 1) * 86_400_000_000;
+    if text.len() == end {
+        return Ok(IsoValue::Naive { local_micros: days });
+    }
+    let rest = &text[end..];
+    let separator = rest.chars().next().ok_or_else(fail)?;
+    let rest = &rest[separator.len_utf8()..];
+    let (clock, offset) = parse_iso_time(rest).ok_or_else(fail)?;
+    let Some(offset) = offset else {
+        return Ok(IsoValue::Naive {
+            local_micros: days + clock.micros(),
+        });
+    };
+    let utc = days + clock.micros() - offset;
+    if !(0..i128::from(LAST_ORDINAL) * 86_400_000_000).contains(&utc) {
+        return Err("date value out of range".into());
+    }
+    Ok(IsoValue::Aware { utc_micros: utc })
+}
+
 pub(super) fn validate(s: &str, iso: bool) -> Result<(), String> {
     if iso {
-        let text = s.trim_matches(|c: char| c.is_whitespace() || matches!(c, '\u{1c}'..='\u{1f}'));
-        let fail = || {
-            format!(
-                "TIMESTAMPTZ value {} is not a valid ISO 8601 timestamp",
-                py_repr(s)
-            )
+        return match parse_iso(s)? {
+            IsoValue::Aware { .. } => Ok(()),
+            IsoValue::Naive { .. } => Err(NAIVE_MESSAGE.into()),
         };
-        let (end, ordinal) = date(text).ok_or_else(fail)?;
-        if text.len() == end {
-            return Err(
-                "TIMESTAMPTZ value must include a timezone offset or use a configured timezone"
-                    .into(),
-            );
-        }
-        let rest = &text[end..];
-        let separator = rest.chars().next().ok_or_else(fail)?;
-        let rest = &rest[separator.len_utf8()..];
-        let (clock, offset) = parse_iso_time(rest).ok_or_else(fail)?;
-        let Some(offset) = offset else {
-            return Err(
-                "TIMESTAMPTZ value must include a timezone offset or use a configured timezone"
-                    .into(),
-            );
-        };
-        let utc = i128::from(ordinal - 1) * 86_400_000_000 + clock.micros() - offset;
-        if !(0..i128::from(LAST_ORDINAL) * 86_400_000_000).contains(&utc) {
-            return Err("date value out of range".into());
-        }
-        return Ok(());
     }
     let fail = || {
         format!(

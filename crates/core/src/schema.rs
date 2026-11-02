@@ -17,6 +17,8 @@ pub enum DataType {
     VarChar,
     Json,
     Array,
+    /// UTC Unix 微秒的 int64（0025）；列沿用 `ColumnData::Int64`，类型差异只在 schema。
+    Timestamptz,
     FloatVector,
 }
 
@@ -34,6 +36,7 @@ impl DataType {
             Self::VarChar => "VARCHAR",
             Self::Json => "JSON",
             Self::Array => "ARRAY",
+            Self::Timestamptz => "TIMESTAMPTZ",
             Self::FloatVector => "FLOAT_VECTOR",
         }
     }
@@ -160,7 +163,10 @@ impl CollectionSchema {
                 })?;
                 if matches!(
                     element,
-                    DataType::Array | DataType::Json | DataType::FloatVector
+                    DataType::Array
+                        | DataType::Json
+                        | DataType::FloatVector
+                        | DataType::Timestamptz
                 ) {
                     return Err(EngineError::unsupported(
                         "ARRAY element type",
@@ -170,6 +176,11 @@ impl CollectionSchema {
                         ),
                     ));
                 }
+            }
+            if f.data_type == DataType::Timestamptz
+                && let Some(default) = f.default_value.as_ref().filter(|v| !v.is_null())
+            {
+                crate::timestamptz::check_default(default)?;
             }
         }
 
@@ -255,6 +266,19 @@ impl CollectionSchema {
             ));
         }
         Ok(())
+    }
+
+    /// 校验通过后的规范化：TIMESTAMPTZ 的字符串默认值换成 UTC 微秒（3.x 在 `validate_schema` 里就地替换）。
+    pub(crate) fn normalized(mut self) -> Result<Self> {
+        for field in &mut self.fields {
+            if field.data_type == DataType::Timestamptz
+                && let Some(serde_json::Value::String(text)) = &field.default_value
+            {
+                field.default_value =
+                    Some(serde_json::Value::from(crate::timestamptz::parse(text)?));
+            }
+        }
+        Ok(self)
     }
 
     pub fn partition_key(&self) -> Option<&FieldSchema> {

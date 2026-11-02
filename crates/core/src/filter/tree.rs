@@ -152,6 +152,10 @@ impl Tree {
                     match schema.fields.iter().find(|f| &f.name == name) {
                         Some(f) if f.data_type == DataType::Json => "string",
                         Some(f) if f.data_type == DataType::Array => "dynamic",
+                        // 时间戳字段参与过滤要等 0025 第 2 步（ISO / INTERVAL 求值）。
+                        Some(f) if f.data_type == DataType::Timestamptz => {
+                            return Err(eval::unsupported());
+                        }
                         Some(f) => eval::sem(f.data_type).ok_or_else(|| {
                             parser::diagnostic(
                                 &format!(

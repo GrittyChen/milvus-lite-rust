@@ -618,7 +618,10 @@ fn validate_decoded(schema: &CollectionSchema, decoded: &DecodedData) -> Result<
                 | (DataType::Int8, ColumnData::Int8(_))
                 | (DataType::Int16, ColumnData::Int16(_))
                 | (DataType::Int32, ColumnData::Int32(_))
-                | (DataType::Int64, ColumnData::Int64(_))
+                | (
+                    DataType::Int64 | DataType::Timestamptz,
+                    ColumnData::Int64(_)
+                )
                 | (DataType::Float, ColumnData::Float(_))
                 | (DataType::Double, ColumnData::Double(_))
                 | (DataType::VarChar, ColumnData::VarChar(_))

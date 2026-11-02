@@ -21,6 +21,7 @@ fn m1_type(t: i32) -> Option<DataType> {
         21 => DataType::VarChar,
         23 => DataType::Json,
         22 => DataType::Array,
+        26 => DataType::Timestamptz,
         101 => DataType::FloatVector,
         _ => return None,
     })
@@ -38,15 +39,15 @@ pub(crate) fn milvus_type(t: DataType) -> i32 {
         DataType::VarChar => 21,
         DataType::Json => 23,
         DataType::Array => 22,
+        DataType::Timestamptz => 26,
         DataType::FloatVector => 101,
     }
 }
 
-/// 3.x 支持、M1 尚不支持的类型（ARRAY、GEOMETRY、TIMESTAMPTZ、稀疏向量）。
+/// 3.x 支持、当前尚不支持的类型（GEOMETRY、稀疏向量）。
 fn unsupported_in_m1(t: i32) -> Option<&'static str> {
     Some(match t {
         24 => "GEOMETRY fields",
-        26 => "TIMESTAMPTZ fields",
         104 => "SPARSE_FLOAT_VECTOR fields",
         _ => return None,
     })
@@ -388,6 +389,7 @@ fn encode_default(dtype: DataType, value: &Value) -> Result<Option<pb::ValueFiel
             })?)
         }
         DataType::Int64 => Data::LongData(int()?),
+        DataType::Timestamptz => Data::TimestamptzData(int()?),
         DataType::Float => Data::FloatData(float()? as f32),
         DataType::Double => Data::DoubleData(float()?),
         DataType::VarChar => Data::StringData(match value {

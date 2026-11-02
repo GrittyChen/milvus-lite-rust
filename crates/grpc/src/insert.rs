@@ -52,6 +52,11 @@ pub(crate) fn decode(
             Err(e) => return Err(e),
         };
         check_column_len(&fd.field_name, &values, n)?;
+        let values = if fd.r#type == 26 {
+            timestamps(values)?
+        } else {
+            values
+        };
         // 3.x：is_dynamic 或名为 `$meta` 的列都承载动态字段。
         let name = if fd.is_dynamic {
             META_FIELD.to_owned()
@@ -71,10 +76,8 @@ pub(crate) fn decode(
 
 fn scalar(name: &str, t: i32, sf: pb::ScalarField) -> Result<InputValues, EngineError> {
     use scalar_field::Data;
-    match t {
-        24 => return Err(unsupported("GEOMETRY values")),
-        26 => return Err(unsupported("TIMESTAMPTZ values")),
-        _ => {}
+    if t == 24 {
+        return Err(unsupported("GEOMETRY values"));
     }
     // 槽位与 type 不符时，3.x 读到的是空数组，随后报行数不符。
     Ok(match (t, sf.data) {
@@ -118,6 +121,11 @@ fn scalar(name: &str, t: i32, sf: pb::ScalarField) -> Result<InputValues, Engine
         // 保留所有原始列，让同名后列覆盖时也不能隐藏前列的坏 JSON。
         (23, Some(Data::JsonData(a))) => InputValues::Json(a.data),
         (23, _) => InputValues::Json(Vec::new()),
+        // TIMESTAMPTZ：pymilvus 发 string_data（ISO 字符串），原始 gRPC 也可发 timestamptz_data（UTC 微秒）；
+        // long_data 槽 3.x 不读，视为空列。字符串在 valid_data 展开后再换算（见 `timestamps`）。
+        (26, Some(Data::TimestamptzData(a))) => InputValues::Int(a.data),
+        (26, Some(Data::StringData(a))) => InputValues::Str(a.data),
+        (26, _) => InputValues::Int(Vec::new()),
         _ => {
             return Err(EngineError::SchemaValidation(format!(
                 "FieldData {} uses scalar type {} which MilvusLite does not support",
@@ -125,6 +133,39 @@ fn scalar(name: &str, t: i32, sf: pb::ScalarField) -> Result<InputValues, Engine
                 type_name(t)
             )));
         }
+    })
+}
+
+/// TIMESTAMPTZ 的字符串列换算成 UTC 微秒；空值行不解析。3.x 在 `fields_data_to_records` 里逐列做这件事，
+/// 因此解析错误出现在该列的位置，先于之后各列的错误与引擎的校验。
+fn timestamps(values: InputValues) -> Result<InputValues, EngineError> {
+    use milvus_lite_core::timestamptz::parse;
+    Ok(match values {
+        InputValues::Str(v) => {
+            InputValues::Int(v.iter().map(|text| parse(text)).collect::<Result<_, _>>()?)
+        }
+        InputValues::Nullable { values, validity } => match *values {
+            InputValues::Str(v) => InputValues::Nullable {
+                values: Box::new(InputValues::Int(
+                    v.iter()
+                        .enumerate()
+                        .map(|(row, text)| {
+                            if validity.get(row) {
+                                parse(text)
+                            } else {
+                                Ok(0)
+                            }
+                        })
+                        .collect::<Result<_, _>>()?,
+                )),
+                validity,
+            },
+            other => InputValues::Nullable {
+                values: Box::new(other),
+                validity,
+            },
+        },
+        other => other,
     })
 }
 

@@ -286,6 +286,23 @@ fn scalar(
         DataType::Int64 => Data::LongData(pb::LongArray {
             data: collect!(Int64, |v| *v),
         }),
+        // 3.x 以 UTC 的 ISO 字符串输出（`micros_to_iso_z`），空值行为空串；越界值只可能来自 3.x 写出的毒化数据。
+        DataType::Timestamptz => {
+            let mut text = Vec::new();
+            for column in parts {
+                let ColumnData::Int64(values) = column.values() else {
+                    unreachable!("{MISMATCH}");
+                };
+                for (row, &micros) in values.iter().enumerate() {
+                    text.push(if column.is_null(row) {
+                        String::new()
+                    } else {
+                        milvus_lite_core::timestamptz::format_iso_z(micros)?
+                    });
+                }
+            }
+            Data::StringData(pb::StringArray { data: text })
+        }
         DataType::Float => Data::FloatData(pb::FloatArray {
             data: collect!(Float, |v| *v),
         }),

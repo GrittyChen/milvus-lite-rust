@@ -4,9 +4,10 @@ use std::sync::Arc;
 
 use arrow_array::{
     Array, ArrayRef, BooleanArray, FixedSizeListArray, Float32Array, Float64Array, Int8Array,
-    Int16Array, Int32Array, Int64Array, ListArray, RecordBatch, StringArray, UInt64Array,
+    Int16Array, Int32Array, Int64Array, ListArray, RecordBatch, StringArray,
+    TimestampMicrosecondArray, UInt64Array,
 };
-use arrow_schema::{DataType as ArrowType, Field, Schema};
+use arrow_schema::{DataType as ArrowType, Field, Schema, TimeUnit};
 use serde_json::{Map, Value};
 
 use crate::data::{ArrayData, ColumnData, Pk, Validity};
@@ -446,6 +447,11 @@ fn decode_delta(
     })
 }
 
+/// 3.x 的 TIMESTAMPTZ 列类型：`timestamp[us, tz=UTC]`，值是 UTC Unix 微秒。
+fn timestamptz_type() -> ArrowType {
+    ArrowType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
+}
+
 fn user_fields(schema: &CollectionSchema) -> Result<Vec<Field>, ArrowDataError> {
     schema
         .fields
@@ -460,6 +466,7 @@ fn user_fields(schema: &CollectionSchema) -> Result<Vec<Field>, ArrowDataError> 
                 DataType::Float => ArrowType::Float32,
                 DataType::Double => ArrowType::Float64,
                 DataType::VarChar | DataType::Json => ArrowType::Utf8,
+                DataType::Timestamptz => timestamptz_type(),
                 DataType::Array => {
                     let element =
                         field
@@ -591,12 +598,15 @@ fn build_batch(
         let array: ArrayRef = match column {
             ColumnData::Array(array) => encode_array(array, None)?,
             ColumnData::Nullable { values, validity } => {
-                nullable_array(&field.name, values, validity, json_encoding)?
+                nullable_array(field, values, validity, json_encoding)?
             }
             ColumnData::Bool(v) => Arc::new(BooleanArray::from(v.clone())),
             ColumnData::Int8(v) => Arc::new(Int8Array::from(v.clone())),
             ColumnData::Int16(v) => Arc::new(Int16Array::from(v.clone())),
             ColumnData::Int32(v) => Arc::new(Int32Array::from(v.clone())),
+            ColumnData::Int64(v) if field.data_type == DataType::Timestamptz => {
+                Arc::new(TimestampMicrosecondArray::from(v.clone()).with_timezone("UTC"))
+            }
             ColumnData::Int64(v) => Arc::new(Int64Array::from(v.clone())),
             ColumnData::Float(v) => Arc::new(Float32Array::from(v.clone())),
             ColumnData::Double(v) => Arc::new(Float64Array::from(v.clone())),
@@ -643,11 +653,12 @@ fn build_batch(
 }
 
 fn nullable_array(
-    name: &str,
+    field: &FieldSchema,
     values: &ColumnData,
     validity: &Validity,
     json_encoding: JsonEncoding,
 ) -> Result<ArrayRef, ArrowDataError> {
+    let name = field.name.as_str();
     if values.len() != validity.len() {
         return Err(ArrowDataError::RowCount {
             name: name.into(),
@@ -671,6 +682,14 @@ fn nullable_array(
         ColumnData::Int8(v) => numbers!(Int8Array, v),
         ColumnData::Int16(v) => numbers!(Int16Array, v),
         ColumnData::Int32(v) => numbers!(Int32Array, v),
+        ColumnData::Int64(v) if field.data_type == DataType::Timestamptz => Arc::new(
+            TimestampMicrosecondArray::from_iter(
+                v.iter()
+                    .enumerate()
+                    .map(|(i, v)| validity.get(i).then_some(*v)),
+            )
+            .with_timezone("UTC"),
+        ) as ArrayRef,
         ColumnData::Int64(v) => numbers!(Int64Array, v),
         ColumnData::Float(v) => numbers!(Float32Array, v),
         ColumnData::Double(v) => numbers!(Float64Array, v),
@@ -801,6 +820,19 @@ fn decode_column(field: &FieldSchema, array: &ArrayRef) -> Result<ColumnData, Ar
                 .values()
                 .to_vec(),
         ),
+        DataType::Timestamptz => {
+            if array.data_type() != &timestamptz_type() {
+                return Err(bad());
+            }
+            ColumnData::Int64(
+                array
+                    .as_any()
+                    .downcast_ref::<TimestampMicrosecondArray>()
+                    .ok_or_else(bad)?
+                    .values()
+                    .to_vec(),
+            )
+        }
         DataType::Int64 => ColumnData::Int64(
             array
                 .as_any()
