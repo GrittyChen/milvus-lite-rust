@@ -5,6 +5,7 @@
 `database_properties.json` 逐字节相同。已登记的差异（属性文件的非字符串值与无法解析的文案、写 `timezone`）单独断言。
 """
 
+import os
 from pathlib import Path
 
 import grpc
@@ -294,3 +295,91 @@ def test_create_database_registered_differences(pair):
             call(rust, "CreateDatabase", db_name=name, properties=kv(("timezone", zone)))
         assert info.value.code() == grpc.StatusCode.UNIMPLEMENTED
         assert not (Path(pair.rust_path) / "databases" / name).exists()
+
+
+def test_drop_database_matches_3x(pair):
+    # 手工布局：残留目录、悬空别名、损坏的属性与别名文件都不阻止删除。
+    for root in (pair.rust_path, pair.ref_path):
+        databases = Path(root) / "databases"
+        residue = databases / "residue"
+        (residue / "collections" / "junk").mkdir(parents=True)
+        (residue / "aliases.json").write_bytes(b'{"dangling": "nope"}')
+        (residue / "database_properties.json").write_bytes(b"{")
+        (databases / "badalias" / "collections").mkdir(parents=True)
+        (databases / "badalias" / "aliases.json").write_bytes(b"{")
+    d = pair.open()
+    both = Both(pair)
+    both("CreateDatabase", db_name="d1", properties=kv(("k", "v")))
+    both("CreateDatabase", db_name="empty")
+    d.step("using d1", lambda c: c.using_database("d1"))
+    d.step("create in d1", lambda c: c.create_collection("same", schema=schema(), index_params=index("L2")))
+    d.step("back to default", lambda c: c.using_database("default"))
+
+    # default 与空名：ValueError（1/0），文案一致；不存在 6/6；非空 6/6；非法名与超长名 1/0。
+    for name in ["default", ""]:
+        assert both("DropDatabase", db_name=name) == (1, 0, "cannot drop default database")
+    assert both("DropDatabase", db_name="nope") == (6, 6, "database 'nope' does not exist")
+    assert both("DropDatabase", db_name="d1") == (6, 6, "database 'd1' is not empty")
+    for name in ["a/b", "x" * 256]:
+        assert both("DropDatabase", db_name=name)[:2] == (1, 0), name
+    # DropDatabase 只读请求体：dbname 元数据被忽略。
+    for uri in pair.uris:
+        with grpc.insecure_channel(uri.removeprefix("http://"), options=[("grpc.enable_http_proxy", 0)]) as channel:
+            stub = milvus_pb2_grpc.MilvusServiceStub(channel)
+            reply = stub.DropDatabase(milvus_pb2.DropDatabaseRequest(), metadata=[("dbname", "empty")])
+            assert (reply.code, reply.error_code) == (1, 0), "empty name routes to default, never to metadata"
+    assert both("ListDatabases")[3] == ["badalias", "d1", "default", "empty", "residue"]
+
+    # 成功：空库、带残留与损坏元数据的库；目录与 staging 两边一致。
+    for name in ["empty", "residue", "badalias"]:
+        assert both("DropDatabase", db_name=name) == (0, 0, ""), name
+    assert both("ListDatabases")[3] == ["d1", "default"]
+    for root in (pair.rust_path, pair.ref_path):
+        assert sorted(p.name for p in (Path(root) / "databases").iterdir()) == ["d1"]
+        assert list((Path(root) / ".database-staging").iterdir()) == []
+    both("DescribeDatabase", db_name="empty")
+    d.step("using dropped database", lambda c: c.using_database("empty"), error=True)
+
+    # 集合删除后库为空；删除后同名重建得到全新的库，重开后一致。
+    d.step("using d1", lambda c: c.using_database("d1"))
+    d.step("drop same", lambda c: c.drop_collection("same"))
+    d.step("using default again", lambda c: c.using_database("default"))
+    d.step("drop_database via client", lambda c: c.drop_database("d1"))
+    d.step("list_databases", lambda c: c.list_databases())
+    both("CreateDatabase", db_name="d1")
+    assert both("DescribeDatabase", db_name="d1")[4] == []
+    both.props_file("d1")
+    pair.close()
+    pair.open()
+    both("ListDatabases")
+    both("DescribeDatabase", db_name="d1")
+
+
+def test_drop_database_registered_differences(pair):
+    make_layout(pair)
+    pair.open()
+    rust, ref = pair.uris
+    # 只差大小写的名字：大小写不敏感文件系统上 3.x 按路径命中并删除，本实现按精确名字报不存在、不删除。
+    for uri in pair.uris:
+        assert call(uri, "CreateDatabase", db_name="casey")[:2] == (0, 0)
+    if case_insensitive(pair.root):
+        assert call(ref, "DropDatabase", db_name="CASEY") == (0, 0, "")
+        assert not (Path(pair.ref_path) / "databases/casey").exists()
+        assert call(rust, "DropDatabase", db_name="CASEY") == (6, 6, "database 'CASEY' does not exist")
+        assert (Path(pair.rust_path) / "databases/casey").is_dir()
+    else:
+        assert call(rust, "DropDatabase", db_name="CASEY") == call(ref, "DropDatabase", db_name="CASEY")
+    # 符号链接形式的空库：两边都拒绝（1/0，文案不同），链接与目标都保留。
+    for root in (pair.rust_path, pair.ref_path):
+        target = Path(root).parent / f"{Path(root).name}-linked-target"
+        (target / "collections").mkdir(parents=True)
+        os.symlink(target, Path(root) / "databases" / "linked")
+    # 注册表在打开时建立，运行期手工建立的库重开后才可见。
+    pair.close()
+    pair.open()
+    rust_reply = call(pair.uris[0], "DropDatabase", db_name="linked")
+    ref_reply = call(pair.uris[1], "DropDatabase", db_name="linked")
+    assert rust_reply[:2] == ref_reply[:2] == (1, 0), (rust_reply, ref_reply)
+    for root in (pair.rust_path, pair.ref_path):
+        assert (Path(root) / "databases" / "linked").is_symlink()
+        assert (Path(root).parent / f"{Path(root).name}-linked-target" / "collections").is_dir()

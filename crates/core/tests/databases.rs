@@ -978,3 +978,322 @@ fn process_exit_around_database_creation_reopens_before_or_after() {
         db.close();
     }
 }
+
+fn not_empty(result: Result<(), EngineError>, name: &str) {
+    match result {
+        Err(EngineError::DatabaseNotEmpty(found)) => assert_eq!(found, name),
+        other => panic!("expected DatabaseNotEmpty for {name}: {other:?}"),
+    }
+}
+
+#[test]
+fn drop_database_checks_default_then_existence_then_emptiness() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("m.db");
+    let db = open(&path);
+    for name in ["", "default"] {
+        match db.drop_database(name) {
+            Err(EngineError::InvalidArgument(reason)) => {
+                assert_eq!(reason, "cannot drop default database");
+            }
+            other => panic!("expected InvalidArgument: {other:?}"),
+        }
+    }
+    for name in ["a/b", ".", &"x".repeat(256)] {
+        assert!(matches!(
+            db.drop_database(name),
+            Err(EngineError::InvalidArgument(_))
+        ));
+    }
+    missing(db.drop_database("nope"), "nope");
+
+    db.create_database("d1", &pairs(&[("k", "v")])).unwrap();
+    db.create_database("empty", &[]).unwrap();
+    db.create_collection("d1", "c", schema()).unwrap();
+    db.insert("d1", "c", batch(&[1])).unwrap();
+    assert_eq!(
+        db.drop_database("d1").unwrap_err().to_string(),
+        "database 'd1' is not empty"
+    );
+    not_empty(db.drop_database("d1"), "d1");
+    assert_eq!(names(&db, "d1"), ["c"]);
+    db.drop_database("empty").unwrap();
+    assert!(!path.join("databases/empty").exists());
+    assert!(staging_entries(&path).is_empty());
+    assert_eq!(db.list_databases(), ["d1", "default"]);
+    missing(db.describe_database("empty"), "empty");
+    missing(db.list_collections("empty"), "empty");
+    // 集合删除后库即为空，可以删除；databases/ 本身保留。
+    db.drop_collection("d1", "c").unwrap();
+    db.drop_database("d1").unwrap();
+    assert_eq!(db.list_databases(), ["default"]);
+    assert!(path.join("databases").is_dir());
+    assert!(staging_entries(&path).is_empty());
+
+    // 删除之后同名重建得到全新的库：属性、别名、集合都不残留。
+    db.create_database("d1", &[]).unwrap();
+    assert!(describe(&db, "d1").1.is_empty());
+    assert!(names(&db, "d1").is_empty());
+    assert!(db.list_aliases("d1", "").unwrap().1.is_empty());
+    db.create_collection("d1", "c", schema()).unwrap();
+    db.close();
+    drop(db);
+    let db = open(&path);
+    assert_eq!(db.list_databases(), ["d1", "default"]);
+    db.close();
+}
+
+#[test]
+fn drop_database_ignores_residue_and_damaged_metadata_but_removes_everything() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("m.db");
+    let d1 = path.join("databases/d1");
+    // 残留目录（无 schema.json）、悬空别名、损坏的属性与别名文件、改名意图都不阻止删除。
+    std::fs::create_dir_all(d1.join("collections/residue")).unwrap();
+    std::fs::write(d1.join("aliases.json"), br#"{"dangling": "nope"}"#).unwrap();
+    std::fs::write(d1.join("database_properties.json"), b"{").unwrap();
+    std::fs::write(d1.join("milvus-lite-rust.rename-intent.json"), b"not json").unwrap();
+    std::fs::write(d1.join("collections/stray-file"), b"x").unwrap();
+    let db = open(&path);
+    db.drop_database("d1").unwrap();
+    assert!(!d1.exists());
+    assert!(staging_entries(&path).is_empty());
+    assert_eq!(db.list_databases(), ["default"]);
+    // 默认库不受影响。
+    db.create_collection("", "c", schema()).unwrap();
+    db.close();
+}
+
+#[test]
+fn drop_database_uses_exact_names() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("m.db");
+    let db = open(&path);
+    db.create_database("d1", &[]).unwrap();
+    // 只差大小写的名字：按精确名字报不存在，不删除另一个库（大小写不敏感的文件系统上 3.x 会删除）。
+    if case_insensitive(root.path()) {
+        missing(db.drop_database("D1"), "D1");
+        assert!(path.join("databases/d1").is_dir());
+        assert_eq!(db.list_databases(), ["d1", "default"]);
+    }
+    db.close();
+}
+
+#[cfg(unix)]
+#[test]
+fn drop_database_never_follows_a_symlinked_database() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("m.db");
+    let databases = path.join("databases");
+    std::fs::create_dir_all(&databases).unwrap();
+    let empty = root.path().join("elsewhere-empty");
+    let full = root.path().join("elsewhere-full");
+    std::fs::create_dir_all(empty.join("collections")).unwrap();
+    std::fs::write(empty.join("keep.txt"), b"keep").unwrap();
+    std::fs::create_dir_all(full.join("collections/c")).unwrap();
+    std::fs::write(full.join("collections/c/schema.json"), b"{}").unwrap();
+    std::os::unix::fs::symlink(&empty, databases.join("empty")).unwrap();
+    std::os::unix::fs::symlink(&full, databases.join("full")).unwrap();
+    let db = open(&path);
+    // 空库：不跟随删除，报存储错误，链接与目标都保留；非空：与目录形式的库一样报非空。
+    assert!(matches!(
+        db.drop_database("empty"),
+        Err(EngineError::Storage(_))
+    ));
+    assert!(
+        std::fs::symlink_metadata(databases.join("empty"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert!(empty.join("keep.txt").is_file());
+    not_empty(db.drop_database("full"), "full");
+    assert_eq!(db.list_databases(), ["default", "empty", "full"]);
+    assert!(staging_entries(&path).is_empty());
+    db.close();
+}
+
+#[test]
+fn concurrent_drop_and_create_collection_never_leave_a_collection_in_a_missing_database() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("m.db");
+    let db = open(&path);
+    for round in 0..30 {
+        let name = format!("r{round}");
+        db.create_database(&name, &[]).unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let dropper = {
+            let (db, name, barrier) = (db.clone(), name.clone(), barrier.clone());
+            std::thread::spawn(move || {
+                barrier.wait();
+                db.drop_database(&name)
+            })
+        };
+        let creator = {
+            let (db, name, barrier) = (db.clone(), name.clone(), barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                db.create_collection(&name, "c", schema())
+            })
+        };
+        let dropped = dropper.join().unwrap();
+        let created = creator.join().unwrap();
+        match (dropped, created) {
+            // 先创建集合：库非空，删除失败。
+            (Err(EngineError::DatabaseNotEmpty(_)), Ok(())) => {
+                assert_eq!(names(&db, &name), ["c"], "round {round}");
+                db.drop_collection(&name, "c").unwrap();
+                db.drop_database(&name).unwrap();
+            }
+            // 先删除库：创建集合报数据库不存在。
+            (Ok(()), Err(EngineError::DatabaseNotFound(_))) => {}
+            other => panic!("round {round}: unexpected outcome {other:?}"),
+        }
+        assert!(
+            !path.join("databases").join(&name).exists(),
+            "round {round}"
+        );
+        missing(db.describe_database(&name), &name);
+    }
+    assert!(staging_entries(&path).is_empty());
+    db.close();
+}
+
+#[cfg(feature = "fault-injection")]
+#[test]
+fn drop_database_failure_before_the_rename_changes_nothing() {
+    use milvus_lite_core::db::{
+        DirectoryFault, DirectoryOperation, DirectoryPoint, inject_directory_fault_once,
+    };
+    for fault in [DirectoryFault::Error, DirectoryFault::Panic] {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("m.db");
+        let db = open(&path);
+        db.create_database("d1", &pairs(&[("k", "v")])).unwrap();
+        inject_directory_fault_once(
+            DirectoryOperation::DropDatabase,
+            DirectoryPoint::BeforeRename,
+            fault,
+        );
+        let error = db.drop_database("d1").unwrap_err();
+        assert!(error.to_string().contains("storage error"), "{error}");
+        assert_eq!(db.list_databases(), ["d1", "default"]);
+        assert_eq!(describe(&db, "d1").1, pairs(&[("k", "v")]));
+        assert!(staging_entries(&path).is_empty());
+        // 写入没有被封锁，重试成功。
+        db.create_collection("d1", "c", schema()).unwrap();
+        db.drop_collection("d1", "c").unwrap();
+        db.drop_database("d1").unwrap();
+        db.close();
+    }
+}
+
+#[cfg(feature = "fault-injection")]
+#[test]
+fn drop_database_failures_after_the_rename_remove_the_database_and_seal_writes() {
+    use milvus_lite_core::db::{
+        DirectoryFault, DirectoryOperation, DirectoryPoint, inject_directory_fault_once,
+    };
+    for point in [
+        DirectoryPoint::AfterRename,
+        DirectoryPoint::CollectionsSync,
+        DirectoryPoint::StagingSync,
+    ] {
+        for fault in [DirectoryFault::Error, DirectoryFault::Panic] {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("m.db");
+            let db = open(&path);
+            db.create_collection("", "c", schema()).unwrap();
+            db.create_database("d1", &[]).unwrap();
+            inject_directory_fault_once(DirectoryOperation::DropDatabase, point, fault);
+            let error = db.drop_database("d1").unwrap_err();
+            assert!(
+                error.to_string().contains("durability is unconfirmed"),
+                "{point:?}: {error}"
+            );
+            // 提交点已过：库已不存在，写入全部封锁，读照常。
+            assert_eq!(db.list_databases(), ["default"], "{point:?}");
+            missing(db.describe_database("d1"), "d1");
+            for result in [
+                db.insert("", "c", batch(&[1])).map(|_| ()),
+                db.create_database("d1", &[]),
+                db.drop_database("d1"),
+            ] {
+                assert!(result.is_err());
+            }
+            assert!(db.collection("", "c").is_ok());
+            db.close();
+            drop(db);
+            // 重开：库不存在，staging 中的残留被清空。
+            let db = open(&path);
+            assert_eq!(db.list_databases(), ["default"], "{point:?}");
+            assert!(staging_entries(&path).is_empty());
+            db.create_database("d1", &[]).unwrap();
+            db.close();
+        }
+    }
+}
+
+/// 进程在改名进 staging 前后退出：重开只有「未删除」或「已删除」，staging 残留被清空。
+#[cfg(feature = "fault-injection")]
+#[test]
+fn process_exit_around_database_drop_reopens_before_or_after() {
+    use milvus_lite_core::db::{
+        DirectoryFault, DirectoryOperation, DirectoryPoint, inject_directory_fault_once,
+    };
+    use std::process::Command;
+    let test = "process_exit_around_database_drop_reopens_before_or_after";
+    if let Ok(stage) = std::env::var("MILVUS_LITE_DB_DROP_CRASH") {
+        let path = std::path::PathBuf::from(std::env::var("MILVUS_LITE_CRASH_DIR").unwrap());
+        let db = open(&path);
+        db.create_database("d1", &pairs(&[("k", "v")])).unwrap();
+        let point = if stage == "before" {
+            DirectoryPoint::BeforeRename
+        } else {
+            DirectoryPoint::AfterRename
+        };
+        inject_directory_fault_once(
+            DirectoryOperation::DropDatabase,
+            point,
+            DirectoryFault::Exit,
+        );
+        db.drop_database("d1").unwrap();
+        panic!("database drop crash injection did not fire");
+    }
+    if std::env::var_os("MILVUS_LITE_DB_DROP_PARENT").is_none() {
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test, "--nocapture"])
+            .env("MILVUS_LITE_DB_DROP_PARENT", "1")
+            .status()
+            .unwrap();
+        assert!(
+            status.success(),
+            "isolated recovery parent failed: {status:?}"
+        );
+        return;
+    }
+    for (stage, dropped) in [("before", false), ("after", true)] {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("drop-crash.db");
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test, "--nocapture"])
+            .env("MILVUS_LITE_DB_DROP_CRASH", stage)
+            .env("MILVUS_LITE_CRASH_DIR", &path)
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(88), "{stage}");
+        let db = open(&path);
+        assert!(staging_entries(&path).is_empty(), "{stage}");
+        if dropped {
+            assert_eq!(db.list_databases(), ["default"], "{stage}");
+            assert!(!path.join("databases/d1").exists());
+        } else {
+            assert_eq!(db.list_databases(), ["d1", "default"], "{stage}");
+            assert_eq!(describe(&db, "d1").1, pairs(&[("k", "v")]), "{stage}");
+        }
+        // 两种结果之后创建与删除都照常。
+        db.create_database("again", &[]).unwrap();
+        db.drop_database("again").unwrap();
+        db.close();
+    }
+}

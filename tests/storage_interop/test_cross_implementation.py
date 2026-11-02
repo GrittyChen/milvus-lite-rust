@@ -571,7 +571,7 @@ client.create_collection('c', schema=schema, index_params=indexes)
 client.insert('c', [{'id': 1, 'vector': [1.0, 0.0]}])
 client.create_alias('c', 'a')
 """,
-        # 第二方：读取对方创建的库与属性，经别名读写 d1，修改属性并再创建一个库。
+        # 第二方：读取对方创建的库与属性，经别名读写 d1，修改属性、再创建一个库并删除对方创建的空库 d2。
         """
 assert client.list_databases() == ['d1', 'd2', 'default']
 info = client.describe_database('d1')
@@ -584,13 +584,14 @@ client.insert('c', [{'id': 2, 'vector': [0.0, 1.0]}])
 client.alter_database_properties('d1', {'new': 'v'})
 client.drop_database_properties('d1', ['zz'])
 client.create_database('d3', properties={'k': 'v'})
+client.drop_database('d2')
 client.using_database('default')
 client.load_collection('c')
 assert client.query('c', filter='', output_fields=['id']) == [{'id': 100}]
 """,
         # 第一方：看到对方的属性修改与新库，d1 内的数据与别名完整。
         """
-assert client.list_databases() == ['d1', 'd2', 'd3', 'default']
+assert client.list_databases() == ['d1', 'd3', 'default']
 info = client.describe_database('d1')
 assert info['owner'] == 'x' and info['new'] == 'v' and 'zz' not in info
 assert client.describe_database('d3')['k'] == 'v'
@@ -603,11 +604,11 @@ assert client.describe_alias('a')['collection_name'] == 'c'
     alternate(tmp_path, interpreters, first, root, steps)
     databases = root / "databases"
     assert (databases / "d1" / "database_properties.json").read_text() == '{\n  "new": "v",\n  "owner": "x"\n}'
-    assert (databases / "d2" / "database_properties.json").read_text() == "{}"
     assert (databases / "d3" / "database_properties.json").read_text() == '{\n  "k": "v"\n}'
     assert json.loads((databases / "d1" / "aliases.json").read_text()) == {"a": "c"}
     assert not (root / "aliases.json").exists()
-    assert sorted(path.name for path in databases.iterdir()) == ["d1", "d2", "d3"]
+    assert sorted(path.name for path in databases.iterdir()) == ["d1", "d3"]
+    assert not any((root / ".database-staging").iterdir())
 
 
 @pytest.mark.parametrize("first", ["rust", "reference"])

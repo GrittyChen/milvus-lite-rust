@@ -344,6 +344,9 @@ pub enum DirectoryOperation {
     /// CreateDatabase：点同 `Create`（`BeforeRename` 为改名进 `databases/` 之前，`AfterRename` / `CollectionsSync`
     /// / `StagingSync` 为发布之后的目录同步），另有 `NameVerification` 与 `Rollback`（含义同改名）。
     CreateDatabase,
+    /// DropDatabase：点同 `Drop`（`BeforeRename` 为改名进 staging 之前，`AfterRename` / `CollectionsSync` /
+    /// `StagingSync` 为提交点之后的目录同步）。
+    DropDatabase,
     /// 改名：`BeforeRename` 为目录改名之前，`CollectionsSync` 为退役旧名后（及重开收尾时）同步 `collections/`，
     /// `Aliases` / `AliasesAfterRename` 为别名改指，其余为改名专用的点。
     Rename,
@@ -717,7 +720,8 @@ fn sync_directory_change(
             let op = match (database, creating) {
                 (false, true) => DirectoryOperation::Create,
                 (false, false) => DirectoryOperation::Drop,
-                (true, _) => DirectoryOperation::CreateDatabase,
+                (true, true) => DirectoryOperation::CreateDatabase,
+                (true, false) => DirectoryOperation::DropDatabase,
             };
             directory_fault(op, DirectoryPoint::AfterRename)?;
             directory_fault(op, DirectoryPoint::CollectionsSync)?;
@@ -730,7 +734,8 @@ fn sync_directory_change(
             match (database, creating) {
                 (false, true) => DirectoryOperation::Create,
                 (false, false) => DirectoryOperation::Drop,
-                (true, _) => DirectoryOperation::CreateDatabase,
+                (true, true) => DirectoryOperation::CreateDatabase,
+                (true, false) => DirectoryOperation::DropDatabase,
             },
             DirectoryPoint::StagingSync,
         )?;
@@ -1457,6 +1462,80 @@ impl Db {
             )));
         }
         *blocked = false;
+        Ok(())
+    }
+
+    /// 3.x `drop_database`：名字只取请求体，空串即 `default`；`default` 为 ValueError（1/0），其后不存在 6/6、
+    /// 非空 6/6。持独占许可与目录变更锁，提交点是把 `databases/<name>` 整个改名移入 `.database-staging/`
+    /// （0023 B「生命周期协议」，同集合 drop）；之后才清注册表与删除 staging 子目录。库内只有残留、悬空别名或
+    /// 损坏的元数据文件时不阻止删除。
+    pub fn drop_database(&self, name: &str) -> Result<()> {
+        let name = if name.is_empty() {
+            DEFAULT_DATABASE
+        } else {
+            name
+        };
+        validate_filesystem_name(name, "database")?;
+        if name == DEFAULT_DATABASE {
+            return Err(EngineError::invalid("cannot drop default database"));
+        }
+        let _intent = NamespaceIntent::new(&self.namespace_waiters);
+        let mut blocked = self.write_gate.write();
+        if *blocked {
+            return Err(storage(
+                "database writes are blocked after an unconfirmed directory change",
+            ));
+        }
+        let _namespace = self.namespace.lock();
+        let state = self.database(name)?;
+        if database_has_collections(&state)? {
+            return Err(EngineError::DatabaseNotEmpty(name.to_owned()));
+        }
+        let databases_dir = self.databases_dir();
+        let target = databases_dir.join(name);
+        // 符号链接形式的库不跟随删除（3.x 的 `rmtree` 同样拒绝），链接与目标都保留。
+        match fs::symlink_metadata(&target) {
+            Ok(meta) if meta.file_type().is_dir() => {}
+            Ok(_) => {
+                return Err(storage(format!(
+                    "database path {target:?} is not a directory"
+                )));
+            }
+            Err(error) => return Err(storage(error)),
+        }
+        let staging_root = self.staging_root();
+        fs_commit::create_dir_synced(&staging_root).map_err(storage)?;
+        let staging = staging_root.join(format!(
+            "drop-db-{}-{}",
+            std::process::id(),
+            STAGING_NUMBER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let renamed = guarded_io(|| {
+            #[cfg(feature = "fault-injection")]
+            directory_fault(
+                DirectoryOperation::DropDatabase,
+                DirectoryPoint::BeforeRename,
+            )?;
+            fs::rename(&target, &staging)
+        });
+        if let Err(error) = renamed {
+            return Err(storage(error));
+        }
+        // 提交点已过：库已不存在，之后的同步失败只封锁写入。
+        *blocked = true;
+        self.databases.write().remove(name);
+        self.open_failures
+            .write()
+            .retain(|key, _| key.database != name);
+        if let Err(error) = sync_directory_change(&databases_dir, &staging_root, false, true) {
+            return Err(EngineError::Storage(format!(
+                "database was dropped, but directory durability is unconfirmed: {error}"
+            )));
+        }
+        *blocked = false;
+        if let Err(error) = fs::remove_dir_all(&staging) {
+            eprintln!("drop staging cleanup deferred for {staging:?}: {error}");
+        }
         Ok(())
     }
 
@@ -4056,6 +4135,31 @@ impl Db {
         };
         Ok(shaped && self.exact_name_in(state, name)?)
     }
+}
+
+/// 3.x `_database_has_collections`：`collections/` 下带 `schema.json` 的目录（`isdir` 与 `exists` 都跟随符号链接）
+/// 即非空。`collections/` 不存在为无；列目录与 metadata 的 NotFound 以外的错误向上报（3.x 的 `exists` 吞错）。
+fn database_has_collections(state: &DatabaseState) -> Result<bool> {
+    let entries = match fs::read_dir(state.collections_dir()) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(storage(error)),
+    };
+    for entry in entries {
+        let path = entry.map_err(storage)?.path();
+        match fs::metadata(&path) {
+            Ok(meta) if meta.is_dir() => {}
+            Ok(_) => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(storage(error)),
+        }
+        match fs::metadata(path.join("schema.json")) {
+            Ok(_) => return Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(storage(error)),
+        }
+    }
+    Ok(false)
 }
 
 /// 取舍 1：数据库属性中的 `timezone` 随 TIMESTAMPTZ 切片解除，请求零写入。

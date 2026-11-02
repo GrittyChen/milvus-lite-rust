@@ -48,6 +48,7 @@ const IMPLEMENTED_METHODS: &[&str] = &[
     "DescribeAlias",
     "ListAliases",
     "CreateDatabase",
+    "DropDatabase",
     "ListDatabases",
     "DescribeDatabase",
     "AlterDatabase",
