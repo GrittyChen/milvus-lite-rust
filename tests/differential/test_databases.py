@@ -205,3 +205,92 @@ def test_registered_differences(pair):
     assert not (Path(pair.rust_path) / "databases/hand/database_properties.json").exists()
     assert call(rust, "AlterDatabase", db_name="nope", properties=kv(("timezone", "UTC")))[:2] == (6, 6)
     assert call(ref, "AlterDatabase", db_name="nope", properties=kv(("timezone", "UTC")))[:2] == (6, 6)
+
+
+def tree(root):
+    return sorted(str(p.relative_to(root)) + ("/" if p.is_dir() else "") for p in Path(root).rglob("*"))
+
+
+def test_create_database_matches_3x(pair):
+    d = pair.open()
+    both = Both(pair)
+    # 成功：属性解码（空 key 丢弃、同名保留首位取末值、空值保留、非 ASCII），落盘字节与目录形状两边相同。
+    both("CreateDatabase", db_name="d1", properties=kv(("zz", "1"), ("", "dropped"), ("aa", ""), ("zz", "2"), ("键", "值")))
+    both("CreateDatabase", db_name="d2")
+    for name in ["d1", "d2"]:
+        assert both("DescribeDatabase", db_name=name)[3] == name
+        both.props_file(name)
+    assert both("DescribeDatabase", db_name="d1")[4] == [("zz", "2"), ("aa", ""), ("键", "值")]
+    assert both.props_file("d2") == b"{}"
+    rust_tree = tree(Path(pair.rust_path) / "databases")
+    assert rust_tree == tree(Path(pair.ref_path) / "databases")
+    assert "d1/collections/" in rust_tree and "d1/database_properties.json" in rust_tree
+    assert tree(Path(pair.rust_path) / ".database-staging") == tree(Path(pair.ref_path) / ".database-staging") == []
+
+    # 已存在与名字校验：两边完全一致（含文案）。空名即 default。
+    for name in ["default", "", "d1"]:
+        assert both("CreateDatabase", db_name=name)[:2] == (6, 6)
+    assert both("CreateDatabase", db_name="d1")[2] == "database 'd1' already exists"
+    both("CreateDatabase", db_name="d1", properties=kv(("timezone", "UTC")))
+    for name in ["a/b", "a\\b", ".", "..", "x" * 256]:
+        assert both("CreateDatabase", db_name=name)[:2] == (1, 0), name
+    for name in [" sp ", "a:b", "库一", "y" * 255]:
+        assert both("CreateDatabase", db_name=name)[:2] == (0, 0), name
+    if case_insensitive(pair.root):
+        both("CreateDatabase", db_name="D1")
+    # CreateDatabase 只读请求体：dbname 元数据被忽略，空名仍是 default。
+    for uri in pair.uris:
+        with grpc.insecure_channel(uri.removeprefix("http://"), options=[("grpc.enable_http_proxy", 0)]) as channel:
+            stub = milvus_pb2_grpc.MilvusServiceStub(channel)
+            via_metadata = stub.CreateDatabase(milvus_pb2.CreateDatabaseRequest(db_name="m1"), metadata=[("dbname", "d1")])
+            assert (via_metadata.code, via_metadata.error_code) == (0, 0)
+            ignored = stub.CreateDatabase(milvus_pb2.CreateDatabaseRequest(), metadata=[("dbname", "fresh")])
+            assert (ignored.code, ignored.error_code) == (6, 6)
+    names = both("ListDatabases")[3]
+    assert names == sorted(names) and "default" in names and "m1" in names
+
+    # 新库内的集合、别名、同名隔离与 SDK 入口。
+    d.step("create in default", lambda c: c.create_collection("same", schema=schema(), index_params=index("L2")))
+    d.step("using d1", lambda c: c.using_database("d1"))
+    d.step("create in d1", lambda c: c.create_collection("same", schema=schema(), index_params=index("L2")))
+    d.step("insert in d1", lambda c: c.insert("same", [{"id": 7, "vector": [1.0, 0.0]}]))
+    d.step("alias in d1", lambda c: c.create_alias("same", "al"))
+    d.step("query alias", lambda c: c.query("al", filter="id >= 0", output_fields=["id"]))
+    d.step("list in d1", lambda c: c.list_collections())
+    d.step("using default", lambda c: c.using_database("default"))
+    d.step("alias missing in default", lambda c: c.describe_alias("al"), error=True)
+    d.step("query default empty", lambda c: c.query("same", filter="id >= 0", output_fields=["id"]))
+    d.step("create_database via client", lambda c: c.create_database("viaclient", properties={"owner": "x"}))
+    d.step("describe viaclient", lambda c: c.describe_database("viaclient"))
+    d.step("list_databases", lambda c: c.list_databases())
+    both.props_file("viaclient")
+
+    # 重开：数据库、属性（文件键序）、别名与其中的集合照常可见。
+    pair.close()
+    pair.open()
+    for name in ["d1", "d2", "viaclient", "m1"]:
+        both("DescribeDatabase", db_name=name)
+        both.props_file(name)
+    both("ListDatabases")
+    both("ShowCollections", db_name="d1")
+    both("ListAliases", db_name="d1")
+
+
+def test_create_database_registered_differences(pair):
+    pair.open()
+    rust, ref = pair.uris
+    # 目标路径被普通文件占用：3.x 的 os.rename 失败（1/0，文案带绝对路径），本实现报已存在（6/6），不覆盖。
+    for root in (pair.rust_path, pair.ref_path):
+        (Path(root) / "databases").mkdir(exist_ok=True)
+        (Path(root) / "databases" / "afile").write_bytes(b"keep")
+    assert call(ref, "CreateDatabase", db_name="afile")[:2] == (1, 0)
+    assert call(rust, "CreateDatabase", db_name="afile") == (6, 6, "database 'afile' already exists")
+    assert (Path(pair.rust_path) / "databases/afile").read_bytes() == b"keep"
+    # 写 timezone：3.x 校验后创建，本实现 UNIMPLEMENTED 且零写入；未知时区 3.x 为 6/6，本实现同为 UNIMPLEMENTED。
+    assert call(ref, "CreateDatabase", db_name="tz", properties=kv(("timezone", "UTC")))[:2] == (0, 0)
+    assert call(ref, "CreateDatabase", db_name="tzbad", properties=kv(("timezone", "Mars/Base")))[:2] == (6, 6)
+    for name, zone in [("tz", "UTC"), ("tzbad", "Mars/Base")]:
+        with pytest.raises(grpc.RpcError) as info:
+            call(rust, "CreateDatabase", db_name=name, properties=kv(("timezone", zone)))
+        assert info.value.code() == grpc.StatusCode.UNIMPLEMENTED
+        assert not (Path(pair.rust_path) / "databases" / name).exists()

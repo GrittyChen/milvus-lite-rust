@@ -341,6 +341,9 @@ pub enum DirectoryOperation {
     Alter,
     /// AlterDatabase 的 `database_properties.json` 替换，点同 `Alter`。
     DatabaseProperties,
+    /// CreateDatabase：点同 `Create`（`BeforeRename` 为改名进 `databases/` 之前，`AfterRename` / `CollectionsSync`
+    /// / `StagingSync` 为发布之后的目录同步），另有 `NameVerification` 与 `Rollback`（含义同改名）。
+    CreateDatabase,
     /// 改名：`BeforeRename` 为目录改名之前，`CollectionsSync` 为退役旧名后（及重开收尾时）同步 `collections/`，
     /// `Aliases` / `AliasesAfterRename` 为别名改指，其余为改名专用的点。
     Rename,
@@ -704,14 +707,17 @@ fn sync_directory_change(
     root: &std::path::Path,
     staging: &std::path::Path,
     creating: bool,
+    database: bool,
 ) -> std::io::Result<()> {
     std::panic::catch_unwind(|| {
+        #[cfg(not(feature = "fault-injection"))]
+        let _database = database;
         #[cfg(feature = "fault-injection")]
         {
-            let op = if creating {
-                DirectoryOperation::Create
-            } else {
-                DirectoryOperation::Drop
+            let op = match (database, creating) {
+                (false, true) => DirectoryOperation::Create,
+                (false, false) => DirectoryOperation::Drop,
+                (true, _) => DirectoryOperation::CreateDatabase,
             };
             directory_fault(op, DirectoryPoint::AfterRename)?;
             directory_fault(op, DirectoryPoint::CollectionsSync)?;
@@ -721,10 +727,10 @@ fn sync_directory_change(
         fs_commit::sync_dir(root)?;
         #[cfg(feature = "fault-injection")]
         directory_fault(
-            if creating {
-                DirectoryOperation::Create
-            } else {
-                DirectoryOperation::Drop
+            match (database, creating) {
+                (false, true) => DirectoryOperation::Create,
+                (false, false) => DirectoryOperation::Drop,
+                (true, _) => DirectoryOperation::CreateDatabase,
             },
             DirectoryPoint::StagingSync,
         )?;
@@ -1199,7 +1205,7 @@ impl Db {
         self.collections
             .write()
             .insert(key.clone(), Arc::new(RwLock::new(collection)));
-        if let Err(error) = sync_directory_change(&root, &staging_root, true) {
+        if let Err(error) = sync_directory_change(&root, &staging_root, true, false) {
             return Err(EngineError::Storage(format!(
                 "collection was created, but directory durability is unconfirmed: {error}"
             )));
@@ -1313,7 +1319,7 @@ impl Db {
         self.collections.write().remove(&key);
         self.open_failures.write().remove(&key);
         *blocked = true;
-        if let Err(error) = sync_directory_change(&root, &staging_root, false) {
+        if let Err(error) = sync_directory_change(&root, &staging_root, false, false) {
             return Err(storage(format!(
                 "collection was removed, but directory durability is unconfirmed: {error}"
             )));
@@ -1330,6 +1336,156 @@ impl Db {
             eprintln!("drop staging cleanup deferred for {staging:?}: {error}");
         }
         Ok(())
+    }
+
+    /// 3.x `create_database`：名字只取请求体（空串即 `default`），校验名字 → 已存在 → 属性。持独占许可与目录变更锁，
+    /// 沿用集合 create 的 staging 与封锁做法（0023 B「生命周期协议」）：在 `.database-staging/` 建好 `collections/` 与
+    /// `database_properties.json`，改名移入 `databases/` 并核对精确名字，发布到注册表后同步 `databases/` 与 staging。
+    pub fn create_database(&self, name: &str, properties: &[(String, String)]) -> Result<()> {
+        let name = if name.is_empty() {
+            DEFAULT_DATABASE
+        } else {
+            name
+        };
+        validate_filesystem_name(name, "database")?;
+        let _intent = NamespaceIntent::new(&self.namespace_waiters);
+        let mut blocked = self.write_gate.write();
+        if *blocked {
+            return Err(storage(
+                "database writes are blocked after an unconfirmed directory change",
+            ));
+        }
+        let _namespace = self.namespace.lock();
+        let databases_dir = self.databases_dir();
+        let target = databases_dir.join(name);
+        // 路径被任何东西占用（含普通文件、悬空链接、只差大小写的名字）都是已存在，不覆盖。
+        if name == DEFAULT_DATABASE
+            || self.databases.read().contains_key(name)
+            || path_exists(&target)?
+        {
+            return Err(EngineError::DatabaseAlreadyExists(name.to_owned()));
+        }
+        if properties.iter().any(|(key, _)| key == "timezone") {
+            return Err(database_timezone_unsupported());
+        }
+        let bytes = database_properties::to_bytes(&properties.to_vec());
+        self.ensure_databases_dir()?;
+        let staging_root = self.staging_root();
+        fs_commit::create_dir_synced(&staging_root).map_err(storage)?;
+        let staging = staging_root.join(format!(
+            "create-db-{}-{}",
+            std::process::id(),
+            STAGING_NUMBER.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&staging).map_err(storage)?;
+        if let Err(error) = fs_commit::sync_dir(&staging_root) {
+            cleanup_failed_staging(&staging);
+            return Err(storage(error));
+        }
+        // `write_new_schema` 在文件落盘后同步其父目录，也就同步了 `collections/` 的目录项。
+        let built = fs::create_dir(staging.join("collections"))
+            .map_err(storage)
+            .and_then(|()| {
+                fs_commit::write_new_schema(&staging.join("database_properties.json"), &bytes)
+                    .map_err(storage)
+            });
+        if let Err(error) = built {
+            cleanup_failed_staging(&staging);
+            return Err(error);
+        }
+        let renamed = guarded_io(|| {
+            #[cfg(feature = "fault-injection")]
+            directory_fault(
+                DirectoryOperation::CreateDatabase,
+                DirectoryPoint::BeforeRename,
+            )?;
+            fs::rename(&staging, &target)
+        });
+        if let Err(error) = renamed {
+            cleanup_failed_staging(&staging);
+            return Err(storage(error));
+        }
+        let verification = guarded_io(|| {
+            #[cfg(feature = "fault-injection")]
+            directory_fault(
+                DirectoryOperation::CreateDatabase,
+                DirectoryPoint::NameVerification,
+            )?;
+            Ok(())
+        });
+        let mismatch = match verification {
+            Err(_) => Some(format!(
+                "created database name {name:?} was normalized by the filesystem"
+            )),
+            Ok(()) => match self.exact_database_name(name) {
+                Ok(true) => None,
+                Ok(false) => Some(format!(
+                    "created database name {name:?} was normalized by the filesystem"
+                )),
+                Err(error) => Some(error.to_string()),
+            },
+        };
+        if let Some(reason) = mismatch {
+            let rollback = guarded_io(|| {
+                #[cfg(feature = "fault-injection")]
+                directory_fault(DirectoryOperation::CreateDatabase, DirectoryPoint::Rollback)?;
+                fs::rename(&target, &staging)?;
+                fs_commit::sync_dir(&databases_dir)?;
+                fs_commit::sync_dir(&staging_root)
+            });
+            if let Err(error) = rollback {
+                *blocked = true;
+                return Err(storage(format!(
+                    "database name verification failed ({reason}); rollback durability is unconfirmed: {error}"
+                )));
+            }
+            cleanup_failed_staging(&staging);
+            return Err(storage(reason));
+        }
+        *blocked = true;
+        let state = DatabaseState::new(&self.data_root, name);
+        *state.properties.lock() = Some(properties.to_vec());
+        self.databases
+            .write()
+            .insert(name.to_owned(), Arc::new(state));
+        self.open_failures
+            .write()
+            .retain(|key, _| key.database != name);
+        if let Err(error) = sync_directory_change(&databases_dir, &staging_root, true, true) {
+            return Err(EngineError::Storage(format!(
+                "database was created, but directory durability is unconfirmed: {error}"
+            )));
+        }
+        *blocked = false;
+        Ok(())
+    }
+
+    /// `databases/` 是目录（跟随符号链接，同 3.x 的 `makedirs`）；不存在才创建并同步数据根。
+    fn ensure_databases_dir(&self) -> Result<()> {
+        let dir = self.databases_dir();
+        match fs::symlink_metadata(&dir) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                fs_commit::create_dir_synced(&dir).map_err(storage)
+            }
+            Err(error) => Err(storage(error)),
+            Ok(_) => match fs::metadata(&dir) {
+                Ok(meta) if meta.is_dir() => Ok(()),
+                Ok(_) => Err(storage(format!(
+                    "databases path {dir:?} is not a directory"
+                ))),
+                Err(error) => Err(storage(error)),
+            },
+        }
+    }
+
+    /// 创建之后以 `databases/` 的目录列表核对精确名字（文件系统可能规范化了名字）。
+    fn exact_database_name(&self, name: &str) -> Result<bool> {
+        for entry in fs::read_dir(self.databases_dir()).map_err(storage)? {
+            if entry.map_err(storage)?.file_name() == name {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// 3.x 的 `_require_database`：空名即 `default`；其余先校验名字（1/0），再按精确名字查注册表
@@ -1365,6 +1521,10 @@ impl Db {
 
     fn staging_root(&self) -> PathBuf {
         self.data_root.join(STAGING_DIR)
+    }
+
+    fn databases_dir(&self) -> PathBuf {
+        self.data_root.join(DATABASES_DIR)
     }
 
     /// 0023 必须保留的行为 1：每个集合入口先解析别名，命中即换成目标名。只解析一层，别名指向的总是真实集合名。
@@ -3847,10 +4007,7 @@ impl Db {
         }
         let state = self.database(&scope.database)?;
         if properties.iter().any(|(key, _)| key == "timezone") {
-            return Err(EngineError::unsupported(
-                "database timezone property",
-                "database timezone is not supported in this build of milvus-lite-rust yet",
-            ));
+            return Err(database_timezone_unsupported());
         }
         let mut cache = state.properties.lock();
         let current = database_properties::load(&mut cache, &state.root)?;
@@ -3899,6 +4056,14 @@ impl Db {
         };
         Ok(shaped && self.exact_name_in(state, name)?)
     }
+}
+
+/// 取舍 1：数据库属性中的 `timezone` 随 TIMESTAMPTZ 切片解除，请求零写入。
+fn database_timezone_unsupported() -> EngineError {
+    EngineError::unsupported(
+        "database timezone property",
+        "database timezone is not supported in this build of milvus-lite-rust yet",
+    )
 }
 
 /// create / drop 沿用 0007 的悬空别名剔除：目标路径不存在即悬空，按路径而非精确名字判定，

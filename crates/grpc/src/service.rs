@@ -741,6 +741,19 @@ impl Service for MilvusService {
         .await
     }
 
+    async fn create_database(
+        &self,
+        request: Request<svc::CreateDatabaseRequest>,
+    ) -> Result<Response<common::Status>, Status> {
+        // 3.x 只读请求体的 db_name，忽略 dbname 元数据。
+        let req = request.into_inner();
+        self.run(Branch::Engine, move |db| {
+            db.create_database(&req.db_name, &schema::properties(&req.properties))?;
+            Ok(success())
+        })
+        .await
+    }
+
     async fn list_databases(
         &self,
         _request: Request<svc::ListDatabasesRequest>,

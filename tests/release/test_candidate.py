@@ -75,14 +75,14 @@ def test_matrix_shape():
     for platform in scorecard.PLATFORMS:
         stages_ = scorecard.MATRIX[platform]
         assert stages_["python-3.15-2.6.17"] == {"collected": 485, "executed": 485, "group": 0}
-        assert stages_["differential-3.0.2"] == {"collected": 434, "executed": 434, "group": 118}
+        assert stages_["differential-3.0.2"] == {"collected": 436, "executed": 436, "group": 118}
         assert ("pid1" in stages_) == platform.startswith("linux-")
     assert "previous-reader" in scorecard.MATRIX["linux-x86_64"] and "previous-reader" not in scorecard.MATRIX["linux-aarch64"]
 
 
 def test_scorecard_expect_cli(capsys):
     scorecard.main(["expect", "macos-x86_64", "interop", "collected"])
-    assert capsys.readouterr().out == "248\n"
+    assert capsys.readouterr().out == "250\n"
     with pytest.raises(SystemExit):
         scorecard.main(["expect", "linux-x86_64", "rust-default", "passed"])
 

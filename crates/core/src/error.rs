@@ -40,6 +40,9 @@ pub enum EngineError {
     /// 3.x `DatabaseNotFoundError`。
     #[error("database {} does not exist", py_repr(.0))]
     DatabaseNotFound(String),
+    /// 3.x `DatabaseAlreadyExistsError`。
+    #[error("database {} already exists", py_repr(.0))]
+    DatabaseAlreadyExists(String),
     /// 引擎已关闭（3.x `_check_open` 抛出的 RuntimeError）。
     #[error("MilvusLite is closed")]
     Closed,

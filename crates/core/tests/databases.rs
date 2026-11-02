@@ -627,3 +627,354 @@ fn process_exit_around_the_property_replace_reopens_before_or_after() {
         );
     }
 }
+
+fn case_insensitive(dir: &Path) -> bool {
+    let probe = dir.join("Case-Probe");
+    std::fs::create_dir(&probe).unwrap();
+    let insensitive = dir.join("case-probe").exists();
+    std::fs::remove_dir(&probe).unwrap();
+    insensitive
+}
+
+fn staging_entries(path: &Path) -> Vec<String> {
+    match std::fs::read_dir(path.join(".database-staging")) {
+        Ok(entries) => entries
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+fn already_exists(result: Result<(), EngineError>, name: &str) {
+    match result {
+        Err(EngineError::DatabaseAlreadyExists(found)) => assert_eq!(found, name),
+        other => panic!("expected DatabaseAlreadyExists for {name}: {other:?}"),
+    }
+}
+
+#[test]
+fn create_database_builds_the_3x_layout_and_registers_it() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("m.db");
+    let db = open(&path);
+    // 没有 databases/ 与 staging 的数据目录：创建时补建。
+    assert!(!path.join("databases").exists());
+    db.create_database("d1", &pairs(&[("zz", "2"), ("aa", ""), ("键", "值")]))
+        .unwrap();
+    db.create_database("d2", &[]).unwrap();
+    let d1 = path.join("databases/d1");
+    assert!(d1.join("collections").is_dir());
+    assert_eq!(
+        properties_file(&d1).unwrap(),
+        "{\n  \"aa\": \"\",\n  \"zz\": \"2\",\n  \"键\": \"值\"\n}"
+    );
+    assert_eq!(properties_file(&path.join("databases/d2")).unwrap(), "{}");
+    assert!(!d1.join("aliases.json").exists());
+    assert!(staging_entries(&path).is_empty());
+    assert_eq!(db.list_databases(), ["d1", "d2", "default"]);
+    // 进程内按请求顺序返回，各库互不影响；新库立即可用。
+    assert_eq!(
+        describe(&db, "d1").1,
+        pairs(&[("zz", "2"), ("aa", ""), ("键", "值")])
+    );
+    assert!(describe(&db, "d2").1.is_empty());
+    db.create_collection("d1", "c", schema()).unwrap();
+    db.insert("d1", "c", batch(&[1, 2])).unwrap();
+    db.create_alias("d1", "c", "a").unwrap();
+    assert_eq!(names(&db, "d1"), ["c"]);
+    assert!(names(&db, "d2").is_empty());
+    assert!(names(&db, "").is_empty());
+    db.alter_database("d1", &pairs(&[("new", "v")]), &[])
+        .unwrap();
+    db.close();
+    drop(db);
+
+    // 重开后各库仍在，属性读回为文件的键序。
+    let db = open(&path);
+    assert_eq!(db.list_databases(), ["d1", "d2", "default"]);
+    assert_eq!(
+        describe(&db, "d1").1,
+        pairs(&[("aa", ""), ("new", "v"), ("zz", "2"), ("键", "值")])
+    );
+    assert_eq!(names(&db, "d1"), ["c"]);
+    assert!(db.collection("d1", "a").is_ok());
+    db.close();
+}
+
+#[test]
+fn create_database_checks_name_then_existence_then_properties() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("m.db");
+    let db = open(&path);
+    db.create_database("d1", &[]).unwrap();
+    // 空名即 default，已存在；名字校验先于存在判定，存在判定先于属性。
+    already_exists(db.create_database("", &[]), "default");
+    already_exists(db.create_database("default", &[]), "default");
+    already_exists(db.create_database("d1", &[]), "d1");
+    already_exists(
+        db.create_database("d1", &pairs(&[("timezone", "UTC")])),
+        "d1",
+    );
+    for name in ["a/b", "a\\b", ".", "..", "a\0b", &"x".repeat(256)] {
+        assert!(
+            matches!(
+                db.create_database(name, &pairs(&[("timezone", "UTC")])),
+                Err(EngineError::InvalidArgument(_))
+            ),
+            "{name:?}"
+        );
+    }
+    assert_eq!(
+        db.create_database(&"x".repeat(256), &[])
+            .unwrap_err()
+            .to_string(),
+        "database name too long (256 bytes, max 255)"
+    );
+    // timezone 在创建之前返回 Unsupported，零写入。
+    for request in [
+        pairs(&[("timezone", "UTC")]),
+        pairs(&[("a", "1"), ("timezone", "Mars/Base")]),
+    ] {
+        assert!(matches!(
+            db.create_database("tz", &request),
+            Err(EngineError::Unsupported { .. })
+        ));
+    }
+    assert!(!path.join("databases/tz").exists());
+    assert!(staging_entries(&path).is_empty());
+    // 空格、冒号、非 ASCII、255 字节都是合法名字。
+    for name in [" sp ", "a:b", "库一", &"y".repeat(255)] {
+        db.create_database(name, &[]).unwrap();
+    }
+    // 路径被普通文件占用：已存在，不覆盖。
+    std::fs::write(path.join("databases/afile"), b"keep").unwrap();
+    already_exists(db.create_database("afile", &[]), "afile");
+    assert_eq!(
+        std::fs::read(path.join("databases/afile")).unwrap(),
+        b"keep"
+    );
+    missing(db.describe_database("afile"), "afile");
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(root.path().join("nowhere"), path.join("databases/dangling"))
+            .unwrap();
+        already_exists(db.create_database("dangling", &[]), "dangling");
+    }
+    // 只差大小写的名字：大小写不敏感的文件系统上路径已存在，报已存在；敏感时是另一个库。
+    if case_insensitive(root.path()) {
+        already_exists(db.create_database("D1", &[]), "D1");
+        missing(db.describe_database("D1"), "D1");
+    } else {
+        db.create_database("D1", &[]).unwrap();
+    }
+    assert!(staging_entries(&path).is_empty());
+    db.close();
+}
+
+#[cfg(unix)]
+#[test]
+fn create_database_follows_a_symlinked_databases_root() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("m.db");
+    let elsewhere = root.path().join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    std::fs::create_dir_all(&path).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, path.join("databases")).unwrap();
+    let db = open(&path);
+    db.create_database("d1", &pairs(&[("k", "v")])).unwrap();
+    assert!(elsewhere.join("d1/collections").is_dir());
+    assert_eq!(db.list_databases(), ["d1", "default"]);
+    db.close();
+}
+
+#[cfg(feature = "fault-injection")]
+#[test]
+fn create_database_failures_before_the_rename_change_nothing() {
+    use milvus_lite_core::db::{
+        DirectoryFault, DirectoryOperation, DirectoryPoint, inject_directory_fault_once,
+    };
+    for fault in [DirectoryFault::Error, DirectoryFault::Panic] {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("m.db");
+        let db = open(&path);
+        inject_directory_fault_once(
+            DirectoryOperation::CreateDatabase,
+            DirectoryPoint::BeforeRename,
+            fault,
+        );
+        let error = db.create_database("d1", &pairs(&[("k", "v")])).unwrap_err();
+        assert!(error.to_string().contains("storage error"), "{error}");
+        assert!(!path.join("databases/d1").exists());
+        assert!(staging_entries(&path).is_empty());
+        assert_eq!(db.list_databases(), ["default"]);
+        // 写入没有被封锁，同名创建照常成功。
+        db.create_collection("", "c", schema()).unwrap();
+        db.create_database("d1", &pairs(&[("k", "v")])).unwrap();
+        assert_eq!(describe(&db, "d1").1, pairs(&[("k", "v")]));
+        db.close();
+    }
+}
+
+#[cfg(feature = "fault-injection")]
+#[test]
+fn create_database_failures_after_the_rename_publish_and_seal_writes() {
+    use milvus_lite_core::db::{
+        DirectoryFault, DirectoryOperation, DirectoryPoint, inject_directory_fault_once,
+    };
+    for point in [
+        DirectoryPoint::AfterRename,
+        DirectoryPoint::CollectionsSync,
+        DirectoryPoint::StagingSync,
+    ] {
+        for fault in [DirectoryFault::Error, DirectoryFault::Panic] {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("m.db");
+            let db = open(&path);
+            db.create_collection("", "c", schema()).unwrap();
+            inject_directory_fault_once(DirectoryOperation::CreateDatabase, point, fault);
+            let error = db.create_database("d1", &pairs(&[("k", "v")])).unwrap_err();
+            assert!(
+                error.to_string().contains("durability is unconfirmed"),
+                "{point:?}: {error}"
+            );
+            // 提交点已过：库已发布且完整，写入全部封锁，读照常。
+            assert_eq!(db.list_databases(), ["d1", "default"], "{point:?}");
+            assert_eq!(describe(&db, "d1").1, pairs(&[("k", "v")]));
+            assert!(path.join("databases/d1/collections").is_dir());
+            for result in [
+                db.insert("", "c", batch(&[1])).map(|_| ()),
+                db.create_database("d2", &[]),
+                db.alter_database("d1", &pairs(&[("n", "1")]), &[]),
+            ] {
+                assert!(result.unwrap_err().to_string().contains("blocked"));
+            }
+            assert!(db.collection("", "c").is_ok());
+            db.close();
+            drop(db);
+            let db = open(&path);
+            assert_eq!(describe(&db, "d1").1, pairs(&[("k", "v")]));
+            db.create_collection("d1", "c", schema()).unwrap();
+            db.close();
+        }
+    }
+}
+
+#[cfg(feature = "fault-injection")]
+#[test]
+fn create_database_name_verification_failure_rolls_back_or_seals() {
+    use milvus_lite_core::db::{
+        DirectoryFault, DirectoryOperation, DirectoryPoint, inject_directory_fault_once,
+    };
+    // 核对不通过：改回 staging 并删除，状态不变，写入不封锁。
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("m.db");
+    let db = open(&path);
+    inject_directory_fault_once(
+        DirectoryOperation::CreateDatabase,
+        DirectoryPoint::NameVerification,
+        DirectoryFault::Error,
+    );
+    let error = db.create_database("d1", &[]).unwrap_err().to_string();
+    assert!(error.contains("normalized by the filesystem"), "{error}");
+    assert!(!path.join("databases/d1").exists());
+    assert!(staging_entries(&path).is_empty());
+    assert_eq!(db.list_databases(), ["default"]);
+    db.create_database("d1", &[]).unwrap();
+    db.close();
+    drop(db);
+
+    // 核对不通过且改回也失败：整库写入封锁，目录留在原处，重开后是完整的库。
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("m.db");
+    let db = open(&path);
+    for point in [DirectoryPoint::NameVerification, DirectoryPoint::Rollback] {
+        inject_directory_fault_once(
+            DirectoryOperation::CreateDatabase,
+            point,
+            DirectoryFault::Error,
+        );
+    }
+    let error = db
+        .create_database("d1", &pairs(&[("k", "v")]))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("rollback durability is unconfirmed"),
+        "{error}"
+    );
+    assert_eq!(db.list_databases(), ["default"]);
+    assert!(
+        db.create_collection("", "c", schema())
+            .unwrap_err()
+            .to_string()
+            .contains("blocked")
+    );
+    db.close();
+    drop(db);
+    let db = open(&path);
+    assert_eq!(describe(&db, "d1").1, pairs(&[("k", "v")]));
+    db.close();
+}
+
+/// 进程在改名进 `databases/` 前后退出：重开只有「未创建」或「已创建且完整」，staging 残留被清空。
+#[cfg(feature = "fault-injection")]
+#[test]
+fn process_exit_around_database_creation_reopens_before_or_after() {
+    use milvus_lite_core::db::{
+        DirectoryFault, DirectoryOperation, DirectoryPoint, inject_directory_fault_once,
+    };
+    use std::process::Command;
+    let test = "process_exit_around_database_creation_reopens_before_or_after";
+    if let Ok(stage) = std::env::var("MILVUS_LITE_DB_CREATE_CRASH") {
+        let path = std::path::PathBuf::from(std::env::var("MILVUS_LITE_CRASH_DIR").unwrap());
+        let db = open(&path);
+        let point = if stage == "before" {
+            DirectoryPoint::BeforeRename
+        } else {
+            DirectoryPoint::AfterRename
+        };
+        inject_directory_fault_once(
+            DirectoryOperation::CreateDatabase,
+            point,
+            DirectoryFault::Exit,
+        );
+        db.create_database("d1", &pairs(&[("k", "v")])).unwrap();
+        panic!("database creation crash injection did not fire");
+    }
+    if std::env::var_os("MILVUS_LITE_DB_CREATE_PARENT").is_none() {
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test, "--nocapture"])
+            .env("MILVUS_LITE_DB_CREATE_PARENT", "1")
+            .status()
+            .unwrap();
+        assert!(
+            status.success(),
+            "isolated recovery parent failed: {status:?}"
+        );
+        return;
+    }
+    for (stage, created) in [("before", false), ("after", true)] {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("create-crash.db");
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test, "--nocapture"])
+            .env("MILVUS_LITE_DB_CREATE_CRASH", stage)
+            .env("MILVUS_LITE_CRASH_DIR", &path)
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(88), "{stage}");
+        let db = open(&path);
+        assert!(staging_entries(&path).is_empty(), "{stage}");
+        if created {
+            assert_eq!(db.list_databases(), ["d1", "default"], "{stage}");
+            assert_eq!(describe(&db, "d1").1, pairs(&[("k", "v")]), "{stage}");
+            assert!(path.join("databases/d1/collections").is_dir());
+            db.create_collection("d1", "c", schema()).unwrap();
+        } else {
+            assert_eq!(db.list_databases(), ["default"], "{stage}");
+            assert!(!path.join("databases/d1").exists());
+            db.create_database("d1", &[]).unwrap();
+        }
+        db.close();
+    }
+}

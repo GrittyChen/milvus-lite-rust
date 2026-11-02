@@ -58,7 +58,9 @@ pub(crate) fn from_engine(
         | EngineError::AliasConflictsWithCollection(_) => (1, 1),
         EngineError::PartitionNotFound(_) => (200, 200),
         EngineError::PartitionAlreadyExists(_) => (1, 1),
-        EngineError::SchemaValidation(_) | EngineError::DatabaseNotFound(_) => (6, 6),
+        EngineError::SchemaValidation(_)
+        | EngineError::DatabaseNotFound(_)
+        | EngineError::DatabaseAlreadyExists(_) => (6, 6),
         EngineError::CollectionNotLoaded(_) => (101, 101),
         EngineError::IndexAlreadyExists(_) => (35, 35),
         EngineError::IndexNotFound(_) => (700, 11),

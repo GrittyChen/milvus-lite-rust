@@ -556,6 +556,61 @@ assert client.list_collections() == ['c1']
 
 
 @pytest.mark.parametrize("first", ["rust", "reference"])
+def test_databases_created_by_one_implementation_open_and_change_in_the_other(tmp_path, interpreters, first):
+    """0023 B 互通：数据库、属性、库内集合与别名在两边交替创建与修改，`databases/<db>/` 互相读写。"""
+    root = tmp_path / "databases.db"
+    steps = [
+        # 第一方：两个数据库（一个带属性），默认库与 d1 各有同名集合，d1 内有别名。
+        """
+client.create_database('d1', properties={'owner': 'x', 'zz': '1'})
+client.create_database('d2')
+client.create_collection('c', schema=schema, index_params=indexes)
+client.insert('c', [{'id': 100, 'vector': [1.0, 0.0]}])
+client.using_database('d1')
+client.create_collection('c', schema=schema, index_params=indexes)
+client.insert('c', [{'id': 1, 'vector': [1.0, 0.0]}])
+client.create_alias('c', 'a')
+""",
+        # 第二方：读取对方创建的库与属性，经别名读写 d1，修改属性并再创建一个库。
+        """
+assert client.list_databases() == ['d1', 'd2', 'default']
+info = client.describe_database('d1')
+assert info['owner'] == 'x' and info['zz'] == '1'
+client.using_database('d1')
+assert client.list_collections() == ['c']
+client.load_collection('a')
+assert client.query('a', filter='', output_fields=['id']) == [{'id': 1}]
+client.insert('c', [{'id': 2, 'vector': [0.0, 1.0]}])
+client.alter_database_properties('d1', {'new': 'v'})
+client.drop_database_properties('d1', ['zz'])
+client.create_database('d3', properties={'k': 'v'})
+client.using_database('default')
+client.load_collection('c')
+assert client.query('c', filter='', output_fields=['id']) == [{'id': 100}]
+""",
+        # 第一方：看到对方的属性修改与新库，d1 内的数据与别名完整。
+        """
+assert client.list_databases() == ['d1', 'd2', 'd3', 'default']
+info = client.describe_database('d1')
+assert info['owner'] == 'x' and info['new'] == 'v' and 'zz' not in info
+assert client.describe_database('d3')['k'] == 'v'
+client.using_database('d1')
+client.load_collection('c')
+assert client.query('c', filter='', output_fields=['count(*)']) == [{'count(*)': 2}]
+assert client.describe_alias('a')['collection_name'] == 'c'
+""",
+    ]
+    alternate(tmp_path, interpreters, first, root, steps)
+    databases = root / "databases"
+    assert (databases / "d1" / "database_properties.json").read_text() == '{\n  "new": "v",\n  "owner": "x"\n}'
+    assert (databases / "d2" / "database_properties.json").read_text() == "{}"
+    assert (databases / "d3" / "database_properties.json").read_text() == '{\n  "k": "v"\n}'
+    assert json.loads((databases / "d1" / "aliases.json").read_text()) == {"a": "c"}
+    assert not (root / "aliases.json").exists()
+    assert sorted(path.name for path in databases.iterdir()) == ["d1", "d2", "d3"]
+
+
+@pytest.mark.parametrize("first", ["rust", "reference"])
 def test_collection_properties_altered_by_one_implementation_are_read_and_changed_by_the_other(
     tmp_path, interpreters, first
 ):
