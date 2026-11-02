@@ -187,3 +187,23 @@ def test_dynamic_zero_hit_search_with_meta_projection(milvus_client):
     assert len(results) == 1
     assert list(results[0]) == []
     milvus_client.drop_collection(name)
+
+
+def test_dynamic_star_survives_grpc_group_by(milvus_client):
+    name = _create_dynamic_collection(milvus_client, "dynamic_group_by")
+
+    results = milvus_client.search(
+        name,
+        data=[[0.0, 0.0]],
+        anns_field="vec",
+        search_params={"metric_type": "L2", "params": {}},
+        limit=2,
+        group_by_field="bucket",
+        group_size=1,
+        output_fields=["*"],
+    )
+
+    assert len({hit["entity"]["bucket"] for hit in results[0]}) == 2
+    assert all("page" in hit["entity"] for hit in results[0])
+    assert all("source" in hit["entity"] for hit in results[0])
+    milvus_client.drop_collection(name)

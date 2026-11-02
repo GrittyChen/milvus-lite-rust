@@ -140,7 +140,7 @@ jobs:
           . .github/ci/crash_capture.sh
           .venv/bin/python tests/sharding/shard.py plan --python .venv/bin/python --suite tests/differential \
             --out "$RUNNER_TEMP/plan" --shards ${{ matrix.shards }} \
-            --group-fixture diff --group-fixture rust_uri --group-fixture ref_uri --expect 438 --expect-group 118
+            --group-fixture diff --group-fixture rust_uri --group-fixture ref_uri --expect 439 --expect-group 118
           .venv/bin/python tests/sharding/shard.py run --plan "$RUNNER_TEMP/plan/plan.json" --out "$RUNNER_TEMP/run"
       - name: 差分（pymilvus 2.6.17，安装 wheel，仓库外运行）
         if: matrix.suite == 'diff-2.6.17'
@@ -151,7 +151,7 @@ jobs:
           mkdir "$RUNNER_TEMP/outside"
           .venv/bin/python tests/sharding/shard.py plan --python "$RUNNER_TEMP/v26/bin/python" --suite "$PWD/tests/differential" \
             --cwd "$RUNNER_TEMP/outside" --out "$RUNNER_TEMP/plan" --shards ${{ matrix.shards }} \
-            --group-fixture diff --group-fixture rust_uri --group-fixture ref_uri --expect 438 --expect-group 118
+            --group-fixture diff --group-fixture rust_uri --group-fixture ref_uri --expect 439 --expect-group 118
           .venv/bin/python tests/sharding/shard.py run --plan "$RUNNER_TEMP/plan/plan.json" --out "$RUNNER_TEMP/run"
       - name: 存储互通
         if: matrix.suite == 'interop'

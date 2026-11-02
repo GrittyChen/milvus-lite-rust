@@ -6,16 +6,16 @@
 
 | 状态 | 含义 | 条数 |
 | --- | --- | --- |
-| 已复制 | 原样复制到本目录 | 211 |
+| 已复制 | 原样复制到本目录 | 217 |
 | 改后复制 | 仅按 0004「验收」第 2 项与 0006 第 25 项授权的条件替换，逐条说明改动 | 0 |
-| 范围外 | 用到当前切片不支持的功能，不复制；未实现能力的代表性入口见「范围外功能的 `UNIMPLEMENTED` 断言」 | 58 |
+| 范围外 | 用到当前切片不支持的功能，不复制；未实现能力的代表性入口见「范围外功能的 `UNIMPLEMENTED` 断言」 | 57 |
 | 待复用 | 原功能阻断已解除，尚未复制到本地默认套件；0015 的条目已通过固定外部套件验收 | 53 |
-| 依赖内部模块 | 导入或使用 3.x 的内部模块、内部对象，换成本实现后无法运行 | 33 |
+| 依赖内部模块 | 导入或使用 3.x 的内部模块、内部对象，换成本实现后无法运行 | 39 |
 | 不运行 | 上游被同名定义覆盖，上游自己也不运行 | 1 |
 
-以上是逐条列出的 25 个文件中的 356 条；其余 22 个文件的 281 条整个文件记一行原因，见「整个文件不复用的文件」。
+以上是逐条列出的 26 个文件中的 367 条；其余 21 个文件的 270 条整个文件记一行原因，见「整个文件不复用的文件」。
 
-「已复制」与「改后复制」共 211 个用例函数，参数化展开后 252 条（0023 B 新增 19 个函数、31 条：数据库用例 17 个函数 29 条，加两个按数据库隔离的用例）。S1 恢复 [test_grpc_crud.py](test_grpc_crud.py) 中的原过滤表达式，并纳入除 LIKE 外的全部 19 条；它们在本实现与真实 3.x 上的两条客户端线均作为 S1 验收。随后迁移全部 40 条待复用用例，恢复此前为绕过过滤限制而替换的原表达式；顶层动态字段切片另加入原样的 TestDynamicField 用例。0014 已恢复原 HNSW 定义，并新增创建 HNSW、DropIndex 和 describe 参数的原用例；检索仍按 FLAT 执行。
+「已复制」与「改后复制」共 217 个用例函数，参数化展开后 258 条（0024 新增 6 个函数、6 条：分组检索 5 个与动态字段 `["*"]` 随分组返回 1 个；0023 B 新增 19 个函数、31 条：数据库用例 17 个函数 29 条，加两个按数据库隔离的用例）。S1 恢复 [test_grpc_crud.py](test_grpc_crud.py) 中的原过滤表达式，并纳入除 LIKE 外的全部 19 条；它们在本实现与真实 3.x 上的两条客户端线均作为 S1 验收。随后迁移全部 40 条待复用用例，恢复此前为绕过过滤限制而替换的原表达式；顶层动态字段切片另加入原样的 TestDynamicField 用例。0014 已恢复原 HNSW 定义，并新增创建 HNSW、DropIndex 和 describe 参数的原用例；检索仍按 FLAT 执行。
 
 历史的 HNSW→FLAT 授权替换按 0014 恢复原定义；`== N` 换成 `in [N]` 的条件见 0004「验收」第 2 项及 0006 第 25 项。已接通 S1 的 CRUD 副本不再替换表达式或读回方式。其余副本只删去随范围外用例一起不再使用的 import、helper 与空的分节标题；上游用于跳过的 `importorskip` 改为直接导入（本仓不允许因缺依赖静默跳过），上游因 HNSW 需要 faiss 而加的 `skipif` 随 HNSW 一起去掉。起服务的 fixture 与清理见 [conftest.py](conftest.py)。
 
@@ -186,7 +186,7 @@
 
 ### [test_dynamic_field_coverage.py](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_dynamic_field_coverage.py)
 
-8 条：已复制 5，范围外 3。
+8 条：已复制 6，范围外 2。
 
 | 用例 | 状态 | 说明 |
 | --- | --- | --- |
@@ -195,7 +195,7 @@
 | [`test_dynamic_path_and_array_filters_through_grpc`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_dynamic_field_coverage.py#L132) | 已复制 | 0014 切片 B，保留参照原用例 |
 | [`test_dynamic_multi_query_search_with_meta_projection`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_dynamic_field_coverage.py#L160) | 已复制 |  |
 | [`test_dynamic_zero_hit_search_with_meta_projection`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_dynamic_field_coverage.py#L180) | 已复制 | 0014 切片 B，保留参照原用例 |
-| [`test_dynamic_star_survives_grpc_group_by`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_dynamic_field_coverage.py#L198) | 范围外 | group_by |
+| [`test_dynamic_star_survives_grpc_group_by`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_dynamic_field_coverage.py#L198) | 已复制 | 0024 |
 | [`test_dynamic_star_survives_grpc_ranker`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_dynamic_field_coverage.py#L218) | 范围外 | rerank |
 | [`test_dynamic_star_survives_hybrid_search_group_by`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_dynamic_field_coverage.py#L246) | 范围外 | hybrid search、rerank、group_by |
 
@@ -548,6 +548,24 @@
 | [`test_same_alias_isolated_by_database`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_database.py#L478) | 已复制 |  |
 | [`test_using_database_rejects_non_string_without_changing_default_state`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_database.py#L528) | 已复制 |  |
 
+### [test_group_by.py](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_group_by.py)（0024）
+
+11 条：已复制 5，依赖内部模块 6。
+
+| 用例 | 状态 | 说明 |
+| --- | --- | --- |
+| [`test_group_by_varchar`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_group_by.py#L58) | 依赖内部模块 | 3.x 内部 `Collection`（`milvus_lite.engine.collection`）的引擎层用例 |
+| [`test_group_by_int64`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_group_by.py#L75) | 依赖内部模块 | 3.x 内部 `Collection`（`milvus_lite.engine.collection`）的引擎层用例 |
+| [`test_group_size`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_group_by.py#L90) | 依赖内部模块 | 3.x 内部 `Collection`（`milvus_lite.engine.collection`）的引擎层用例 |
+| [`test_strict_group_size_true`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_group_by.py#L110) | 依赖内部模块 | 3.x 内部 `Collection`（`milvus_lite.engine.collection`）的引擎层用例 |
+| [`test_strict_group_size_false`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_group_by.py#L129) | 依赖内部模块 | 3.x 内部 `Collection`（`milvus_lite.engine.collection`）的引擎层用例 |
+| [`test_no_group_by_backward_compat`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_group_by.py#L146) | 依赖内部模块 | 3.x 内部 `Collection`（`milvus_lite.engine.collection`）的引擎层用例 |
+| [`test_grpc_group_by_basic`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_group_by.py#L186) | 已复制 |  |
+| [`test_grpc_group_by_group_size`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_group_by.py#L201) | 已复制 |  |
+| [`test_grpc_group_by_strict`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_group_by.py#L218) | 已复制 |  |
+| [`test_grpc_group_by_with_filter`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_group_by.py#L237) | 已复制 |  |
+| [`test_grpc_group_by_nullable_varchar`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_group_by.py#L253) | 已复制 |  |
+
 ## [test_grpc_compaction.py](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_compaction.py)
 
 2 条：已复制 2。自动维护及两个应答 RPC 的合同见 [0010](../../../docs/decisions/0010-compaction-and-tombstone-gc.md)；Completed 是兼容应答，不表示后台维护已排空。
@@ -570,7 +588,7 @@
 | schema：GEOMETRY、TIMESTAMPTZ、稀疏向量、nullable 向量、向量默认值、JSON/嵌套 ARRAY 元素、function、多向量字段、analyzer，properties 中的 `timezone` | `test_create_collection_remaining_unsupported`、`test_pymilvus_entry_points_remaining_unsupported` |
 | 写入 null 值 | `test_insert_m1_unsupported` |
 | 修改 schema | `test_pymilvus_entry_points_remaining_unsupported` |
-| HybridSearch、group_by、rerank、请求中的 `timezone` | `test_search_m1_unsupported`、`test_pymilvus_entry_points_remaining_unsupported` |
+| HybridSearch、rerank（含与 group_by 同时出现）、请求中的 `timezone` | `test_search_m1_unsupported`、`test_pymilvus_entry_points_remaining_unsupported` |
 | FLAT、BRUTE_FORCE、AUTOINDEX 以外的索引类型 | `test_create_index_m1_unsupported` |
 | DropIndex | `test_pymilvus_entry_points_remaining_unsupported` |
 | GetCompactionPlans | [test_server_manager.py](../test_server_manager.py) 的 `test_unimplemented_rpc_reason` |
@@ -586,7 +604,6 @@
 | [test_array_field.py](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_array_field.py) | 9 | 0015 B 后 gRPC 用例待复用；其中 7 条依赖内部模块，仍不直接复制 |
 | [test_array_milvus.py](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_array_milvus.py) | 22 | 0015 B 已通过固定外部套件，待复用 |
 | [test_boost_ranker.py](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_boost_ranker.py) | 8 | rerank（boost） |
-| [test_group_by.py](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_group_by.py) | 11 | group_by；其中 6 条依赖内部模块 |
 | [test_grpc_fts.py](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_fts.py) | 7 | BM25、稀疏向量、text_match；其中 1 条依赖内部模块 |
 | [test_grpc_geometry.py](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_geometry.py) | 8 | GEOMETRY |
 | [test_grpc_partition_key.py](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_partition_key.py) | 6 | partition key |

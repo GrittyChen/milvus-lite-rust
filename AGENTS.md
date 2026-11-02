@@ -178,7 +178,7 @@ pymilvus ──server_manager──▶ adapter/grpc ──▶ db（多 collectio
 | 独立 CLI server | `.venv/bin/milvus-lite server --data-dir <data_dir> --host 127.0.0.1 --port 19530 --max-workers 10`；也可 `python -m milvus_lite server ...`，合同见 0012 |
 | 构建 wheel / sdist | `.venv/bin/maturin build --release -m crates/py/Cargo.toml` / `.venv/bin/maturin sdist -m crates/py/Cargo.toml` |
 | 核对依赖图中没有 C++ 构建与 protoc | `cargo tree --workspace -e all` |
-| 发行物与安装验收（本地诊断，候选以发行工作流为准；根配置；工作目录在仓库外） | `.venv/bin/python tests/packaging/run_acceptance.py --work-dir <work_dir> --constraints <constraints.txt> --suite --suite-expect 517`；约束文件与完整步骤见 [打包验收](tests/packaging/README.md) |
+| 发行物与安装验收（本地诊断，候选以发行工作流为准；根配置；工作目录在仓库外） | `.venv/bin/python tests/packaging/run_acceptance.py --work-dir <work_dir> --constraints <constraints.txt> --suite --suite-expect 523`；约束文件与完整步骤见 [打包验收](tests/packaging/README.md) |
 | 发行物/平台脚本自检 | `.venv/bin/python -m pytest tests/packaging tests/platform` |
 | CI 纯文档分类与汇总判定自检 | `.venv/bin/python -m pytest tests/ci` |
 | 发行工作流：演练 / 正式运行（0021；从以冻结提交为最新提交的已推送分支触发，正式运行引用同一提交含 PID 1 的成功演练） | `gh workflow run release.yml --repo <owner/repo> --ref <冻结分支> -f commit=<完整 SHA> -f version=<版本> -f dry_run=true`；正式运行改为 `-f dry_run=false -f pid1_dry_run=<演练运行 ID>.<attempt>` |
