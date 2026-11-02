@@ -104,7 +104,7 @@ wheel 由 `fcb263e` 之上的工作区构建；与 `fcb263e` 相比产品源码�
 
 ## 残余风险与未覆盖
 
-- **B 未实施**：数据库 RPC 共 38 条参照用例与 `databases` 探针仍 UNIMPLEMENTED；`using_database` 与带 `db_name` 的访问对已存在的非默认库仍返回 UNIMPLEMENTED。
+- **B 未实施**（后续：B 已实施，见 [0023-b-acceptance](0023-b-acceptance.md)；以下为本记录当时的状态）：数据库 RPC 共 38 条参照用例与 `databases` 探针仍 UNIMPLEMENTED；`using_database` 与带 `db_name` 的访问对已存在的非默认库仍返回 UNIMPLEMENTED。
 - **平台**：全部在 macOS arm64 本机执行。Linux 两个架构、Intel Mac 与 CI 环境未跑；工作流的计数与预构建清单已改并通过静态检查，但本批未实际运行，须在下次互通 CI 或候选前跑一次。
 - **断电类故障**：进程退出不丢页缓存，因此「目录同步之前的断电回退」只由目录同步的错误注入与顺序钩子覆盖，没有真实断电实测，同 [0007](../decisions/0007-m2-storage-engine.md) 的既有边界。
 - **临时文件写入与文件同步失败**未单独注入：它们与改名同在 `replace_file` 的第一个闭包内、走同一出口，由钩子与改名失败的单元测试证明出口分类，没有逐一注入写入与同步。

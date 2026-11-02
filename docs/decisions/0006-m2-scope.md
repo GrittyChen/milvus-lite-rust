@@ -349,7 +349,7 @@ M1 证明了整条链路可行，但数据只在内存中，不发布（[0004](0
     - 请求的名字命中 `aliases.json`，或 `databases/<db>` 已存在时，返回 UNIMPLEMENTED；
     - 新建 collection 的名字与已有别名相同时，与 3.x 报同样的错误；
     - `.database-staging/` 的残留在打开数据库、拿到 LOCK 之后清空，与 3.x 相同（M1 拒绝打开）。
-    - **后续修订**：别名命中的 UNIMPLEMENTED 从未实现（经别名的访问报「collection 不存在」），由 [0023](0023-aliases-rename-truncate-databases.md) 的 A 改为按 3.x 解析别名并支持别名 RPC；`databases/<db>` 已存在时返回 UNIMPLEMENTED 由 A 的 `require_database` 实现，数据库本身的支持属于 0023 的 B。
+    - **后续修订**：别名命中的 UNIMPLEMENTED 从未实现（经别名的访问报「collection 不存在」），由 [0023](0023-aliases-rename-truncate-databases.md) 的 A 改为按 3.x 解析别名并支持别名 RPC；`databases/<db>` 已存在时返回 UNIMPLEMENTED 由 A 的 `require_database` 实现，0023 的 B 起数据库按 3.x 使用（打开时枚举 `databases/`，Create / Drop / Alter / Describe / List 均已支持），此项不再适用。
 16. **collection 何时打开、按什么顺序打开。** **建议与 3.x 相同，在第一次被访问时打开并恢复，失败只影响这个 collection。**
     - **顺序：先完成全部读取与判定，再做任何删除**：
       - 读取与判定：schema、manifest、snapshot 元数据；manifest 引用的全部文件都读入并校验；读取 WAL。
@@ -580,6 +580,10 @@ M1 证明了整条链路可行，但数据只在内存中，不发布（[0004](0
 | 已提交删除覆盖旧行时的部分 upsert（待 Upsert 接入后验收） | 3.x 在缺陷 a 留下的重复目录上可能仍读旧行并合并字段 | 只合并仍有效的最新行，不读已提交删除覆盖的旧版本 | 缺陷 a；[0007「写入」](0007-m2-storage-engine.md#写入) | 3.x 崩溃后带重复 WAL 的目录 |
 | 检索中距离并列且落在截断位置时，取哪几行 | 由 numpy `argpartition` 决定，每个源取的个数不少于 4 时近似任意 | 取全局顺序中位置最先的 | 第 23 项；复刻要放弃流式 TopK 与并行。M1 起即如此 | 距离大量相同的检索 |
 | 0023 A 的请求语义差异：RenameCollection 的 `newDBName` 指向其他数据库；改名新名为悬空别名或路径已被占用（残留目录、文件、符号链接）；清空时 snapshot 标识不合法或 `wal/` 为符号链接；范围外 schema 上的清空与改属性；写 `timezone`；非法语法名字（读类 RPC、DropAlias、AlterCollection）；`aliases.json` 含 `NaN` / `Infinity` 或嵌套过深 | 忽略 `newDBName`；悬空别名与空目录上改名成功，其他路径 1/0；照常清空；能成功；校验后保存；读类 100/4、DropAlias 无操作成功；解析接受 | 分别为 UNIMPLEMENTED、1/1 零写入、零写入拒绝、UNIMPLEMENTED 零写入、UNIMPLEMENTED 零写入、1/0、解析失败 1/0 | 不静默改变用户请求的对象，不覆盖任何已有路径，不对不理解的内容清空，不放宽解析器；逐项理由与出口见 [0023「实施登记的差异」](0023-aliases-rename-truncate-databases.md#实施登记的差异与更严格的出口) | raw gRPC 与 pymilvus 的预期差异用例 |
+| 0023 B 的请求语义差异：CreateDatabase 的 `databases/<name>` 被普通文件或悬空符号链接占用；DropDatabase 的符号链接形式的空库；只差大小写的数据库名（Describe / Drop / Create）；写 `timezone`（CreateDatabase / AlterDatabase） | 占用时 `os.rename` 失败（1/0，文案带绝对路径）；空的符号链接库 `rmtree` 拒绝（1/0）；大小写不敏感文件系统上按路径命中，Describe 成功、Drop 删除另一个库；`timezone` 校验后保存 | 占用时 6/6 已存在，零写入；空的符号链接库 1/0，链接与目标都保留（文案不同）；按精确名字报不存在（Create 在路径已存在时报已存在）；UNIMPLEMENTED，零写入，判定在存在性之后 | 不覆盖、不暴露绝对路径、不跟随链接删除、不让一个名字删掉另一个库；`timezone` 取舍 1 | raw gRPC 与 pymilvus 的预期差异用例，见 [0023「B 实施设计」](0023-aliases-rename-truncate-databases.md#b-实施设计评审稿) |
+| 0023 B 的属性文件与注册表语义：`database_properties.json` 的非字符串值、无法解析或 `timezone` 取值未知；`databases/default` 目录；运行期由外部创建 / 删除的 `databases/<db>`；名字不是 UTF-8 的目录 | 非字符串值 Describe 按 `str()` 展示、Alter 保留原类型；CreateCollection 与打开集合也读该文件并随其失败；`ListDatabases` 出现两个 `default`；外部变更立即可见；名字按 surrogateescape 列出 | Describe / Alter 报存储错误（1/0）零写入；只有 Describe / Alter 读该文件，创建与打开集合不读，`timezone` 值原样保留；`databases/default` 跳过并记日志；打开时枚举，重开后可见；跳过并记日志 | 属性只影响延后的 TIMESTAMPTZ 默认时区；数据目录由 LOCK 独占，目录只由本进程修改；README「已知差异」同样写明本实现能打开并写入 3.x 因属性文件损坏而打不开的库 | 手工编辑的属性文件、手工建立的目录 |
+| 0023 B 的 I/O 出口：`databases/` 不可读、不是目录或为悬空 / 循环符号链接；Drop 非空判定中的列目录与 metadata 错误 | 启动只 `makedirs`，不可读时仍启动、按请求失败；`exists` / `isdir` 吞错，`listdir` 不吞 | 启动失败；向上报存储错误 | 同 0023 A 的 I/O 出口原则 | 权限与链接配置异常的数据目录 |
+| 0023 B 的 staging 与目标目录须在同一文件系统：数据库 create / drop、集合 create / drop 与清空都先改名进 `.database-staging/`（数据根），若 `databases/` 是指向另一文件系统的符号链接，跨文件系统的 `rename` 失败（`EXDEV`）；集合改名只在该库的 `collections/` 内完成，不受影响 | 在目标目录内原地创建 / 删除，可以成功（Create 先在数据根 staging 再改名，同样失败） | 上述 staging 操作报存储错误（1/0），状态不变 | 改名是目录操作的原子提交点；不支持把 `databases/` 或其中的库放在其他文件系统上，实测结果见 [0023-b 验收](../testing/0023-b-acceptance.md) | 将 `databases/` 链接到另一个卷 |
 | 0023 A 的清空结果形状：manifest `version`、`.prev`、无 manifest 的 partition key 集合、目录形状 | `version` 为 1，无 `.prev`；无 manifest 的 partition key 集合重建 16 个桶；目录重建 | `version` 为旧值加 1，`.prev` 与 manifest 相同，桶由注册表补回，原地保留空分区目录、不建 `wal/` | 清空以一次 manifest 原子替换为提交点；读取与路由与 3.x 相同 | 互通用例逐 id 比较两边清空后的路由与数据 |
 | 0023 A 的 I/O 与解析出口：别名路径（create / drop 的悬空别名剔除、目标存在判定、别名文件读取）、`schema.json` 无法读取时的 AlterCollection 与改名、改名的新名与旧名判定 | 把 I/O 错误当「不存在」继续；从内存重建；旧名判定失败报 100/4 | 向上传递（1/0 或存储错误），零写入；create 可能由成功变为失败，drop 后清理失败的别名残留到下一次 create / drop | 规则 5：I/O 与校验失败必须向上传递；只比 3.x 更严格 | 见 0023 的更严格出口表 |
 | 清空、改名的崩溃窗口与重开收尾 | 可能留下残缺集合，或名字与目录不一致、别名指向旧名 | 私有意图文件加原子提交点；重开后只有「操作前」或「操作后」，意图无法处理时 fail-closed 并给出人工恢复步骤，I/O 失败的收尾不缓存、不封锁整库 | 0002 约束 1 的例外清单、[0023](0023-aliases-rename-truncate-databases.md) | 两种意图的故障与进程退出用例 |
@@ -593,7 +597,7 @@ M1 证明了整条链路可行，但数据只在内存中，不发布（[0004](0
 | 差异 | 3.x | M2 | 理由 | 影响的用例 |
 | --- | --- | --- | --- | --- |
 | 含不支持内容的 collection | 能使用 | 列出；DescribeCollection 与 drop 照常，其余返回 UNIMPLEMENTED | 第 14 项 | 用 3.x 的其他功能写过的目录 |
-| 已有的其他数据库 | 能使用 | UNIMPLEMENTED（别名已由 0023 的 A 支持） | 第 15 项 | 经 `db_name` 的访问 |
+| 已有的其他数据库 | 能使用 | 0023 B 起按 3.x 使用，创建、删除与属性 RPC 均已支持（0.3.0rc3 及更早为 UNIMPLEMENTED，别名由 0023 的 A 支持）；差异见下面 0023 B 的各行 | 第 15 项 | 经 `db_name` 的访问 |
 | 带 limit 的过滤结果顺序 | 后台 compaction 之后改变 | M2 历史不合并；首发扩展按 [0010](0010-compaction-and-tombstone-gc.md) 的来源序/差异验收 | 第 3 项及后续 0010 | 带 limit 且文件数不少于 4 的过滤 |
 | ManualCompaction 与 GetCompactionState | 返回成功，恒为 Completed | M2 历史 UNIMPLEMENTED；首发扩展成功应答/Completed，不能当成 drain | 第 3 项、0010，不变量 15 | `client.compact()`、`optimize()` |
 | 被覆盖的旧版本与已删除的行 | compaction 回收 | M2 历史不回收；首发按 0010/0011 合并与 GC | 第 3 项、0010/0011 | 长期运行的写入 |

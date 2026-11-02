@@ -65,3 +65,19 @@ def test_collection_properties_via_alias(milvus_client):
         milvus_client.describe_alias("target_alias")["collection_name"]
         == "target"
     )
+
+
+def test_collection_properties_are_database_isolated(milvus_client):
+    milvus_client.create_database("tenant_a")
+    milvus_client.create_database("tenant_b")
+    for database, value in (("tenant_a", "a"), ("tenant_b", "b")):
+        milvus_client.using_database(database)
+        _create(milvus_client, "shared")
+        milvus_client.alter_collection_properties(
+            "shared", {"custom.owner": value}
+        )
+
+    milvus_client.using_database("tenant_a")
+    assert _properties(milvus_client, "shared")["custom.owner"] == "a"
+    milvus_client.using_database("tenant_b")
+    assert _properties(milvus_client, "shared")["custom.owner"] == "b"

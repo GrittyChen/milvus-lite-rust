@@ -1,6 +1,6 @@
 # 0023 别名、改名、清空、集合属性与多数据库
 
-- 状态：合同终稿；2026-10-29 负责人确认五项取舍（见「已确认的取舍」），独立评审三轮后按意见修订并确认。**A 已按设计分七步实施并逐步评审，验收见 [0023-a-acceptance](../testing/0023-a-acceptance.md)；B（多数据库）的实施设计评审中，见文末「B 实施设计」**
+- 状态：合同终稿；2026-10-29 负责人确认五项取舍（见「已确认的取舍」），独立评审三轮后按意见修订并确认。**A 已按设计分七步实施并逐步评审，验收见 [0023-a-acceptance](../testing/0023-a-acceptance.md)；B（多数据库）已按文末「B 实施设计」分五步实施并逐步评审，验收见 [0023-b-acceptance](../testing/0023-b-acceptance.md)**
 - 日期：2026-10-29
 - 参照：milvus-lite v3.2.1 / `43d1257774e629bc9f66873977ab7c320d5bf5a7`；pymilvus 3.0.2 实测，2.6.17 经源码核对：`use_database` 同样先调 DescribeDatabase，改名请求只设 `newDBName`，数据库经 `dbname` 元数据传递，与 3.0.2 一致
 - 基线：已发布 `0.3.0rc3`；仓库基线 `1026c0854886c70e303b725b4fdb00b98e95ff3a`
@@ -484,7 +484,7 @@
 - **`Db` 入口**：`create_database(name, properties)`、`drop_database(name)`、`list_databases()`、`describe_database(database)`、`alter_database(database, properties, delete_keys)`；`require_database` 保持名字校验后查注册表，不再对存在的非默认库返回 UNIMPLEMENTED（0006 第 15 项的数据库部分由此落实为「按 3.x 使用」）。
 - **启动**（`Db::new`，LOCK 与 staging 清理之后、服务开始之前）：默认库的状态先单独建立，枚举只增加非默认库。归属写死：默认库的根清扫在 [data_dir.rs](../../crates/core/src/data_dir.rs) 的 `DataDir::open`（白名单增加 `database_properties.json`），非默认库的清扫在枚举中；`settle_rename` 对包括默认库在内的每个状态只执行一次。枚举规则：
   - `databases/` 以跟随符号链接的 `fs::metadata` 判定：不存在为无；存在但不是目录、`read_dir` 失败或迭代失败，启动失败（3.x 在启动时 `makedirs(databases)`，非目录会使打开失败；`databases/` 不可读时 3.x 启动成功、按请求报 1/0，本实现更严格，登记）。`databases/` 是指向目录的符号链接时与 3.x 一样跟随，Create 对 `databases/` 同样用跟随的判定（已是目录就不再创建；staging 根保持 A 的「符号链接即拒绝」）。
-  - 条目按 `fs::metadata().is_dir()` 判定（跟随符号链接，同 3.x 的 `isdir`）；单个条目的 `metadata` 失败按「不是数据库」跳过并记日志，不使启动失败（同 3.x `isdir` 吞错）；名字不是 UTF-8 的条目跳过并记日志；名为 `default` 的条目跳过并记日志（默认库来自数据根；3.x 会在 `ListDatabases` 中给出两个 `default`，本实现不复现，登记）。
+  - 条目按 `fs::metadata().is_dir()` 判定（跟随符号链接，同 3.x 的 `isdir`）；单个条目的 `metadata` 失败按「不是数据库」跳过，不使启动失败（同 3.x `isdir` 吞错），NotFound（如悬空符号链接）静默跳过，其余错误记日志；名字不是 UTF-8 的条目跳过并记日志；名为 `default` 的条目跳过并记日志（默认库来自数据根；3.x 会在 `ListDatabases` 中给出两个 `default`，本实现不复现，登记）。
   - 对每个非默认库：先 `cleanup_replace_temps(root, ["aliases.json", rename 意图, "database_properties.json"])`（枚举失败使启动失败，单文件失败为警告，同 N2），再进入 `settle_rename`（失败置改名未完成、不使启动失败，同 A）。
   - 0007「文件替换的残留」补充：非默认库的清扫发生在 `Db::new`，前提同为「LOCK 之后、无写者」。
 
@@ -572,9 +572,46 @@
 
 第 1 步之后每步单独评审。回退到 0.3.0rc3 及更早：旧版对已有的非默认库返回 UNIMPLEMENTED、不触碰其内容，`.database-staging/` 仍在打开时清空；发行说明写明回退后数据库内的集合不可访问但数据保留。
 
-### 待负责人确认
+### 已确认的取舍（B）
+
+评审确认如下四项：
 
 1. **打开时枚举数据库**（细化表第一行）而非按需注册。
 2. **属性值只接受字符串、集合操作不读属性文件**（两处差异）。
 3. **路径被占用的 Create 一律报已存在**。
 4. **写入封锁保持整库一个标志**，不按数据库拆分。
+
+### B 实施登记与验收口径
+
+实施按「实施顺序」五步进行，第 1 步之后每步单独评审；第 5 步分两批（补测与小整理、文档同步与统计）。以下是实施中相对设计文本的出入与补充，合同与设计正文不改。
+
+**相对设计的出入**
+
+| 设计文本 | 实际 | 理由 |
+| --- | --- | --- |
+| 启动枚举：条目 `metadata` 失败记日志 | NotFound（悬空符号链接）静默跳过，其余错误记日志 | 悬空链接是 3.x 的 `isdir` 也判为非数据库的常见形态，逐个记日志只会制造噪声 |
+| `databases/` 缺失为无 | 路径本身不存在才算无；悬空或循环的符号链接是「存在但不是目录」，启动失败 | 3.x 的 `makedirs(databases)` 对悬空链接同样抛 `FileExistsError`（第 1 步评审） |
+| Drop 的目录类型检查在改名之前 | 先确认库内无集合（6/6），再检查 `databases/<name>` 是真实目录（符号链接形式的空库报存储错误），再确认 staging 根 | 与目录形式的库保持一致的错误顺序：非空优先于类型错误 |
+| 新增故障操作 `CreateDatabase`、`DropDatabase`、`DatabaseProperties` | `sync_directory_change` 增加库作用域参数，`(true, true)` 为创建、`(true, false)` 为删除 | 复用集合 create / drop 的同步点与封锁路径，故障点名称一致（第 3 步评审的交接项） |
+| `databases_dir()` 在第 3 步加入 | 同 | Create 才需要创建与同步 `databases/` |
+| staging 目录名 | 常量放在 `data_dir::STAGING_DIR`，打开时清空、数据库与集合的创建 / 删除 / 清空共用 | 路径单源（第 1 步评审建议） |
+| 差分 / 互通 / Python 计数 | 差分 431→438（新增 7 条）、互通 248→250、Python 485→516（含复制的参照数据库用例 31 条） | 随新增用例同步 `compare.yml`、`ci.yml`、`scorecard.py`、候选自检夹具、分片 README、打包 README 与 0020 |
+
+**登记的差异**（全部落在 [0006 差异表](0006-m2-scope.md#与-3x-的差异)的 0023 B 各行）
+
+- 请求语义：被普通文件或悬空链接占用的 Create、符号链接形式的空库的 Drop、只差大小写的数据库名、写 `timezone`。
+- 属性文件与注册表：非字符串值、无法解析或 `timezone` 未知时只有 Describe / Alter 读文件（创建与打开集合不读，因此能打开并写入 3.x 因该文件损坏而打不开的库）、`databases/default`、运行期由外部创建或删除的 `databases/<db>`（两个方向，重开后才可见）、名字不是 UTF-8 的目录。
+- I/O 出口：`databases/` 不可读、不是目录或为悬空 / 循环符号链接时启动失败；Drop 非空判定中的列目录与 metadata 错误向上报。
+- **staging 与目标目录须在同一文件系统**：数据库 create / drop、集合 create / drop 与清空（`wal/` 移入）都先改名进数据根的 `.database-staging/`；集合改名只在该库的 `collections/` 内完成，不经过 staging，跨文件系统仍可用。实测（macOS APFS，第二个卷上的目录符号链接为 `databases/`）：3.x 的 CreateDatabase 同样因 `EXDEV` 失败（先在数据根 staging 再改名），但其库内集合的 create / 改名 / drop 与 DropDatabase 原地进行、全部成功；本实现的 CreateDatabase、库内集合 create、已存在集合的 drop 与清空、DropDatabase 都以存储错误失败（`Cross-device link`）、状态不变，已存在集合的改名成功。3.x 的清空未测。Linux 未实测，`rename(2)` 的跨文件系统语义相同。不支持把 `databases/` 或其中的库放在其他文件系统上。
+- **迟到读**：读请求在 Drop 提交点附近已取得旧状态时，属性（或别名）尚未加载则可能读到空表（文件已随目录移走），而不是数据库不存在；已加载的缓存给出删除前的值。不会报存储错误，3.x 无锁，同类竞态；`describe_racing_a_drop_never_fails_with_a_storage_error` 固定这一边界。
+
+**设计测试矩阵「并发」行的覆盖口径**
+
+| 组合 | 证据 |
+| --- | --- |
+| Drop 与同库 CreateCollection 的先后 | `concurrent_drop_and_create_collection_never_leave_a_collection_in_a_missing_database`（30 轮，只出现「先建集合、删除报非空」或「先删库、创建报库不存在」） |
+| 两个 CreateDatabase 同名 | `concurrent_creates_of_one_name_succeed_exactly_once`（4 线程 × 20 轮，缓存与文件来自同一胜者） |
+| Alter 与 Alter、Alter 与 Describe | `concurrent_alters_are_serialized_and_the_file_matches_the_cache`（8 线程，每次 Alter 后同线程 Describe 可见，重开与缓存一致） |
+| Create / Drop 与他库的 CreateCollection、写入、改名、Drop 集合 | `database_lifecycle_does_not_disturb_activity_in_other_databases`（他库持续创建、写入、改名、删除集合，同时 40 轮库的创建 / Alter / 删除，均无错误，最终状态一致） |
+| Drop 与迟到持有旧状态的读 | `describe_racing_a_drop_never_fails_with_a_storage_error`（见上，登记为已知行为） |
+| 库生命周期与懒打开、合并 | 结构性保证：懒打开与合并全程持数据库写入闸门的共享许可，库的创建、删除与属性修改持独占许可（[0007](0007-m2-storage-engine.md#取锁顺序)）；独占许可与进行中合并的先后沿用 A 的 `compaction.rs` 独占变更用例，库生命周期没有单独的合并用例，Drop 要求库内无集合，因而不存在需要排空的合并任务 |

@@ -1502,3 +1502,83 @@ fn concurrent_alters_are_serialized_and_the_file_matches_the_cache() {
     assert_eq!(reread, expected);
     db.close();
 }
+
+/// 他库内的集合 create / drop / 改名 / 写入与数据库的创建、删除并发：独占许可使两者互斥，互不丢失、互不报错。
+#[test]
+fn database_lifecycle_does_not_disturb_activity_in_other_databases() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("m.db");
+    let db = open(&path);
+    db.create_database("busy", &[]).unwrap();
+    db.create_collection("busy", "base", schema()).unwrap();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let worker = {
+        let (db, stop) = (db.clone(), stop.clone());
+        std::thread::spawn(move || {
+            let mut rounds = 0_i64;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                db.create_collection("busy", "tmp", schema()).unwrap();
+                db.insert("busy", "tmp", batch(&[rounds])).unwrap();
+                db.rename_collection("busy", "tmp", "moved", "").unwrap();
+                db.insert("busy", "base", batch(&[rounds])).unwrap();
+                db.drop_collection("busy", "moved").unwrap();
+                rounds += 1;
+            }
+            rounds
+        })
+    };
+    for round in 0..40 {
+        let name = format!("life{round}");
+        db.create_database(&name, &pairs(&[("round", &round.to_string())]))
+            .unwrap();
+        db.alter_database(&name, &pairs(&[("k", "v")]), &[])
+            .unwrap();
+        db.drop_database(&name).unwrap();
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    assert!(worker.join().unwrap() > 0);
+    assert_eq!(db.list_databases(), ["busy", "default"]);
+    assert_eq!(names(&db, "busy"), ["base"]);
+    assert!(staging_entries(&path).is_empty());
+    db.close();
+}
+
+/// 读请求在 Drop 的提交点附近取得旧状态：只会得到数据库不存在、删除前的属性，或（属性尚未加载时）空属性，
+/// 不会报存储错误或 panic（3.x 无锁，同类竞态；验收记录说明该行为）。
+#[test]
+fn describe_racing_a_drop_never_fails_with_a_storage_error() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("m.db");
+    for round in 0..30 {
+        let db = open(&path);
+        let name = format!("race{round}");
+        db.create_database(&name, &pairs(&[("k", "v")])).unwrap();
+        db.close();
+        drop(db);
+        // 重开后属性缓存为空，读者在 Drop 窗口内要从文件加载。
+        let db = open(&path);
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let reader = {
+            let (db, name, barrier) = (db.clone(), name.clone(), barrier.clone());
+            std::thread::spawn(move || {
+                barrier.wait();
+                (0..50)
+                    .map(|_| db.describe_database(&name))
+                    .collect::<Vec<_>>()
+            })
+        };
+        barrier.wait();
+        db.drop_database(&name).unwrap();
+        for result in reader.join().unwrap() {
+            match result {
+                Ok((found, properties)) => {
+                    assert_eq!(found, name);
+                    assert!(properties.is_empty() || properties == pairs(&[("k", "v")]));
+                }
+                Err(EngineError::DatabaseNotFound(found)) => assert_eq!(found, name),
+                Err(other) => panic!("round {round}: unexpected {other:?}"),
+            }
+        }
+        db.close();
+    }
+}

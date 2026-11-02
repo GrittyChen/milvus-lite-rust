@@ -35,7 +35,7 @@
 
 | 对象 | 是否互通 | 说明 |
 | --- | --- | --- |
-| 目录布局 | 是 | 数据目录根：默认数据库的 `collections/`、`aliases.json`、`database_properties.json`，以及只有一份的 `.database-staging/`（3.x 每次打开时清空；本实现的 drop 与 create 也借它完成原子的改名，见 [0006](0006-m2-scope.md) 第 17 项）；其他数据库各自在 `databases/<db>/` 下有 `collections/`、`aliases.json`、`database_properties.json`（见 [db.py](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/milvus_lite/db.py#L7)）。collection 级：`schema.json`、`manifest.json`（首次 flush 之前可能不存在）、`manifest.json.prev`、`wal/wal_{data,delta}_NNNNNN.arrow`、`partitions/<p>/{data,delta,indexes}/`、`snapshots/metadata/<name>.json`、`snapshots/manifests/<name>/`，以及原子写入时的 `*.json.tmp` |
+| 目录布局 | 是 | 数据目录根：默认数据库的 `collections/`、`aliases.json`、`database_properties.json`，以及只有一份的 `.database-staging/`（3.x 每次打开时清空；本实现的 drop 与 create，含数据库的创建与删除，也借它完成原子的改名，见 [0006](0006-m2-scope.md) 第 17 项；它与 `databases/` 须在同一文件系统）；其他数据库各自在 `databases/<db>/` 下有 `collections/`、`aliases.json`、`database_properties.json`（见 [db.py](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/milvus_lite/db.py#L7)）。collection 级：`schema.json`、`manifest.json`（首次 flush 之前可能不存在）、`manifest.json.prev`、`wal/wal_{data,delta}_NNNNNN.arrow`、`partitions/<p>/{data,delta,indexes}/`、`snapshots/metadata/<name>.json`、`snapshots/manifests/<name>/`，以及原子写入时的 `*.json.tmp` |
 | `LOCK` | 是 | 同一个文件，互斥语义一致，见约束 10 |
 | WAL | 是 | Arrow IPC stream。data 列为 `_seq`、`_partition`、用户字段、可选 `$meta`；delta 列为主键、`_seq`、`_partition`（见 [arrow_builder.py](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/milvus_lite/schema/arrow_builder.py)）。batch 语义见约束 3 |
 | Parquet data / delta | 是 | data 列为 `_seq(uint64)` + 用户字段 + 可选 `$meta(string)`；delta 列为主键 + `_seq`。文件名语义见约束 2，写入参数见约束 9 |
@@ -105,7 +105,7 @@
     - 这里的 fail-closed 按 collection 生效：只有出问题的 collection 不能使用，目录中其余 collection 照常（[0006](0006-m2-scope.md) 第 14 项）。未知的 index_type 是例外：3.x 自己就会写出这类目录（约束 1），因此与 3.x 保持同样的粒度，目录照常打开，只在该 collection build 索引时报错。
     - 读取老目录时，缺失的键按 3.x 的默认值处理；3.0.x 到 3.1.0 在 Windows 上写出的 `\` 路径（manifest 与 snapshot 元数据中都可能出现；修复首见于 v3.1.1）要规范化为 `/`。
     - `aliases.json` 与 `database_properties.json` 没有版本字段。
-    - **共享 JSON 的写出格式**（0023）：`schema.json`、`manifest.json`（含 `.prev`）、`aliases.json`、`database_properties.json` 一律按 3.x 的 `json.dump(indent=2, sort_keys=True, ensure_ascii=False)` 逐字节输出，读取仍保留文件顺序；此前的 0.3.0rc3 按字段插入顺序写出 `schema.json`，3.x 读回后顺序与本实现不同，重写时即被规范化。`aliases.json`、`schema.json` 的替换按「写 tmp、fsync、改名、fsync 目录」完成，改名之后目录同步未确认时按 0007 封锁写入；3.x 对这几个文件都不 fsync 目录，`aliases.json` 也不 fsync 文件。与 3.x 在字节上的唯一差异：溢出为 inf 的数字保留 `1e+999` 文本（见 [0006 差异表](0006-m2-scope.md#与-3x-的差异)）。
+    - **共享 JSON 的写出格式**（0023）：`schema.json`、`manifest.json`（含 `.prev`）、`aliases.json`、`database_properties.json` 一律按 3.x 的 `json.dump(indent=2, sort_keys=True, ensure_ascii=False)` 逐字节输出，读取仍保留文件顺序；此前的 0.3.0rc3 按字段插入顺序写出 `schema.json`，3.x 读回后顺序与本实现不同，重写时即被规范化。`aliases.json`、`schema.json`、`database_properties.json` 的替换按「写 tmp、fsync、改名、fsync 目录」完成，改名之后目录同步未确认时按 0007 封锁写入；3.x 对这几个文件都不 fsync 目录，`aliases.json` 也不 fsync 文件。数据库的创建在 `.database-staging/` 中建好 `collections/` 与 `database_properties.json` 后改名移入 `databases/`，删除是整体改名移入 staging 后再删除（0023 B）；`database_properties.json` 里本实现只接受字符串值，`timezone` 的取值原样保留。与 3.x 在字节上的唯一差异：溢出为 inf 的数字保留 `1e+999` 文本（见 [0006 差异表](0006-m2-scope.md#与-3x-的差异)）。
 12. **3.x 升级格式时**，先评估新格式，再决定跟进或拒绝；跟进时按 [AGENTS.md](../../AGENTS.md) 规则 8 记录兼容性影响。对照版本升级时，同步更新本文的「对照版本」，并重跑[验证](#验证)中的全部跨实现测试。
 13. **正确性不变量照旧适用**：互通不放宽 [AGENTS.md](../../AGENTS.md) 规则 3 中的任何一条。有效位图（[0001](0001-refactor-baseline.md#对-rust-实现的约束) 约束 2）只在内存中维护，由数据文件与 delta 推导，不成为共享格式的一部分。位图的删除判定必须与 3.x 语义相同：在 collection 级按 pk 判定，某个 pk 只要存在 `_seq` 更大的 tombstone，就视为已删除，**不看 tombstone 所在的 delta 属于哪个分区**（3.x 的 `DeltaIndex` 是 collection 级的 pk → 最大删除 seq 映射，[delta_index.py](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/milvus_lite/storage/delta_index.py#L1)）。如果按分区套用 delta，读取约束 3 所述的误路由目录时，结果就会与 3.x 不同。
 
@@ -140,6 +140,7 @@
 - **删除判定的分区语义**：tombstone 与其对应的数据行分处不同分区（包括约束 3 所述的误路由目录，以及 `_all` 删除），Rust 与 3.x 读出的结果一致（约束 13）。
 - **第一阶段的索引定义**：pymilvus 快速建表（AUTOINDEX）可用；当前源码新建 HNSW / HNSW_SQ / IVF_FLAT / IVF_SQ8 / 标量 INVERTED 可用，定义原样保存，向量按 FLAT、标量按扫描执行；3.x 自身无法构建的类型与稀疏字段继续拒绝；打开 3.x 写的 HNSW / AUTOINDEX / INVERTED / SPARSE_INVERTED_INDEX 目录时，定义原样保留，检索与过滤结果正确（稀疏检索明确报错），3.x 再次打开时仍能使用原索引；Rust 写出的任何索引定义，3.x 都能 load。
 - **集合管理与两种意图**（0023）：两边交替创建别名、改指、删除，改名（含经别名）与清空（含经别名），别名、分区、索引定义、属性顺序、load 状态与 auto_id 互相可读；本实现在改名、清空的每个退出点强制退出后由 3.x 打开并改动，再由本实现重开收尾；3.x 改名或清空中途退出留下的目录由本实现直接打开。覆盖见 [互通 README](../../tests/storage_interop/README.md) 与 [0023 验收](../testing/0023-a-acceptance.md)。
+- **多数据库**（0023 B）：两边交替创建数据库（带属性）、在默认库与非默认库内建同名集合与别名、修改与删除属性、删除对方创建的空库，库列表、属性（含键序）、别名、集合与 `databases/` 的落盘字节互相一致；3.x 手工建立的目录形状（缺 `collections/`、符号链接库、损坏的属性文件）的差异登记在 [0006](0006-m2-scope.md#与-3x-的差异)。
 - **互斥**：一方持有 `LOCK` 时，另一方打开失败并明确报错。Linux（flock 与 fcntl 互不感知）与 Windows（字节范围锁）需要在对应平台上实测。
 - **fail-closed**：伪造未知的格式版本号、未知的键，以及未知的 dtype、metric 时，Rust 拒绝打开该 collection、其余 collection 照常，不改动任何文件；未知的 index_type 与 3.x 一致，只在该 collection build 索引时报错。
 - **库版本组合**：arrow-rs 写、pyarrow（3.x 支持的版本范围内）读，以及反过来，覆盖 IPC 与 Parquet；包括 TIMESTAMPTZ 时区串的写法。

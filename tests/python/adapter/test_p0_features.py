@@ -149,6 +149,29 @@ def test_truncate_released_collection_then_flush(milvus_client):
     ) == 0
 
 
+def test_truncate_is_database_isolated(milvus_client):
+    for database, row_id in (("truncate_db_a", 1), ("truncate_db_b", 2)):
+        milvus_client.create_database(database)
+        milvus_client.using_database(database)
+        _create_basic_collection(milvus_client, "shared")
+        milvus_client.insert(
+            "shared",
+            [
+                {
+                    "id": row_id,
+                    "vec": [1.0, 0.0, 0.0, 0.0],
+                    "tag": database,
+                }
+            ],
+        )
+
+    milvus_client.using_database("truncate_db_a")
+    milvus_client.truncate_collection("shared")
+    assert int(milvus_client.get_collection_stats("shared")["row_count"]) == 0
+    milvus_client.using_database("truncate_db_b")
+    assert int(milvus_client.get_collection_stats("shared")["row_count"]) == 1
+
+
 
 def test_collection_stats_follow_upsert_delete_flush_and_truncate(milvus_client):
     _create_basic_collection(milvus_client, "collection_stats")
