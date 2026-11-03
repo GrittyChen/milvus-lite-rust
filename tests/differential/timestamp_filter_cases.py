@@ -242,6 +242,9 @@ CASES = [
     ("dynf not in [ISO '2025-01-01T00:00:00Z']", 'rows'),
     ("dynw in [ISO '2025-01-01T00:00:00Z'] and n > 0", 'empty'),
     ("dynw not in [ISO '2025-01-01T00:00:00Z'] and n > 0", 'rows'),
+    # ARRAY 在 Hybrid 路线上列式求值报错后退回 Python 路线：比较成功得空集，`in` 因列表不可哈希报 1。
+    ("arr > ISO '2025-01-01T00:00:00Z' and dynn > -1000", 'empty'),
+    ("arr in [ISO '2025-01-01T00:00:00Z'] and dynn > -1000", 'error'),
 ]
 
 # 四百位数字的区间：浮点转换得到无穷大，3.x 在解析阶段报错。

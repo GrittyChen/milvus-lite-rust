@@ -215,7 +215,7 @@ def test_varchar_slot_strings_with_a_configured_timezone_match_3x(pair):
 
     d.step("create", create)
 
-    def send(c, collection, values, row_id, valid=None, upsert=False, broken_vector=False):
+    def send(c, collection, values, row_id, valid=None, upsert=False, broken_vector=False, time_first=False, field_type=21):
         n = len(valid) if valid else len(values)
         ids = schema_pb2.FieldData(type=5, field_name="id")
         ids.scalars.long_data.data.extend(range(row_id, row_id + n))
@@ -223,15 +223,15 @@ def test_varchar_slot_strings_with_a_configured_timezone_match_3x(pair):
         if not broken_vector:
             vec.vectors.dim = 2
             vec.vectors.float_vector.data.extend([0.0] * (2 * n))
-        ts = schema_pb2.FieldData(type=21, field_name="ts")
+        ts = schema_pb2.FieldData(type=field_type, field_name="ts")
         ts.scalars.string_data.data.extend(values)
         ts.valid_data.extend(valid or [])
         stub = c._get_connection()._stub
         request = (milvus_pb2.UpsertRequest if upsert else milvus_pb2.InsertRequest)(
-            collection_name=collection, num_rows=n, fields_data=[ids, vec, ts]
+            collection_name=collection, num_rows=n, fields_data=[ids, ts, vec] if time_first else [ids, vec, ts]
         )
         reply = (stub.Upsert if upsert else stub.Insert)(request)
-        return reply.status.code, reply.status.reason
+        return reply.status.code, reply.status.reason, reply.status.error_code
 
     naive, shanghai = "2025-01-01T08:00:00", "2025-01-01T00:00:00Z"
     cases = [
@@ -244,7 +244,9 @@ def test_varchar_slot_strings_with_a_configured_timezone_match_3x(pair):
             a = send(d.rust, collection, values, 100 * (i + 1))
             b = send(d.ref, collection, values, 100 * (i + 1))
             assert a == b, f"{collection} {values!r}\n  rust: {a!r}\n  3.x:  {b!r}"
-    # nullable、Upsert 与解码错误的先后（时间列在后面的列之前，3.x 的 adapter 不解析 type 21）。
+    # nullable、Upsert 与解码错误的先后。type 21 的字符串由引擎事后解析，所以无论时间列排在坏向量列之前还是之后，
+    # 先报的都是向量列的解码错误；type 26 在 adapter 里按列顺序解析，列顺序决定先后（时间列错误的 1 / 6 与
+    # 向量列的 6 谁先出现取决于时间列在哪一边）。
     for kwargs in (
         {"values": ["", "2025-01-01T08:00:00"], "valid": [False, True]},
         {"values": ["", "0001-01-01T00:00:00"], "valid": [False, True]},
@@ -252,8 +254,20 @@ def test_varchar_slot_strings_with_a_configured_timezone_match_3x(pair):
         {"values": [naive, "nope"], "upsert": True},
         {"values": ["0001-01-01T00:00:00"], "broken_vector": True},
         {"values": [naive, "nope"], "broken_vector": True},
+        {"values": ["0001-01-01T00:00:00"], "broken_vector": True, "time_first": True},
+        {"values": [naive, "nope"], "broken_vector": True, "time_first": True},
+        {"values": [naive], "broken_vector": True, "time_first": True},
+        {"values": ["nope"], "broken_vector": True, "field_type": 26},
+        {"values": ["nope"], "broken_vector": True, "field_type": 26, "time_first": True},
+        {"values": ["0001-01-01T00:00:00"], "broken_vector": True, "field_type": 26, "time_first": True},
+        {"values": ["0001-01-01T00:00:00"], "broken_vector": True, "field_type": 26},
+        {"values": ["9999-12-31T23:59:59-08:00"], "broken_vector": True, "field_type": 26, "time_first": True},
     ):
         a = send(d.rust, "s", row_id=900, **kwargs)
         b = send(d.ref, "s", row_id=900, **kwargs)
         assert a == b, f"{kwargs!r}\n  rust: {a!r}\n  3.x:  {b!r}"
+        # 先后要真的被区分：坏向量列只在它排在前面（或时间列由引擎事后解析）时先报。
+        if kwargs.get("broken_vector"):
+            vector_first = kwargs.get("field_type") != 26 or not kwargs.get("time_first")
+            assert ("neither scalars nor vectors" in b[1]) == vector_first, f"{kwargs!r}: {b!r}"
     d.step("rows", lambda c: query(c, "s"))

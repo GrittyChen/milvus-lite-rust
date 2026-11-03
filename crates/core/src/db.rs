@@ -4071,22 +4071,42 @@ impl Db {
         self.databases.read().keys().cloned().collect()
     }
 
-    /// 数据库的 `timezone` 属性（空串视为没有）。只给需要时区的操作按需调用：取注册表叶子拿到状态后立即释放，
-    /// 再取该库的属性叶子；调用者不得持有集合锁。属性文件不可读时报存储错误，且不缓存失败（0025）。
+    /// 数据库的 `timezone` 属性。只给需要时区的操作按需调用：取注册表叶子拿到状态后立即释放，
+    /// 再取该库的属性叶子；调用者不得持有集合锁。属性文件不可读或取值校验不过（含空串、未知名字）时与 3.x 加载
+    /// 属性一致地报错，且不缓存失败，文件修正后下次调用重新读取（0025）。
     pub fn database_timezone(&self, database: &str) -> Result<Option<String>> {
         let scope = self.key(database, "")?;
         self.database_timezone_of(&scope.database)
     }
 
+    /// 3.x 加载数据库属性时就校验 `timezone`，校验不过的加载不缓存：这里同样清掉刚加载的缓存，
+    /// 文件被修正后下一次调用会重新读取。
+    fn load_validated<'a>(
+        cache: &'a mut Option<database_properties::Properties>,
+        root: &Path,
+    ) -> Result<&'a mut database_properties::Properties> {
+        let checked =
+            database_properties::load(cache, root).and_then(|properties| {
+                match properties.iter().find(|(key, _)| key == "timezone") {
+                    Some((_, value)) => crate::timezone::validate_property(value),
+                    None => Ok(()),
+                }
+            });
+        if let Err(error) = checked {
+            *cache = None;
+            return Err(error);
+        }
+        database_properties::load(cache, root)
+    }
+
     fn database_timezone_of(&self, database: &str) -> Result<Option<String>> {
         let state = self.database(database)?;
         let mut cache = state.properties.lock();
-        let properties = database_properties::load(&mut cache, &state.root)?;
+        let properties = Self::load_validated(&mut cache, &state.root)?;
         Ok(properties
             .iter()
             .find(|(key, _)| key == "timezone")
-            .map(|(_, value)| value.clone())
-            .filter(|value| !value.is_empty()))
+            .map(|(_, value)| value.clone()))
     }
 
     /// 3.x `describe_database`：返回归一化后的名字与属性（进程内按插入顺序）。读取失败不缓存。
@@ -4094,11 +4114,7 @@ impl Db {
         let scope = self.key(database, "")?;
         let state = self.database(&scope.database)?;
         let mut cache = state.properties.lock();
-        let properties = database_properties::load(&mut cache, &state.root)?;
-        // 3.x 加载属性时就校验 `timezone`，取值未知的文件在 Describe / Alter 里同样报 6。
-        if let Some((_, value)) = properties.iter().find(|(key, _)| key == "timezone") {
-            crate::timezone::validate_property(value)?;
-        }
+        let properties = Self::load_validated(&mut cache, &state.root)?;
         Ok((scope.database, properties.clone()))
     }
 
@@ -4121,12 +4137,9 @@ impl Db {
         }
         let state = self.database(&scope.database)?;
         let mut cache = state.properties.lock();
-        let current = database_properties::load(&mut cache, &state.root)?;
-        // 3.x 加载属性时就校验已保存的 timezone（取值未知的文件让 Alter 永远报 6，连删除或改成合法值的请求也一样），
+        // 先校验已保存的 timezone（取值未知的文件让 Alter 永远报 6，连删除或改成合法值的请求也一样），
         // 再校验合并后的结果，没有变化的请求也会经过这两步。
-        if let Some((_, value)) = current.iter().find(|(key, _)| key == "timezone") {
-            crate::timezone::validate_property(value)?;
-        }
+        let current = Self::load_validated(&mut cache, &state.root)?;
         let next = database_properties::merge(current, properties, delete_keys);
         if let Some((_, value)) = next
             .as_ref()

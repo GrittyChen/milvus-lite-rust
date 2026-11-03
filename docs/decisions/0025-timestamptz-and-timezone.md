@@ -1,6 +1,6 @@
 # 0025 TIMESTAMPTZ 与 timezone 属性
 
-- 状态：设计评审通过（r2）；第 1 步（类型与存储）、第 2 步（过滤）已实施并提交，第 3 步（时区与属性 RPC）已实施待评审，第 4 步待做
+- 状态：设计评审通过（r2）；第 1 步（类型与存储）、第 2 步（过滤）、第 3 步（时区与属性 RPC）已实施并提交（本地），第 4 步（差分、参照用例、文档与验收）已实施待评审；验收见 [0025 验收](../testing/0025-timestamptz-acceptance.md)
 - 日期：2026-11-02
 - 参照：milvus-lite v3.2.1 / `43d1257774e629bc9f66873977ab7c320d5bf5a7`；pymilvus 3.0.2 实测，2.6.17 经源码核对（`timezone`、`time_fields` 参数与 `DataType.TIMESTAMPTZ` 同样存在，实施阶段补测）
 - 前置：[0014](0014-index-definitions-and-filter-expressions.md)（过滤语法与 ISO / INTERVAL 字面量的语法校验）、[0015](0015-nullable-defaults-and-array.md)（nullable 与默认值）、[0023](0023-aliases-rename-truncate-databases.md)（集合与数据库属性；其取舍 1 把 `timezone` 留给本切片）、[0024](0024-group-by-search.md)
@@ -8,7 +8,7 @@
 
 ## 依据与范围
 
-0024 合入后的缺口统计中，TIMESTAMPTZ 挡住 16 条参照用例，数据库 `timezone` 属性挡住 7 条（含 1 条 TIMESTAMPTZ 用例），合计 23 条；另有 3.x 的引擎层用例与 `AlterCollection` / `AlterDatabase` 的 `timezone` 取值。当前仓库对此全部返回 UNIMPLEMENTED（类型、属性、ISO / INTERVAL 字面量求值）。
+0024 合入后的缺口统计中，TIMESTAMPTZ 挡住 16 条参照用例，数据库 `timezone` 属性挡住 7 条（含 1 条 TIMESTAMPTZ 用例），合计 23 条；另有 3.x 的引擎层用例与 `AlterCollection` / `AlterDatabase` 的 `timezone` 取值。设计时（0024 合入后）仓库对此全部返回 UNIMPLEMENTED（类型、属性、ISO / INTERVAL 字面量求值），已由下方四步实施解除。
 
 范围：
 
@@ -114,7 +114,7 @@ pymilvus 把时间值作为字符串（`string_data`）发送；原始 gRPC 还�
   - Arrow 路线（只含 schema 字段）：时间戳与区间都是 int64 微秒，加减按 **int64 回绕**（`wrapping_add` / `wrapping_sub`）；区间超出 int64 时在把标量交给 Arrow 处报 1 `Python int too large to convert to C long`，只在真正对行求值时发生（空集合不报，`count(*)` 与 search 报）。
   - Hybrid 路线（含动态字段）：先走与 Arrow 相同的列式求值；遇到内核错误（动态列与时间戳列的比较、不支持的 `in` 类型配对、ARRAY 与时间值的比较）退回 Python 求值器。区间超出 int64 的 OverflowError 不退回，直接报错。
   - Python 路线（含 JSON 路径、`array_length`、`text_match` 等，或 Hybrid 的退回）：值是 `datetime` / `timedelta`，**不回绕**：`timedelta` 的天数超过 999999999 报 1 `days=N; must have magnitude <= 999999999`（超过 C int 报 1 `Python int too large to convert to C int`），`datetime ± timedelta` 超出 `[0001, 9999]` 报 1 `date value out of range`；区间字面量在每行求值到它时才构造，所以会被 `and` / `or` 的短路跳过。时间戳与动态值的 `==` 为假、`!=` 为真、顺序比较为空值（未知），`in` 为假，`not in` 为真。
-  - 因此同一个表达式在不同路线上对极端数据的结果不同（如 `ts + INTERVAL 'P1D'` 在含 `9999-12-31` 的数据上，Arrow 路线成功、Python 路线报 1）；这是 3.x 的行为，被差分表（`timestamp_filter_cases.py`，237 个表达式）钉住。
+  - 因此同一个表达式在不同路线上对极端数据的结果不同（如 `ts + INTERVAL 'P1D'` 在含 `9999-12-31` 的数据上，Arrow 路线成功、Python 路线报 1）；这是 3.x 的行为，被差分表（`timestamp_filter_cases.py`，239 个表达式）钉住。
 - 列式求值器给每一列标注时间类别（无 / 时间戳 / 区间）。**比较**：类别不同的两列按内核错误处理，使 Hybrid 退回 Python 求值器，与 3.x 的 Arrow 报 `ArrowNotImplementedError` 后退回一致；这样动态整数 `dynn > ISO '0001-01-01...'` 不会因为同为 int64 而误判为真。ARRAY 与时间值的比较先于类别检查，错误文案按 pyarrow 的类型名显示（`Function 'greater' has no kernel matching input types (list<item: int64>, timestamp[us, tz=UTC])`，区间是 `duration[us]`）。
 - **`in` / `not in` 不同于比较**：Arrow 的 `is_in` 会把 timestamp 的 value_set 转成 int64 微秒，所以整数列（含动态整数列）与 `ISO` 列表按微秒值比较，`dmicro in [ISO '2025-01-01T00:00:00Z']` 命中值恰为该微秒数的行；全空列的 `is_in` 为 false、`not in` 为 true；浮点 / 字符串 / 布尔 / ARRAY 列等不支持的配对才是内核错误：含动态字段（Hybrid）时退回 Python 求值器，纯 Arrow 路线（只含 schema 字段）直接报该内核错误。Python 路线（含 JSON 路径的表达式）仍不做微秒匹配，这是 3.x 的路线差异，差分表同时钉住两种结果。
 - 过滤的 S1 快路径（`legacy_shape`）排除 TIMESTAMPTZ 字段，时间戳表达式一律走布尔树。
@@ -140,13 +140,13 @@ pymilvus 把时间值作为字符串（`string_data`）发送；原始 gRPC 还�
 - **CreateCollection**：naive 默认值的时区取请求属性里的 `timezone`，其次数据库闭包；在取得命名空间意图与写入闸门**之前**（不持有任何集合锁与许可）调用叶子锁并规范化，再写进 schema；并发 AlterDatabase 改时区时，默认值取到改前或改后的完整值，不撕裂（并发测试钉住），已创建的集合不受之后的改动影响。
 - **AlterDatabase / DropDatabaseProperties** 更新叶子锁里的缓存（先写文件、再换缓存，沿用 0023 B 的 `Unchanged` / `Unconfirmed` 处理）；下一次请求的闭包读到新值，所以数据库时区的改动对该库**已打开的集合**立即生效。**不引入**以不含时区的表达式文本为键的编译结果缓存（3.x 正是因为这个缓存要在改库时区时清空）。
 - **数据库属性不可读**（文件损坏、I/O 错误）：只有真的需要数据库时区的操作（无偏移字符串、`time_fields` 的默认时区、naive 默认值）报 1/0 存储错误，**零写入**（Insert 在解码处失败，尚未取写许可）；不需要时区的操作照常，沿用 0023 B「集合操作不读属性」的立场并只在需要时读。需要在 0006 的「只有 Describe / Alter 读」一行和 0023 取舍 1 里同步这一变化。
-- 测试：debug 锁序检查下的并发用例（并发 AlterDatabase 改时区 × Insert / Query / Search / Delete / CreateCollection，断言无死锁、每次解析都看到完整的改前或改后的值；同一请求的过滤编译与响应编码各解析一次，其间允许看到不同的值，与 3.x 的每次读取当前属性一致，不做按请求记忆）；损坏属性文件下的 naive insert / filter / `time_fields` / 默认值用例。
+- 测试：debug 锁序检查下的并发用例（并发 AlterDatabase 改时区 × 过滤查询 / Search / Delete / CreateCollection，断言无死锁；Insert 的无偏移字符串在 gRPC 解码处换算，经 `database_timezone` 读取同一把叶子锁，不另设并发用例、每次解析都看到完整的改前或改后的值；同一请求的过滤编译与响应编码各解析一次，其间允许看到不同的值，与 3.x 的每次读取当前属性一致，不做按请求记忆）；损坏属性文件下的 naive insert / filter / `time_fields` / 默认值用例。
 
 #### 实施记录（第 3 步）
 
 - 模块 `timezone`：`resolve`（路径格式错误 1 → 找不到 6）、`Zone`（`local_to_utc_micros`、`components`）、`TimezoneSource`；`ParsedFilter::parse_with` 在表达式非空时先 `validate_request()` 再解析，无偏移的 `ISO` 字面量经解析器的 `NaiveResolver` 回调到 `for_naive()`（数据库闭包只在此时才被调用）；`Predicate::from_parsed` 之外的旧入口 `ParsedFilter::parse` 等价于没有任何时区配置。
 - 换算细节：jiff 的 `Timestamp` 对 1970 年之前带小数的瞬间用带符号的纳秒分量，`as_second()` 向零截断，所以换算只让 jiff 处理整秒，微秒部分单独加回（fixture 抓到的缺陷：`0001-01-01T23:59:59.999999` 多出 1 秒）；`9999-12-29` 起的本地时间与 `9999-12-30T22:00:00Z` 起的瞬间用该点的偏移补算，597 个时区 × 范围两端的样本与 CPython 3.12 逐项一致（一次性核对，常驻 fixture 取 38 个代表时区）。
-- 写入路径：type 26 的字符串在 gRPC 解码处按「集合 → 数据库」换算（写入没有请求时区）。**type 21（VARCHAR 槽）的字符串**3.x 在 adapter 不解析，由引擎逐行按集合 → 数据库时区解析（第 1 步遗留项 ③ 的结论）：解码处只做带时区的逐行替换，不提前报错、不整列回退——能换算的行写成规范的 UTC 字符串，换算后越界的无偏移字符串换成越界占位（`0001-01-01T00:00:00+23:59`），其余行保留原文，三者都由引擎按它自己的行序与列序报告（带偏移越界 1、类型不符 6），因此错误码、错误行与后续列的解码错误先后都与 3.x 相同（差分用例 `test_varchar_slot_strings_with_a_configured_timezone_match_3x` 钉住混合批次、nullable 与 Upsert；「时间列在后续列之前时，后续列的解码错误先报」由仓库外探针对照 3.x 验证，差分用例补 `[ids, ts, vec]` 字段顺序与 `error_code` 比较留到第 4 步）。读取数据库属性失败（3.x 里这个库打不开）报存储错误。
+- 写入路径：type 26 的字符串在 gRPC 解码处按「集合 → 数据库」换算（写入没有请求时区）。**type 21（VARCHAR 槽）的字符串**3.x 在 adapter 不解析，由引擎逐行按集合 → 数据库时区解析（第 1 步遗留项 ③ 的结论）：解码处只做带时区的逐行替换，不提前报错、不整列回退——能换算的行写成规范的 UTC 字符串，换算后越界的无偏移字符串换成越界占位（`0001-01-01T00:00:00+23:59`），其余行保留原文，三者都由引擎按它自己的行序与列序报告（带偏移越界 1、类型不符 6），因此错误码、错误行与后续列的解码错误先后都与 3.x 相同（差分用例 `test_varchar_slot_strings_with_a_configured_timezone_match_3x` 钉住混合批次、nullable、Upsert，以及时间列排在向量列之前与之后两种字段顺序下的先后与 `error_code`）。时区本身不可用（手改的数据库属性文件里是路径形态、未知名字或空串）时，无偏移的行先解析有效时区，把 3.x 在打开集合时报的错误原样向上传，不换成「越界」占位。读取数据库属性失败（3.x 里这个库打不开）报存储错误。
 - CreateCollection 的 naive 默认值经 `CollectionSchema::validate_with` / `normalized`（集合 → 数据库）换算，数据库闭包在创建的命名空间锁之外取（`Collection::new_in` 在取写入闸门之前调用）；Delete 的闭包在写入许可（共享）之内、集合锁之外调用，叶子锁序为闸门 → 属性。
 - 第 1 步遗留项 ②（`alter_collection` 未调 `normalized`）不处理：3.x 的 `validate_schema` 在创建时就把字符串默认值替换成微秒再落盘，字符串默认值只可能来自手改的文件；这类 schema 打开时需要数据库时区才能规范化，打开路径没有这个上下文，所以 `SchemaFile::to_core` 把 TIMESTAMPTZ 的字符串默认值按范围外 schema（fail-closed，UNIMPLEMENTED）处理并登记为差异；`alter_collection` 改为 `validate_with`（带数据库闭包），合并后的 `timezone` 属性按 3.x 校验。
 
@@ -166,7 +166,7 @@ Query、Search 输出支持（Hybrid 随 HybridSearch）；非 TIMESTAMPTZ 字�
 - **降级**：0.3.0rc3 及更早的本实现读到 `timestamptz` 的 `schema.json` 会因未知 `dtype` 拒绝打开该集合（`deny_unknown_fields` / `known_dtype`），数据保留；README 已有的降级说明里补这一点。
 - **时区名与 3.x Linux**：本实现接受并原样保存大小写不规范的名字（如 `utc`），3.x 在 Linux 上的 `ZoneInfo` 会拒绝；互通 fixture 一律使用规范名，README 与验收记录说明：用非规范大小写名字写入的数据目录搬到 Linux 上的 3.x 可能无法使用。
 
-## 与参照的差异（预案，评审通过后正式登记）
+## 与参照的差异
 
 | 项 | 3.x | 本实现 | 理由 |
 | --- | --- | --- | --- |
@@ -183,26 +183,29 @@ Query、Search 输出支持（Hybrid 随 HybridSearch）；非 TIMESTAMPTZ 字�
 | 手改的 `schema.json` 里 TIMESTAMPTZ 的字符串默认值 | 打开时按集合、数据库时区规范化 | 该集合按范围外 schema 处理（fail-closed）：`DescribeCollection` 返回 UNIMPLEMENTED，`DropCollection`、别名与改名可用，清空与改属性按 0023 的差异表拒绝，不会半打开 | 3.x 只会写出微秒整数，字符串只可能来自手改文件；打开路径没有数据库时区上下文 |
 | type 21 字符串需要数据库时区而属性文件不可读 | 库打不开 | 报存储错误（1/0），零写入；其余行为同 3.x | 本实现不读无关的数据库属性（0023 B） |
 | 读取 3.x 毒化目录（越界整数微秒） | 任何读到这些行的查询整体报 1 | 同样报 1 `date value out of range`，不 panic | 一致；本实现只是不再能写出这样的目录 |
+| 手改的数据库 `database_properties.json` 里 `timezone` 取值不合法（路径形态、未知名字、空串），操作本身不需要时区（带偏移的字符串、原始整数微秒的写入，Load，不涉及 `time_fields` 的读取，绝对时间的过滤） | 3.x 加载属性就校验，打开该库的任何集合（含 Load）都报同一个错误（路径形态 1，未知名字 6，空串 6 `timezone property must be a non-empty string`）；写入里不合法或越界的时间字符串也先报这个错误 | 这些操作照常成功；数据本身的错误先于属性错误：不合法的时间字符串（type 21 与 type 26）报 6 `does not match dtype` / `is not a valid ISO 8601 timestamp`，带偏移但越界的值报 1 `date value out of range`；`DescribeDatabase`、任何 `AlterDatabase` 与需要时区的操作（无偏移字符串、`time_fields` 的默认时区、naive 默认值）报与 3.x 相同的错误；校验不过的加载不缓存，所有读取数据库时区的路径共用同一个加载器，文件修正后下次调用重新读取 | 0023 B 已登记「集合操作不读无关属性」；3.x 只会写出校验过的值，不可达的输入；差分 `test_invalid_stored_database_zone_follows_the_registered_rule` 对三种取值钉住两边各自的表现，核心测试 `invalid_stored_zone_fails_every_zone_read_and_is_not_cached` 钉住不缓存 |
 
 ## 测试矩阵
 
 - **解析与换算单元**：ISO 值解析（沿用 0014 的 CPython 模糊对照，扩展为返回数值，对照 `datetime.fromisoformat` + `astimezone`）；区间浮点公式与向零截断；`fold=0` 规则的夏令时 / 重复 / 不存在 / 历史 / 未来 / 极端样本，用 Python 生成的 fixture（含 `--verify` 脚本，沿用 0023 B 属性字节样本的做法），**必含** `Asia/Tokyo` 的 `9999-12-31T23:59:59`、`Pacific/Kiritimati`、`America/New_York` 的 `9999-12-31`、`Asia/Tokyo` 的 `0001-01-01`；时区名大小写与伪时区名的单元测试（`utc`、`ASIA/SHANGHAI`、`Factory`、`posixrules`、`localtime`、三种路径格式错误）。
 - **引擎**：类型的写入、读取、Upsert、Delete、nullable、默认值（含 `DescribeCollection` 回显 `timestamptz_data`）、重开、合并、WAL 恢复；过滤的比较 / `in` / 算术 / 空值 / 类型错误；int64 回绕与区间越界；请求与属性时区的优先级；数据库时区改动立即生效；`ARRAY<TIMESTAMPTZ>` 在 create 与 insert 上的 UNIMPLEMENTED（文案沿用现有 `ARRAY element type TIMESTAMPTZ is not supported ...`）；主键 / 分区键 / 分组字段 / 保留字 / `INVERTED` 定义；越界整数整批拒绝零写入；读取毒化数据报 1 不 panic；损坏的数据库属性文件下的 naive 写入 / 过滤 / `time_fields` / 默认值（1/0、零写入）；debug 锁序下并发 AlterDatabase 的用例。
-- **差分（真实 3.x 对本实现，两条 SDK）**：探针脚本的 269 + 90 + 42 + 39 个场景整理成场景表，覆盖：
-  - 写入取值形态、过滤字面量与运算、请求时区矩阵（含坏名字、空串）、夏令时 / 历史 / 极端时区、集合与数据库时区属性及其对已有集合的影响、`count(*)`、搜索与按主键取值、类型限制；
-  - **校验时机与错误优先级**（本稿新增）：`count(*)` 空表达式 + 坏时区成功、非空表达式时失败；集合不存在 / 未加载先于坏时区；坏时区先于坏过滤；不存在的输出字段被忽略（不构成错误）；分组 / anns / 度量名与坏时区的先后；空结果与空集合上的坏时区；`time_fields` 坏组件在零行 / 整列为空 / 字段不在 `output_fields` / 空集合 / `count(*)` 上成功，输出非空时间戳值时报 6；Query 与 Search 两条路径各一份；
-  - 凡是依赖平台 tzdata 的场景（大小写、伪时区名）不进差分，由引擎单元覆盖。
+- **差分（真实 3.x 对本实现，两条 SDK）**：探针脚本整理成差分用例（`tests/differential/` 的 `test_timestamptz.py`、`test_timestamp_filters.py` + `timestamp_filter_cases.py`、`test_timezone.py`），逐项在两边执行并比较完整结果（含错误码与文案）：
+  - 写入取值形态、过滤字面量与运算（239 个表达式的结果类别表）、请求时区矩阵（含坏名字、空串、路径格式错误）、夏令时 / 历史 / 极端时区（31 个 `(时区, 本地时间)` 样本，写入与过滤字面量各验一遍）、集合与数据库时区属性及其对已有集合的影响（含数据库时区改动立即生效、Delete / Upsert、naive 默认值）、`count(*)`、搜索、按主键取值、类型限制；
+  - **校验时机与错误优先级**：`count(*)` 空表达式 + 坏时区成功、非空表达式时失败；集合不存在 / 未加载先于坏时区；坏时区先于坏过滤；不存在的输出字段被忽略（不构成错误）；分组 / anns / 度量名与坏时区的先后；空结果与空集合上的坏时区；`time_fields` 坏组件在零行 / 整列为空 / 字段不在 `output_fields` / 空集合 / `count(*)` 上成功，输出非空时间戳值时报 6；Query 与 Search 两条路径各一份；
+  - 原始 gRPC：`timestamptz_data`、`long_data`、`string_data` 三种数据槽、type 21 字符串（含集合 / 数据库时区、混合批次、解码错误先后与 `error_code`）、响应字段形态（类型、数据槽、有效位、`time_fields` 的 type 22 数组）；
+  - Query iterator 的 `time_fields`、`timezone` 与 naive 过滤；
+  - 凡是依赖平台 tzdata 的场景（名字大小写、`posixrules` / `zone.tab` 等平台文件、`Factory`、旧别名）不与 3.x 对比，只断言本实现一侧（`test_platform_dependent_zone_names`）。
 - **互通**：本实现写、3.x 读与 3.x 写、本实现读两个方向，含默认值、属性时区（规范名）、nullable、`INVERTED` 索引定义；`schema.json` 字节样本；3.x 经原始 gRPC 写出的越界整数毒化目录（读取报 1，不 panic）。
 - **QueryIterator**：走 Query RPC，`time_fields` 与普通 Query 相同，用一个迭代器用例钉住；Hybrid 的 `time_fields` 不在本切片。
-- **参照用例**：移入 `test_grpc_timestamptz_milvus_compat.py` 的 16 个用例与 `test_grpc_database.py` 里随 `timezone` 阻断的 6 个用例，INVENTORY 与计数同步；同步改写既有的 UNIMPLEMENTED 断言（见「属性 RPC」）。
-- **预期计数**：差分、互通、Python 套件的新增数量在各步骤同批同步所有固定点。
+- **参照用例**（第 4 步已移入）：`test_grpc_timestamptz_milvus_compat.py` 的 16 个用例与 `test_grpc_database.py` 里随 `timezone` 阻断的 6 个用例，INVENTORY 与计数同步；既有的 UNIMPLEMENTED 断言已在第 3 步改写（见「属性 RPC」）。
+- **预期计数**：差分、互通、Python 套件的新增数量在各步骤同批同步所有固定点；第 4 步结束时 Python 547、差分 457（会话组 118）、互通 255。
 
 ## 实施步骤
 
 1. **类型与存储**：`Timestamptz` 数据类型、`schema.json` / Arrow / WAL / Parquet、gRPC 编解码与输出（含默认值回显）、`INVERTED` 定义、保留字、`ARRAY<TIMESTAMPTZ>` 拒绝、整数范围校验与毒化读取、互通 fixture 与用例；此时只接受带偏移的字符串，无偏移仍按「没有配置时区」报错。
 2. **过滤**（已实施）：ISO / INTERVAL 求值、类型检查、`in`、加减与回绕、三条求值路线的差异、错误顺序；差分表 237 个表达式。
 3. **时区**：jiff 依赖、时区解析与 `fold=0` 换算及边界补算、`TimezoneSource` 与锁边界、请求 / 集合 / 数据库时区的优先级与两个校验点、无偏移字符串（写入、默认值、过滤字面量）、`time_fields`、属性 RPC（集合与数据库）与既有断言的改写、并发与损坏属性文件的测试。
-4. **差分、参照用例、文档与计数**：探针转差分，复制参照用例，0006 差异登记（含「只有 Describe / Alter 读」一行与 0023 取舍 1 的同步），README、AGENTS（依赖、索引）、验收记录与固定统计。
+4. **差分、参照用例、文档与计数**（已实施）：探针转差分，复制参照用例，0006 差异登记（含「只有 Describe / Alter 读」一行与 0023 取舍 1 的同步），README、AGENTS（依赖、索引）、验收记录与固定统计。同批处理第 3 步评审的遗留建议：数据库属性校验不过的加载不缓存；`Collection::new_in` 的校验与归一化共用一次数据库时区读取；type 21 在配置的时区本身不可用时向上传 3.x 的错误而不是「越界」占位；type 21 差分补字段顺序与 `error_code`。
 
 每步写完停下评审，评审通过且授权后才提交。**第 4 步的差分与验收完成之前不推送 main**（第 1–3 步各自带有引擎与互通测试，但对外行为的差分作证在第 4 步）。推送另行授权。
 

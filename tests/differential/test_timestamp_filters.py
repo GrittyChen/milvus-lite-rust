@@ -81,12 +81,20 @@ def test_filter_in_other_requests_and_empty_collections_match_3x(pair):
     d.step("count", lambda c: c.query("t", filter=ok, output_fields=["count(*)"]))
     d.step("search", lambda c: [[h["id"] for h in x] for x in c.search("t", data=[V], limit=5, filter=ok)])
     d.step("query output", lambda c: sorted((r["id"], r["ts"]) for r in c.query("t", filter=ok, output_fields=["id", "ts"])))
-    d.step("delete", lambda c: (c.delete("t", filter="ts2 < ISO '2024-06-01T00:00:00Z'"), ids(c, "id >= 0"))[1])
-    d.step("delete by arithmetic", lambda c: (c.delete("t", filter="ts + INTERVAL 'P1D' == ISO '2025-01-02T00:00:00Z'"), ids(c, "id >= 0"))[1])
-    # 动态整数列配 ISO 列表：Arrow 把 value_set 转成 int64 微秒比较，各类请求结果一致。
+    # 动态整数列配 ISO 列表：Arrow 把 value_set 转成 int64 微秒比较，各类请求结果一致。这些请求放在删除之前，
+    # 否则命中的行已被删掉，三边都是空结果。
     hit = "dmicro in [ISO '2025-01-01T00:00:00Z']"
-    d.step("dynamic count", lambda c: c.query("t", filter=hit, output_fields=["count(*)"]))
-    d.step("dynamic search", lambda c: [[h["id"] for h in x] for x in c.search("t", data=[V], limit=5, filter=hit)])
-    d.step("dynamic not in", lambda c: ids(c, "dmicro not in [ISO '2025-01-01T00:00:00Z']"))
-    d.step("dynamic delete", lambda c: (c.delete("t", filter=hit), ids(c, "id >= 0"))[1])
+    counted = d.step("dynamic count", lambda c: c.query("t", filter=hit, output_fields=["count(*)"]))
+    assert counted == ("ok", [{"count(*)": 1}])
+    found = d.step("dynamic search", lambda c: [[h["id"] for h in x] for x in c.search("t", data=[V], limit=5, filter=hit)])
+    assert found == ("ok", [[1]])
+    other = d.step("dynamic not in", lambda c: ids(c, "dmicro not in [ISO '2025-01-01T00:00:00Z']"))
+    assert other == ("ok", [2, 3, 4])
+    seven = "dmicro in [ISO '1970-01-01T00:00:00.000007Z']"
+    left = d.step("dynamic delete", lambda c: (c.delete("t", filter=seven), ids(c, "id >= 0"))[1])
+    assert left == ("ok", [1, 3, 4])
+    left = d.step("delete", lambda c: (c.delete("t", filter="ts2 < ISO '2024-06-01T00:00:00Z'"), ids(c, "id >= 0"))[1])
+    assert left == ("ok", [1, 4])
+    left = d.step("delete by arithmetic", lambda c: (c.delete("t", filter="ts + INTERVAL 'P1D' == ISO '2025-01-02T00:00:00Z'"), ids(c, "id >= 0"))[1])
+    assert left == ("ok", [4])
     d.step("delete naive", lambda c: c.delete("t", filter="ts < ISO '2025-01-01T00:00:00'"), error=True)

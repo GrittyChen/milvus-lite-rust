@@ -234,7 +234,7 @@
    - CreateDatabase：名字校验与「已存在」之后，对应 3.x 的属性校验位置；
    - AlterCollection、AlterDatabase：先判对象存在，再判 `timezone`。
 
-   删除 `timezone` 键不受影响。数据库属性中 3.x 已写入的 `timezone` 可以读取、展示与删除；集合 schema 中已有 `timezone` 的集合仍是 0006 第 14 项的范围外 schema（Describe、Drop、别名与改名可用，清空与改属性按差异表返回 UNIMPLEMENTED）。受影响的 6 条数据库参照用例（3 条直接设置 `timezone`，2 条使用带 `timezone` 的哨兵数据库，1 条重复创建用例）标记为「由 TIMESTAMPTZ 切片解除」，不算 B 的遗漏。理由：编译期时区数据库只能得到近似 3.x 的名字集合，而 3.x 的集合取决于平台 `zoneinfo`；TIMESTAMPTZ 正式实现时还要决定时区与夏令时规则的来源，现在做半套会提前固定数据来源。
+   删除 `timezone` 键不受影响。数据库属性中 3.x 已写入的 `timezone` 可以读取、展示与删除；集合 schema 中已有 `timezone` 的集合当时是 0006 第 14 项的范围外 schema（Describe、Drop、别名与改名可用，清空与改属性按差异表返回 UNIMPLEMENTED）；历史说明：0025 第 3 步起这类 schema 不再按范围外处理，清空与改属性与 3.x 一致。受影响的 6 条数据库参照用例（3 条直接设置 `timezone`，2 条使用带 `timezone` 的哨兵数据库，1 条重复创建用例）标记为「由 TIMESTAMPTZ 切片解除」，不算 B 的遗漏。理由：编译期时区数据库只能得到近似 3.x 的名字集合，而 3.x 的集合取决于平台 `zoneinfo`；TIMESTAMPTZ 正式实现时还要决定时区与夏令时规则的来源，现在做半套会提前固定数据来源。
 2. **清空时的 snapshot：提交后清理，加可恢复的清空意图。** 不在 manifest 提交前删除 snapshot：那会出现「旧数据完整、集合尚未清空，snapshot 却已部分或全部消失」的第三种状态。snapshot 的恢复不会自动发生，真正的风险是清空成功后旧 snapshot 仍可被恢复、继续钉住旧文件，由提交后清理与重开时按意图补做来消除。协议见「清空」。
 3. **放宽 `schema.json` 名字与目录不同。** 只放宽「合法但不相等」这一种情况：仍要求 JSON 可解析、字段与类型合法、`collection_name` 存在且为字符串；打开后一律以目录名为准，DescribeCollection 返回目录名。读取时不修复文件；改名时只改原始 JSON 的 `collection_name`，AlterCollection 重写时写入目录名，重开处理改名意图时补写。其他损坏仍 fail-closed。同步修改 [recovery.rs](../../crates/core/src/storage/recovery.rs) 的打开校验与 [db.rs](../../crates/core/src/db.rs) 中未打开集合的 load 状态判定。
 4. **拒绝跨数据库改名。** 见「有意的请求语义差异」。

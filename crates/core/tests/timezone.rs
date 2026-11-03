@@ -334,6 +334,47 @@ fn unreadable_database_properties_only_fail_operations_that_need_the_zone() {
 }
 
 #[test]
+fn invalid_stored_zone_fails_every_zone_read_and_is_not_cached() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("m.db");
+    std::fs::create_dir_all(path.join("databases/bad/collections")).unwrap();
+    let file = path.join("databases/bad/database_properties.json");
+    let db = open(&path);
+    // 3.x 加载属性就校验 timezone：未知名字、空串与路径形态的读取都失败，文案与 Describe / Alter 相同。
+    for (text, expected) in [
+        (
+            &br#"{"timezone": "Mars/Base"}"#[..],
+            "unknown timezone 'Mars/Base'",
+        ),
+        (
+            &br#"{"timezone": ""}"#[..],
+            "timezone property must be a non-empty string",
+        ),
+    ] {
+        std::fs::write(&file, text).unwrap();
+        assert!(matches!(
+            db.database_timezone("bad"),
+            Err(EngineError::SchemaValidation(m)) if m == expected
+        ));
+        assert!(matches!(
+            db.describe_database("bad"),
+            Err(EngineError::SchemaValidation(m)) if m == expected
+        ));
+    }
+    // 失败不缓存：文件修正后，下一次时区读取（不经过 Describe / Alter）直接成功。
+    std::fs::write(&file, br#"{"timezone": "Mars/Base"}"#).unwrap();
+    assert!(db.database_timezone("bad").is_err());
+    std::fs::write(&file, br#"{"timezone": "UTC"}"#).unwrap();
+    assert_eq!(db.database_timezone("bad").unwrap().as_deref(), Some("UTC"));
+    // 删除属性后恢复为未配置。
+    std::fs::write(&file, b"{}").unwrap();
+    db.alter_database("bad", &[], &["timezone".to_owned()])
+        .unwrap();
+    assert_eq!(db.database_timezone("bad").unwrap(), None);
+    db.close();
+}
+
+#[test]
 fn concurrent_database_zone_changes_never_deadlock_or_tear() {
     let root = tempfile::tempdir().unwrap();
     let db = open(root.path());

@@ -79,7 +79,7 @@
 | 签发前的候选保全门闩：环境审批、本地保全与机器核对的保全回执、目录布局与崩溃恢复、失败语义与试点计划（实施与试点完成：门闩拒绝、错误回执与先保存后签发均在正式环境实测，测试版本 rc904 已签发、未发布；2026-10-27 已采纳并入 0021 第 3、13、19、20 条；两个环境长期保留；`test/rc904` 已删除） | [0022](docs/decisions/0022-pre-signing-preservation-gate.md)、[试点记录](docs/testing/0022-gate-pilot.md) |
 | 别名、改名、清空与集合属性（A）：参照实测、必须保留的行为、已登记差异、清空与改名的私有意图与提交协议、锁与测试矩阵；A 已实施并逐步评审；多数据库（B：数据库注册表、五个数据库 RPC、`db_name` 路由、属性、各库隔离）已按 B 实施设计分步实施并评审，验收见 B 验收；跨数据库改名保持 UNIMPLEMENTED（`timezone` 属性已随 0025 第 3 步解除） | [0023](docs/decisions/0023-aliases-rename-truncate-databases.md)、[A 验收](docs/testing/0023-a-acceptance.md)、[B 验收](docs/testing/0023-b-acceptance.md) |
 | 分组检索（`group_by_field` / `group_size` / `strict_group_size`）：3.x 实测的候选窗口、展平后的 offset 切片、空值组与参数真值，设计评审通过、第 1 步（core 与 gRPC）已实施；HybridSearch 与 rerank 内的分组留给各自切片，主键非 `id`、可空 `distance` / `id` 字段两个 3.x 缺陷不复制并登记 | [0024](docs/decisions/0024-group-by-search.md) |
-| TIMESTAMPTZ 与 `timezone` 属性：3.x 实测的 UTC 微秒值、ISO 解析与输出、请求 / 集合 / 数据库时区的优先级与 `fold=0` 换算、`time_fields`、请求时区的两个校验点与错误先后、毒化整数的处理；设计评审通过，第 1 步（类型与存储）、第 2 步（过滤：ISO / INTERVAL 求值、三条求值路线的差异）与第 3 步（时区：内置 tzdata 的 `fold=0` 换算、请求 / 集合 / 数据库时区、`time_fields`、集合与数据库 `timezone` 属性）已实施，差分与验收在第 4 步；采用内置 tzdata（jiff）的取舍已确认 | [0025](docs/decisions/0025-timestamptz-and-timezone.md) |
+| TIMESTAMPTZ 与 `timezone` 属性：3.x 实测的 UTC 微秒值、ISO 解析与输出、请求 / 集合 / 数据库时区的优先级与 `fold=0` 换算、`time_fields`、请求时区的两个校验点与错误先后、毒化整数的处理；设计评审通过，第 1 步（类型与存储）、第 2 步（过滤：ISO / INTERVAL 求值、三条求值路线的差异）与第 3 步（时区：内置 tzdata 的 `fold=0` 换算、请求 / 集合 / 数据库时区、`time_fields`、集合与数据库 `timezone` 属性）已实施；第 4 步（差分、参照用例、文档与验收）已实施待评审，开发验收见验收记录；采用内置 tzdata（jiff）的取舍已确认 | [0025](docs/decisions/0025-timestamptz-and-timezone.md)、[验收](docs/testing/0025-timestamptz-acceptance.md) |
 | 验收与调查记录引用的证据分哪几类、谁能复核（仓库内可重跑 / 公开产物 / 本地留存），以及验收与调查记录的写法约定 | [证据的存放与复核范围](docs/testing/README.md) |
 | 性能基线怎么测 / 口径 / 注意事项 | [benchmarks/baseline/README.md](benchmarks/baseline/README.md) |
 | 代码审查 / 修复复审（冻结合同、完整调用链、同类全域清扫、分级与证据门槛、二三阶影响矩阵） | [code-review-rules](.agents/skills/code-review-rules/SKILL.md)（Claude Code 经 `.claude/skills` 软链读取同一份） |
@@ -181,7 +181,7 @@ pymilvus ──server_manager──▶ adapter/grpc ──▶ db（多 collectio
 | 独立 CLI server | `.venv/bin/milvus-lite server --data-dir <data_dir> --host 127.0.0.1 --port 19530 --max-workers 10`；也可 `python -m milvus_lite server ...`，合同见 0012 |
 | 构建 wheel / sdist | `.venv/bin/maturin build --release -m crates/py/Cargo.toml` / `.venv/bin/maturin sdist -m crates/py/Cargo.toml` |
 | 核对依赖图中没有 C++ 构建与 protoc | `cargo tree --workspace -e all` |
-| 发行物与安装验收（本地诊断，候选以发行工作流为准；根配置；工作目录在仓库外） | `.venv/bin/python tests/packaging/run_acceptance.py --work-dir <work_dir> --constraints <constraints.txt> --suite --suite-expect 525`；约束文件与完整步骤见 [打包验收](tests/packaging/README.md) |
+| 发行物与安装验收（本地诊断，候选以发行工作流为准；根配置；工作目录在仓库外） | `.venv/bin/python tests/packaging/run_acceptance.py --work-dir <work_dir> --constraints <constraints.txt> --suite --suite-expect 547`；约束文件与完整步骤见 [打包验收](tests/packaging/README.md) |
 | 发行物/平台脚本自检 | `.venv/bin/python -m pytest tests/packaging tests/platform` |
 | CI 纯文档分类与汇总判定自检 | `.venv/bin/python -m pytest tests/ci` |
 | 发行工作流：演练 / 正式运行（0021；从以冻结提交为最新提交的已推送分支触发，正式运行引用同一提交含 PID 1 的成功演练） | `gh workflow run release.yml --repo <owner/repo> --ref <冻结分支> -f commit=<完整 SHA> -f version=<版本> -f dry_run=true`；正式运行改为 `-f dry_run=false -f pid1_dry_run=<演练运行 ID>.<attempt>` |

@@ -207,10 +207,17 @@ fn timestamp_texts(
                 if validity.is_some_and(|valid| !valid.get(row)) {
                     return Ok(text.clone());
                 }
+                // 配置的时区本身不可用（手改的属性文件）：3.x 打开集合时就报错，不属于逐行的解析错误。
+                if milvus_lite_core::timestamptz::is_naive(text) {
+                    timezone.effective()?;
+                }
                 match timezone.parse_timestamp(text) {
                     Ok(micros) => milvus_lite_core::timestamptz::format_iso_z(micros),
-                    Err(EngineError::InvalidArgument(_))
-                        if milvus_lite_core::timestamptz::is_naive(text) =>
+                    // 只有换算越界才换成占位；时区名的路径格式错误（同为 InvalidArgument）保留原文，
+                    // 由引擎再次解析时报出 3.x 的 zoneinfo 文案。
+                    Err(EngineError::InvalidArgument(message))
+                        if message == "date value out of range"
+                            && milvus_lite_core::timestamptz::is_naive(text) =>
                     {
                         Ok(OUT_OF_RANGE_PLACEHOLDER.to_owned())
                     }

@@ -1,8 +1,7 @@
 """Database namespace integration tests for the gRPC adapter.
 
 复制自参照实现 milvus-lite v3.2.1（43d1257）的 tests/adapter/test_grpc_database.py，Apache-2.0 许可。用例本体不变；
-用到数据库 `timezone` 属性（随 TIMESTAMPTZ 切片解除，0023 取舍 1）的 6 个用例、以及依赖它的哨兵库辅助函数不复制，
-见 INVENTORY.md。
+用到数据库 `timezone` 属性的 6 个用例与哨兵库辅助函数随 TIMESTAMPTZ 切片（0025）一并复制。
 """
 
 from uuid import uuid4
@@ -24,6 +23,44 @@ def _make_schema():
     return schema
 
 
+def _create_sentinel_database(milvus_client):
+    database_name = _unique_name("sentinel")
+    collection_name = _unique_name("docs")
+    properties = {"timezone": "UTC", "custom_marker": "keep"}
+    record = {
+        "id": 4242,
+        "vec": [0, 0, 0, 1],
+        "title": "database-property-sentinel",
+    }
+    milvus_client.create_database(database_name, properties=properties)
+    milvus_client.using_database(database_name)
+    milvus_client.create_collection(collection_name, schema=_make_schema())
+    milvus_client.insert(collection_name, [record])
+    return database_name, collection_name, record
+
+
+def _assert_sentinel_database_unchanged(
+    milvus_client,
+    database_name,
+    collection_name,
+    record,
+    databases_before,
+    collections_before,
+    properties_before,
+):
+    assert milvus_client.list_databases() == databases_before
+    assert milvus_client.has_collection(collection_name)
+    assert milvus_client.list_collections() == collections_before
+    assert milvus_client.describe_database(database_name) == properties_before
+    query_result = milvus_client.query(
+        collection_name,
+        filter="id == 4242",
+        output_fields=["id", "vec", "title"],
+    )
+    assert len(query_result) == 1
+    assert query_result[0] == record
+
+
 # Upstream: test_milvus_client_create_drop_database_default
 def test_database_lifecycle(milvus_client):
     database_name = _unique_name("tenant")
@@ -33,6 +70,95 @@ def test_database_lifecycle(milvus_client):
 
     milvus_client.drop_database(database_name)
     assert database_name not in milvus_client.list_databases()
+
+
+# Upstream: test_milvus_client_create_database_with_properties
+def test_create_database_with_timezone_property(milvus_client):
+    database_name = _unique_name("tenant")
+
+    milvus_client.create_database(database_name, properties={"timezone": "UTC"})
+
+    assert milvus_client.describe_database(database_name)["timezone"] == "UTC"
+
+
+# Upstream: test_milvus_client_alter_database_properties_default
+def test_alter_database_timezone_property(milvus_client):
+    database_name = _unique_name("tenant")
+    milvus_client.create_database(database_name, properties={"timezone": "UTC"})
+
+    milvus_client.alter_database_properties(
+        database_name,
+        properties={"timezone": "Asia/Shanghai"},
+    )
+
+    assert milvus_client.describe_database(database_name)["timezone"] == "Asia/Shanghai"
+
+
+# Upstream: test_milvus_client_drop_database_properties_default
+def test_drop_database_timezone_property(milvus_client):
+    database_name = _unique_name("tenant")
+    milvus_client.create_database(
+        database_name,
+        properties={"timezone": "UTC", "custom_marker": "keep"},
+    )
+
+    milvus_client.drop_database_properties(database_name, ["timezone"])
+
+    properties = milvus_client.describe_database(database_name)
+    assert "timezone" not in properties
+    assert properties["custom_marker"] == "keep"
+
+    properties_before = milvus_client.describe_database(database_name)
+    milvus_client.drop_database_properties(database_name, ["missing_property"])
+
+    assert milvus_client.describe_database(database_name) == properties_before
+
+
+# Upstream: test_milvus_client_alter_database_properties_nonexistent_db_name
+def test_alter_missing_database_properties_fails_without_changes(milvus_client):
+    sentinel_database, collection_name, record = _create_sentinel_database(milvus_client)
+    missing_database = _unique_name("missing")
+    databases_before = milvus_client.list_databases()
+    collections_before = milvus_client.list_collections()
+    properties_before = milvus_client.describe_database(sentinel_database)
+
+    with pytest.raises(MilvusException):
+        milvus_client.alter_database_properties(
+            missing_database,
+            properties={"timezone": "Asia/Shanghai"},
+        )
+
+    _assert_sentinel_database_unchanged(
+        milvus_client,
+        sentinel_database,
+        collection_name,
+        record,
+        databases_before,
+        collections_before,
+        properties_before,
+    )
+
+
+# Upstream: test_milvus_client_drop_database_properties_nonexistent_db_name
+def test_drop_missing_database_properties_fails_without_changes(milvus_client):
+    sentinel_database, collection_name, record = _create_sentinel_database(milvus_client)
+    missing_database = _unique_name("missing")
+    databases_before = milvus_client.list_databases()
+    collections_before = milvus_client.list_collections()
+    properties_before = milvus_client.describe_database(sentinel_database)
+
+    with pytest.raises(MilvusException):
+        milvus_client.drop_database_properties(missing_database, ["timezone"])
+
+    _assert_sentinel_database_unchanged(
+        milvus_client,
+        sentinel_database,
+        collection_name,
+        record,
+        databases_before,
+        collections_before,
+        properties_before,
+    )
 
 
 # Upstream: test_db_default
@@ -49,6 +175,19 @@ def test_create_default_database_fails_and_default_remains(milvus_client):
 
     assert milvus_client.list_databases() == databases_before
     assert "default" in milvus_client.list_databases()
+
+
+# Upstream: test_milvus_client_create_database_with_existed_name
+def test_create_duplicate_database_fails_and_database_remains(milvus_client):
+    database_name = _unique_name("tenant")
+    milvus_client.create_database(database_name, properties={"timezone": "UTC"})
+    databases_before = milvus_client.list_databases()
+
+    with pytest.raises(MilvusException):
+        milvus_client.create_database(database_name)
+
+    assert milvus_client.list_databases() == databases_before
+    assert milvus_client.describe_database(database_name)["timezone"] == "UTC"
 
 
 # Upstream: test_create_db_invalid_name_value, test_drop_db_invalid_name

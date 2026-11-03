@@ -764,8 +764,19 @@ impl Collection {
         schema: CollectionSchema,
         database: &dyn Fn() -> Result<Option<String>>,
     ) -> Result<Self> {
-        schema.validate_with(database)?;
-        let schema = schema.normalized(database)?;
+        // 校验与归一化必须看到同一个数据库时区：两次各读一次时，并发的 AlterDatabase 会让它们分别看到
+        // 改前与改后，报出改前改后都不会单独产生的错误。读取失败不记，直接向上返回。
+        let seen: std::cell::RefCell<Option<Option<String>>> = std::cell::RefCell::new(None);
+        let database = || -> Result<Option<String>> {
+            if let Some(zone) = &*seen.borrow() {
+                return Ok(zone.clone());
+            }
+            let zone = database()?;
+            *seen.borrow_mut() = Some(zone.clone());
+            Ok(zone)
+        };
+        schema.validate_with(&database)?;
+        let schema = schema.normalized(&database)?;
         let pk_pos = schema
             .primary_position()
             .ok_or_else(|| EngineError::schema("schema has no primary key field"))?;
@@ -3999,6 +4010,41 @@ fn check_loaded(name: &str, state: LoadState, deleted: bool, unusable: bool) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn creation_reads_the_database_zone_once_for_validation_and_normalization() {
+        let mut id = FieldSchema::new("id", DataType::Int64);
+        id.is_primary = true;
+        let mut vector = FieldSchema::new("v", DataType::FloatVector);
+        vector.dim = Some(2);
+        let mut ts = FieldSchema::new("ts", DataType::Timestamptz);
+        ts.nullable = true;
+        ts.default_value = Some(serde_json::json!("2025-07-01T12:00:00"));
+        let schema = CollectionSchema {
+            fields: vec![id, vector, ts],
+            enable_dynamic_field: false,
+            properties: Vec::new(),
+        };
+        let reads = std::cell::Cell::new(0);
+        // 每次读取返回不同的时区：校验与归一化若各读一次，会看到并发改动前后的两个值。
+        let database = || {
+            reads.set(reads.get() + 1);
+            Ok(Some(
+                if reads.get() == 1 {
+                    "UTC"
+                } else {
+                    "Asia/Shanghai"
+                }
+                .to_owned(),
+            ))
+        };
+        let collection = Collection::new_in("c", schema, &database).unwrap();
+        assert_eq!(reads.get(), 1);
+        assert_eq!(
+            collection.schema().fields[2].default_value,
+            Some(serde_json::json!(1_751_371_200_000_000_i64))
+        );
+    }
 
     #[test]
     fn persistent_json_default_keeps_normalized_wal_bytes() {

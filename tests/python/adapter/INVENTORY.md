@@ -6,16 +6,16 @@
 
 | 状态 | 含义 | 条数 |
 | --- | --- | --- |
-| 已复制 | 原样复制到本目录 | 217 |
+| 已复制 | 原样复制到本目录 | 239 |
 | 改后复制 | 仅按 0004「验收」第 2 项与 0006 第 25 项授权的条件替换，逐条说明改动 | 0 |
-| 范围外 | 用到当前切片不支持的功能，不复制；未实现能力的代表性入口见「范围外功能的 `UNIMPLEMENTED` 断言」 | 57 |
+| 范围外 | 用到当前切片不支持的功能，不复制；未实现能力的代表性入口见「范围外功能的 `UNIMPLEMENTED` 断言」 | 51 |
 | 待复用 | 原功能阻断已解除，尚未复制到本地默认套件；0015 的条目已通过固定外部套件验收 | 53 |
 | 依赖内部模块 | 导入或使用 3.x 的内部模块、内部对象，换成本实现后无法运行 | 39 |
 | 不运行 | 上游被同名定义覆盖，上游自己也不运行 | 1 |
 
-以上是逐条列出的 26 个文件中的 367 条；其余 21 个文件的 270 条整个文件记一行原因，见「整个文件不复用的文件」。
+以上是逐条列出的 27 个文件中的 383 条；其余 20 个文件的 254 条整个文件记一行原因，见「整个文件不复用的文件」。
 
-「已复制」与「改后复制」共 217 个用例函数，参数化展开后 258 条（0024 新增 6 个函数、6 条：分组检索 5 个与动态字段 `["*"]` 随分组返回 1 个；0023 B 新增 19 个函数、31 条：数据库用例 17 个函数 29 条，加两个按数据库隔离的用例）。S1 恢复 [test_grpc_crud.py](test_grpc_crud.py) 中的原过滤表达式，并纳入除 LIKE 外的全部 19 条；它们在本实现与真实 3.x 上的两条客户端线均作为 S1 验收。随后迁移全部 40 条待复用用例，恢复此前为绕过过滤限制而替换的原表达式；顶层动态字段切片另加入原样的 TestDynamicField 用例。0014 已恢复原 HNSW 定义，并新增创建 HNSW、DropIndex 和 describe 参数的原用例；检索仍按 FLAT 执行。
+「已复制」与「改后复制」共 239 个用例函数，参数化展开后 280 条（0025 新增 22 个函数、22 条：TIMESTAMPTZ 的 16 个与数据库 `timezone` 属性的 6 个；0024 新增 6 个函数、6 条：分组检索 5 个与动态字段 `["*"]` 随分组返回 1 个；0023 B 新增 19 个函数、31 条：数据库用例 17 个函数 29 条，加两个按数据库隔离的用例）。S1 恢复 [test_grpc_crud.py](test_grpc_crud.py) 中的原过滤表达式，并纳入除 LIKE 外的全部 19 条；它们在本实现与真实 3.x 上的两条客户端线均作为 S1 验收。随后迁移全部 40 条待复用用例，恢复此前为绕过过滤限制而替换的原表达式；顶层动态字段切片另加入原样的 TestDynamicField 用例。0014 已恢复原 HNSW 定义，并新增创建 HNSW、DropIndex 和 describe 参数的原用例；检索仍按 FLAT 执行。
 
 历史的 HNSW→FLAT 授权替换按 0014 恢复原定义；`== N` 换成 `in [N]` 的条件见 0004「验收」第 2 项及 0006 第 25 项。已接通 S1 的 CRUD 副本不再替换表达式或读回方式。其余副本只删去随范围外用例一起不再使用的 import、helper 与空的分节标题；上游用于跳过的 `importorskip` 改为直接导入（本仓不允许因缺依赖静默跳过），上游因 HNSW 需要 faiss 而加的 `skipif` 随 HNSW 一起去掉。起服务的 fixture 与清理见 [conftest.py](conftest.py)。
 
@@ -520,19 +520,19 @@
 
 ### [test_grpc_database.py](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_database.py)（0023 B）
 
-23 条：已复制 17，范围外 6。
+23 条：已复制 23（原有 6 个用到数据库 `timezone` 属性的用例随 0025 第 4 步复制）。
 
 | 用例 | 状态 | 说明 |
 | --- | --- | --- |
 | [`test_database_lifecycle`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_database.py#L61) | 已复制 |  |
-| [`test_create_database_with_timezone_property`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_database.py#L72) | 范围外 | 数据库属性 `timezone`（0023 取舍 1，随 TIMESTAMPTZ 切片解除） |
-| [`test_alter_database_timezone_property`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_database.py#L81) | 范围外 | 数据库属性 `timezone`（0023 取舍 1，随 TIMESTAMPTZ 切片解除） |
-| [`test_drop_database_timezone_property`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_database.py#L94) | 范围外 | 数据库属性 `timezone`（0023 取舍 1，随 TIMESTAMPTZ 切片解除） |
-| [`test_alter_missing_database_properties_fails_without_changes`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_database.py#L114) | 范围外 | 数据库属性 `timezone`（0023 取舍 1，随 TIMESTAMPTZ 切片解除） |
-| [`test_drop_missing_database_properties_fails_without_changes`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_database.py#L139) | 范围外 | 数据库属性 `timezone`（0023 取舍 1，随 TIMESTAMPTZ 切片解除） |
+| [`test_create_database_with_timezone_property`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_database.py#L72) | 已复制 |  |
+| [`test_alter_database_timezone_property`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_database.py#L81) | 已复制 |  |
+| [`test_drop_database_timezone_property`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_database.py#L94) | 已复制 |  |
+| [`test_alter_missing_database_properties_fails_without_changes`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_database.py#L114) | 已复制 |  |
+| [`test_drop_missing_database_properties_fails_without_changes`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_database.py#L139) | 已复制 |  |
 | [`test_default_database_exists`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_database.py#L161) | 已复制 |  |
 | [`test_create_default_database_fails_and_default_remains`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_database.py#L166) | 已复制 |  |
-| [`test_create_duplicate_database_fails_and_database_remains`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_database.py#L177) | 范围外 | 数据库属性 `timezone`（0023 取舍 1，随 TIMESTAMPTZ 切片解除） |
+| [`test_create_duplicate_database_fails_and_database_remains`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_database.py#L177) | 已复制 |  |
 | [`test_unsafe_database_name_create_and_drop_fail_without_changes`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_database.py#L191) | 已复制 |  |
 | [`test_database_name_over_255_bytes_create_fails_without_changes`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_database.py#L207) | 已复制 |  |
 | [`test_missing_database_operation_fails_without_changes`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_database.py#L224) | 已复制 |  |
@@ -566,6 +566,29 @@
 | [`test_grpc_group_by_with_filter`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_group_by.py#L237) | 已复制 |  |
 | [`test_grpc_group_by_nullable_varchar`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_group_by.py#L253) | 已复制 |  |
 
+### [test_grpc_timestamptz_milvus_compat.py](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_timestamptz_milvus_compat.py)（0025）
+
+16 条：已复制 16。
+
+| 用例 | 状态 | 说明 |
+| --- | --- | --- |
+| [`test_milvus_client_timestamptz_utc_insert_query`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_timestamptz_milvus_compat.py#L57) | 已复制 |  |
+| [`test_milvus_client_timestamptz_query_operators_and_interval`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_timestamptz_milvus_compat.py#L75) | 已复制 |  |
+| [`test_milvus_client_timestamptz_default_value`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_timestamptz_milvus_compat.py#L116) | 已复制 |  |
+| [`test_milvus_client_timestamptz_default_value_uses_collection_timezone`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_timestamptz_milvus_compat.py#L133) | 已复制 |  |
+| [`test_milvus_client_timestamptz_search_filter`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_timestamptz_milvus_compat.py#L151) | 已复制 |  |
+| [`test_milvus_client_timestamptz_insert_delete_upsert_flush`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_timestamptz_milvus_compat.py#L171) | 已复制 |  |
+| [`test_milvus_client_timestamptz_invalid_time_format`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_timestamptz_milvus_compat.py#L195) | 已复制 |  |
+| [`test_milvus_client_timestamptz_upstream_edge_cases`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_timestamptz_milvus_compat.py#L210) | 已复制 |  |
+| [`test_milvus_client_timestamptz_feb_29`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_timestamptz_milvus_compat.py#L234) | 已复制 |  |
+| [`test_milvus_client_timestamptz_request_timezone_filter_matrix`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_timestamptz_milvus_compat.py#L250) | 已复制 |  |
+| [`test_milvus_client_timestamptz_collection_timezone_property`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_timestamptz_milvus_compat.py#L295) | 已复制 |  |
+| [`test_milvus_client_timestamptz_alter_collection_timezone`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_timestamptz_milvus_compat.py#L347) | 已复制 |  |
+| [`test_milvus_client_timestamptz_alter_collection_timezone_after_insert`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_timestamptz_milvus_compat.py#L380) | 已复制 |  |
+| [`test_milvus_client_timestamptz_database_timezone_default`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_timestamptz_milvus_compat.py#L422) | 已复制 |  |
+| [`test_milvus_client_timestamptz_different_time_expressions`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_timestamptz_milvus_compat.py#L456) | 已复制 |  |
+| [`test_milvus_client_timestamptz_different_timezone_query`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_timestamptz_milvus_compat.py#L497) | 已复制 |  |
+
 ## [test_grpc_compaction.py](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_compaction.py)
 
 2 条：已复制 2。自动维护及两个应答 RPC 的合同见 [0010](../../../docs/decisions/0010-compaction-and-tombstone-gc.md)；Completed 是兼容应答，不表示后台维护已排空。
@@ -581,14 +604,14 @@
 
 | 功能 | 用例 |
 | --- | --- |
-| 0014 之外的过滤构造（算术、时间、text_match 与几何） | [test_grpc_translation.py](../test_grpc_translation.py) 的 `test_search_m1_unsupported`、`test_query_m1_unsupported`、`test_pymilvus_entry_points_remaining_unsupported` |
+| 0014 与 0025 之外的过滤构造（不涉及时间值的算术、text_match 与几何） | [test_grpc_translation.py](../test_grpc_translation.py) 的 `test_search_m1_unsupported`、`test_query_m1_unsupported`、`test_pymilvus_entry_points_remaining_unsupported` |
 | Query / search iterator V1 | 0016 A / B 接续；V2 不增加服务端实现 |
 | 分区 RPC；写入、检索、查询指定 `_default` 以外的分区；partition key | `test_insert_m1_unsupported`、`test_search_m1_unsupported`、`test_query_m1_unsupported`、`test_pymilvus_entry_points_remaining_unsupported` |
-| 数据库属性 `timezone`、跨数据库改名（数据库 RPC 本身已由 0023 B 实现） | 差分测试 `tests/differential/test_databases.py` 与 `test_rename.py` 的预期差异断言 |
-| schema：GEOMETRY、TIMESTAMPTZ、稀疏向量、nullable 向量、向量默认值、JSON/嵌套 ARRAY 元素、function、多向量字段、analyzer，properties 中的 `timezone` | `test_create_collection_remaining_unsupported`、`test_pymilvus_entry_points_remaining_unsupported` |
+| 跨数据库改名（数据库 RPC 本身已由 0023 B 实现；数据库 `timezone` 属性已由 0025 实现） | 差分测试 `tests/differential/test_databases.py` 与 `test_rename.py` 的预期差异断言 |
+| schema：GEOMETRY、`ARRAY<TIMESTAMPTZ>`、稀疏向量、nullable 向量、向量默认值、JSON/嵌套 ARRAY 元素、function、多向量字段、analyzer | `test_create_collection_remaining_unsupported`、`test_pymilvus_entry_points_remaining_unsupported` |
 | 写入 null 值 | `test_insert_m1_unsupported` |
 | 修改 schema | `test_pymilvus_entry_points_remaining_unsupported` |
-| HybridSearch、rerank（含与 group_by 同时出现）、请求中的 `timezone` | `test_search_m1_unsupported`、`test_pymilvus_entry_points_remaining_unsupported` |
+| HybridSearch、rerank（含与 group_by 同时出现） | `test_search_m1_unsupported`、`test_pymilvus_entry_points_remaining_unsupported` |
 | FLAT、BRUTE_FORCE、AUTOINDEX 以外的索引类型 | `test_create_index_m1_unsupported` |
 | DropIndex | `test_pymilvus_entry_points_remaining_unsupported` |
 | GetCompactionPlans | [test_server_manager.py](../test_server_manager.py) 的 `test_unimplemented_rpc_reason` |
@@ -608,7 +631,6 @@
 | [test_grpc_geometry.py](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_geometry.py) | 8 | GEOMETRY |
 | [test_grpc_partition_key.py](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_partition_key.py) | 6 | partition key |
 | [test_grpc_snapshot.py](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_snapshot.py) | 10 | snapshot；全部依赖内部模块：经 fixture 返回的 3.x `db` 对象创建 snapshot，[L11](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_snapshot.py#L11) 顶层导入 |
-| [test_grpc_timestamptz_milvus_compat.py](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_timestamptz_milvus_compat.py) | 16 | TIMESTAMPTZ、default value |
 | [test_grpc_translators_records.py](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_translators_records.py) | 26 | 全部依赖内部模块：3.x 翻译层的单元测试，[L21](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_translators_records.py#L21)–28 顶层导入 |
 | [test_grpc_translators_result.py](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_translators_result.py) | 1 | 依赖内部模块：3.x 翻译层的单元测试，[L3](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_translators_result.py#L3)–5 顶层导入 |
 | [test_grpc_translators_schema.py](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_translators_schema.py) | 16 | 全部依赖内部模块：3.x 翻译层的单元测试，[L14](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_translators_schema.py#L14)–19 顶层导入 |

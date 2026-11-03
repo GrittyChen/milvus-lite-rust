@@ -440,6 +440,10 @@ fn unknown_timezone_in_the_file_fails_describe_and_alter_like_3x() {
         ));
     }
     assert_eq!(std::fs::read(&file).unwrap(), before);
+    // 3.x 校验不过的加载不缓存：文件被修正后，同一个进程里的下一次调用重新读取。
+    std::fs::write(&file, br#"{"timezone": "UTC", "k": "v"}"#).unwrap();
+    let (_, properties) = db.describe_database("d1").unwrap();
+    assert_eq!(properties, pairs(&[("timezone", "UTC"), ("k", "v")]));
     db.close();
 }
 
