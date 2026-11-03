@@ -487,6 +487,8 @@ pub(super) fn members(shape: Shape, values: &[Literal]) -> Option<Vec<Literal>> 
         .map(|value| match (shape, value) {
             (Shape::Int, Literal::Bool(b)) => Some(Literal::Int(if *b { "1" } else { "0" }.into())),
             (Shape::Int, Literal::String(s)) => int_string(s).map(|i| Literal::Int(i.to_string())),
+            // Arrow 的 is_in 把 timestamp 的 value_set 转成 int64 微秒后与整数列比较。
+            (Shape::Int, Literal::Timestamp(v)) => Some(Literal::Int(v.to_string())),
             (Shape::Float, Literal::Bool(b)) => Some(Literal::Float(if *b { 1.0 } else { 0.0 })),
             (Shape::Float, Literal::String(s)) => float_string(s).map(Literal::Float),
             (Shape::Bool, Literal::Int(s)) => Some(Literal::Bool(int_cmp(s, "0").is_ne())),

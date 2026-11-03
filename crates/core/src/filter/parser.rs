@@ -10,7 +10,10 @@ pub(super) enum Literal {
     Float(f64),
     String(String),
     Bool(bool),
-    Temporal,
+    /// UTC Unix 微秒（`ISO '...'`）。
+    Timestamp(i64),
+    /// 区间的微秒数，已按 Python `int()` 向零截断；可能超出 int64（求值时才报错，同 3.x）。
+    Interval(f64),
 }
 impl Literal {
     pub(super) fn negate(self) -> Self {
@@ -32,7 +35,8 @@ impl Literal {
             Self::Float(_) => "float",
             Self::String(_) => "string",
             Self::Bool(_) => "bool",
-            Self::Temporal => "temporal",
+            Self::Timestamp(_) => "timestamptz",
+            Self::Interval(_) => "interval",
         }
     }
 }
@@ -67,6 +71,10 @@ pub(super) enum Kind {
         mode: String,
     },
     Length(usize),
+    /// 二元算术；只有含时间字面量或时间戳字段的才会被求值，其余仍是范围外构造。
+    Arith(String, usize, usize),
+    /// 一元负号作用在非数字字面量上。
+    Neg(usize),
     In {
         field: usize,
         list: usize,
@@ -613,12 +621,12 @@ impl Parser<'_> {
             matches!(self.peek().kind.as_str(), "+" | "-")
         } {
             let tok = self.take();
-            if mul {
-                self.unary()?;
+            let right = if mul {
+                self.unary()?
             } else {
-                self.arith(true)?;
-            }
-            left = self.node(Kind::Unsupported, tok.pos);
+                self.arith(true)?
+            };
+            left = self.node(Kind::Arith(tok.text.clone(), left, right), tok.pos);
         }
         Ok(left)
     }
@@ -633,7 +641,7 @@ impl Parser<'_> {
                 Kind::Lit(lit @ (Literal::Int(_) | Literal::Float(_))) => {
                     Kind::Lit(lit.clone().negate())
                 }
-                _ => Kind::Unsupported,
+                _ => Kind::Neg(id),
             };
             Ok(self.node(kind, tok.pos))
         } else if self.has("exists") {
@@ -888,9 +896,9 @@ impl Parser<'_> {
             ));
         };
         self.take();
-        super::temporal::validate(&s, tok.kind == "iso")
+        let literal = super::temporal::literal(&s, tok.kind == "iso")
             .map_err(|m| self.error(m, value.pos, 1, None))?;
-        Ok(self.node(Kind::Lit(Literal::Temporal), tok.pos))
+        Ok(self.node(Kind::Lit(literal), tok.pos))
     }
     fn function(&mut self, tok: Token) -> Result<usize> {
         let name = tok.text.to_lowercase();

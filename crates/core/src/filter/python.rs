@@ -91,6 +91,10 @@ pub(super) enum Value<'a> {
     Decoded(Arc<Document>, usize),
     Vector(&'a [f32]),
     Targets(Vec<Value<'a>>),
+    /// `datetime`：UTC 微秒。
+    Timestamp(i64),
+    /// `timedelta`：微秒数（构造时已按 Python 的范围检查）。
+    Interval(i128),
 }
 enum Atom<'a> {
     Null,
@@ -100,6 +104,8 @@ enum Atom<'a> {
     Text(Cow<'a, [u32]>),
     List(usize),
     Object(usize),
+    Timestamp(i64),
+    Interval(i128),
 }
 impl Value<'_> {
     fn atom(&self) -> Result<Atom<'_>> {
@@ -136,6 +142,8 @@ impl Value<'_> {
             },
             Self::Vector(v) => Atom::List(v.len()),
             Self::Targets(v) => Atom::List(v.len()),
+            Self::Timestamp(v) => Atom::Timestamp(*v),
+            Self::Interval(v) => Atom::Interval(*v),
         })
     }
     fn boolean(&self) -> Result<Option<bool>> {
@@ -309,6 +317,8 @@ fn equal(a: &Value<'_>, b: &Value<'_>, identity: bool) -> Result<bool> {
         match (av, bv) {
             (Atom::Null, Atom::Null) => {}
             (Atom::Text(a), Atom::Text(b)) if a == b => {}
+            (Atom::Timestamp(a), Atom::Timestamp(b)) if a == b => {}
+            (Atom::Interval(a), Atom::Interval(b)) if a == b => {}
             (Atom::List(an), Atom::List(bn)) if an == bn => {
                 for i in (0..an).rev() {
                     let (Some(av), Some(bv)) = (a.list_item(i)?, b.list_item(i)?) else {
@@ -348,6 +358,8 @@ fn ordered(a: &Value<'_>, b: &Value<'_>) -> Result<Ordered> {
         }
         match (av, bv) {
             (Atom::Text(a), Atom::Text(b)) => return Ok(Ordered::Comparable(a.cmp(&b))),
+            (Atom::Timestamp(a), Atom::Timestamp(b)) => return Ok(Ordered::Comparable(a.cmp(&b))),
+            (Atom::Interval(a), Atom::Interval(b)) => return Ok(Ordered::Comparable(a.cmp(&b))),
             (Atom::List(an), Atom::List(bn)) => {
                 let mut next = None;
                 for i in 0..an.min(bn) {
@@ -401,8 +413,39 @@ fn from_literal(l: &Literal) -> Result<Value<'_>> {
         Literal::Float(v) => Value::Float(*v, false),
         Literal::String(s) => Value::Text(Cow::Owned(s.chars().map(u32::from).collect())),
         Literal::Bool(v) => Value::Bool(*v),
-        _ => return Err(super::eval::unsupported()),
+        Literal::Timestamp(v) => Value::Timestamp(*v),
+        Literal::Interval(v) => Value::Interval(timedelta(*v)?),
     })
+}
+
+/// Python `timedelta(microseconds=int(v))` 的范围：天数超过 999999999 报 OverflowError，
+/// 超过 C int 时是另一条信息（3.x 的 python 后端在每行求值区间字面量时报错）。
+fn timedelta(micros: f64) -> Result<i128> {
+    // 浮点数的整数值与 Python `int()` 相同；天数用整数除法，避免 f64 除法在大数上舍入。
+    let micros = micros as i128;
+    let days = micros.div_euclid(86_400_000_000);
+    if days > i128::from(i32::MAX) {
+        return Err(EngineError::invalid(
+            "Python int too large to convert to C int",
+        ));
+    }
+    if days > 999_999_999 {
+        return Err(EngineError::invalid(format!(
+            "days={days}; must have magnitude <= 999999999"
+        )));
+    }
+    Ok(micros)
+}
+
+/// `datetime ± timedelta`：结果超出 `[0001-01-01, 9999-12-31T23:59:59.999999]` 报 OverflowError。
+fn shifted(timestamp: i64, interval: i128, subtract: bool) -> Result<Value<'static>> {
+    let delta = if subtract { -interval } else { interval };
+    let micros = i128::from(timestamp) + delta;
+    i64::try_from(micros)
+        .ok()
+        .filter(|m| crate::timestamptz::check_micros(*m).is_ok())
+        .map(Value::Timestamp)
+        .ok_or_else(|| EngineError::invalid("date value out of range"))
 }
 fn column_value(column: &ColumnData, index: usize) -> Result<Value<'_>> {
     Ok(if column.is_null(index) {
@@ -445,6 +488,14 @@ fn operand<'a>(op: &'a Operand, row: &DynamicRow<'a>) -> Result<Value<'a>> {
             .and_then(|m| m.get(key))
             .map_or(Value::Null, Value::Json),
         Operand::Column(i) => column_value(&row.columns[*i], row.row)?,
+        Operand::Timestamp(i) => {
+            let column = &row.columns[*i];
+            match column.values() {
+                _ if column.is_null(row.row) => Value::Null,
+                ColumnData::Int64(v) => Value::Timestamp(v[row.row]),
+                _ => return Err(EngineError::Storage("timestamp column lost type".into())),
+            }
+        }
     })
 }
 fn membership(value: &Value<'_>, literals: &[Literal]) -> Result<Option<bool>> {
@@ -531,7 +582,7 @@ pub(super) fn evaluate_tree(tree: &Tree, rows: &[DynamicRow<'_>]) -> Result<Sour
                         kind => {
                             tasks.push(Task::Finish(id));
                             match kind {
-                                Kind::Cmp(_, a, b) => {
+                                Kind::Cmp(_, a, b) | Kind::Arith(_, a, b) => {
                                     tasks.extend([Task::Visit(*b), Task::Visit(*a)])
                                 }
                                 Kind::Not(value)
@@ -676,6 +727,19 @@ pub(super) fn evaluate_tree(tree: &Tree, rows: &[DynamicRow<'_>]) -> Result<Sour
                             Comparison::parse(op)?,
                         )?
                         .map_or(Value::Null, Value::Bool),
+                        Kind::Arith(op, a, b) => {
+                            let (a, b) = (node_value(&values, *a)?, node_value(&values, *b)?);
+                            match (a.atom()?, b.atom()?, op.as_str()) {
+                                (Atom::Null, _, _) | (_, Atom::Null, _) => Value::Null,
+                                (Atom::Timestamp(t), Atom::Interval(d), "+" | "-") => {
+                                    shifted(t, d, op == "-")?
+                                }
+                                (Atom::Interval(d), Atom::Timestamp(t), "+") => {
+                                    shifted(t, d, false)?
+                                }
+                                _ => Value::Null,
+                            }
+                        }
                         Kind::Not(value) => node_value(&values, *value)?
                             .boolean()?
                             .map_or(Value::Null, |b| Value::Bool(!b)),
@@ -754,6 +818,59 @@ pub(super) fn evaluate_tree(tree: &Tree, rows: &[DynamicRow<'_>]) -> Result<Sour
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn python_timedelta_and_datetime_ranges_match_3x_messages() {
+        // 天数 ≤ 999999999 的区间可构造；再大按 C int 分界报两种信息。
+        let day = 86_400_000_000.0;
+        assert_eq!(timedelta(1_000.0 * day).unwrap(), 1_000 * 86_400_000_000);
+        // 'P999999999D' 的浮点微秒数舍入后天数为 999999998，仍可构造（3.x 在这里不报 timedelta 错误）。
+        assert_eq!(
+            timedelta(999_999_999.0 * 86_400.0 * 1_000_000.0).unwrap(),
+            86_399_999_913_599_991_808
+        );
+        assert_eq!(
+            timedelta(999_999_999.0 * day).unwrap(),
+            86_399_999_913_599_991_808
+        );
+        // 比 10^9 天小一个浮点间隔（16384 微秒）：天数恰为 999999999，仍可构造。
+        assert!(timedelta(1_000_000_000.0 * day - 16_384.0).is_ok());
+        assert_eq!(
+            timedelta(1_000_000_000.0 * day).unwrap_err().to_string(),
+            "days=1000000000; must have magnitude <= 999999999"
+        );
+        assert_eq!(
+            timedelta(2_147_483_520.0 * day).unwrap_err().to_string(),
+            "days=2147483520; must have magnitude <= 999999999"
+        );
+        assert_eq!(
+            timedelta(2_147_483_648.0 * day).unwrap_err().to_string(),
+            "Python int too large to convert to C int"
+        );
+        assert_eq!(
+            timedelta(1e300).unwrap_err().to_string(),
+            "Python int too large to convert to C int"
+        );
+        // datetime ± timedelta 超出 [0001, 9999] 报 date value out of range，边界上的结果可用。
+        let min = crate::timestamptz::MIN_MICROS;
+        let max = crate::timestamptz::MAX_MICROS;
+        assert!(matches!(shifted(max, 0, false), Ok(Value::Timestamp(v)) if v == max));
+        assert!(matches!(shifted(max, 1, true), Ok(Value::Timestamp(v)) if v == max - 1));
+        assert!(matches!(shifted(min, 1, false), Ok(Value::Timestamp(v)) if v == min + 1));
+        for (t, d, subtract) in [
+            (max, 1, false),
+            (min, 1, true),
+            (0, i128::from(i64::MAX) * 4, false),
+        ] {
+            assert_eq!(
+                shifted(t, d, subtract)
+                    .err()
+                    .map(|e| e.to_string())
+                    .as_deref(),
+                Some("date value out of range")
+            );
+        }
+    }
 
     #[test]
     fn python_comparison_separates_nan_from_unknown_type_ordering() {

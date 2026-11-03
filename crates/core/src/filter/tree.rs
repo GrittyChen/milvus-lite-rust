@@ -23,13 +23,35 @@ pub(super) struct Tree {
     pub(super) patterns: Vec<Option<super::python::LikePattern>>,
 }
 
+fn numeric_operand(
+    op: &str,
+    side: &str,
+    ast: &Ast,
+    id: usize,
+    t: &str,
+    pos: usize,
+    source: &str,
+) -> EngineError {
+    let description = eval::describe(ast, id, t);
+    parser::diagnostic(
+        &format!("arithmetic '{op}' requires numeric operands, {side} side is {description}"),
+        source,
+        pos,
+        op.len(),
+        Some(&format!("operand is {description}")),
+    )
+}
+
 pub(super) fn legacy_shape(ast: &Ast, schema: &CollectionSchema) -> bool {
     let field = |id: usize| match &ast.nodes[id].kind {
         Kind::Field(name) => !schema.fields.iter().any(|f| {
             &f.name == name
                 && matches!(
                     f.data_type,
-                    DataType::Json | DataType::Array | DataType::FloatVector
+                    DataType::Json
+                        | DataType::Array
+                        | DataType::FloatVector
+                        | DataType::Timestamptz
                 )
         }),
         Kind::Meta(_) => true,
@@ -126,11 +148,12 @@ impl Tree {
                         }
                         continue;
                     }
-                    Kind::Cmp(_, a, b) => vec![*a, *b],
+                    Kind::Cmp(_, a, b) | Kind::Arith(_, a, b) => vec![*a, *b],
                     Kind::In { field, list, .. } => vec![*field, *list],
                     Kind::List(ids) => ids.clone(),
                     Kind::Not(value)
                     | Kind::Length(value)
+                    | Kind::Neg(value)
                     | Kind::Like { value, .. }
                     | Kind::IsNull { value, .. }
                     | Kind::Contains { value, .. } => vec![*value],
@@ -152,10 +175,7 @@ impl Tree {
                     match schema.fields.iter().find(|f| &f.name == name) {
                         Some(f) if f.data_type == DataType::Json => "string",
                         Some(f) if f.data_type == DataType::Array => "dynamic",
-                        // 时间戳字段参与过滤要等 0025 第 2 步（ISO / INTERVAL 求值）。
-                        Some(f) if f.data_type == DataType::Timestamptz => {
-                            return Err(eval::unsupported());
-                        }
+                        Some(f) if f.data_type == DataType::Timestamptz => "timestamptz",
                         Some(f) => eval::sem(f.data_type).ok_or_else(|| {
                             parser::diagnostic(
                                 &format!(
@@ -292,6 +312,33 @@ impl Tree {
                         "bool"
                     }
                 }
+                Kind::Arith(op, left, right) => {
+                    let (a, b) = (types[*left], types[*right]);
+                    // 时间戳 ± 区间、区间 + 时间戳得到时间戳；其余组合要求数值操作数（3.x 同）。
+                    if (a == "timestamptz" && b == "interval" && matches!(op.as_str(), "+" | "-"))
+                        || (a == "interval" && b == "timestamptz" && op == "+")
+                    {
+                        "timestamptz"
+                    } else {
+                        for (side, id, t) in [("left", *left, a), ("right", *right, b)] {
+                            if !matches!(t, "int" | "float" | "dynamic") {
+                                return Err(numeric_operand(
+                                    op, side, ast, id, t, node.pos, source,
+                                ));
+                            }
+                        }
+                        return Err(eval::unsupported());
+                    }
+                }
+                Kind::Neg(child) => {
+                    let t = types[*child];
+                    if !matches!(t, "int" | "float" | "dynamic") {
+                        return Err(numeric_operand(
+                            "-", "right", ast, *child, t, node.pos, source,
+                        ));
+                    }
+                    return Err(eval::unsupported());
+                }
                 Kind::Unsupported => return Err(eval::unsupported()),
             };
         }
@@ -315,7 +362,11 @@ impl Tree {
                 Kind::Field(name) if matches!(name.as_str(), "_seq" | "_partition") => None,
                 Kind::Field(name) => Some(
                     if let Some(i) = schema.fields.iter().position(|f| &f.name == name) {
-                        Operand::Column(i)
+                        if schema.fields[i].data_type == DataType::Timestamptz {
+                            Operand::Timestamp(i)
+                        } else {
+                            Operand::Column(i)
+                        }
                     } else {
                         if schema.enable_dynamic_field && backend == Backend::Arrow {
                             backend = Backend::Hybrid;

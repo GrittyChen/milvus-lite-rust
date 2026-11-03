@@ -878,8 +878,23 @@ def test_timestamptz_translation(env):
             6, 6, f"field 'ts' value '{text}' does not match dtype DataType.TIMESTAMPTZ")
     for text in ("0001-01-01T00:00:00+01:00", "9999-12-31T23:59:59-08:00"):
         assert status_of(raw(1, [text], ts_type=21)) == (1, 0, "date value out of range")
-    # 过滤暂不支持时间戳字段（0025 第 2 步）：UNIMPLEMENTED，不是类型错误。
-    unimplemented(stub.Query, milvus_pb2.QueryRequest(collection_name="t", expr="ts is null"))
+    # 过滤：比较、`in`、空值、时间戳 ± 区间；类型错误与无偏移字面量沿用 3.x 的错误码与文案。
+    def ids(expr):
+        return sorted(r["id"] for r in client.query("t", filter=expr, output_fields=["id"]))
+    assert ids("id < 4 and ts > ISO '2025-01-01T00:00:00Z'") == [1]
+    assert ids("id < 4 and ts == ISO '2025-01-02T12:30:00.5+08:00'") == [1]
+    assert ids("id < 4 and ts in [ISO '0001-01-01T00:00:00Z']") == [3]
+    assert ids("id < 4 and ts is null") == [2]
+    assert ids("id < 4 and ts + INTERVAL 'P1D' > ISO '2025-01-03T00:00:00Z'") == [1]
+    assert ids("id < 4 and ts - INTERVAL 'P1D' < ts2") == [3]
+    reply = stub.Query(milvus_pb2.QueryRequest(collection_name="t", expr="ts > 1"))
+    assert status_of(reply)[0] == 6 and "comparison '>' between incompatible types" in status_of(reply)[2]
+    reply = stub.Query(milvus_pb2.QueryRequest(collection_name="t", expr="ts > ISO '2025-01-01T00:00:00'"))
+    assert status_of(reply)[0] == 6 and naive in status_of(reply)[2]
+    reply = stub.Query(milvus_pb2.QueryRequest(collection_name="t", expr="ts + INTERVAL 'P106751992D' > ts2"))
+    assert status_of(reply)[0::2] == (1, "Python int too large to convert to C long")
+    # 不涉及时间值的算术仍是范围外构造。
+    unimplemented(stub.Query, milvus_pb2.QueryRequest(collection_name="t", expr="id + 1 > 2"))
     # schema 规则。
     for name, build in {
         "pk": lambda s: s.add_field("p", DataType.TIMESTAMPTZ, is_primary=True),
@@ -970,7 +985,10 @@ def test_query_m1_unsupported(env):
     assert status_of(response)[0] == 0
     assert list(response.fields_data[0].scalars.long_data.data) == [1]
     unimplemented(stub.Query, query_req(expr="id + 1 > 0"))
-    unimplemented(stub.Query, query_req(expr="ISO '2025-01-01T00:00:00Z' == ISO '2025-01-01T00:00:00Z'"))
+    # 时间字面量的比较已支持（0025）：恒真时命中全部行。
+    constant = stub.Query(query_req(
+        expr="ISO '2025-01-01T00:00:00Z' == ISO '2025-01-01T00:00:00Z'", output_fields=["count(*)"]))
+    assert status_of(constant)[0] == 0 and list(constant.fields_data[0].scalars.long_data.data) == [5]
     empty = stub.Query(query_req(expr="id in [1]", partition_names=["p"]))
     assert status_of(empty)[0] == 0 and not empty.fields_data[0].scalars.long_data.data
     timezone = [common_pb2.KeyValuePair(key="timezone", value="UTC")]
@@ -1118,7 +1136,7 @@ def test_pymilvus_entry_points_remaining_unsupported(env):
         (lambda: client.add_collection_field("q", "x", DataType.INT64, nullable=True), f"AddCollectionField: {rpc}"),
         (lambda: client.hybrid_search("q", [AnnSearchRequest([[1, 0]], "vector", {}, 2)], RRFRanker(), limit=2),
          f"HybridSearch: {rpc}"),
-        (lambda: client.search("q", [[1, 0]], filter="id + 1 > 0"), "filter expressions: arithmetic, temporal literals, text_match, and geometry predicates are not supported"),
+        (lambda: client.search("q", [[1, 0]], filter="id + 1 > 0"), "filter expressions: arithmetic, text_match, and geometry predicates are not supported"),
         (lambda: client.search("q", [[1, 0]], ranker=decay), f"rerank and function chains: {feature}"),
         # 分组检索已实现；与 rerank 同时出现时，rerank 的 UNIMPLEMENTED 不能被分组路径吞掉。
         (lambda: client.search("q", [[1, 0]], ranker=decay, group_by_field="id"),

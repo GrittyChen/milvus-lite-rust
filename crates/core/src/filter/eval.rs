@@ -8,6 +8,8 @@ use crate::storage::visibility::SourceBits;
 #[derive(Debug, Clone)]
 pub(super) enum Operand {
     Column(usize),
+    /// TIMESTAMPTZ 列（UTC 微秒的 Int64）：只在布尔树的求值中出现，用来区分时间戳与普通整数。
+    Timestamp(usize),
     Dynamic(String),
     Literal(Literal),
 }
@@ -67,8 +69,37 @@ pub(crate) struct Predicate {
 pub(super) fn unsupported() -> EngineError {
     EngineError::unsupported(
         "filter expressions",
-        "arithmetic, temporal literals, text_match, and geometry predicates are not supported",
+        "arithmetic, text_match, and geometry predicates are not supported",
     )
+}
+/// 含范围外构造，或含不涉及时间戳的算术：时间戳 / 区间的加减由求值器支持，其余算术仍是范围外。
+fn general_arithmetic(ast: &Ast, schema: &CollectionSchema) -> bool {
+    // 子节点总先于父节点创建，顺序扫描即可得到每个子树是否含时间值。
+    let mut temporal = vec![false; ast.nodes.len()];
+    for (id, node) in ast.nodes.iter().enumerate() {
+        temporal[id] = match &node.kind {
+            Kind::Unsupported => return true,
+            Kind::Lit(Literal::Timestamp(_) | Literal::Interval(_)) => true,
+            Kind::Field(name) => schema
+                .fields
+                .iter()
+                .any(|f| &f.name == name && f.data_type == DataType::Timestamptz),
+            Kind::Arith(_, a, b) => {
+                if !(temporal[*a] || temporal[*b]) {
+                    return true;
+                }
+                true
+            }
+            Kind::Neg(a) => {
+                if !temporal[*a] {
+                    return true;
+                }
+                true
+            }
+            _ => false,
+        };
+    }
+    false
 }
 pub(super) fn compatible(a: &str, b: &str) -> bool {
     a == b
@@ -203,11 +234,7 @@ impl Predicate {
             });
         };
         // 语法总是完整检查；范围外构造优先 UNIMPLEMENTED，不执行其语义检查（0006 第 1 项）。
-        if ast
-            .nodes
-            .iter()
-            .any(|node| matches!(node.kind, Kind::Unsupported | Kind::Lit(Literal::Temporal)))
-        {
+        if general_arithmetic(ast, schema) {
             return Err(unsupported());
         }
         if !super::tree::legacy_shape(ast, schema) {

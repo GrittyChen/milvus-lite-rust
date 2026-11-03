@@ -18,11 +18,19 @@ type ColumnResult<T> = std::result::Result<T, Failure>;
 fn kernel(reason: impl Into<String>) -> Failure {
     Failure::Kernel(EngineError::invalid(reason))
 }
+/// 时间戳与区间都以 int64 微秒存放；标签让它们不会与普通整数互相比较（Arrow 没有对应的核）。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Temporal {
+    None,
+    Timestamp,
+    Interval,
+}
 struct Column<'a> {
     data: Cow<'a, ColumnData>,
     valid: SourceBits,
     shape: Shape,
     scalar: bool,
+    temporal: Temporal,
 }
 impl Column<'_> {
     fn index(&self, row: usize) -> usize {
@@ -47,6 +55,7 @@ fn booleans(values: Vec<bool>, valid: SourceBits) -> Column<'static> {
         valid,
         shape: Shape::Bool,
         scalar: false,
+        temporal: Temporal::None,
     }
 }
 fn all(n: usize) -> SourceBits {
@@ -147,6 +156,14 @@ fn arrow_type(column: &ColumnData) -> String {
         _ => "null".into(),
     }
 }
+/// Arrow 的类型名：时间戳与区间在内部是 Int64，对外要按 pyarrow 的名字显示。
+fn column_type(column: &Column<'_>) -> String {
+    match column.temporal {
+        Temporal::Timestamp => "timestamp[us, tz=UTC]".into(),
+        Temporal::Interval => "duration[us]".into(),
+        Temporal::None => arrow_type(&column.data),
+    }
+}
 fn compare(
     a: &Column<'_>,
     b: &Column<'_>,
@@ -170,10 +187,13 @@ fn compare(
             };
             return Err(kernel(format!(
                 "Function '{name}' has no kernel matching input types ({}, {})",
-                arrow_type(&a.data),
-                arrow_type(&b.data)
+                column_type(a),
+                column_type(b)
             )));
         }
+        return Err(kernel("no matching comparison kernel"));
+    }
+    if a.temporal != b.temporal {
         return Err(kernel("no matching comparison kernel"));
     }
     let pair = Pair(&a.data, &b.data);
@@ -191,6 +211,55 @@ fn compare(
         }
     }
     Ok(booleans(values, valid))
+}
+
+fn interval_micros(micros: f64) -> ColumnResult<i64> {
+    if (-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0).contains(&micros) {
+        Ok(micros as i64)
+    } else {
+        Err(Failure::Fatal(EngineError::invalid(
+            "Python int too large to convert to C long",
+        )))
+    }
+}
+
+/// 时间戳 ± 区间（类型检查已保证两边是时间戳与区间）；Arrow 的非检查运算按 int64 回绕。
+fn arithmetic(op: &str, a: &Column<'_>, b: &Column<'_>, n: usize) -> ColumnResult<Column<'static>> {
+    let (timestamp, interval) = match (a.temporal, b.temporal) {
+        (Temporal::Timestamp, Temporal::Interval) => (a, b),
+        (Temporal::Interval, Temporal::Timestamp) if op == "+" => (b, a),
+        _ => return Err(kernel("no matching arithmetic kernel")),
+    };
+    let (ColumnData::Int64(left), ColumnData::Int64(right)) =
+        (timestamp.data.as_ref(), interval.data.as_ref())
+    else {
+        return Err(Failure::Fatal(EngineError::Storage(
+            "temporal arithmetic lost its integer columns".into(),
+        )));
+    };
+    let scalar = a.scalar && b.scalar;
+    let rows = if scalar { 1 } else { n };
+    let mut valid = SourceBits::new(rows);
+    let mut values = vec![0_i64; rows];
+    for (row, out) in values.iter_mut().enumerate() {
+        if timestamp.valid(row) && interval.valid(row) {
+            let t = left[timestamp.index(row)];
+            let d = right[interval.index(row)];
+            *out = if op == "-" {
+                t.wrapping_sub(d)
+            } else {
+                t.wrapping_add(d)
+            };
+            valid.set(row, true);
+        }
+    }
+    Ok(Column {
+        data: Cow::Owned(ColumnData::Int64(values)),
+        valid,
+        shape: Shape::Int,
+        scalar,
+        temporal: Temporal::Timestamp,
+    })
 }
 
 fn in_list(
@@ -368,6 +437,7 @@ fn evaluate(
                 valid,
                 shape,
                 scalar: false,
+                temporal: Temporal::None,
             },
         );
     }
@@ -376,7 +446,7 @@ fn evaluate(
             .names
             .iter()
             .any(|name| name == &format!("__meta__{key}")),
-        Operand::Column(i) => keys
+        Operand::Column(i) | Operand::Timestamp(i) => keys
             .iter()
             .any(|key| tree.names[*i] == format!("__meta__{key}")),
         _ => false,
@@ -401,6 +471,21 @@ fn evaluate(
                             shape: shape(column.values()),
                             valid,
                             scalar: false,
+                            temporal: Temporal::None,
+                        }
+                    }
+                    Operand::Timestamp(i) => {
+                        let column = &base[*i];
+                        let mut valid = live.clone();
+                        if let Some(mask) = column.validity() {
+                            valid.intersect(mask.bits());
+                        }
+                        Column {
+                            data: Cow::Borrowed(column.values()),
+                            shape: shape(column.values()),
+                            valid,
+                            scalar: false,
+                            temporal: Temporal::Timestamp,
                         }
                     }
                     Operand::Dynamic(key) => {
@@ -414,6 +499,7 @@ fn evaluate(
                             shape: column.shape,
                             valid: column.valid.clone(),
                             scalar: false,
+                            temporal: Temporal::None,
                         }
                     }
                     Operand::Literal(literal) => {
@@ -429,13 +515,20 @@ fn evaluate(
                             Literal::Float(v) => ColumnData::Double(vec![*v]),
                             Literal::Bool(v) => ColumnData::Bool(vec![*v]),
                             Literal::String(v) => ColumnData::VarChar(vec![v.clone()]),
-                            _ => return Err(Failure::Fatal(eval::unsupported())),
+                            Literal::Timestamp(v) => ColumnData::Int64(vec![*v]),
+                            // 区间超出 int64 时，3.x 在把标量交给 Arrow 的位置报 OverflowError。
+                            Literal::Interval(v) => ColumnData::Int64(vec![interval_micros(*v)?]),
                         };
                         Column {
                             shape: shape(&data),
                             data: Cow::Owned(data),
                             valid: all(1),
                             scalar: true,
+                            temporal: match literal {
+                                Literal::Timestamp(_) => Temporal::Timestamp,
+                                Literal::Interval(_) => Temporal::Interval,
+                                _ => Temporal::None,
+                            },
                         }
                     }
                 });
@@ -446,7 +539,9 @@ fn evaluate(
                 Kind::And(ids) | Kind::Or(ids) => {
                     work.extend(ids.iter().rev().map(|&id| (id, false)))
                 }
-                Kind::Cmp(_, a, b) => work.extend([(*b, false), (*a, false)]),
+                Kind::Cmp(_, a, b) | Kind::Arith(_, a, b) => {
+                    work.extend([(*b, false), (*a, false)])
+                }
                 Kind::Not(child)
                 | Kind::Like { value: child, .. }
                 | Kind::IsNull { value: child, .. }
@@ -471,6 +566,7 @@ fn evaluate(
                 Comparison::parse(op).map_err(Failure::Fatal)?,
                 n,
             )?,
+            Kind::Arith(op, a, b) => arithmetic(op, get(*a)?, get(*b)?, n)?,
             Kind::And(ids) | Kind::Or(ids) => {
                 let and = matches!(tree.ast.nodes[id].kind, Kind::And(_));
                 let mut data = vec![and; n];
@@ -574,7 +670,7 @@ pub(super) fn evaluate_rows(tree: &Tree, rows: &[DynamicRow<'_>]) -> Result<Sour
         .iter()
         .flatten()
         .filter_map(|operand| {
-            if let Operand::Column(i) = operand {
+            if let Operand::Column(i) | Operand::Timestamp(i) = operand {
                 Some(*i)
             } else {
                 None

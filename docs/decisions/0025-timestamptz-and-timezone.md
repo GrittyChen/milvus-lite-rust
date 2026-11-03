@@ -1,6 +1,6 @@
 # 0025 TIMESTAMPTZ 与 timezone 属性
 
-- 状态：设计评审通过（r2）；第 1 步（类型与存储）已实施，第 2–4 步待做
+- 状态：设计评审通过（r2）；第 1 步（类型与存储）已实施并提交，第 2 步（过滤）已实施待评审，第 3–4 步待做
 - 日期：2026-11-02
 - 参照：milvus-lite v3.2.1 / `43d1257774e629bc9f66873977ab7c320d5bf5a7`；pymilvus 3.0.2 实测，2.6.17 经源码核对（`timezone`、`time_fields` 参数与 `DataType.TIMESTAMPTZ` 同样存在，实施阶段补测）
 - 前置：[0014](0014-index-definitions-and-filter-expressions.md)（过滤语法与 ISO / INTERVAL 字面量的语法校验）、[0015](0015-nullable-defaults-and-array.md)（nullable 与默认值）、[0023](0023-aliases-rename-truncate-databases.md)（集合与数据库属性；其取舍 1 把 `timezone` 留给本切片）、[0024](0024-group-by-search.md)
@@ -103,13 +103,21 @@ pymilvus 把时间值作为字符串（`string_data`）发送；原始 gRPC 还�
 - 整数微秒（`timestamptz_data`）在解码处校验到 `[0001-01-01, 9999-12-31T23:59:59.999999]`，越界报 1 `date value out of range`，**整批拒绝、零写入**，不复制 3.x 的「写入成功、读取全体失败」。
 - 读取 3.x 已经写出的越界整数（毒化目录）：输出换算处对同一范围做检查，越界报同文案的 1，不 panic、不返回截断值；该报错与 3.x 一致（3.x 对这类目录本来就整体失败）。互通用例用 3.x 经原始 gRPC 写出的毒化 fixture 钉住。
 - INVERTED 索引定义接受该类型（与其它标量一致，按扫描执行）；保留字 `iso` / `interval` 加入字段名检查。
-- `ARRAY<TIMESTAMPTZ>`：把 `Timestamptz` 加入 [schema.rs](../../crates/core/src/schema.rs) 里 ARRAY 元素的拒绝列表（现为 Array / Json / FloatVector），报 `EngineError::unsupported`（UNIMPLEMENTED，文案 `ARRAY of TIMESTAMPTZ ...`）；不拒绝的话枚举新增后会被接受，之后在数据层失败。create / insert 各有测试钉住。
+- `ARRAY<TIMESTAMPTZ>`：把 `Timestamptz` 加入 [schema.rs](../../crates/core/src/schema.rs) 里 ARRAY 元素的拒绝列表（现为 Array / Json / FloatVector），报 `EngineError::unsupported`（UNIMPLEMENTED，文案 `ARRAY element type TIMESTAMPTZ is not supported ...`）；不拒绝的话枚举新增后会被接受，之后在数据层失败。create / insert 各有测试钉住。
 
-### 过滤（第 2 步）
+### 过滤（第 2 步，已实施）
 
-- 解析阶段把 `ISO` 字面量算成 UTC 微秒、`INTERVAL` 算成微秒（浮点公式与向零截断同 3.x）；无偏移的 ISO 先走第 3 步给出的时区，未配置时给出 3.x 的 6 错误。
-- 语义检查增加时间戳 / 区间两个类型：比较与 `in` 只允许同类型；加减只放开「时间戳 ± 区间」「区间 + 时间戳」；其余算术保持现有 UNIMPLEMENTED，但用到时间戳 / 区间的错误组合先报 3.x 的类型错误（与 3.x 的先后顺序一致，由差分钉住）。
-- 求值：列是 Int64 微秒，加减用 `wrapping_add` / `wrapping_sub` 复刻 int64 回绕；区间微秒超出 i64 报 1 `Python int too large to convert to C long`。动态字段 / JSON 路径与时间戳比较不命中。
+- 解析阶段把 `ISO` 字面量算成 UTC 微秒（`Literal::Timestamp`）、`INTERVAL` 算成向零截断的微秒（`Literal::Interval(f64)`，浮点运算次序同 3.x：周先乘 7 再乘 86400）；错误位置是字符串字面量。无偏移的 ISO 先走第 3 步给出的时区，未配置时给出 3.x 的 6 错误。四百位数字的区间在解析阶段得到无穷大，报 6 `cannot convert float infinity to integer`。
+- 语义检查增加 `timestamptz` / `interval` 两个类型（文案与 3.x 相同，字段描述为 `timestamptz (field 'ts')`）：比较与 `in` 只允许同类型或动态字段；加减只放开「时间戳 ± 区间」「区间 + 时间戳」；其余组合报 6 `arithmetic '+' requires numeric operands, left|right side is ...`，一元负号作用在非数字上同理（位置是 `-`）。
+- **范围外的算术**：不涉及时间值的算术（`n + 1`、`-n`）仍是 UNIMPLEMENTED，并且与既有约定一致，先于该表达式里的语义错误（3.x 对 `n + 1 > 2 and ts > 5` 报类型错误，本实现报 UNIMPLEMENTED）。解析阶段的错误（无偏移 / 非法字面量 / 非法区间）两边相同，先于 UNIMPLEMENTED。判定：算术节点的子树里没有时间字面量也没有 TIMESTAMPTZ 字段，即为范围外。
+- **求值沿用三条路线，语义随路线而不同**（3.x 实测，探针 147 个场景）：
+  - Arrow 路线（只含 schema 字段）：时间戳与区间都是 int64 微秒，加减按 **int64 回绕**（`wrapping_add` / `wrapping_sub`）；区间超出 int64 时在把标量交给 Arrow 处报 1 `Python int too large to convert to C long`，只在真正对行求值时发生（空集合不报，`count(*)` 与 search 报）。
+  - Hybrid 路线（含动态字段）：先走与 Arrow 相同的列式求值；遇到内核错误（动态列与时间戳列的比较、不支持的 `in` 类型配对、ARRAY 与时间值的比较）退回 Python 求值器。区间超出 int64 的 OverflowError 不退回，直接报错。
+  - Python 路线（含 JSON 路径、`array_length`、`text_match` 等，或 Hybrid 的退回）：值是 `datetime` / `timedelta`，**不回绕**：`timedelta` 的天数超过 999999999 报 1 `days=N; must have magnitude <= 999999999`（超过 C int 报 1 `Python int too large to convert to C int`），`datetime ± timedelta` 超出 `[0001, 9999]` 报 1 `date value out of range`；区间字面量在每行求值到它时才构造，所以会被 `and` / `or` 的短路跳过。时间戳与动态值的 `==` 为假、`!=` 为真、顺序比较为空值（未知），`in` 为假，`not in` 为真。
+  - 因此同一个表达式在不同路线上对极端数据的结果不同（如 `ts + INTERVAL 'P1D'` 在含 `9999-12-31` 的数据上，Arrow 路线成功、Python 路线报 1）；这是 3.x 的行为，被差分表（`timestamp_filter_cases.py`，237 个表达式）钉住。
+- 列式求值器给每一列标注时间类别（无 / 时间戳 / 区间）。**比较**：类别不同的两列按内核错误处理，使 Hybrid 退回 Python 求值器，与 3.x 的 Arrow 报 `ArrowNotImplementedError` 后退回一致；这样动态整数 `dynn > ISO '0001-01-01...'` 不会因为同为 int64 而误判为真。ARRAY 与时间值的比较先于类别检查，错误文案按 pyarrow 的类型名显示（`Function 'greater' has no kernel matching input types (list<item: int64>, timestamp[us, tz=UTC])`，区间是 `duration[us]`）。
+- **`in` / `not in` 不同于比较**：Arrow 的 `is_in` 会把 timestamp 的 value_set 转成 int64 微秒，所以整数列（含动态整数列）与 `ISO` 列表按微秒值比较，`dmicro in [ISO '2025-01-01T00:00:00Z']` 命中值恰为该微秒数的行；全空列的 `is_in` 为 false、`not in` 为 true；浮点 / 字符串 / 布尔 / ARRAY 列等不支持的配对才是内核错误：含动态字段（Hybrid）时退回 Python 求值器，纯 Arrow 路线（只含 schema 字段）直接报该内核错误。Python 路线（含 JSON 路径的表达式）仍不做微秒匹配，这是 3.x 的路线差异，差分表同时钉住两种结果。
+- 过滤的 S1 快路径（`legacy_shape`）排除 TIMESTAMPTZ 字段，时间戳表达式一律走布尔树。
 
 ### 时区（第 3 步）
 
@@ -162,6 +170,7 @@ Query、Search 输出支持（Hybrid 随 HybridSearch）；非 TIMESTAMPTZ 字�
 | 高端边界附近（`9999-12-29` 起）无偏移时间的换算 | 由 zoneinfo 精确换算 | 用 `9999-12-30T22:00Z` 处的偏移补算（该处没有偏移变换），结果与 3.x 一致，越界同样报 1 | jiff 的 `Timestamp` 上界比 Python 低约 26 小时 |
 | ARRAY 的 TIMESTAMPTZ 元素 | 能建表（pymilvus 无法写入元素，数据为空） | 创建 UNIMPLEMENTED；打开含该字段的 3.x 目录时，访问该集合 fail-closed 为带明确文案的 UNIMPLEMENTED（不是 100），其他集合不受影响，互通用例钉住 | 范围外，需要时单独做 |
 | 区间微秒超出 int64 | 1 `Python int too large to convert to C long` | 同 3.x | 复刻 |
+| 不涉及时间值的算术与时间值同在一个表达式里（`n + 1 > 2 and ts > 5`、`(n + 1) + ts > 5`） | 报类型错误（6） | UNIMPLEMENTED | 一般算术仍在范围外，沿用「范围外构造先于语义检查」（0006 第 1 项）；纯时间值的算术、解析阶段的错误与 3.x 相同 |
 | 数据库 `database_properties.json` 不可读时的 naive 时间字符串 / `time_fields` / naive 默认值 | 数据库打开时已经读过该文件，损坏的库根本打不开 | 只有这些操作报 1/0 存储错误，零写入；其余操作不读该文件 | 0023 B 已登记「集合操作不读属性」，只对需要时区的操作例外 |
 | 读取 3.x 毒化目录（越界整数微秒） | 任何读到这些行的查询整体报 1 | 同样报 1 `date value out of range`，不 panic | 一致；本实现只是不再能写出这样的目录 |
 
@@ -181,7 +190,7 @@ Query、Search 输出支持（Hybrid 随 HybridSearch）；非 TIMESTAMPTZ 字�
 ## 实施步骤
 
 1. **类型与存储**：`Timestamptz` 数据类型、`schema.json` / Arrow / WAL / Parquet、gRPC 编解码与输出（含默认值回显）、`INVERTED` 定义、保留字、`ARRAY<TIMESTAMPTZ>` 拒绝、整数范围校验与毒化读取、互通 fixture 与用例；此时只接受带偏移的字符串，无偏移仍按「没有配置时区」报错。
-2. **过滤**：ISO / INTERVAL 求值、类型检查、`in`、加减与回绕、错误顺序。
+2. **过滤**（已实施）：ISO / INTERVAL 求值、类型检查、`in`、加减与回绕、三条求值路线的差异、错误顺序；差分表 237 个表达式。
 3. **时区**：jiff 依赖、时区解析与 `fold=0` 换算及边界补算、`TimezoneSource` 与锁边界、请求 / 集合 / 数据库时区的优先级与两个校验点、无偏移字符串（写入、默认值、过滤字面量）、`time_fields`、属性 RPC（集合与数据库）与既有断言的改写、并发与损坏属性文件的测试。
 4. **差分、参照用例、文档与计数**：探针转差分，复制参照用例，0006 差异登记（含「只有 Describe / Alter 读」一行与 0023 取舍 1 的同步），README、AGENTS（依赖、索引）、验收记录与固定统计。
 

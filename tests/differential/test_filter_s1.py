@@ -35,10 +35,10 @@ def test_iso_diagnostics_cover_clock_shapes_offsets_and_tail_bytes(diff):
                  "ISO '2025-01-01T00200400Z'", "ISO '2025-01-01T002004001Z'",
                  "ISO '2025-01-01T12345678901234Z'", "ISO '2025-01-01T00200400+08'",
                  "ISO '0001-01-01T00:00:00.3+00:00:00.4'", "ISO '2025-01-01T00Z\x00+08'"]:
-        assert run(lambda c:c.query(name,filter=expr),diff.rust)[:2]==("rpc","UNIMPLEMENTED")
-        reference=run(lambda c:c.query(name,filter=expr),diff.ref)
-        assert reference[:3]==("err",6,6)
-        assert reference[3].startswith("top-level filter expression must evaluate to bool, got timestamptz")
+        # 语法合法的 ISO 字面量单独成表达式：两边都在类型检查处报同一条 6（0025 起本实现也求值时间字面量）。
+        result=diff.step(f"valid_{expr}",lambda c:c.query(name,filter=expr),error=True)
+        assert result[:3]==("err",6,6)
+        assert result[3].startswith("top-level filter expression must evaluate to bool, got timestamptz")
 
 MAX = 9223372036854775807
 BELOW_2_63 = 9223372036854774784  # 小于 2^63 的最大 double
@@ -340,8 +340,10 @@ def test_filter_errors_and_full_syntax_before_unsupported(diff):
         diff.step(expr, lambda c: c.query(name, filter=expr))
     for expr in ["true and missing>1", "active and missing>1", "array_length(age) > 0"]:
         diff.step(expr, lambda c: c.query(name, filter=expr), error=True)
-    for expr in ["age + 1 > 0", "text_match(title, 'x')", "ISO '2025-01-01T00:00:00Z' == ISO '2025-01-01T00:00:00Z'"]:
+    for expr in ["age + 1 > 0", "text_match(title, 'x')"]:
         assert run(lambda c: c.query(name, filter=expr), diff.rust)[:2] == ("rpc", "UNIMPLEMENTED"), expr
+    # 时间字面量的比较已支持（0025）：两边都求值。
+    diff.step("iso_literals", lambda c: c.query(name, filter="ISO '2025-01-01T00:00:00Z' == ISO '2025-01-01T00:00:00Z'", output_fields=["id"]))
     diff.step("disabled_meta_access",lambda c:c.query(name,filter="$meta['x'] == 1"),error=True)
 
 def test_dynamic_collections_keep_reserved_field_errors_and_resolve_dynamic_fields(diff):

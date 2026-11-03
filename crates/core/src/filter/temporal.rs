@@ -1,4 +1,4 @@
-//! ISO / INTERVAL 在 S1 中只解析与校验，不参与求值；仍须先报告字面量的语法错误。
+//! ISO / INTERVAL 字面量的解析：语法错误在解析阶段报告，数值供过滤求值使用（0025）。
 use crate::error::py_repr;
 
 fn number(s: &str) -> Option<u32> {
@@ -273,10 +273,15 @@ pub(crate) fn parse_iso(s: &str) -> Result<IsoValue, String> {
     Ok(IsoValue::Aware { utc_micros: utc })
 }
 
-pub(super) fn validate(s: &str, iso: bool) -> Result<(), String> {
+/// 3.x 在解析阶段就把字面量换算成数值；没有偏移的 ISO 需要时区（见 `NAIVE_MESSAGE`），超范围报 `date value out of range`。
+pub(super) fn literal(s: &str, iso: bool) -> Result<super::parser::Literal, String> {
+    use super::parser::Literal;
     if iso {
         return match parse_iso(s)? {
-            IsoValue::Aware { .. } => Ok(()),
+            value @ IsoValue::Aware { .. } => value
+                .unix_micros()
+                .map(Literal::Timestamp)
+                .ok_or_else(|| "date value out of range".to_owned()),
             IsoValue::Naive { .. } => Err(NAIVE_MESSAGE.into()),
         };
     }
@@ -319,30 +324,69 @@ pub(super) fn validate(s: &str, iso: bool) -> Result<(), String> {
             return Err(fail());
         }
         let value = amount.parse::<f64>().map_err(|_| fail())?;
-        seconds += value
-            * match unit {
-                'W' => 604800.0,
-                'D' => 86400.0,
-                'H' => 3600.0,
-                'M' => 60.0,
-                _ => 1.0,
-            };
+        // 与 3.x 同序的浮点运算：周先乘 7 再乘 86400，舍入与一次乘 604800 可能不同。
+        seconds += match unit {
+            'W' => value * 7.0 * 86400.0,
+            'D' => value * 86400.0,
+            'H' => value * 3600.0,
+            'M' => value * 60.0,
+            _ => value,
+        };
         any |= value > 0.0;
         rest = &rest[end + 1..];
     }
     if !rest.is_empty() || (!any && upper != "P0D") {
         return Err(fail());
     }
-    if !(seconds * 1_000_000.0).is_finite() {
+    let micros = seconds * 1_000_000.0;
+    if !micros.is_finite() {
         return Err("cannot convert float infinity to integer".into());
     }
-    Ok(())
+    Ok(Literal::Interval(micros.trunc()))
 }
 
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+
+    fn validate(s: &str, iso: bool) -> Result<(), String> {
+        literal(s, iso).map(drop)
+    }
+
+    fn interval(s: &str) -> Result<f64, String> {
+        match literal(s, false)? {
+            super::super::parser::Literal::Interval(v) => Ok(v),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn interval_micros_follow_the_3x_float_arithmetic_and_truncate_toward_zero() {
+        assert_eq!(interval("P1D").unwrap(), 86_400_000_000.0);
+        assert_eq!(interval("p1w1d").unwrap(), 691_200_000_000.0);
+        assert_eq!(interval("PT1.9999999S").unwrap(), 1_999_999.0);
+        assert_eq!(interval("P1DT1H1M1.5S").unwrap(), 90_061_500_000.0);
+        assert_eq!(interval("P0D").unwrap(), 0.0);
+        // 周先乘 7 再乘 86400：一次乘 604800 会差 1 微秒（3.x 的结果是前者）。
+        assert_eq!(interval("P6.52W").unwrap(), 3_943_296_000_000.0);
+        assert_eq!(interval("P2.5507W").unwrap(), 1_542_663_360_000.0);
+        assert_eq!(interval("P1DT").unwrap(), 86_400_000_000.0);
+        // 超出 int64 的值保留给求值阶段报错；无穷大在解析阶段报错。
+        assert!(interval("P106751992D").unwrap() >= 9_223_372_036_854_775_808.0);
+        assert_eq!(
+            interval(&format!("P{}D", "9".repeat(400))).unwrap_err(),
+            "cannot convert float infinity to integer"
+        );
+        for bad in ["", "PT", "PT0S", "P0W", "P-1D", "P1Y", "P1M", "1D", "P1D1W"] {
+            assert!(
+                interval(bad)
+                    .unwrap_err()
+                    .starts_with("unsupported INTERVAL"),
+                "{bad}"
+            );
+        }
+    }
 
     #[test]
     fn clocks_and_offsets_share_one_scanner_with_cpython_tail_rules() {
