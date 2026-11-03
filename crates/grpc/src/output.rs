@@ -2,6 +2,7 @@
 //! 输出投影中的 schema 字段与主键（主键总在，位于它在 schema 中的位置），开启动态字段时最后是 `$meta` 列。
 //! 没有结果时各列仍然设置对应的槽位。
 
+use milvus_lite_core::timezone::{Components, TimezoneSource};
 use milvus_lite_core::{
     CollectionSchema, ColumnData, DataType, EngineError, META_FIELD, Pk, Projection, Rows, pyjson,
 };
@@ -10,10 +11,108 @@ use serde_json::{Map, Value};
 use crate::pb::schema::{self as pb, field_data, scalar_field, vector_field};
 use crate::schema::milvus_type;
 
+/// 请求里的 `time_fields`：TIMESTAMPTZ 输出字段改为按有效时区取的各分量（`Array<Int64>`）。
+/// 分量名与时区都只在真正编码一个非空时间戳值时才校验（3.x `extract_time_fields`）。
+pub(crate) struct TimeFields<'a> {
+    parts: Vec<String>,
+    timezone: &'a TimezoneSource<'a>,
+}
+
+impl<'a> TimeFields<'a> {
+    /// 3.x `_parse_time_fields`：逗号或空白分隔，空段忽略；没有任何分量时与未设置相同。
+    pub(crate) fn new(raw: Option<&str>, timezone: &'a TimezoneSource<'a>) -> Option<Self> {
+        let parts: Vec<String> = raw?
+            .split(|c: char| c == ',' || is_python_space(c))
+            .filter(|part| !part.is_empty())
+            .map(str::to_owned)
+            .collect();
+        (!parts.is_empty()).then_some(Self { parts, timezone })
+    }
+
+    fn values(&self, micros: i64) -> Result<Vec<i64>, EngineError> {
+        milvus_lite_core::timestamptz::check_micros(micros)?;
+        let local = self.timezone.for_time_fields()?.components(micros)?;
+        self.parts
+            .iter()
+            .map(|part| component(&local, part))
+            .collect()
+    }
+}
+
+/// Python `str.isspace` / `re` 的 `\s`：Unicode 空白加上 `\x1c`–`\x1f`。
+fn is_python_space(c: char) -> bool {
+    c.is_whitespace() || matches!(c, '\u{1c}'..='\u{1f}')
+}
+
+fn component(local: &Components, name: &str) -> Result<i64, EngineError> {
+    // Python 的 casefold 还会把长 s（ſ）折叠为 s。
+    Ok(match name.to_lowercase().replace('ſ', "s").as_str() {
+        "year" => local.year,
+        "month" => local.month,
+        "day" => local.day,
+        "hour" => local.hour,
+        "minute" => local.minute,
+        "second" => local.second,
+        "microsecond" => local.microsecond,
+        _ => {
+            return Err(EngineError::SchemaValidation(format!(
+                "unsupported time_fields component {}; supported: year, month, day, hour, minute, second, microsecond",
+                milvus_lite_core::error::py_repr(name)
+            )));
+        }
+    })
+}
+
+/// `Array<Int64>` 形式的时间分量列；空值行 `valid_data = false`（有空值时才带 `valid_data`）。
+fn time_fields_data(
+    name: &str,
+    columns: &[&ColumnData],
+    time_fields: &TimeFields<'_>,
+) -> Result<pb::FieldData, EngineError> {
+    let mut data = Vec::new();
+    for column in columns {
+        let ColumnData::Int64(values) = column.values() else {
+            unreachable!("{MISMATCH}");
+        };
+        for (row, &micros) in values.iter().enumerate() {
+            let null = column.is_null(row);
+            data.push(pb::ScalarField {
+                data: Some(scalar_field::Data::LongData(pb::LongArray {
+                    data: if null {
+                        Vec::new()
+                    } else {
+                        time_fields.values(micros)?
+                    },
+                })),
+            });
+        }
+    }
+    Ok(pb::FieldData {
+        r#type: milvus_type(DataType::Array),
+        field_name: name.to_owned(),
+        valid_data: if columns.iter().any(|c| c.validity().is_some()) {
+            columns
+                .iter()
+                .flat_map(|c| (0..c.len()).map(|row| !c.is_null(row)))
+                .collect()
+        } else {
+            Vec::new()
+        },
+        field: Some(field_data::Field::Scalars(pb::ScalarField {
+            data: Some(scalar_field::Data::ArrayData(pb::ArrayArray {
+                data,
+                element_type: milvus_type(DataType::Int64),
+            })),
+        })),
+        ..Default::default()
+    })
+}
+
 pub(crate) fn fields_data(
     schema: &CollectionSchema,
     projection: &Projection,
     rows: &[&Rows],
+    time_fields: Option<&TimeFields<'_>>,
 ) -> Result<Vec<pb::FieldData>, EngineError> {
     let mut out = Vec::new();
     for (i, field) in schema.fields.iter().enumerate() {
@@ -24,6 +123,12 @@ pub(crate) fn fields_data(
         } else {
             continue;
         };
+        if let (DataType::Timestamptz, Column::Data(columns), Some(time_fields)) =
+            (field.data_type, &column, time_fields)
+        {
+            out.push(time_fields_data(&field.name, columns, time_fields)?);
+            continue;
+        }
         out.push(field_data(
             &field.name,
             field.data_type,

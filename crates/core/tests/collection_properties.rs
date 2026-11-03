@@ -163,7 +163,7 @@ fn alter_merges_in_3x_order_and_reopens_in_file_order() {
 }
 
 #[test]
-fn timezone_is_rejected_after_existence_with_zero_writes() {
+fn invalid_timezone_is_rejected_after_existence_with_zero_writes() {
     let root = tempfile::tempdir().unwrap();
     let path = schema_path(root.path(), "c");
     let db = open(root.path());
@@ -176,27 +176,77 @@ fn timezone_is_rejected_after_existence_with_zero_writes() {
         db.alter_collection("", "nope", &pairs(&[("timezone", "Mars/Base")]), &[]),
         Err(EngineError::CollectionNotFound(_))
     ));
-    for request in [
-        pairs(&[("timezone", "UTC")]),
-        pairs(&[("a", "1"), ("timezone", "Mars/Base")]),
+    for (request, message) in [
+        (
+            pairs(&[("timezone", "Mars/Base")]),
+            "unknown timezone 'Mars/Base'",
+        ),
+        (
+            pairs(&[("a", "1"), ("timezone", "Mars/Base")]),
+            "unknown timezone 'Mars/Base'",
+        ),
+        (
+            pairs(&[("timezone", "")]),
+            "timezone property must be a non-empty string",
+        ),
+        (pairs(&[("timezone", " UTC")]), "unknown timezone ' UTC'"),
     ] {
         // 混在普通属性里也不先写普通属性；删除同名键也不能绕过。
         for delete in [keys(&[]), keys(&["timezone", "keep"])] {
-            assert!(matches!(
-                db.alter_collection("", "c", &request, &delete),
-                Err(EngineError::Unsupported {
-                    feature: "timezone property",
-                    ..
-                })
-            ));
+            match db.alter_collection("", "c", &request, &delete) {
+                Err(EngineError::SchemaValidation(m)) => assert_eq!(m, message),
+                other => panic!("{request:?} {delete:?}: {other:?}"),
+            }
         }
     }
+    assert!(matches!(
+        db.alter_collection("", "c", &pairs(&[("timezone", "../etc/passwd")]), &[]),
+        Err(EngineError::InvalidArgument(m))
+            if m == "ZoneInfo keys must refer to subdirectories of TZPATH, got: ../etc/passwd"
+    ));
     assert_eq!(properties(&db, "c"), pairs(&[("keep", "1")]));
     assert_eq!(file_state(&path), before);
     // 只删除 `timezone` 键不受影响。
     db.alter_collection("", "c", &[], &keys(&["timezone"]))
         .unwrap();
     assert_eq!(file_state(&path), before);
+    db.close();
+}
+
+#[test]
+fn valid_timezone_is_saved_verbatim_survives_reopen_and_can_be_removed() {
+    let root = tempfile::tempdir().unwrap();
+    let path = schema_path(root.path(), "c");
+    let db = open(root.path());
+    db.create_collection("", "c", schema()).unwrap();
+    // 值原样保存，不规范大小写；大小写不规范的名字也能解析。
+    db.alter_collection("", "c", &pairs(&[("timezone", "utc"), ("keep", "1")]), &[])
+        .unwrap();
+    assert_eq!(
+        properties(&db, "c"),
+        pairs(&[("timezone", "utc"), ("keep", "1")])
+    );
+    db.alter_collection("", "c", &pairs(&[("timezone", "Asia/Shanghai")]), &[])
+        .unwrap();
+    assert_eq!(
+        properties(&db, "c"),
+        pairs(&[("timezone", "Asia/Shanghai"), ("keep", "1")])
+    );
+    db.close();
+    let db = open(root.path());
+    // 文件按键排序保存，重开后按文件顺序。
+    assert_eq!(
+        properties(&db, "c"),
+        pairs(&[("keep", "1"), ("timezone", "Asia/Shanghai")])
+    );
+    assert!(
+        std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("\"timezone\": \"Asia/Shanghai\"")
+    );
+    db.alter_collection("", "c", &[], &keys(&["timezone"]))
+        .unwrap();
+    assert_eq!(properties(&db, "c"), pairs(&[("keep", "1")]));
     db.close();
 }
 
@@ -238,8 +288,8 @@ fn out_of_scope_schemas_are_unsupported_without_writes() {
     let db = open(root.path());
     db.create_collection("", "c", schema()).unwrap();
     db.close();
-    // 非字符串属性与 3.x 写入的 `timezone` 都是 0006 第 14 项的范围外 schema。
-    for properties in [r#"{"n": 1}"#, r#"{"timezone": "UTC"}"#] {
+    // 非字符串属性是 0006 第 14 项的范围外 schema。
+    for properties in [r#"{"n": 1}"#] {
         let text = std::fs::read_to_string(&path).unwrap();
         let start = text.find("\"properties\": ").unwrap();
         let end = start + text[start..].find(['}']).unwrap() + 1;
@@ -254,7 +304,7 @@ fn out_of_scope_schemas_are_unsupported_without_writes() {
         .unwrap();
         let db = open(root.path());
         let before = file_state(&path);
-        for delete in [keys(&[]), keys(&["n", "timezone"])] {
+        for delete in [keys(&[]), keys(&["n"])] {
             assert!(matches!(
                 db.alter_collection("", "c", &pairs(&[("k", "v")]), &delete),
                 Err(EngineError::Unsupported { .. })

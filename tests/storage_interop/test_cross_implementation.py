@@ -1567,6 +1567,62 @@ assert rows[4]['ts'] is None and rows[4]['ts2'] == '1999-12-31T23:00:00Z', rows
     assert manifest["partitions"]["_default"]["data_files"]
 
 
+@pytest.mark.parametrize("first", ["rust", "reference"])
+def test_timezone_property_written_by_one_implementation_is_honored_by_the_other(
+    tmp_path, interpreters, first
+):
+    """0025 互通：集合的 `timezone` 属性（规范名）写在 schema.json 里，两边按它解释无偏移的时间字符串；
+    一边改属性后另一边立即按新值解释，已存数据不变；naive 默认值在创建时换算成微秒。"""
+    root = tmp_path / "timezone.db"
+    steps = [
+        TIMESTAMPTZ_SCHEMA
+        + """
+client.create_collection('c', schema=ts_schema, index_params=indexes, properties={'timezone': 'Asia/Shanghai'})
+client.insert('c', [
+    {'id': 1, 'vector': [0.0, 0.0], 'ts': '2025-01-01T08:00:00', 'ts2': '2025-01-01T08:00:00'},
+    {'id': 2, 'vector': [0.0, 0.0], 'ts': '2025-01-01T08:00:00+01:00'},
+])
+dflt = MilvusClient.create_schema(auto_id=False)
+dflt.add_field('id', DataType.INT64, is_primary=True)
+dflt.add_field('vector', DataType.FLOAT_VECTOR, dim=2)
+dflt.add_field('ts', DataType.TIMESTAMPTZ, default_value='2025-07-01T12:00:00')
+client.create_collection('d', schema=dflt, index_params=indexes, properties={'timezone': 'America/New_York'})
+client.flush('c')
+""",
+        """
+client.load_collection('c')
+client.load_collection('d')
+assert client.describe_collection('c')['properties']['timezone'] == 'Asia/Shanghai'
+rows = {r['id']: r['ts'] for r in client.query('c', filter="ts == ISO '2025-01-01T08:00:00'", output_fields=['ts'])}
+assert rows == {1: '2025-01-01T00:00:00Z'}, rows
+assert [r['ts'] for r in client.query('c', filter='id == 1', output_fields=['ts'], time_fields='hour')] == [[8]]
+client.insert('d', [{'id': 1, 'vector': [0.0, 0.0]}])
+assert [r['ts'] for r in client.query('d', filter='id == 1', output_fields=['ts'])] == ['2025-07-01T16:00:00Z']
+client.insert('c', [{'id': 3, 'vector': [0.0, 0.0], 'ts': '2025-01-01T09:00:00'}])
+client.alter_collection_properties('c', {'timezone': 'UTC'})
+client.flush('c')
+""",
+        """
+client.load_collection('c')
+client.load_collection('d')
+assert client.describe_collection('c')['properties']['timezone'] == 'UTC'
+ids = sorted(r['id'] for r in client.query('c', filter="ts == ISO '2025-01-01T00:00:00'", output_fields=['id']))
+assert ids == [1], ids
+rows = {r['id']: r['ts'] for r in client.query('c', filter='id >= 1', output_fields=['ts'])}
+assert rows[1] == '2025-01-01T00:00:00Z' and rows[2] == '2025-01-01T07:00:00Z', rows
+assert rows[3] == '2025-01-01T01:00:00Z', rows
+assert [r['ts'] for r in client.query('c', filter='id == 1', output_fields=['ts'], time_fields='hour')] == [[0]]
+assert [r['ts'] for r in client.query('d', filter='id == 1', output_fields=['ts'])] == ['2025-07-01T16:00:00Z']
+""",
+    ]
+    alternate(tmp_path, interpreters, first, root, steps)
+    schema_json = json.loads((root / "collections/c/schema.json").read_text())
+    assert schema_json["properties"] == {"timezone": "UTC"}
+    default = json.loads((root / "collections/d/schema.json").read_text())
+    ts = next(f for f in default["fields"] if f["name"] == "ts")
+    assert ts["default_value"] == 1_751_385_600_000_000 and default["properties"] == {"timezone": "America/New_York"}
+
+
 def test_reference_poisoned_timestamps_fail_reads_without_crashing_rust(tmp_path, interpreters):
     """3.x 对原始 gRPC 的整数微秒不校验，越界值只能留在 WAL（3.x 自己刷盘也会失败）；读到时本实现与 3.x 一样报 1 `date value out of range`，不 panic。
     3.x 也接受越界的整数默认值，含它的目录本实现必须能打开与描述；使用该默认值的写入报 1（已登记差异），显式给值的写入与读取照常。"""

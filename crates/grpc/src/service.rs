@@ -538,8 +538,16 @@ impl Service for MilvusService {
         let database = database(&request, |r| &r.db_name);
         let req = request.into_inner();
         self.run(Branch::Engine, move |db| {
-            let _handle = db.collection(&database, &req.collection_name)?;
-            let batch = insert::decode(req.fields_data, req.num_rows)?;
+            let handle = db.collection(&database, &req.collection_name)?;
+            let database_timezone = || db.database_timezone(&database);
+            let (timestamptz_fields, timezone) =
+                insert::timezone_context(&handle, &database_timezone);
+            let batch = insert::decode(
+                req.fields_data,
+                req.num_rows,
+                &timestamptz_fields,
+                &timezone,
+            )?;
             let outcome = db.insert_partition_with_pk_type(
                 &database,
                 &req.collection_name,
@@ -589,11 +597,19 @@ impl Service for MilvusService {
         let database = database(&request, |r| &r.db_name);
         let req = request.into_inner();
         self.run(Branch::Engine, move |db| {
-            let _handle = db.collection(&database, &req.collection_name)?;
+            let handle = db.collection(&database, &req.collection_name)?;
             if !req.field_ops.is_empty() {
                 return Err(schema::unsupported("field_ops"));
             }
-            let batch = insert::decode(req.fields_data, req.num_rows)?;
+            let database_timezone = || db.database_timezone(&database);
+            let (timestamptz_fields, timezone) =
+                insert::timezone_context(&handle, &database_timezone);
+            let batch = insert::decode(
+                req.fields_data,
+                req.num_rows,
+                &timestamptz_fields,
+                &timezone,
+            )?;
             let outcome = db.upsert_partition_with_pk_type(
                 &database,
                 &req.collection_name,
@@ -652,7 +668,7 @@ impl Service for MilvusService {
         let req = request.into_inner();
         self.run(Branch::Engine, move |db| {
             let handle = db.collection(&database, &req.collection_name)?;
-            query::query(&handle, req)
+            query::query(&handle, &|| db.database_timezone(&database), req)
         })
         .await
     }
@@ -678,7 +694,13 @@ impl Service for MilvusService {
             if let Some(pause) = after_snapshot {
                 pause();
             }
-            search::search(&snapshot, db.compute(), parsed, req.output_fields)
+            search::search(
+                &snapshot,
+                db.compute(),
+                &|| db.database_timezone(&database),
+                parsed,
+                req.output_fields,
+            )
         })
         .await
     }

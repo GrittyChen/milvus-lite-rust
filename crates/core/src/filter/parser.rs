@@ -417,6 +417,7 @@ fn lex(source: &str) -> Result<Vec<Token>> {
 struct Parser<'a> {
     tokens: Vec<Token>,
     at: usize,
+    naive: NaiveResolver<'a>,
     source: &'a str,
     nodes: Vec<Node>,
     depth: usize,
@@ -896,8 +897,13 @@ impl Parser<'_> {
             ));
         };
         self.take();
-        let literal = super::temporal::literal(&s, tok.kind == "iso")
-            .map_err(|m| self.error(m, value.pos, 1, None))?;
+        let literal =
+            super::temporal::literal(&s, tok.kind == "iso", self.naive).map_err(|failure| {
+                match failure {
+                    super::temporal::Failure::Message(m) => self.error(m, value.pos, 1, None),
+                    super::temporal::Failure::Engine(e) => e,
+                }
+            })?;
         Ok(self.node(Kind::Lit(literal), tok.pos))
     }
     fn function(&mut self, tok: Token) -> Result<usize> {
@@ -1041,11 +1047,15 @@ impl Parser<'_> {
     }
 }
 
-pub(super) fn parse(source: &str) -> Result<Ast> {
+/// 把没有偏移的本地时间（自 `0001-01-01` 起的微秒）换算成 UTC Unix 微秒。
+pub(super) type NaiveResolver<'a> = &'a dyn Fn(i128) -> Result<i64>;
+
+pub(super) fn parse(source: &str, naive: NaiveResolver<'_>) -> Result<Ast> {
     let tokens = lex(source)?;
     let mut parser = Parser {
         tokens,
         at: 0,
+        naive,
         source,
         nodes: Vec::new(),
         depth: 0,
@@ -1070,6 +1080,12 @@ pub(super) fn parse(source: &str) -> Result<Ast> {
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+    /// 语法与诊断的语料不涉及时区：无偏移的 ISO 字面量按「没有配置时区」处理。
+    fn parse(source: &str) -> Result<Ast> {
+        super::parse(source, &|_| {
+            Err(EngineError::schema(super::super::temporal::NAIVE_MESSAGE))
+        })
+    }
     #[test]
     fn reference_parser_acceptance_and_diagnostics_match_the_generated_corpus() {
         let cases: serde_json::Value =

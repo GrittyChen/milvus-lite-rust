@@ -337,12 +337,16 @@ def test_create_collection_remaining_unsupported(env):
     unimplemented(create, stub, "c", pk, v, field("t", DataType.VARCHAR, max_length=8, enable_analyzer="True"))
     unimplemented(create, stub, "c", pk, v, field("t", DataType.VARCHAR, max_length=8,
                                                   analyzer_params='{"type": "english", "x": NaN}'))
-    unimplemented(
-        stub.CreateCollection,
-        milvus_pb2.CreateCollectionRequest(
-            collection_name="tz", schema=schema_bytes(pk, v),
-            properties=[common_pb2.KeyValuePair(key="timezone", value="UTC")]),
-    )
+    # 集合的 timezone 属性随 TIMESTAMPTZ 一起接入（0025）：合法值保存，坏值 6 且不创建。
+    def create_with_timezone(name, value):
+        return status_of(stub.CreateCollection(milvus_pb2.CreateCollectionRequest(
+            collection_name=name, schema=schema_bytes(pk, v),
+            properties=[common_pb2.KeyValuePair(key="timezone", value=value)])))
+    assert create_with_timezone("tz", "UTC") == (0, 0, "")
+    assert create_with_timezone("tz_bad", "Mars/Base") == (6, 6, "unknown timezone 'Mars/Base'")
+    assert create_with_timezone("tz_bad", "") == (6, 6, "timezone property must be a non-empty string")
+    assert [name for name in stub.ShowCollections(milvus_pb2.ShowCollectionsRequest()).collection_names
+            if name.startswith("tz")] == ["tz"]
 
 
 # ── 写入 ─────────────────────────────────────────────────────
@@ -742,7 +746,10 @@ def test_search_m1_unsupported(env):
     assert list(response.results.ids.int_id.data) == [1, 2]
     empty = stub.Search(search_req(partition_names=["p"]))
     assert status_of(empty)[0] == 0 and not empty.results.ids.int_id.data
-    unimplemented(stub.Search, search_req(params={"timezone": "UTC"}))
+    # 请求的 timezone 已接入（0025）：合法时区不影响结果，坏时区在响应编码处报 6（空表达式也一样）。
+    assert status_of(stub.Search(search_req(params={"timezone": "UTC"})))[0] == 0
+    assert status_of(stub.Search(search_req(params={"timezone": "Mars/Base"}))) == (
+        6, 6, "unknown timezone 'Mars/Base'")
     # Python 的 json.loads 能解析、serde_json 不能解析的 params：其中可能有 range search 的参数，
     # 不能像解析失败那样忽略（0004「决策」）。
     for extra in ["NaN", "Infinity", "-Infinity", '"\\ud800"']:
@@ -807,6 +814,95 @@ def test_search_group_by_translation(env):
     basic(stub, "d", dynamic=True)
     assert status_of(stub.Search(search_req("d", params={"group_by_field": "zz"})))[2] == (
         "group_by_field 'zz' not found in schema")
+
+
+def test_timezone_translation(env):
+    """0025 第 3 步：请求、集合、数据库三层 timezone 的优先级、两个校验点与 time_fields 的输出形态；
+    与 3.x 的逐项对照见 tests/differential。"""
+    client, stub, _ = env
+
+    def make(name, **properties):
+        schema = MilvusClient.create_schema(auto_id=False)
+        schema.add_field("id", DataType.INT64, is_primary=True)
+        schema.add_field("v", DataType.FLOAT_VECTOR, dim=2)
+        schema.add_field("ts", DataType.TIMESTAMPTZ, nullable=True)
+        index = client.prepare_index_params()
+        index.add_index("v", index_type="FLAT", metric_type="L2")
+        client.create_collection(name, schema=schema, index_params=index,
+                                 **({"properties": properties} if properties else {}))
+        client.load_collection(name)
+
+    def ids(name, expr, **kwargs):
+        return sorted(r["id"] for r in client.query(name, filter=expr, output_fields=["id"], **kwargs))
+
+    def error(call, *args, **kwargs):
+        with pytest.raises(Exception) as caught:
+            call(*args, **kwargs)
+        return str(caught.value)
+
+    naive = "TIMESTAMPTZ value must include a timezone offset or use a configured timezone"
+    make("plain")
+    assert naive in error(client.insert, "plain", [{"id": 1, "v": [0.0, 0.0], "ts": "2025-01-01T08:00:00"}])
+    # 请求 timezone 只影响过滤与 time_fields，写入没有请求时区。
+    client.insert("plain", [{"id": 1, "v": [0.0, 0.0], "ts": "2025-01-01T00:00:00Z"}])
+    assert ids("plain", "ts == ISO '2025-01-01T08:00:00'", timezone="Asia/Shanghai") == [1]
+    assert ids("plain", "ts == ISO '2025-01-01T08:00:00'", timezone="utc") == []
+    assert naive in error(client.query, "plain", filter="ts == ISO '2025-01-01T08:00:00'")
+
+    # 集合 timezone：写入与过滤按它解释，请求值覆盖它，改属性不改已存数据。
+    make("shanghai", timezone="Asia/Shanghai")
+    client.insert("shanghai", [{"id": 1, "v": [0.0, 0.0], "ts": "2025-01-01T08:00:00"}])
+    assert ids("shanghai", "ts == ISO '2025-01-01T00:00:00Z'") == [1]
+    assert ids("shanghai", "ts == ISO '2025-01-01T08:00:00'") == [1]
+    assert ids("shanghai", "ts == ISO '2025-01-01T08:00:00'", timezone="UTC") == []
+    client.alter_collection_properties("shanghai", {"timezone": "America/New_York"})
+    assert ids("shanghai", "ts == ISO '2025-01-01T00:00:00Z'") == [1]
+    assert ids("shanghai", "ts == ISO '2024-12-31T19:00:00'") == [1]
+    client.drop_collection_properties("shanghai", ["timezone"])
+    assert naive in error(client.query, "shanghai", filter="ts == ISO '2024-12-31T19:00:00'")
+
+    # 数据库 timezone：没有集合值时生效，改动立即影响已打开的集合；写入的 naive 默认值按创建时的值换算。
+    client.create_database("tzdb", properties={"timezone": "Asia/Tokyo"})
+    client.use_database("tzdb")
+    make("dbc")
+    client.insert("dbc", [{"id": 1, "v": [0.0, 0.0], "ts": "2025-01-01T09:00:00"}])
+    assert ids("dbc", "ts == ISO '2025-01-01T00:00:00Z'") == [1]
+    client.alter_database_properties("tzdb", {"timezone": "UTC"})
+    assert ids("dbc", "ts == ISO '2025-01-01T09:00:00'") == []
+    assert ids("dbc", "ts == ISO '2025-01-01T00:00:00'") == [1]
+    client.drop_database_properties("tzdb", ["timezone"])
+    assert naive in error(client.insert, "dbc", [{"id": 2, "v": [0.0, 0.0], "ts": "2025-01-01T00:00:00"}])
+    client.use_database("default")
+    client.drop_collection("dbc", db_name="tzdb")
+
+    # 校验点：非空表达式在解析之前、响应编码处再一次；count(*) 加空表达式不经过任何一处。
+    assert "unknown timezone 'bad'" in error(client.query, "plain", filter="id >", timezone="bad")
+    assert "unknown timezone 'bad'" in error(client.query, "plain", filter="", output_fields=["id"], timezone="bad")
+    assert client.query("plain", filter="", output_fields=["count(*)"], timezone="bad") == [{"count(*)": 1}]
+    assert "unknown timezone 'bad'" in error(
+        client.query, "plain", filter="id >= 0", output_fields=["count(*)"], timezone="bad")
+    assert "unknown timezone 'bad'" in error(
+        client.search, "plain", data=[[0.0, 0.0]], limit=1, timezone="bad")
+
+    # time_fields：TIMESTAMPTZ 输出改为 Array<Int64>，空值整行无效，坏组件只在编码非空值时报错。
+    client.insert("plain", [{"id": 2, "v": [0.0, 0.0], "ts": None},
+                            {"id": 3, "v": [0.0, 0.0], "ts": "2025-03-09T07:30:15.25Z"}])
+    rows = {r["id"]: r["ts"] for r in client.query(
+        "plain", filter="id in [2, 3]", output_fields=["ts"],
+        time_fields="Year, month,DAY\thour minute,second,microsecond", timezone="America/New_York")}
+    assert rows == {2: None, 3: [2025, 3, 9, 3, 30, 15, 250000]}
+    reply = stub.Query(milvus_pb2.QueryRequest(collection_name="plain", expr="id in [2, 3]", output_fields=["ts"],
+                                               query_params=[common_pb2.KeyValuePair(key="time_fields", value="hour")]))
+    column = next(f for f in reply.fields_data if f.field_name == "ts")
+    assert column.type == 22 and column.scalars.array_data.element_type == 5
+    assert list(column.valid_data) == [False, True]
+    assert [list(a.long_data.data) for a in column.scalars.array_data.data] == [[], [7]]
+    assert client.query("plain", filter="id == 2", output_fields=["ts"], time_fields="weekday")[0]["ts"] is None
+    assert "unsupported time_fields component 'weekday'" in error(
+        client.query, "plain", filter="id == 3", output_fields=["ts"], time_fields="weekday")
+    hits = client.search("plain", data=[[0.0, 0.0]], limit=5, filter="id == 3", output_fields=["ts"],
+                         time_fields="year,hour", timezone="Asia/Shanghai")
+    assert hits[0][0]["entity"]["ts"] == [2025, 15]
 
 
 def test_timestamptz_translation(env):
@@ -992,7 +1088,10 @@ def test_query_m1_unsupported(env):
     empty = stub.Query(query_req(expr="id in [1]", partition_names=["p"]))
     assert status_of(empty)[0] == 0 and not empty.fields_data[0].scalars.long_data.data
     timezone = [common_pb2.KeyValuePair(key="timezone", value="UTC")]
-    unimplemented(stub.Query, query_req(expr="id in [1]", query_params=timezone))
+    assert status_of(stub.Query(query_req(expr="id in [1]", query_params=timezone)))[0] == 0
+    bad = [common_pb2.KeyValuePair(key="timezone", value="Mars/Base")]
+    assert status_of(stub.Query(query_req(expr="id in [1]", query_params=bad))) == (
+        6, 6, "unknown timezone 'Mars/Base'")
 
 
 def test_query_load_state(env):

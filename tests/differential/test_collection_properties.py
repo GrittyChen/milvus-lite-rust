@@ -1,7 +1,7 @@
 """0023 A AlterCollection：合同「参照实测 / 集合属性」逐行对照 3.x（43d1257）。
 
 raw gRPC 比较 code、error_code、文案与 DescribeCollection 的属性顺序；每次写入后两边的 `schema.json`
-逐字节相同。`timezone` 与非法语法名字的预期差异单独断言。
+逐字节相同。非法语法名字的预期差异单独断言（`timezone` 自 0025 起与 3.x 一致）。
 """
 
 import json
@@ -57,7 +57,7 @@ def test_alter_collection_matches_3x(pair):
     both("CreateAlias", collection_name="c", alias="a")
     both("AlterCollection", collection_name="a", properties=kv(("via", "alias")))
     assert props(both, "c")[-1] == ("via", "alias")
-    for properties in [kv(("k", "v")), kv(("timezone", "UTC"))]:
+    for properties in [kv(("k", "v")), kv(("timezone", "UTC")), kv(("timezone", "Mars/Base"))]:
         result = both("AlterCollection", collection_name="nope", properties=properties)
         assert result[:3] == (100, 4, "collection 'nope' does not exist"), result
     same_schema_bytes(pair, "c")
@@ -90,28 +90,34 @@ def test_alter_collection_matches_3x(pair):
     assert schema_files(pair, "c")[0].read_bytes() != unsorted
 
 
-def test_timezone_and_invalid_names_are_expected_differences(pair):
+def test_timezone_property_matches_3x_and_invalid_names_differ(pair):
     d = pair.open()
+    both = Both(pair)
     d.step("create", lambda c: c.create_collection("c", schema=schema()))
     rust_uri, ref_uri = pair.uris
+    # timezone 属性（0025 起与 3.x 一致）：先判存在，再校验；坏值整请求零写入（混入普通属性、同时删除同名键也一样），
+    # 合法值原样保存。只用规范名：大小写与平台文件相关的名字不进差分（0025「时区库」）。
+    both("AlterCollection", collection_name="c", properties=kv(("keep", "1")))
     before = [path.read_bytes() for path in schema_files(pair, "c")]
-    # 范围延后（合同「范围延后」，取舍 1）：本实现整请求 UNIMPLEMENTED、零写入；3.x 校验后保存。
-    for properties, ref_status in [
-        (kv(("timezone", "UTC")), (0, 0, "")),
-        (kv(("keep", "1"), ("timezone", "Mars/Base")), (6, 6, "unknown timezone 'Mars/Base'")),
+    for properties, delete_keys in [
+        (kv(("timezone", "Mars/Base")), []),
+        (kv(("other", "1"), ("timezone", "Mars/Base")), []),
+        (kv(("timezone", "")), []),
+        (kv(("timezone", " UTC")), ["timezone", "keep"]),
+        (kv(("timezone", "../etc/passwd")), []),
+        (kv(("timezone", "/etc/localtime")), []),
+        (kv(("timezone", "Asia/Shanghai/")), []),
     ]:
-        try:
-            call(rust_uri, "AlterCollection", collection_name="c", properties=properties)
-        except grpc.RpcError as error:
-            assert error.code() == grpc.StatusCode.UNIMPLEMENTED
-            assert error.details().startswith("MilvusLite does not support timezone property"), error.details()
-        else:
-            raise AssertionError("timezone must be UNIMPLEMENTED")
-        assert call(ref_uri, "AlterCollection", collection_name="c", properties=properties)[:3] == ref_status
-    assert schema_files(pair, "c")[0].read_bytes() == before[0]
-    assert call(rust_uri, "DescribeCollection", collection_name="c")[-1] == []
-    # 删除 `timezone` 键不受影响。
-    assert call(rust_uri, "AlterCollection", collection_name="c", delete_keys=["timezone"])[:2] == (0, 0)
+        result = both("AlterCollection", collection_name="c", properties=properties, delete_keys=delete_keys)
+        assert result[0] != 0, result
+    assert [path.read_bytes() for path in schema_files(pair, "c")] == before
+    for zone in ["Asia/Shanghai", "UTC", "America/New_York"]:
+        assert both("AlterCollection", collection_name="c", properties=kv(("timezone", zone)))[:2] == (0, 0)
+        assert props(both, "c") == [("keep", "1"), ("timezone", zone)]
+        same_schema_bytes(pair, "c")
+    assert both("AlterCollection", collection_name="c", delete_keys=["timezone"])[:2] == (0, 0)
+    assert props(both, "c") == [("keep", "1")]
+    same_schema_bytes(pair, "c")
 
     # 非法语法的名字：3.x 按路径判定为不存在（100/4），本实现先做名字校验（1/0），与其他集合入口相同。
     for name in ["", "a/b", "..", "a" * 256]:

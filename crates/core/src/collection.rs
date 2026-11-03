@@ -138,6 +138,14 @@ impl GetSnapshot {
     }
 }
 
+/// 检索的过滤、范围、分组与时区来源，一起传给内部实现。
+struct FilterContext<'a> {
+    expr: &'a str,
+    range: Option<SearchRange>,
+    group: Option<&'a GroupBy>,
+    timezone: &'a crate::timezone::TimezoneSource<'a>,
+}
+
 impl ReadSnapshot {
     pub fn name(&self) -> &str {
         &self.name
@@ -180,8 +188,38 @@ impl ReadSnapshot {
         range: Option<SearchRange>,
         group: Option<GroupBy>,
     ) -> Result<SearchResult> {
+        self.search_grouped_in(
+            req,
+            compute,
+            expr,
+            range,
+            group,
+            &crate::timezone::TimezoneSource::none(),
+        )
+    }
+
+    /// 同 [`Self::search_grouped`]；过滤里无偏移的 ISO 字面量按 `timezone` 的有效时区换算（0025）。
+    pub fn search_grouped_in(
+        &self,
+        req: SearchRequest,
+        compute: &Compute,
+        expr: &str,
+        range: Option<SearchRange>,
+        group: Option<GroupBy>,
+        timezone: &crate::timezone::TimezoneSource<'_>,
+    ) -> Result<SearchResult> {
         let rows_per_block = (BLOCK_ELEMS / field_dim(&self.schema.fields[self.vector_pos])).max(1);
-        self.search_filtered_in_blocks(req, compute, rows_per_block, expr, range, group.as_ref())
+        self.search_filtered_in_blocks(
+            req,
+            compute,
+            rows_per_block,
+            FilterContext {
+                expr,
+                range,
+                group: group.as_ref(),
+                timezone,
+            },
+        )
     }
 
     fn search_in_blocks(
@@ -190,7 +228,17 @@ impl ReadSnapshot {
         compute: &Compute,
         rows_per_block: usize,
     ) -> Result<SearchResult> {
-        self.search_filtered_in_blocks(req, compute, rows_per_block, "", None, None)
+        self.search_filtered_in_blocks(
+            req,
+            compute,
+            rows_per_block,
+            FilterContext {
+                expr: "",
+                range: None,
+                group: None,
+                timezone: &crate::timezone::TimezoneSource::none(),
+            },
+        )
     }
 
     fn search_filtered_in_blocks(
@@ -198,10 +246,14 @@ impl ReadSnapshot {
         req: SearchRequest,
         compute: &Compute,
         rows_per_block: usize,
-        expr: &str,
-        range: Option<SearchRange>,
-        group: Option<&GroupBy>,
+        filter: FilterContext<'_>,
     ) -> Result<SearchResult> {
+        let FilterContext {
+            expr,
+            range,
+            group,
+            timezone,
+        } = filter;
         let projection = Projection::new(&self.schema, &req.output_fields, ApiKind::Search);
         // 3.x：没有查询向量时在一切检查之前返回空结果。
         if matches!(&req.vectors, QueryVectors::Dense(v) if v.is_empty()) {
@@ -236,7 +288,10 @@ impl ReadSnapshot {
         let predicate = if expr.is_empty() {
             None
         } else {
-            Some(crate::filter::Predicate::compile(expr, &self.schema)?)
+            Some(crate::filter::Predicate::from_parsed(
+                &crate::filter::ParsedFilter::parse_with(expr, timezone)?,
+                &self.schema,
+            )?)
         };
         let range = range.filter(|r| r.radius.is_some() || r.range_filter.is_some());
         let end = req.limit.saturating_add(req.offset);
@@ -700,8 +755,17 @@ pub struct Collection {
 
 impl Collection {
     pub fn new(name: impl Into<String>, schema: CollectionSchema) -> Result<Self> {
-        schema.validate()?;
-        let schema = schema.normalized()?;
+        Self::new_in(name, schema, &|| Ok(None))
+    }
+
+    /// `database` 取所在数据库的 `timezone` 属性，只在没有偏移的字符串默认值需要时才调用。
+    pub(crate) fn new_in(
+        name: impl Into<String>,
+        schema: CollectionSchema,
+        database: &dyn Fn() -> Result<Option<String>>,
+    ) -> Result<Self> {
+        schema.validate_with(database)?;
+        let schema = schema.normalized(database)?;
         let pk_pos = schema
             .primary_position()
             .ok_or_else(|| EngineError::schema("schema has no primary key field"))?;

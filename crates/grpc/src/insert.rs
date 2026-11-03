@@ -3,8 +3,9 @@
 //! M1 不支持的列（空值、ARRAY 等类型）记下第一个，全部列解码完才报告，使 3.x 在其后各列上的
 //! 解码错误照样优先（0004「决策」）。
 
-use milvus_lite_core::data::check_column_len;
+use milvus_lite_core::data::{Validity, check_column_len};
 use milvus_lite_core::error::py_repr;
+use milvus_lite_core::timezone::TimezoneSource;
 use milvus_lite_core::{EngineError, InputValues, InsertBatch, META_FIELD, Pk};
 
 use crate::output::{pk_int, pk_string};
@@ -16,9 +17,13 @@ fn type_name(t: i32) -> String {
     milvus_type_name(t).map_or_else(|| format!("Unknown({t})"), str::to_owned)
 }
 
+/// `timestamptz_fields` 是 schema 中 TIMESTAMPTZ 字段的名字（type 21 的字符串只对它们按时间解析）；
+/// `timezone` 提供无偏移字符串的有效时区（写入没有请求时区：集合 → 数据库）。
 pub(crate) fn decode(
     fields_data: Vec<pb::FieldData>,
     num_rows: u32,
+    timestamptz_fields: &[String],
+    timezone: &TimezoneSource<'_>,
 ) -> Result<InsertBatch, EngineError> {
     let n = num_rows as usize;
     // 3.x：num_rows 为 0 时不看任何列。
@@ -52,8 +57,12 @@ pub(crate) fn decode(
             Err(e) => return Err(e),
         };
         check_column_len(&fd.field_name, &values, n)?;
+        // 3.x 在这一列的位置换算时间字符串：type 26 的解析错误直接报告；type 21（VARCHAR 槽）的字符串由引擎
+        // 按 schema 逐行解析，这里只做带时区的逐行替换，错误留给引擎（见 `timestamp_texts`）。
         let values = if fd.r#type == 26 {
-            timestamps(values)?
+            timestamps(values, timezone)?
+        } else if fd.r#type == 21 && timestamptz_fields.contains(&fd.field_name) {
+            timestamp_texts(values, timezone)?
         } else {
             values
         };
@@ -136,28 +145,96 @@ fn scalar(name: &str, t: i32, sf: pb::ScalarField) -> Result<InputValues, Engine
     })
 }
 
+/// 写入的时区上下文：schema 里 TIMESTAMPTZ 字段的名字与有效时区的来源（写入没有请求时区）。
+/// 只在读锁内复制集合属性后立即释放，数据库属性由闭包按需读取。
+pub(crate) fn timezone_context<'a>(
+    handle: &milvus_lite_core::CollectionHandle,
+    database: &'a dyn Fn() -> Result<Option<String>, EngineError>,
+) -> (Vec<String>, TimezoneSource<'a>) {
+    let collection = handle.read();
+    let schema = collection.schema();
+    let fields = schema
+        .fields
+        .iter()
+        .filter(|f| f.data_type == milvus_lite_core::DataType::Timestamptz)
+        .map(|f| f.name.clone())
+        .collect();
+    (
+        fields,
+        TimezoneSource::new(None, schema.timezone().map(str::to_owned), database),
+    )
+}
+
+/// 换算后恰好越界的占位：带偏移的合法字符串，引擎按 `date value out of range`（1）报告，且报告位置仍在引擎逐行校验的次序里。
+const OUT_OF_RANGE_PLACEHOLDER: &str = "0001-01-01T00:00:00+23:59";
+
 /// TIMESTAMPTZ 的字符串列换算成 UTC 微秒；空值行不解析。3.x 在 `fields_data_to_records` 里逐列做这件事，
-/// 因此解析错误出现在该列的位置，先于之后各列的错误与引擎的校验。
-fn timestamps(values: InputValues) -> Result<InputValues, EngineError> {
-    use milvus_lite_core::timestamptz::parse;
+/// 因此解析错误出现在该列的位置，先于之后各列的错误与引擎的校验。没有偏移的字符串按集合、数据库的时区
+/// 解释，数据库属性只在遇到这样的字符串时才读取。
+fn timestamps(
+    values: InputValues,
+    timezone: &TimezoneSource<'_>,
+) -> Result<InputValues, EngineError> {
+    map_texts(values, |texts, validity| {
+        texts
+            .iter()
+            .enumerate()
+            .map(|(row, text)| {
+                if validity.is_some_and(|valid| !valid.get(row)) {
+                    Ok(0)
+                } else {
+                    timezone.parse_timestamp(text)
+                }
+            })
+            .collect::<Result<_, _>>()
+            .map(InputValues::Int)
+    })
+}
+
+/// type 21（VARCHAR 槽）的字符串：3.x 在 adapter 不解析，由引擎按 schema 逐行解析（带集合、数据库的时区），
+/// 所以这里逐行处理而不是整列回退，也不提前报错：能换算的行写成规范的 UTC 字符串，换算后越界的无偏移字符串
+/// 换成越界占位，其余行（类型不符、带偏移越界）保留原文，三者都由引擎按行、按它自己的次序报告。
+/// 数据库属性读取失败（3.x 里这个库根本打不开）原样向上传。
+fn timestamp_texts(
+    values: InputValues,
+    timezone: &TimezoneSource<'_>,
+) -> Result<InputValues, EngineError> {
+    map_texts(values, |texts, validity| {
+        texts
+            .iter()
+            .enumerate()
+            .map(|(row, text)| {
+                if validity.is_some_and(|valid| !valid.get(row)) {
+                    return Ok(text.clone());
+                }
+                match timezone.parse_timestamp(text) {
+                    Ok(micros) => milvus_lite_core::timestamptz::format_iso_z(micros),
+                    Err(EngineError::InvalidArgument(_))
+                        if milvus_lite_core::timestamptz::is_naive(text) =>
+                    {
+                        Ok(OUT_OF_RANGE_PLACEHOLDER.to_owned())
+                    }
+                    Err(EngineError::SchemaValidation(_) | EngineError::InvalidArgument(_)) => {
+                        Ok(text.clone())
+                    }
+                    Err(error) => Err(error),
+                }
+            })
+            .collect::<Result<_, _>>()
+            .map(InputValues::Str)
+    })
+}
+
+/// 对（可空的）字符串列整体替换；其他形态的列原样返回。
+fn map_texts(
+    values: InputValues,
+    convert: impl Fn(&[String], Option<&Validity>) -> Result<InputValues, EngineError>,
+) -> Result<InputValues, EngineError> {
     Ok(match values {
-        InputValues::Str(v) => {
-            InputValues::Int(v.iter().map(|text| parse(text)).collect::<Result<_, _>>()?)
-        }
+        InputValues::Str(v) => convert(&v, None)?,
         InputValues::Nullable { values, validity } => match *values {
             InputValues::Str(v) => InputValues::Nullable {
-                values: Box::new(InputValues::Int(
-                    v.iter()
-                        .enumerate()
-                        .map(|(row, text)| {
-                            if validity.get(row) {
-                                parse(text)
-                            } else {
-                                Ok(0)
-                            }
-                        })
-                        .collect::<Result<_, _>>()?,
-                )),
+                values: Box::new(convert(&v, Some(&validity))?),
                 validity,
             },
             other => InputValues::Nullable {

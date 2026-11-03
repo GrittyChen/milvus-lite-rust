@@ -1086,7 +1086,8 @@ impl Db {
     fn create_collection_inner(&self, key: &CollectionKey, schema: CollectionSchema) -> Result<()> {
         let name = key.name.as_str();
         validate_filesystem_name(name, "collection")?;
-        let mut collection = Collection::new(name, schema)?;
+        let database_timezone = || self.database_timezone_of(&key.database);
+        let mut collection = Collection::new_in(name, schema, &database_timezone)?;
         let _intent = NamespaceIntent::new(&self.namespace_waiters);
         let mut blocked = self.write_gate.write();
         if *blocked {
@@ -1370,8 +1371,8 @@ impl Db {
         {
             return Err(EngineError::DatabaseAlreadyExists(name.to_owned()));
         }
-        if properties.iter().any(|(key, _)| key == "timezone") {
-            return Err(database_timezone_unsupported());
+        if let Some((_, value)) = properties.iter().find(|(key, _)| key == "timezone") {
+            crate::timezone::validate_property(value)?;
         }
         let bytes = database_properties::to_bytes(&properties.to_vec());
         self.ensure_databases_dir()?;
@@ -2103,7 +2104,18 @@ impl Db {
             .find(|field| field.is_primary)
             .ok_or_else(|| EngineError::schema("schema has no primary key field"))?;
         let varchar = pk.data_type == crate::schema::DataType::VarChar;
-        let parsed = ParsedFilter::parse(expr)?;
+        // 3.x 的 Delete 不带请求时区，无偏移的 ISO 字面量只按集合、数据库的时区解释；数据库属性按需读取。
+        let database_timezone = || self.database_timezone_of(&key.database);
+        let collection_timezone = snapshot
+            .schema()
+            .properties
+            .iter()
+            .find(|(k, _)| k == "timezone")
+            .map(|(_, v)| v.clone());
+        let parsed = ParsedFilter::parse_with(
+            expr,
+            &crate::timezone::TimezoneSource::new(None, collection_timezone, &database_timezone),
+        )?;
         let literals = parsed.primary_keys(&pk.name);
         if let Some(literals) = literals {
             return self.mutate_handle(&handle, name, |collection| {
@@ -3065,7 +3077,7 @@ impl Db {
 
     /// 3.x `alter_collection_properties`：先删 `delete_keys` 再设 `properties`（新键追加、已有键原位替换），
     /// 值为字符串。持独占许可（0023 A「对合同方向的细化」）；集合须能按本实现打开，范围外 schema 返回
-    /// Unsupported。请求中的 `timezone` 由 schema 校验拒绝，因而先判集合存在、零写入（取舍 1）。
+    /// Unsupported。请求中的 `timezone` 由 schema 校验（非空且能解析），因而先判集合存在、坏值零写入。
     pub fn alter_collection(
         &self,
         database: &str,
@@ -3105,7 +3117,8 @@ impl Db {
                 None => schema.properties.push((key.clone(), value.clone())),
             }
         }
-        schema.validate()?;
+        let database_timezone = || self.database_timezone_of(&key.database);
+        schema.validate_with(&database_timezone)?;
         let current = fs::read(dir.join("schema.json")).map_err(storage)?;
         let bytes = SchemaFile::with_properties(&current, &key.name, &schema.properties)
             .map_err(storage)?;
@@ -4058,16 +4071,38 @@ impl Db {
         self.databases.read().keys().cloned().collect()
     }
 
+    /// 数据库的 `timezone` 属性（空串视为没有）。只给需要时区的操作按需调用：取注册表叶子拿到状态后立即释放，
+    /// 再取该库的属性叶子；调用者不得持有集合锁。属性文件不可读时报存储错误，且不缓存失败（0025）。
+    pub fn database_timezone(&self, database: &str) -> Result<Option<String>> {
+        let scope = self.key(database, "")?;
+        self.database_timezone_of(&scope.database)
+    }
+
+    fn database_timezone_of(&self, database: &str) -> Result<Option<String>> {
+        let state = self.database(database)?;
+        let mut cache = state.properties.lock();
+        let properties = database_properties::load(&mut cache, &state.root)?;
+        Ok(properties
+            .iter()
+            .find(|(key, _)| key == "timezone")
+            .map(|(_, value)| value.clone())
+            .filter(|value| !value.is_empty()))
+    }
+
     /// 3.x `describe_database`：返回归一化后的名字与属性（进程内按插入顺序）。读取失败不缓存。
     pub fn describe_database(&self, database: &str) -> Result<(String, Properties)> {
         let scope = self.key(database, "")?;
         let state = self.database(&scope.database)?;
         let mut cache = state.properties.lock();
         let properties = database_properties::load(&mut cache, &state.root)?;
+        // 3.x 加载属性时就校验 `timezone`，取值未知的文件在 Describe / Alter 里同样报 6。
+        if let Some((_, value)) = properties.iter().find(|(key, _)| key == "timezone") {
+            crate::timezone::validate_property(value)?;
+        }
         Ok((scope.database, properties.clone()))
     }
 
-    /// 3.x `alter_database_properties`：先判数据库存在，再判 `timezone`（取舍 1，零写入），先删 `delete_keys`
+    /// 3.x `alter_database_properties`：先判数据库存在，再校验合并后的 `timezone`（坏值零写入），先删 `delete_keys`
     /// 再设 `properties`，没有变化时不写。持独占许可（文件替换之后目录同步失败时只能在独占许可下封锁写入），
     /// 读改写全程持属性叶子锁；写入失败不改变缓存，同步未确认时缓存随磁盘更新（同别名写入）。
     pub fn alter_database(
@@ -4085,12 +4120,23 @@ impl Db {
             ));
         }
         let state = self.database(&scope.database)?;
-        if properties.iter().any(|(key, _)| key == "timezone") {
-            return Err(database_timezone_unsupported());
-        }
         let mut cache = state.properties.lock();
         let current = database_properties::load(&mut cache, &state.root)?;
-        let Some(next) = database_properties::merge(current, properties, delete_keys) else {
+        // 3.x 加载属性时就校验已保存的 timezone（取值未知的文件让 Alter 永远报 6，连删除或改成合法值的请求也一样），
+        // 再校验合并后的结果，没有变化的请求也会经过这两步。
+        if let Some((_, value)) = current.iter().find(|(key, _)| key == "timezone") {
+            crate::timezone::validate_property(value)?;
+        }
+        let next = database_properties::merge(current, properties, delete_keys);
+        if let Some((_, value)) = next
+            .as_ref()
+            .unwrap_or(current)
+            .iter()
+            .find(|(key, _)| key == "timezone")
+        {
+            crate::timezone::validate_property(value)?;
+        }
+        let Some(next) = next else {
             return Ok(());
         };
         let fault = |point| {
@@ -4160,14 +4206,6 @@ fn database_has_collections(state: &DatabaseState) -> Result<bool> {
         }
     }
     Ok(false)
-}
-
-/// 取舍 1：数据库属性中的 `timezone` 随 TIMESTAMPTZ 切片解除，请求零写入。
-fn database_timezone_unsupported() -> EngineError {
-    EngineError::unsupported(
-        "database timezone property",
-        "database timezone is not supported in this build of milvus-lite-rust yet",
-    )
 }
 
 /// create / drop 沿用 0007 的悬空别名剔除：目标路径不存在即悬空，按路径而非精确名字判定，

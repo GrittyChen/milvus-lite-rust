@@ -5,13 +5,14 @@
 use std::collections::HashMap;
 
 use milvus_lite_core::error::py_json_repr;
+use milvus_lite_core::timezone::TimezoneSource;
 use milvus_lite_core::{
     Compute, EngineError, GroupBy, Metric, QueryVectors, ReadSnapshot, SearchRange, SearchRequest,
 };
 use prost::Message;
 use serde_json::Value;
 
-use crate::output;
+use crate::output::{self, TimeFields};
 use crate::pb::common::PlaceholderGroup;
 use crate::pb::schema as pb;
 use crate::pb::service as svc;
@@ -35,12 +36,17 @@ pub(crate) struct Parsed {
     group: Option<GroupBy>,
     unsupported: Option<&'static str>,
     expr: String,
+    /// 请求里的 `timezone` / `time_fields`（空串与非字符串视为没有，同 3.x `translators/search.py`）。
+    timezone: Option<String>,
+    time_fields: Option<String>,
 }
 
 /// `parsed` 由 [`parse`] 在取 collection 读锁之前得到。
+/// `database_timezone` 读取所在数据库的 `timezone` 属性，只在需要时才会被调用；调用者不得持有集合锁。
 pub(crate) fn search(
     c: &ReadSnapshot,
     compute: &Compute,
+    database_timezone: &dyn Fn() -> Result<Option<String>, EngineError>,
     parsed: Parsed,
     output_fields: Vec<String>,
 ) -> Result<svc::SearchResults, EngineError> {
@@ -58,7 +64,12 @@ pub(crate) fn search(
     }
     let limit = usize::try_from(end.saturating_sub(skip).max(0)).unwrap_or(usize::MAX);
     let group_field = parsed.group.as_ref().map(|g| g.field.clone());
-    let result = c.search_grouped(
+    let timezone = TimezoneSource::new(
+        parsed.timezone.clone(),
+        c.schema().timezone().map(str::to_owned),
+        database_timezone,
+    );
+    let result = c.search_grouped_in(
         SearchRequest {
             anns_field: parsed.anns_field,
             vectors: parsed.vectors,
@@ -71,7 +82,12 @@ pub(crate) fn search(
         &parsed.expr,
         parsed.range,
         parsed.group,
+        &timezone,
     )?;
+    // 响应编码处再校验一次请求时区（3.x 的第二个校验点）：空表达式、空结果也会在这里报错。
+    timezone.next_phase();
+    timezone.validate_request()?;
+    let time_fields = TimeFields::new(parsed.time_fields.as_deref(), &timezone);
 
     let schema = c.schema();
     let pk = schema.fields.iter().find(|f| f.is_primary).ok_or_else(|| {
@@ -101,7 +117,12 @@ pub(crate) fn search(
         results: Some(pb::SearchResultData {
             num_queries: i64::try_from(result.hits.len()).unwrap_or(i64::MAX),
             top_k: parsed.top_k,
-            fields_data: output::fields_data(schema, &result.projection, &rows)?,
+            fields_data: output::fields_data(
+                schema,
+                &result.projection,
+                &rows,
+                time_fields.as_ref(),
+            )?,
             scores,
             ids: Some(insert::pb_ids(&pks, varchar)),
             topks,
@@ -225,11 +246,6 @@ pub(crate) fn parse(req: &svc::SearchRequest) -> Result<Parsed, EngineError> {
         }),
         _ => None,
     };
-    if let Some(Value::String(s)) = raw.get("timezone")
-        && !s.is_empty()
-    {
-        note("timezone");
-    }
     let offset = match raw.get("offset") {
         None => 0,
         Some(v) => {
@@ -262,7 +278,16 @@ pub(crate) fn parse(req: &svc::SearchRequest) -> Result<Parsed, EngineError> {
         group,
         unsupported: unsupported_feature,
         expr: req.dsl.clone(),
+        timezone: non_empty_string(raw.get("timezone")),
+        time_fields: non_empty_string(raw.get("time_fields")),
     })
+}
+
+fn non_empty_string(value: Option<&Value>) -> Option<String> {
+    match value {
+        Some(Value::String(s)) if !s.is_empty() => Some(s.clone()),
+        _ => None,
+    }
 }
 
 /// 3.x `_decode_placeholder_group`：只看第一个 PlaceholderValue。

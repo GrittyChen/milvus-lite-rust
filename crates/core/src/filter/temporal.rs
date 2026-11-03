@@ -1,5 +1,5 @@
 //! ISO / INTERVAL 字面量的解析：语法错误在解析阶段报告，数值供过滤求值使用（0025）。
-use crate::error::py_repr;
+use crate::error::{EngineError, py_repr};
 
 fn number(s: &str) -> Option<u32> {
     (!s.is_empty() && s.bytes().all(|c| c.is_ascii_digit()))
@@ -273,16 +273,41 @@ pub(crate) fn parse_iso(s: &str) -> Result<IsoValue, String> {
     Ok(IsoValue::Aware { utc_micros: utc })
 }
 
-/// 3.x 在解析阶段就把字面量换算成数值；没有偏移的 ISO 需要时区（见 `NAIVE_MESSAGE`），超范围报 `date value out of range`。
-pub(super) fn literal(s: &str, iso: bool) -> Result<super::parser::Literal, String> {
+/// 字面量解析失败：消息类的错误带上字符串字面量的位置（3.x 的 `FilterParseError`），
+/// 引擎错误（读取数据库属性失败等）原样向上传。
+pub(super) enum Failure {
+    Message(String),
+    Engine(EngineError),
+}
+
+impl From<String> for Failure {
+    fn from(message: String) -> Self {
+        Self::Message(message)
+    }
+}
+
+/// 3.x 在解析阶段就把字面量换算成数值；没有偏移的 ISO 按有效时区换算（`naive`），
+/// 没有时区报 `NAIVE_MESSAGE`，超范围报 `date value out of range`。
+pub(super) fn literal(
+    s: &str,
+    iso: bool,
+    naive: super::parser::NaiveResolver<'_>,
+) -> Result<super::parser::Literal, Failure> {
     use super::parser::Literal;
     if iso {
         return match parse_iso(s)? {
             value @ IsoValue::Aware { .. } => value
                 .unix_micros()
                 .map(Literal::Timestamp)
-                .ok_or_else(|| "date value out of range".to_owned()),
-            IsoValue::Naive { .. } => Err(NAIVE_MESSAGE.into()),
+                .ok_or_else(|| Failure::Message("date value out of range".to_owned())),
+            IsoValue::Naive { local_micros } => naive(local_micros)
+                .map(Literal::Timestamp)
+                .map_err(|error| match error {
+                    EngineError::SchemaValidation(m) | EngineError::InvalidArgument(m) => {
+                        Failure::Message(m)
+                    }
+                    other => Failure::Engine(other),
+                }),
         };
     }
     let fail = || {
@@ -321,7 +346,7 @@ pub(super) fn literal(s: &str, iso: bool) -> Result<super::parser::Literal, Stri
             || split.next().is_some_and(|fraction| !digits(fraction))
             || split.next().is_some()
         {
-            return Err(fail());
+            return Err(fail().into());
         }
         let value = amount.parse::<f64>().map_err(|_| fail())?;
         // 与 3.x 同序的浮点运算：周先乘 7 再乘 86400，舍入与一次乘 604800 可能不同。
@@ -336,11 +361,13 @@ pub(super) fn literal(s: &str, iso: bool) -> Result<super::parser::Literal, Stri
         rest = &rest[end + 1..];
     }
     if !rest.is_empty() || (!any && upper != "P0D") {
-        return Err(fail());
+        return Err(fail().into());
     }
     let micros = seconds * 1_000_000.0;
     if !micros.is_finite() {
-        return Err("cannot convert float infinity to integer".into());
+        return Err(Failure::Message(
+            "cannot convert float infinity to integer".into(),
+        ));
     }
     Ok(Literal::Interval(micros.trunc()))
 }
@@ -350,12 +377,21 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
 
+    fn plain(s: &str, iso: bool) -> Result<super::super::parser::Literal, String> {
+        literal(s, iso, &|_| Err(EngineError::schema(NAIVE_MESSAGE))).map_err(|failure| {
+            match failure {
+                Failure::Message(m) => m,
+                Failure::Engine(e) => e.to_string(),
+            }
+        })
+    }
+
     fn validate(s: &str, iso: bool) -> Result<(), String> {
-        literal(s, iso).map(drop)
+        plain(s, iso).map(drop)
     }
 
     fn interval(s: &str) -> Result<f64, String> {
-        match literal(s, false)? {
+        match plain(s, false)? {
             super::super::parser::Literal::Interval(v) => Ok(v),
             other => panic!("{other:?}"),
         }

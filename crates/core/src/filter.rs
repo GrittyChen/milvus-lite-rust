@@ -35,14 +35,27 @@ impl ParsedFilter {
     pub(crate) fn is_empty(&self) -> bool {
         self.ast.is_none()
     }
+    /// 没有任何时区配置的解析：无偏移的 `ISO` 字面量报 3.x 的「需要时区」错误。
     pub fn parse(source: &str) -> Result<Self> {
+        Self::parse_with(source, &crate::timezone::TimezoneSource::none())
+    }
+    /// 表达式非空时，先校验请求时区（3.x 的过滤编译处），再解析；无偏移的 `ISO` 字面量按有效时区换算，
+    /// 数据库时区只在遇到这样的字面量时才读取。
+    pub fn parse_with(
+        source: &str,
+        timezone: &crate::timezone::TimezoneSource<'_>,
+    ) -> Result<Self> {
+        let ast = if source.is_empty() {
+            None
+        } else {
+            timezone.validate_request()?;
+            Some(parser::parse(source, &|local| {
+                timezone.for_naive()?.local_to_utc_micros(local)
+            })?)
+        };
         Ok(Self {
             source: source.into(),
-            ast: if source.is_empty() {
-                None
-            } else {
-                Some(parser::parse(source)?)
-            },
+            ast,
         })
     }
     /// 非主键快路径仍须绑定 schema 并做语义检查；不得把无法识别当成无过滤。

@@ -3,6 +3,7 @@
 use std::collections::HashSet;
 
 use crate::error::{EngineError, Result, py_repr, py_repr_list};
+use crate::timezone::TimezoneSource;
 
 /// M1 支持的字段类型（见 0004「范围」）。其余 Milvus 类型在 gRPC 层翻译时拒绝。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -107,17 +108,38 @@ const RESERVED_FIELD_NAMES: [&str; 7] = [
 ];
 
 impl CollectionSchema {
+    /// 不带数据库时区的校验：字符串形式的 TIMESTAMPTZ 默认值没有偏移时只能依靠集合自己的 `timezone` 属性。
     pub fn validate(&self) -> Result<()> {
+        self.validate_with(&|| Ok(None))
+    }
+
+    /// 集合属性里的 `timezone`（原样取值；空串视为没有）。
+    pub fn timezone(&self) -> Option<&str> {
+        self.properties
+            .iter()
+            .find(|(k, _)| k == "timezone")
+            .map(|(_, v)| v.as_str())
+            .filter(|v| !v.is_empty())
+    }
+
+    /// 集合属性与数据库属性一起构成默认值的有效时区（0025）。
+    fn timezone_source<'a>(
+        &self,
+        database: &'a dyn Fn() -> Result<Option<String>>,
+    ) -> TimezoneSource<'a> {
+        TimezoneSource::new(None, self.timezone().map(str::to_owned), database)
+    }
+
+    /// `database` 取数据库的 `timezone` 属性，只在没有偏移的字符串默认值需要时才调用。
+    pub fn validate_with(&self, database: &dyn Fn() -> Result<Option<String>>) -> Result<()> {
         if self.fields.is_empty() {
             return Err(EngineError::schema("schema has no fields"));
         }
-        // 3.x 在这里校验并规范化 timezone；它只作用于 TIMESTAMPTZ，M1 不支持（0004「决策」）。
-        if self.properties.iter().any(|(k, _)| k == "timezone") {
-            return Err(EngineError::unsupported(
-                "timezone property",
-                "collection timezone is not supported in this build of milvus-lite-rust yet",
-            ));
+        // 3.x 在这里校验 timezone（值原样保存，不规范化大小写）。
+        if let Some((_, value)) = self.properties.iter().find(|(k, _)| k == "timezone") {
+            crate::timezone::validate_property(value)?;
         }
+        let timezone = self.timezone_source(database);
         let mut seen = HashSet::new();
         for f in &self.fields {
             if let Some(feature) = f.default_value.as_ref().and_then(default_limit) {
@@ -180,7 +202,7 @@ impl CollectionSchema {
             if f.data_type == DataType::Timestamptz
                 && let Some(default) = f.default_value.as_ref().filter(|v| !v.is_null())
             {
-                crate::timestamptz::check_default(default)?;
+                crate::timestamptz::check_default(default, &timezone)?;
             }
         }
 
@@ -269,14 +291,25 @@ impl CollectionSchema {
     }
 
     /// 校验通过后的规范化：TIMESTAMPTZ 的字符串默认值换成 UTC 微秒（3.x 在 `validate_schema` 里就地替换）。
-    pub(crate) fn normalized(mut self) -> Result<Self> {
-        for field in &mut self.fields {
+    /// 没有偏移的默认值按集合、数据库的时区换算；之后改时区不会改变已保存的 schema。
+    pub(crate) fn normalized(
+        mut self,
+        database: &dyn Fn() -> Result<Option<String>>,
+    ) -> Result<Self> {
+        let timezone = self.timezone_source(database);
+        let mut converted = Vec::new();
+        for (index, field) in self.fields.iter().enumerate() {
             if field.data_type == DataType::Timestamptz
                 && let Some(serde_json::Value::String(text)) = &field.default_value
             {
-                field.default_value =
-                    Some(serde_json::Value::from(crate::timestamptz::parse(text)?));
+                converted.push((
+                    index,
+                    serde_json::Value::from(crate::timestamptz::parse_with(text, &timezone)?),
+                ));
             }
+        }
+        for (index, value) in converted {
+            self.fields[index].default_value = Some(value);
         }
         Ok(self)
     }

@@ -217,6 +217,7 @@ pub(super) fn describe(ast: &Ast, id: usize, t: &str) -> String {
 }
 
 impl Predicate {
+    #[cfg(test)]
     pub(crate) fn compile(source: &str, schema: &CollectionSchema) -> Result<Self> {
         Self::from_parsed(&super::ParsedFilter::parse(source)?, schema)
     }

@@ -197,3 +197,63 @@ def test_varchar_slot_strings_and_out_of_range_defaults(pair):
     d = pair.open()
     d.step("list after reopen", lambda c: sorted(c.list_collections()))
     d.step("describe after reopen", lambda c: str(next(f for f in c.describe_collection("dmax")["fields"] if f["name"] == "ts")["default_value"]))
+
+
+def test_varchar_slot_strings_with_a_configured_timezone_match_3x(pair):
+    """0025 第 3 步：type 21 的字符串由引擎逐行按集合 / 数据库时区解析；混合批次、解码错误的先后与 Upsert 都与 3.x 相同。"""
+    d = pair.open()
+
+    def create(c):
+        schema = MilvusClient.create_schema(auto_id=False)
+        schema.add_field("id", DataType.INT64, is_primary=True)
+        schema.add_field("vector", DataType.FLOAT_VECTOR, dim=2)
+        schema.add_field("ts", DataType.TIMESTAMPTZ, nullable=True)
+        c.create_collection("s", schema=schema, index_params=index("L2"), properties={"timezone": "Asia/Shanghai"})
+        c.load_collection("s")
+        c.create_collection("plain", schema=schema, index_params=index("L2"))
+        c.load_collection("plain")
+
+    d.step("create", create)
+
+    def send(c, collection, values, row_id, valid=None, upsert=False, broken_vector=False):
+        n = len(valid) if valid else len(values)
+        ids = schema_pb2.FieldData(type=5, field_name="id")
+        ids.scalars.long_data.data.extend(range(row_id, row_id + n))
+        vec = schema_pb2.FieldData(type=101, field_name="vector")
+        if not broken_vector:
+            vec.vectors.dim = 2
+            vec.vectors.float_vector.data.extend([0.0] * (2 * n))
+        ts = schema_pb2.FieldData(type=21, field_name="ts")
+        ts.scalars.string_data.data.extend(values)
+        ts.valid_data.extend(valid or [])
+        stub = c._get_connection()._stub
+        request = (milvus_pb2.UpsertRequest if upsert else milvus_pb2.InsertRequest)(
+            collection_name=collection, num_rows=n, fields_data=[ids, vec, ts]
+        )
+        reply = (stub.Upsert if upsert else stub.Insert)(request)
+        return reply.status.code, reply.status.reason
+
+    naive, shanghai = "2025-01-01T08:00:00", "2025-01-01T00:00:00Z"
+    cases = [
+        [naive], [naive, "0001-01-01T00:00:00+01:00"], [naive, "nope"], ["nope", naive], [naive, "9999-12-31T23:59:59-08:00"],
+        ["0001-01-01T00:00:00", naive], [naive, "0001-01-01T00:00:00"], ["9999-12-31T23:59:59", "nope"], [naive, shanghai, ""],
+        ["2025-01-01T08:00:00.1234567", "2025-01-01 08:00:00"],
+    ]
+    for i, values in enumerate(cases):
+        for collection in ("s", "plain"):
+            a = send(d.rust, collection, values, 100 * (i + 1))
+            b = send(d.ref, collection, values, 100 * (i + 1))
+            assert a == b, f"{collection} {values!r}\n  rust: {a!r}\n  3.x:  {b!r}"
+    # nullable、Upsert 与解码错误的先后（时间列在后面的列之前，3.x 的 adapter 不解析 type 21）。
+    for kwargs in (
+        {"values": ["", "2025-01-01T08:00:00"], "valid": [False, True]},
+        {"values": ["", "0001-01-01T00:00:00"], "valid": [False, True]},
+        {"values": [naive, naive], "upsert": True},
+        {"values": [naive, "nope"], "upsert": True},
+        {"values": ["0001-01-01T00:00:00"], "broken_vector": True},
+        {"values": [naive, "nope"], "broken_vector": True},
+    ):
+        a = send(d.rust, "s", row_id=900, **kwargs)
+        b = send(d.ref, "s", row_id=900, **kwargs)
+        assert a == b, f"{kwargs!r}\n  rust: {a!r}\n  3.x:  {b!r}"
+    d.step("rows", lambda c: query(c, "s"))

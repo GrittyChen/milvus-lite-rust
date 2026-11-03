@@ -1,6 +1,6 @@
 # 0025 TIMESTAMPTZ 与 timezone 属性
 
-- 状态：设计评审通过（r2）；第 1 步（类型与存储）已实施并提交，第 2 步（过滤）已实施待评审，第 3–4 步待做
+- 状态：设计评审通过（r2）；第 1 步（类型与存储）、第 2 步（过滤）已实施并提交，第 3 步（时区与属性 RPC）已实施待评审，第 4 步待做
 - 日期：2026-11-02
 - 参照：milvus-lite v3.2.1 / `43d1257774e629bc9f66873977ab7c320d5bf5a7`；pymilvus 3.0.2 实测，2.6.17 经源码核对（`timezone`、`time_fields` 参数与 `DataType.TIMESTAMPTZ` 同样存在，实施阶段补测）
 - 前置：[0014](0014-index-definitions-and-filter-expressions.md)（过滤语法与 ISO / INTERVAL 字面量的语法校验）、[0015](0015-nullable-defaults-and-array.md)（nullable 与默认值）、[0023](0023-aliases-rename-truncate-databases.md)（集合与数据库属性；其取舍 1 把 `timezone` 留给本切片）、[0024](0024-group-by-search.md)
@@ -103,7 +103,7 @@ pymilvus 把时间值作为字符串（`string_data`）发送；原始 gRPC 还�
 - 整数微秒（`timestamptz_data`）在解码处校验到 `[0001-01-01, 9999-12-31T23:59:59.999999]`，越界报 1 `date value out of range`，**整批拒绝、零写入**，不复制 3.x 的「写入成功、读取全体失败」。
 - 读取 3.x 已经写出的越界整数（毒化目录）：输出换算处对同一范围做检查，越界报同文案的 1，不 panic、不返回截断值；该报错与 3.x 一致（3.x 对这类目录本来就整体失败）。互通用例用 3.x 经原始 gRPC 写出的毒化 fixture 钉住。
 - INVERTED 索引定义接受该类型（与其它标量一致，按扫描执行）；保留字 `iso` / `interval` 加入字段名检查。
-- `ARRAY<TIMESTAMPTZ>`：把 `Timestamptz` 加入 [schema.rs](../../crates/core/src/schema.rs) 里 ARRAY 元素的拒绝列表（现为 Array / Json / FloatVector），报 `EngineError::unsupported`（UNIMPLEMENTED，文案 `ARRAY element type TIMESTAMPTZ is not supported ...`）；不拒绝的话枚举新增后会被接受，之后在数据层失败。create / insert 各有测试钉住。
+- `ARRAY<TIMESTAMPTZ>`：把 `Timestamptz` 加入 [schema.rs](../../crates/core/src/schema.rs) 里 ARRAY 元素的拒绝列表（现为 Array / Json / FloatVector），报 `EngineError::unsupported`（UNIMPLEMENTED）；不拒绝的话枚举新增后会被接受，之后在数据层失败。引擎层文案是 `ARRAY element type TIMESTAMPTZ is not supported ...`，经 gRPC 的 CreateCollection 由翻译层在引擎之前统一拒绝，线上文案是 `MilvusLite does not support ARRAY element type: not supported in this build of milvus-lite-rust yet`（与 JSON / 嵌套 ARRAY 元素相同，探针实测）。引擎层与 gRPC 层各有测试钉住。
 
 ### 过滤（第 2 步，已实施）
 
@@ -119,7 +119,7 @@ pymilvus 把时间值作为字符串（`string_data`）发送；原始 gRPC 还�
 - **`in` / `not in` 不同于比较**：Arrow 的 `is_in` 会把 timestamp 的 value_set 转成 int64 微秒，所以整数列（含动态整数列）与 `ISO` 列表按微秒值比较，`dmicro in [ISO '2025-01-01T00:00:00Z']` 命中值恰为该微秒数的行；全空列的 `is_in` 为 false、`not in` 为 true；浮点 / 字符串 / 布尔 / ARRAY 列等不支持的配对才是内核错误：含动态字段（Hybrid）时退回 Python 求值器，纯 Arrow 路线（只含 schema 字段）直接报该内核错误。Python 路线（含 JSON 路径的表达式）仍不做微秒匹配，这是 3.x 的路线差异，差分表同时钉住两种结果。
 - 过滤的 S1 快路径（`legacy_shape`）排除 TIMESTAMPTZ 字段，时间戳表达式一律走布尔树。
 
-### 时区（第 3 步）
+### 时区（第 3 步，已实施）
 
 #### 时区库
 
@@ -137,16 +137,24 @@ pymilvus 把时间值作为字符串（`string_data`）发送；原始 gRPC 还�
 - **Query / Search**：`db.collection()`（100）→ 读锁内取快照后释放 → 引擎 `require_loaded`（101）→ 分组 / anns（Search）→ 过滤编译处：表达式非空时 `effective()` 的**请求值校验**先于解析 → 度量 → 执行 → 响应编码处再次 `effective()`（这是 3.x 的第二个校验点；`count(*)` 空表达式既不经过过滤编译也不经过响应编码）。`time_fields` 默认时区在编码一个非空时间戳值时才向下解析到集合 / 数据库 / `UTC`。
 - **Insert / Upsert**：`db.collection()`（100）→ 取集合属性值（读锁内复制后释放）→ 数据库闭包（叶子锁）→ **gRPC 解码处**把 `string_data` 的时间字符串换算成微秒（3.x 同样在 `fields_data_to_records` 里先于引擎校验解析，错误顺序因此不变）→ 之后才进入 `Db::mutate`（写许可、集合写锁）。解码到写锁之间集合被删除重建、schema 变化时，`mutate` 内既有的批校验照常拒绝。
 - **Delete（表达式）**：同样在 `Db::delete_expr` 进入集合锁之前解析集合 / 数据库时区（3.x 的 Delete 不带请求时区）。
-- **CreateCollection**：naive 默认值的时区取请求属性里的 `timezone`，其次数据库闭包；在已持有的命名空间锁 / 独占许可之内调用叶子锁（叶子锁最后取，无反向边），规范化后写进 schema。
+- **CreateCollection**：naive 默认值的时区取请求属性里的 `timezone`，其次数据库闭包；在取得命名空间意图与写入闸门**之前**（不持有任何集合锁与许可）调用叶子锁并规范化，再写进 schema；并发 AlterDatabase 改时区时，默认值取到改前或改后的完整值，不撕裂（并发测试钉住），已创建的集合不受之后的改动影响。
 - **AlterDatabase / DropDatabaseProperties** 更新叶子锁里的缓存（先写文件、再换缓存，沿用 0023 B 的 `Unchanged` / `Unconfirmed` 处理）；下一次请求的闭包读到新值，所以数据库时区的改动对该库**已打开的集合**立即生效。**不引入**以不含时区的表达式文本为键的编译结果缓存（3.x 正是因为这个缓存要在改库时区时清空）。
 - **数据库属性不可读**（文件损坏、I/O 错误）：只有真的需要数据库时区的操作（无偏移字符串、`time_fields` 的默认时区、naive 默认值）报 1/0 存储错误，**零写入**（Insert 在解码处失败，尚未取写许可）；不需要时区的操作照常，沿用 0023 B「集合操作不读属性」的立场并只在需要时读。需要在 0006 的「只有 Describe / Alter 读」一行和 0023 取舍 1 里同步这一变化。
 - 测试：debug 锁序检查下的并发用例（并发 AlterDatabase 改时区 × Insert / Query / Search / Delete / CreateCollection，断言无死锁、每次解析都看到完整的改前或改后的值；同一请求的过滤编译与响应编码各解析一次，其间允许看到不同的值，与 3.x 的每次读取当前属性一致，不做按请求记忆）；损坏属性文件下的 naive insert / filter / `time_fields` / 默认值用例。
+
+#### 实施记录（第 3 步）
+
+- 模块 `timezone`：`resolve`（路径格式错误 1 → 找不到 6）、`Zone`（`local_to_utc_micros`、`components`）、`TimezoneSource`；`ParsedFilter::parse_with` 在表达式非空时先 `validate_request()` 再解析，无偏移的 `ISO` 字面量经解析器的 `NaiveResolver` 回调到 `for_naive()`（数据库闭包只在此时才被调用）；`Predicate::from_parsed` 之外的旧入口 `ParsedFilter::parse` 等价于没有任何时区配置。
+- 换算细节：jiff 的 `Timestamp` 对 1970 年之前带小数的瞬间用带符号的纳秒分量，`as_second()` 向零截断，所以换算只让 jiff 处理整秒，微秒部分单独加回（fixture 抓到的缺陷：`0001-01-01T23:59:59.999999` 多出 1 秒）；`9999-12-29` 起的本地时间与 `9999-12-30T22:00:00Z` 起的瞬间用该点的偏移补算，597 个时区 × 范围两端的样本与 CPython 3.12 逐项一致（一次性核对，常驻 fixture 取 38 个代表时区）。
+- 写入路径：type 26 的字符串在 gRPC 解码处按「集合 → 数据库」换算（写入没有请求时区）。**type 21（VARCHAR 槽）的字符串**3.x 在 adapter 不解析，由引擎逐行按集合 → 数据库时区解析（第 1 步遗留项 ③ 的结论）：解码处只做带时区的逐行替换，不提前报错、不整列回退——能换算的行写成规范的 UTC 字符串，换算后越界的无偏移字符串换成越界占位（`0001-01-01T00:00:00+23:59`），其余行保留原文，三者都由引擎按它自己的行序与列序报告（带偏移越界 1、类型不符 6），因此错误码、错误行与后续列的解码错误先后都与 3.x 相同（差分用例 `test_varchar_slot_strings_with_a_configured_timezone_match_3x` 钉住混合批次、nullable 与 Upsert；「时间列在后续列之前时，后续列的解码错误先报」由仓库外探针对照 3.x 验证，差分用例补 `[ids, ts, vec]` 字段顺序与 `error_code` 比较留到第 4 步）。读取数据库属性失败（3.x 里这个库打不开）报存储错误。
+- CreateCollection 的 naive 默认值经 `CollectionSchema::validate_with` / `normalized`（集合 → 数据库）换算，数据库闭包在创建的命名空间锁之外取（`Collection::new_in` 在取写入闸门之前调用）；Delete 的闭包在写入许可（共享）之内、集合锁之外调用，叶子锁序为闸门 → 属性。
+- 第 1 步遗留项 ②（`alter_collection` 未调 `normalized`）不处理：3.x 的 `validate_schema` 在创建时就把字符串默认值替换成微秒再落盘，字符串默认值只可能来自手改的文件；这类 schema 打开时需要数据库时区才能规范化，打开路径没有这个上下文，所以 `SchemaFile::to_core` 把 TIMESTAMPTZ 的字符串默认值按范围外 schema（fail-closed，UNIMPLEMENTED）处理并登记为差异；`alter_collection` 改为 `validate_with`（带数据库闭包），合并后的 `timezone` 属性按 3.x 校验。
 
 #### `time_fields`
 
 Query、Search 输出支持（Hybrid 随 HybridSearch）；非 TIMESTAMPTZ 字段上的 `time_fields` 不生效；组件名只在编码非空时间戳值时校验（见「校验时机」）。
 
-### 属性 RPC（第 3 步）
+### 属性 RPC（第 3 步，已实施）
 
 - CreateCollection / AlterCollection / DropCollectionProperties / CreateDatabase / AlterDatabase / DropDatabaseProperties 的 `timezone`：非空字符串且在时区库内才保存（原样保存，不规范大小写）；错误文案与 3.x 相同；移除 0023 登记的两个 UNIMPLEMENTED 守卫（`schema.rs` 的集合属性、`db.rs` 的 `database_timezone_unsupported`）及 search / query 的 `timezone` 守卫。
 - 创建集合时 naive 默认值按有效时区规范化后写进 schema；已存集合的 schema 不因之后改时区而变。
@@ -172,6 +180,8 @@ Query、Search 输出支持（Hybrid 随 HybridSearch）；非 TIMESTAMPTZ 字�
 | 区间微秒超出 int64 | 1 `Python int too large to convert to C long` | 同 3.x | 复刻 |
 | 不涉及时间值的算术与时间值同在一个表达式里（`n + 1 > 2 and ts > 5`、`(n + 1) + ts > 5`） | 报类型错误（6） | UNIMPLEMENTED | 一般算术仍在范围外，沿用「范围外构造先于语义检查」（0006 第 1 项）；纯时间值的算术、解析阶段的错误与 3.x 相同 |
 | 数据库 `database_properties.json` 不可读时的 naive 时间字符串 / `time_fields` / naive 默认值 | 数据库打开时已经读过该文件，损坏的库根本打不开 | 只有这些操作报 1/0 存储错误，零写入；其余操作不读该文件 | 0023 B 已登记「集合操作不读属性」，只对需要时区的操作例外 |
+| 手改的 `schema.json` 里 TIMESTAMPTZ 的字符串默认值 | 打开时按集合、数据库时区规范化 | 该集合按范围外 schema 处理（fail-closed）：`DescribeCollection` 返回 UNIMPLEMENTED，`DropCollection`、别名与改名可用，清空与改属性按 0023 的差异表拒绝，不会半打开 | 3.x 只会写出微秒整数，字符串只可能来自手改文件；打开路径没有数据库时区上下文 |
+| type 21 字符串需要数据库时区而属性文件不可读 | 库打不开 | 报存储错误（1/0），零写入；其余行为同 3.x | 本实现不读无关的数据库属性（0023 B） |
 | 读取 3.x 毒化目录（越界整数微秒） | 任何读到这些行的查询整体报 1 | 同样报 1 `date value out of range`，不 panic | 一致；本实现只是不再能写出这样的目录 |
 
 ## 测试矩阵

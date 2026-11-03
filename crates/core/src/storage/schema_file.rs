@@ -168,9 +168,6 @@ impl SchemaFile {
         if !self.functions.is_empty() {
             return Err(SchemaFileError::Unsupported("schema functions".to_owned()));
         }
-        if self.properties.contains_key("timezone") {
-            return Err(SchemaFileError::Unsupported("timezone property".to_owned()));
-        }
         let properties = self
             .properties
             .iter()
@@ -241,6 +238,17 @@ impl SchemaFile {
             enable_dynamic_field: self.enable_dynamic_field,
             properties,
         };
+        // 3.x 在创建时把 TIMESTAMPTZ 的字符串默认值换成微秒再落盘；字符串只可能来自手改的文件，
+        // 它需要数据库时区才能规范化，打开路径不带这个上下文，所以按范围外 schema 处理（0025）。
+        if let Some(field) = schema.fields.iter().find(|f| {
+            f.data_type == DataType::Timestamptz
+                && matches!(f.default_value, Some(Value::String(_)))
+        }) {
+            return Err(SchemaFileError::Unsupported(format!(
+                "string default value for TIMESTAMPTZ field {:?}",
+                field.name
+            )));
+        }
         schema
             .validate()
             .map_err(|source| SchemaFileError::Unsupported(source.to_string()))?;
@@ -402,6 +410,26 @@ mod tests {
         assert!(matches!(
             schema.to_core(),
             Err(SchemaFileError::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn string_timestamptz_defaults_from_hand_edited_files_are_out_of_scope() {
+        let with = |default: &str| {
+            format!(
+                r#"{{"collection_name":"c","version":1,"fields":[{{"name":"id","dtype":"int64","is_primary":true}},{{"name":"v","dtype":"float_vector","dim":2}},{{"name":"ts","dtype":"timestamptz","default_value":{default}}}]}}"#
+            )
+        };
+        // 3.x 写出的是微秒整数；字符串需要数据库时区才能规范化，按范围外 schema 处理。
+        assert!(
+            SchemaFile::parse(with("1735689600000000").as_bytes())
+                .unwrap()
+                .to_core()
+                .is_ok()
+        );
+        assert!(matches!(
+            SchemaFile::parse(with(r#""2025-07-01T12:00:00""#).as_bytes()).unwrap().to_core(),
+            Err(SchemaFileError::Unsupported(m)) if m.contains("string default value for TIMESTAMPTZ")
         ));
     }
 

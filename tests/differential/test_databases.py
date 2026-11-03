@@ -2,7 +2,7 @@
 
 数据库目录在两边启动之前手工建好（CreateDatabase 由后续步骤实现），覆盖合同「参照实测 / 数据库」与设计
 「调查补充」中属性语义的各行：raw gRPC 比较 code、error_code、文案与属性顺序，每次写入后两边的
-`database_properties.json` 逐字节相同。已登记的差异（属性文件的非字符串值与无法解析的文案、写 `timezone`）单独断言。
+`database_properties.json` 逐字节相同。已登记的差异（属性文件的非字符串值与无法解析的文案）单独断言；`timezone` 自 0025 起与 3.x 一致。
 """
 
 import os
@@ -182,6 +182,19 @@ def test_alter_database_matches_3x(pair):
     both("DescribeDatabase", db_name="p_unsorted")
 
 
+def test_unknown_timezone_in_the_properties_file_matches_3x(pair):
+    for root in (pair.rust_path, pair.ref_path):
+        (Path(root) / "databases/badtz").mkdir(parents=True)
+        (Path(root) / "databases/badtz/database_properties.json").write_bytes(b'{"timezone": "Mars/Base", "k": "v"}')
+    pair.open()
+    both = Both(pair)
+    # 3.x 加载属性时就校验 timezone：Describe 与任何 Alter（包括删除或改成合法值）都报 6。
+    assert both("DescribeDatabase", db_name="badtz")[:3] == (6, 6, "unknown timezone 'Mars/Base'")
+    assert both("AlterDatabase", db_name="badtz", properties=kv(("other", "x")))[:2] == (6, 6)
+    assert both("AlterDatabase", db_name="badtz", properties=kv(("timezone", "UTC")))[:2] == (6, 6)
+    assert both("AlterDatabase", db_name="badtz", delete_keys=["timezone"])[:2] == (6, 6)
+
+
 def test_registered_differences(pair):
     make_layout(pair)
     pair.open()
@@ -198,14 +211,22 @@ def test_registered_differences(pair):
     before = (Path(pair.rust_path) / "databases/p_nonstr/database_properties.json").read_bytes()
     assert call(rust, "AlterDatabase", db_name="p_nonstr", properties=kv(("k", "v")))[:2] == (1, 0)
     assert (Path(pair.rust_path) / "databases/p_nonstr/database_properties.json").read_bytes() == before
-    # 写 timezone：3.x 校验后保存，本实现 UNIMPLEMENTED 且零写入（取舍 1）；判定在数据库存在之后。
-    assert call(ref, "AlterDatabase", db_name="hand", properties=kv(("timezone", "UTC")))[:2] == (0, 0)
-    with pytest.raises(grpc.RpcError) as info:
-        call(rust, "AlterDatabase", db_name="hand", properties=kv(("timezone", "UTC")))
-    assert info.value.code() == grpc.StatusCode.UNIMPLEMENTED
-    assert not (Path(pair.rust_path) / "databases/hand/database_properties.json").exists()
-    assert call(rust, "AlterDatabase", db_name="nope", properties=kv(("timezone", "UTC")))[:2] == (6, 6)
-    assert call(ref, "AlterDatabase", db_name="nope", properties=kv(("timezone", "UTC")))[:2] == (6, 6)
+    # timezone（0025 起与 3.x 一致）：先判数据库存在，再校验值；坏值零写入，合法值原样保存。
+    for zone, expected in [
+        ("Mars/Base", (6, 6, "unknown timezone 'Mars/Base'")),
+        ("", (6, 6, "timezone property must be a non-empty string")),
+        ("UTC", (0, 0, "")),
+    ]:
+        a = call(rust, "AlterDatabase", db_name="hand", properties=kv(("timezone", zone)))
+        b = call(ref, "AlterDatabase", db_name="hand", properties=kv(("timezone", zone)))
+        assert a[:3] == b[:3] == expected, (zone, a, b)
+        files = [Path(root) / "databases/hand/database_properties.json" for root in (pair.rust_path, pair.ref_path)]
+        assert files[0].exists() == files[1].exists()
+        if files[1].exists():
+            assert files[0].read_bytes() == files[1].read_bytes()
+    assert call(rust, "AlterDatabase", db_name="nope", properties=kv(("timezone", "Mars/Base")))[:2] == (6, 6)
+    assert call(ref, "AlterDatabase", db_name="nope", properties=kv(("timezone", "Mars/Base")))[:2] == (6, 6)
+    assert call(rust, "AlterDatabase", db_name="nope", properties=kv(("timezone", "Mars/Base")))[2] == "database 'nope' does not exist"
 
 
 def tree(root):
@@ -287,14 +308,16 @@ def test_create_database_registered_differences(pair):
     assert call(ref, "CreateDatabase", db_name="afile")[:2] == (1, 0)
     assert call(rust, "CreateDatabase", db_name="afile") == (6, 6, "database 'afile' already exists")
     assert (Path(pair.rust_path) / "databases/afile").read_bytes() == b"keep"
-    # 写 timezone：3.x 校验后创建，本实现 UNIMPLEMENTED 且零写入；未知时区 3.x 为 6/6，本实现同为 UNIMPLEMENTED。
-    assert call(ref, "CreateDatabase", db_name="tz", properties=kv(("timezone", "UTC")))[:2] == (0, 0)
-    assert call(ref, "CreateDatabase", db_name="tzbad", properties=kv(("timezone", "Mars/Base")))[:2] == (6, 6)
-    for name, zone in [("tz", "UTC"), ("tzbad", "Mars/Base")]:
-        with pytest.raises(grpc.RpcError) as info:
-            call(rust, "CreateDatabase", db_name=name, properties=kv(("timezone", zone)))
-        assert info.value.code() == grpc.StatusCode.UNIMPLEMENTED
-        assert not (Path(pair.rust_path) / "databases" / name).exists()
+    # 写 timezone（0025 起与 3.x 一致）：合法值创建并保存，坏值 6/6 且不创建。
+    for name, zone, expected in [
+        ("tz", "UTC", (0, 0, "")),
+        ("tzbad", "Mars/Base", (6, 6, "unknown timezone 'Mars/Base'")),
+        ("tzempty", "", (6, 6, "timezone property must be a non-empty string")),
+    ]:
+        a = call(rust, "CreateDatabase", db_name=name, properties=kv(("timezone", zone)))
+        b = call(ref, "CreateDatabase", db_name=name, properties=kv(("timezone", zone)))
+        assert a[:3] == b[:3] == expected, (name, a, b)
+        assert (Path(pair.rust_path) / "databases" / name).exists() == (expected[0] == 0)
 
 
 def test_drop_database_matches_3x(pair):

@@ -24,6 +24,7 @@ pub mod pyjson;
 pub mod schema;
 pub mod storage;
 pub mod timestamptz;
+pub mod timezone;
 
 pub use collection::{
     Collection, GetSnapshot, GroupBy, Hits, LoadState, QueryResult, QueryVectors, ReadSnapshot,

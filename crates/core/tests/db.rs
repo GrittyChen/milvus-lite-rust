@@ -240,22 +240,41 @@ fn only_the_default_database_exists() {
 }
 
 #[test]
-fn timezone_property_is_unsupported() {
+fn timezone_property_is_validated_and_saved_verbatim() {
     let (_root, db) = db();
     let mut s = schema();
     s.properties = vec![
         ("a".to_owned(), "1".to_owned()),
-        ("timezone".to_owned(), "UTC".to_owned()),
+        ("timezone".to_owned(), "utc".to_owned()),
     ];
-    let e = db.create_collection("", "c", s).unwrap_err();
-    assert!(matches!(e, EngineError::Unsupported { .. }), "{e}");
+    db.create_collection("", "c", s).unwrap();
+    assert_eq!(
+        db.collection("", "c").unwrap().read().schema().properties,
+        vec![
+            ("a".to_owned(), "1".to_owned()),
+            ("timezone".to_owned(), "utc".to_owned())
+        ]
+    );
+    for (value, message) in [
+        ("Mars/Base", "unknown timezone 'Mars/Base'"),
+        ("", "timezone property must be a non-empty string"),
+    ] {
+        let mut s = schema();
+        s.properties = vec![("timezone".to_owned(), value.to_owned())];
+        let e = db.create_collection("", "bad", s).unwrap_err();
+        assert!(
+            matches!(&e, EngineError::SchemaValidation(m) if m == message),
+            "{e}"
+        );
+    }
+    assert!(db.collection("", "bad").is_err());
     // 3.x 先报「没有字段」，再看 timezone。
     let empty = CollectionSchema {
-        properties: vec![("timezone".to_owned(), "UTC".to_owned())],
+        properties: vec![("timezone".to_owned(), "Mars/Base".to_owned())],
         ..CollectionSchema::default()
     };
     assert_eq!(
-        db.create_collection("", "c", empty)
+        db.create_collection("", "c2", empty)
             .unwrap_err()
             .to_string(),
         "schema has no fields"

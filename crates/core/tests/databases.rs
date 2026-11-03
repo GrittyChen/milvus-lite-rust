@@ -367,11 +367,11 @@ fn describe_and_alter_follow_the_reference_merge_rules() {
 }
 
 #[test]
-fn timezone_is_rejected_before_any_write_but_existing_values_stay_manageable() {
+fn timezone_is_validated_before_any_write_and_existing_values_stay_manageable() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("m.db");
     std::fs::create_dir_all(path.join("databases/d1")).unwrap();
-    // 3.x 已写入的 timezone：可以读取、展示与删除，值不校验。
+    // 3.x 已写入的 timezone：可以读取、展示、修改与删除。
     let file = path.join("databases/d1/database_properties.json");
     std::fs::write(&file, br#"{"timezone": "Asia/Shanghai", "k": "v"}"#).unwrap();
     let db = open(&path);
@@ -380,17 +380,28 @@ fn timezone_is_rejected_before_any_write_but_existing_values_stay_manageable() {
         pairs(&[("timezone", "Asia/Shanghai"), ("k", "v")])
     );
     let before = std::fs::read(&file).unwrap();
+    // 坏值（含混在普通属性里）报 6，零写入。
     for request in [
-        pairs(&[("timezone", "UTC")]),
-        pairs(&[("timezone", "Asia/Shanghai")]),
+        pairs(&[("timezone", "Mars/Base")]),
         pairs(&[("other", "x"), ("timezone", "Mars/Base")]),
+        pairs(&[("timezone", "")]),
     ] {
         match db.alter_database("d1", &request, &[]) {
-            Err(EngineError::Unsupported { .. }) => {}
-            other => panic!("expected Unsupported: {other:?}"),
+            Err(EngineError::SchemaValidation(_)) => {}
+            other => panic!("expected SchemaValidation: {other:?}"),
         }
         assert_eq!(std::fs::read(&file).unwrap(), before);
     }
+    // 没有变化的请求不写文件。
+    db.alter_database("d1", &pairs(&[("timezone", "Asia/Shanghai")]), &[])
+        .unwrap();
+    assert_eq!(std::fs::read(&file).unwrap(), before);
+    // 合法值可以修改，读取到的是最新值，重开后仍在。
+    db.alter_database("d1", &pairs(&[("timezone", "UTC")]), &[])
+        .unwrap();
+    assert_eq!(db.database_timezone("d1").unwrap().as_deref(), Some("UTC"));
+    db.alter_database("d1", &pairs(&[("timezone", "Asia/Shanghai")]), &[])
+        .unwrap();
     assert_eq!(properties_file(&path), None);
     db.alter_database("d1", &[], &["timezone".to_owned()])
         .unwrap();
@@ -399,6 +410,36 @@ fn timezone_is_rejected_before_any_write_but_existing_values_stay_manageable() {
         std::fs::read_to_string(&file).unwrap(),
         "{\n  \"k\": \"v\"\n}"
     );
+    db.close();
+}
+
+#[test]
+fn unknown_timezone_in_the_file_fails_describe_and_alter_like_3x() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("m.db");
+    std::fs::create_dir_all(path.join("databases/d1")).unwrap();
+    let file = path.join("databases/d1/database_properties.json");
+    std::fs::write(&file, br#"{"timezone": "Mars/Base", "k": "v"}"#).unwrap();
+    let db = open(&path);
+    let before = std::fs::read(&file).unwrap();
+    assert!(matches!(
+        db.describe_database("d1"),
+        Err(EngineError::SchemaValidation(m)) if m == "unknown timezone 'Mars/Base'"
+    ));
+    // 3.x 加载属性就失败，所以任何 Alter 都报 6，包括删除或改成合法值的请求；文件保持原样。
+    let delete = ["timezone".to_owned()];
+    for (request, delete_keys) in [
+        (pairs(&[("other", "x")]), &[][..]),
+        (vec![], &[][..]),
+        (pairs(&[("timezone", "UTC")]), &[][..]),
+        (vec![], &delete[..]),
+    ] {
+        assert!(matches!(
+            db.alter_database("d1", &request, delete_keys),
+            Err(EngineError::SchemaValidation(_))
+        ));
+    }
+    assert_eq!(std::fs::read(&file).unwrap(), before);
     db.close();
 }
 
@@ -730,18 +771,29 @@ fn create_database_checks_name_then_existence_then_properties() {
             .to_string(),
         "database name too long (256 bytes, max 255)"
     );
-    // timezone 在创建之前返回 Unsupported，零写入。
-    for request in [
-        pairs(&[("timezone", "UTC")]),
-        pairs(&[("a", "1"), ("timezone", "Mars/Base")]),
+    // 坏的 timezone 在创建之前报 6，零写入；合法值原样保存。
+    for (request, message) in [
+        (
+            pairs(&[("a", "1"), ("timezone", "Mars/Base")]),
+            "unknown timezone 'Mars/Base'",
+        ),
+        (
+            pairs(&[("timezone", "")]),
+            "timezone property must be a non-empty string",
+        ),
     ] {
-        assert!(matches!(
-            db.create_database("tz", &request),
-            Err(EngineError::Unsupported { .. })
-        ));
+        match db.create_database("tz", &request) {
+            Err(EngineError::SchemaValidation(m)) => assert_eq!(m, message),
+            other => panic!("{other:?}"),
+        }
     }
     assert!(!path.join("databases/tz").exists());
     assert!(staging_entries(&path).is_empty());
+    db.create_database("tz", &pairs(&[("timezone", "utc")]))
+        .unwrap();
+    assert_eq!(describe(&db, "tz").1, pairs(&[("timezone", "utc")]));
+    assert_eq!(db.database_timezone("tz").unwrap().as_deref(), Some("utc"));
+    db.drop_database("tz").unwrap();
     // 空格、冒号、非 ASCII、255 字节都是合法名字。
     for name in [" sp ", "a:b", "库一", &"y".repeat(255)] {
         db.create_database(name, &[]).unwrap();

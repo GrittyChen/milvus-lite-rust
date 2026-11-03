@@ -11,6 +11,8 @@ license = "Apache-2.0"
 publish = false
 
 [workspace.dependencies]
+# 内置 tzdata（0025）：不依赖运行平台的时区数据；版本写死，升级须重跑时区 fixture。
+jiff = { version = "=0.2.38", default-features = false, features = ["std", "tzdb-bundle-always"] }
 libc = "0.2"
 md5 = "0.8.1"
 arrow-array = "~60.0"

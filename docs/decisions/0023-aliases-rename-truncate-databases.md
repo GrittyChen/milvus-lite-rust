@@ -149,7 +149,7 @@
 
 | 输入 | 3.x | 本实现 |
 | --- | --- | --- |
-| 写入 `timezone` 属性 | 校验后保存 | 返回 UNIMPLEMENTED，零写入；判定顺序见取舍 1；随 TIMESTAMPTZ 切片解除 |
+| 写入 `timezone` 属性 | 校验后保存 | （历史）0023 实施时返回 UNIMPLEMENTED、零写入；**已随 0025 第 3 步解除，现与 3.x 一致，本行不再是差异** |
 
 ### 已有差异的范围变化
 
@@ -229,7 +229,7 @@
 
 2026-10-29 负责人确认：
 
-1. **`timezone` 延后到 TIMESTAMPTZ 切片。** 请求中只要出现 `timezone` 键（新增、修改或设为与现值相同，不论值是否合法），整个请求返回 UNIMPLEMENTED 且零写入；与普通属性混在一个请求里时也不先写普通属性。判定位置按 RPC 固定：
+1. **`timezone` 延后到 TIMESTAMPTZ 切片。**（**已由 0025 第 3 步解除**：集合与数据库的 `timezone` 属性现在按 3.x 校验并保存，下文是 0023 实施时的合同，保留作历史依据。）请求中只要出现 `timezone` 键（新增、修改或设为与现值相同，不论值是否合法），整个请求返回 UNIMPLEMENTED 且零写入；与普通属性混在一个请求里时也不先写普通属性。判定位置按 RPC 固定：
    - CreateCollection：保持现有位置，即 schema 校验中「schema has no fields」之后、字段校验与「已存在」之前（3.x 的 `validate_schema` 同样先于已存在判定；现有用例见 [crates/core/tests/db.rs](../../crates/core/tests/db.rs)）；
    - CreateDatabase：名字校验与「已存在」之后，对应 3.x 的属性校验位置；
    - AlterCollection、AlterDatabase：先判对象存在，再判 `timezone`。
@@ -471,7 +471,7 @@
 | 「各库的别名叶子锁、改名意图一起冻结」；数据库「按需创建」 | `Db.databases` 改为叶子锁（层级 6）保护的 `BTreeMap<String, Arc<DatabaseState>>`；**打开时枚举 `databases/` 并为每个数据库建立状态**（含启动清扫与改名收尾），运行期只由 Create / Drop 在独占许可下增删 | 数据目录由 LOCK 独占，目录只有本进程会改；一次枚举取代每次请求的目录判定，让存在判定、`ListDatabases` 与「精确名字」规则（只差大小写的名字报不存在）都等价于一次映射查找，也使 N2 的清扫与改名意图的重开处理对每个库同一时机、同一前提。代价：LOCK 持有期间被外部手工创建的数据库在重开前不可见（3.x 每次都读目录） |
 | `Db.path` 与默认库 root 双源（第 2 步评审提醒） | `Db` 只保存数据根 `data_root`；每个库的根由 `DatabaseState::new(data_root, name)` 唯一推导（默认库为数据根，其余为 `databases/<db>`）；staging 根与 `databases/` 目录经 `Db::staging_root()` / `databases_dir()` 取得，不再散落 `self.path.join(..)` | 路径只有一个来源，别名、意图、清扫、staging 都不会指向两个不同的根 |
 | 取得状态用借用 `&DatabaseState` | `Db::database(name)` 返回 `Arc<DatabaseState>`，持有者不依赖注册表的锁 | 注册表是叶子锁，取出即放；Drop 之后迟到的持有者只看到旧状态，而 Drop 需要库内无集合（读路径无法再读到任何集合），写路径在独占许可下与之互斥 |
-| 数据库属性与集合 | 本实现的集合操作**不读** `database_properties.json`：属性只在 Describe / Alter 时读写。3.x 的 CreateCollection 与打开集合都会读它，损坏或 `timezone` 未知时失败 | 属性只影响 TIMESTAMPTZ 的默认时区，已由取舍 1 延后；让无关操作依赖这个文件只会引入新的失败面。登记为差异（下表） |
+| 数据库属性与集合 | 本实现的集合操作**不读** `database_properties.json`：属性只在 Describe / Alter 时读写。3.x 的 CreateCollection 与打开集合都会读它，损坏或 `timezone` 未知时失败 | 属性只影响 TIMESTAMPTZ 的默认时区；让无关操作依赖这个文件只会引入新的失败面。登记为差异（下表）。0025 第 3 步起，只有需要数据库时区的操作（无偏移的时间字符串、`time_fields` 的默认时区、naive 默认值）按需读取，其余仍不读 |
 | 属性值类型 | 值只接受字符串：文件中出现非字符串值时 Describe / Alter 报 Storage 错误（1/0），零写入 | 3.x 自己只写字符串（请求里的键值都是字符串）；复制 Python `str()` 展示与「Alter 保留原类型」只服务手工编辑的文件。登记为差异 |
 | 数据库 Create 的路径被占用 | `databases/<name>` 路径存在（含普通文件、悬空符号链接、只差大小写的名字）一律 6/6 已存在，零写入 | 与集合 Create 同一做法（不覆盖、不暴露绝对路径）；3.x 对非目录占用抛 `OSError` |
 | 写入封锁的范围 | 仍是整个 Db 一个标志，不按数据库拆分 | 目录同步未确认时全库停写是更保守的一侧；按库拆分要重新证明各库共享的 staging 根与 `databases/` 目录的持久化边界，收益只在多租户故障隔离 |
