@@ -460,6 +460,8 @@ fn evaluate(
                     return Err(kernel("ambiguous synthetic column"));
                 }
                 values[id] = Some(match op {
+                    // 只有 RowFilter 的树含这个操作数，它们固定走 Python 路线。
+                    Operand::Absent => return Err(kernel("absent operand in columnar route")),
                     Operand::Column(i) => {
                         let column = &base[*i];
                         let mut valid = live.clone();

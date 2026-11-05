@@ -1236,10 +1236,10 @@ def test_pymilvus_entry_points_remaining_unsupported(env):
         (lambda: client.hybrid_search("q", [AnnSearchRequest([[1, 0]], "vector", {}, 2)], RRFRanker(), limit=2),
          f"HybridSearch: {rpc}"),
         (lambda: client.search("q", [[1, 0]], filter="id + 1 > 0"), "filter expressions: arithmetic, text_match, and geometry predicates are not supported"),
-        (lambda: client.search("q", [[1, 0]], ranker=decay), f"rerank and function chains: {feature}"),
+        (lambda: client.search("q", [[1, 0]], ranker=decay), f"L2 rerank functions: {feature}"),
         # 分组检索已实现；与 rerank 同时出现时，rerank 的 UNIMPLEMENTED 不能被分组路径吞掉。
         (lambda: client.search("q", [[1, 0]], ranker=decay, group_by_field="id"),
-         f"rerank and function chains: {feature}"),
+         f"L2 rerank functions: {feature}"),
     ]
     for call, details in cases:
         with pytest.raises(grpc.RpcError) as info:

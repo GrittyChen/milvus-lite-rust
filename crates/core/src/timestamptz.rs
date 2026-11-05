@@ -96,6 +96,26 @@ pub fn format_iso_z(micros: i64) -> Result<String> {
     Ok(out)
 }
 
+/// Python `str(datetime)`（UTC）：rerank 把同名的 TIMESTAMPTZ 字段写进 VARCHAR 主键时的文本。
+pub(crate) fn python_str(micros: i64) -> String {
+    let days = micros.div_euclid(86_400_000_000);
+    let rest = micros.rem_euclid(86_400_000_000);
+    let (year, month, day) = civil_from_days(days);
+    let seconds = rest / 1_000_000;
+    let fraction = rest % 1_000_000;
+    let mut out = format!(
+        "{year:04}-{month:02}-{day:02} {:02}:{:02}:{:02}",
+        seconds / 3600,
+        seconds / 60 % 60,
+        seconds % 60
+    );
+    if fraction != 0 {
+        out.push_str(&format!(".{fraction:06}"));
+    }
+    out.push_str("+00:00");
+    out
+}
+
 /// 自 1970-01-01 起的天数 → 公历年月日（Howard Hinnant 的 civil_from_days）。
 pub(crate) fn civil_from_days(days: i64) -> (i64, i64, i64) {
     let z = days + 719_468;

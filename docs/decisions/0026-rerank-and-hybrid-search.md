@@ -1,6 +1,8 @@
 # 0026：HybridSearch 与 rerank（RRF / Weighted / boost / decay）
 
-状态：设计评审通过，尚未实施。对照版本为 3.x v3.2.1（`43d1257`）。
+状态：设计评审通过；第 1 步（Search 的 boost 与 `function_score` 解码）已实施并评审通过，第 2–4 步未开始。对照版本为 3.x v3.2.1（`43d1257`）。
+
+第 1 步留下的风险：13 个 `tie *` 的三平台 CI 未执行（本机只验收 5 个 Search 侧场景，2 个 Search + decay 随第 2 步、6 个 Hybrid 随第 3 步，三平台统一在第 4 步执行，不能免除）；变异验证与性能基准未运行。
 
 ## 背景与目标
 
@@ -214,6 +216,15 @@ pymilvus 3.0.2 的可达面比协议窄，影响差分用例怎么写：
 - `$distance`：只有 boost 读，非数字报 `float()` 的错误（数字字符串的三种情况见上面引擎分组第 2 条，无分组时相同），布尔按 1；L2 链不读，成功。
 - `_decay_score`：decay 链被因子覆盖，其余路径不读，全部成功。
 
+boost 路径的其余覆盖值（第 1 步补充探针 `probe_s1x.py`，855 个场景，单独记账，转差分时并入“通过差分”；覆盖 COSINE / IP / L2 × 字段类型 × 过滤命中情况）：
+
+- **TIMESTAMPTZ 同名字段是 `datetime`**，不是整数微秒：`float()` 报 `... not 'datetime.datetime'`，`int()` 同样；VARCHAR 主键下 `$id` 的 `str()` 是 `2025-01-01 00:00:00+00:00`（有微秒时带六位小数）。JSON 同名字段是存储文本，ARRAY 是列表。
+- `$distance` 没被任何函数命中时不做 `float()`，转公共分数时按度量报：COSINE `unsupported operand type(s) for -: 'float' and '<类型>'`，IP `bad operand type for unary -: '<类型>'`，L2 字符串 / 列表 `can't multiply sequence by non-int of type '<类型>'`，其余 `unsupported operand type(s) for *: '<类型>' and '<类型>'`。
+- VARCHAR 主键下 `$id` 的值为 `None`：`ids` 是字符串 `None`，**主键列是空值占位加 `valid_data=false`**，两者不同。整数主键在 `int(None)` 已报错，到不了这里。
+- 过滤里读主键时，读到的是盖掉后的**原生值**（3.x `eval_row[pk] = row.get(pk, row.get("$id"))`），语义检查仍按主键的 schema 类型（`id == 's1'` 对整数主键照报 code 6）。NaN 与无穷不是空值，`datetime` 与字符串比较不成立。实现把主键操作数改绑到值的来源（同名列或动态键 `$id`），不经 JSON 之类的中间表示；此时其余动态字段（包括名字叫 `pk` 的键、`$meta['$id']`）仍不可见。
+- 向量字段本身叫 `$id`：VARCHAR 主键下 `ids` 是向量的 `str()`（`[1.0, 0.05000000074505806]`），`fields_data` 里的向量列被剥除，是零向量加 `valid_data=false`。整数主键在 `int(list)` 报错；向量字段叫 `$distance` 时按上面的算术报错。
+- `str()` 是精确的 Python 文本：ARRAY 内的 NaN 是 `[nan, 0.5]`，超出 int64 的动态值（只能经原始请求写入）是完整的十进制数字；整数主键下超出 int64 报 code 1 `Value out of range: <值>`。
+
 Search 的分组有两条路径，字段校验不同：
 
 - **Search + boost（无 L2）**：分组在引擎里做，沿用 0024（字段必须存在且是 INT8 / 16 / 32 / 64、BOOL、VARCHAR，否则 code 6；`strict_group_size` 生效），组值是字段值或 0024 的主键结果，**链式候选行的存在性表不适用**；同名字段的先后见上。探针 `s boost group field <名>`：未知字段、向量、DOUBLE、FLOAT、JSON、动态字段都报 code 6。
@@ -251,6 +262,10 @@ Search 的分组有两条路径，字段校验不同：
 | Hybrid（顶层 `limit`） | `limit <= 0` 不加 `Limit`，返回全部合并后的候选（20 条），`offset` 不生效；`limit > 0` 用 `Limit` | 组切片 `groups[offset : offset + limit]`（Python 切片）：`limit=0` 无组；`limit=-1, offset=0` 留下除最后一组外的全部；`limit=-3, offset=1` 取 `[1:-2]`；`limit=-1, offset=1` 为空 |
 | Search + L2 | 窗口 `max(limit + offset, limit · 10)`：`<= 0` 时没有候选、结果为空（`limit=0/-1, offset=0`）；`limit <= 0` 而 `limit + offset > 0` 时有候选且不加 `Limit`，返回窗口内全部（`limit=0, offset=5` 返回 5 条，`limit=-1` 返回 4 条，`limit=-3` 返回 2 条） | 同样的窗口再并上 `limit · group_size · 3`，然后 `groups[offset : offset + limit]`；探针中 `limit <= 0` 全部为空 |
 | Search + boost（引擎路径；普通 Search 同） | `effective = limit + offset`，`<= 0` 时没有候选；`offset` **仅 `> 0` 时切片** `hits[offset : offset + limit]`；负 `offset` 只缩小 `effective`，不切片（探针 `eng boost offset -1` 返回 4 条，`-3` 窗口更小，`-100` 为空）；`limit <= 0` 为空 | 引擎分组（0024）：负 `group_size` 为空，0 换成 1，`offset` 同样仅 `> 0` 时切片，负 `offset` 只缩小 `effective`（探针 `eng * group offset -1` 有结果，`-3` 为空），`limit <= 0` 为空 |
+
+并列跨过候选窗口边界时，3.x 由 `argpartition` 任取（60 行同分、窗口 20，取到 `31, 33, 34, ...`），本实现取引擎全序的前 20 个，boost 之后的结果因此可能不同。这与普通 Search 的截断相同，属于 [0004](0004-m1-scope.md#决策) 已允许的差别；差分用例不让并列跨窗口。
+
+引擎路径有 boost、`offset` 不为正时还要 `hits[:top_k]`，**作用在分组展平之后**：`limit=2, group_size=3` 只返回 2 条（探针 `group trunc`），而普通 Search 同样的参数返回 6 条。
 
 **链**（Search + L2、Hybrid）用 `hits[:n]`、`scored_groups[offset : offset + limit]` 与 `LimitOp` 的 Python 切片；**引擎**（Search + boost、普通 Search）不是切片语义，见表。`Limit` 的确切形式（`limit > 0` 时）：`start = min(offset, len)`，`end = min(start + limit, len)`，`chunk[start:end]`，负 `offset` 按 Python 切片——`offset=-1, limit=4` 在候选多于 3 条时为 `chunk[-1:3]`，即空（探针 `s l2 offset -1`、`h rrf offset neg`）。分组时负 `offset` 同样按切片（`s l2 group offset -3` 取到命中，`-1` 为空）。
 
@@ -307,8 +322,8 @@ Search：collection 不存在（100）→ 解码 `function_score`（boost 参数
 
 3.x 的顺序是：boost 在引擎内作用于**内部距离**，随后 `Collection.search` 把内部距离转成**公共分数**，Hybrid 合并与 Search L2 只消费公共分数。本实现当前 `Hits.scores` 已经是公共分数（`flat` 返回 L2 的平方距离、COSINE 的相似度、IP 的点积），因此：
 
-- 引擎稠密检索额外导出 `internal: f32`（L2 = 开方距离，COSINE = `1 − sim`，IP = `−dot`），仅在存在 boost 时由 rerank 入口消费；普通 Search 的分数与排序不变。
-- boost 只消费 internal（f64 里算），完成后一次性转成 public f64（COSINE `1 − d`、IP `−d`、L2 `d²`，与 `Metric::public_f64` 的方向相反，另写一个 `Metric::from_internal`，不复用它）。
+- 内部距离（L2 = 开方距离，COSINE = `max(1 − sim, 0)`，IP = `−dot`）由引擎的 float32 分数经 `Metric::internal` 还原，仅在存在 boost 时消费；普通 Search 的分数与排序不变。还原结果与引擎打分时的内部距离**逐位相同**（单测按步长抽样约 100 万个 float32 位模式核对），所以不在扫描路径上多带一列；以后引入无法由对外分数精确还原的度量时，要重新评审这一点。它与 3.x 的差别只来自 float32 的求和顺序（numpy 与本实现不同），[0004](0004-m1-scope.md#决策) 已登记分数与 `round_decimal` 的允许误差，普通 Search 同样如此（dim 8 实测：L2 普通检索 `round_decimal=6` 为 `377.948028` 对 `377.948120`），导出一列也不会改变这个差别。
+- boost 只消费 internal（f64 里算），完成后一次性转成 public f64（COSINE `1 − d`、IP `−d`、L2 `d²`，与 `Metric::public_f64` 的方向相反，另写一个 `Metric::public_from_internal`，不复用它）。
 - Hybrid 合并、Search L2 的 rrf / weighted / decay 只消费 public f64；不从 public 反推 internal。
 - 响应层对 rerank 路径的最终 public 分数只做 `round_decimal`（Python `round`）与 f32 存储，**不再经过 `round_score` 里的 `Metric::public_f64`**（那个函数接收的是内部 f32 并按度量转换，对已是公共分数的输入会二次转换）。普通 Search 的现有路径保持不变。
 
@@ -343,7 +358,7 @@ Search：collection 不存在（100）→ 解码 `function_score`（boost 参数
 
 ## 测试矩阵
 
-探针共 2822 个场景，分类由归档里的 `classify.py` 机器生成，**不把全部场景写成通过**：
+第 1 步已转入仓库的差分在 [test_rerank_boost.py](../../tests/differential/test_rerank_boost.py)，其余在第 4 步转入。探针共 2822 个场景，分类由归档里的 `classify.py` 机器生成，**不把全部场景写成通过**：
 
 | 类别 | 数量 | 内容 | 断言 |
 | --- | --- | --- | --- |
@@ -367,7 +382,7 @@ Search：collection 不存在（100）→ 解码 `function_score`（boost 参数
 
 ## 实施步骤
 
-1. core：两空间导出、boost 与三组候选窗口、`filter` 的 Python 逐行入口，Search 的 `function_score`（boost）与解码；单元测试。
+1. core：两空间还原、boost 与三组候选窗口、`filter` 的 Python 逐行入口，Search 的 `function_score`（boost）与解码；单元测试。
 2. core：L2 合并（rrf / weighted / decay）、`GroupByOp` 与 Search 的 L2 路径、`round_decimal` 的 rerank 后取整；单元测试。
 3. grpc / core：HybridSearch（`rank_params`、`function_score`、分区、分组、时区与 `time_fields`）。
 4. 差分、参照用例、文档与验收记录；计数同步。

@@ -17,6 +17,8 @@ use crate::filter::PkLiteral;
 use crate::flat;
 use crate::index::{IndexRequest, IndexSpec, Metric, build_spec};
 use crate::projection::{ApiKind, Projection};
+use crate::rerank::boost::{self, BoostPlan, CompiledBoost, DISTANCE_FIELD, ID_FIELD};
+use crate::rerank::pyval::PyVal;
 use crate::schema::{CollectionSchema, DataType, FieldSchema};
 use crate::storage::arrow_data::DecodedData;
 use crate::storage::recovery::RecoveredCollection;
@@ -58,6 +60,14 @@ pub struct GroupBy {
     pub strict: bool,
 }
 
+/// [`ReadSnapshot::search_boosted_in`] 的过滤、范围、分组与时区。
+pub struct BoostedFilter<'a> {
+    pub expr: &'a str,
+    pub range: Option<SearchRange>,
+    pub group: Option<GroupBy>,
+    pub timezone: &'a crate::timezone::TimezoneSource<'a>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct SearchRange {
     pub radius: Option<f64>,
@@ -83,6 +93,11 @@ pub struct Hits {
     pub rows: Rows,
     /// 分组检索时与 `rows` 逐行对应的分组字段值（含空值），不依赖 `output_fields`；否则为 None。
     pub group_values: Option<ColumnData>,
+    /// rerank 路径的 float64 对外分数（`scores` 是它们的 float32 存储）。`round_decimal` 作用在这个值上，
+    /// 不再经过 `Metric::public_f64`：那个函数接收的是内部 float32，对这里的值会二次换算。
+    pub public_scores: Option<Vec<f64>>,
+    /// 同名字段盖掉 `$id` 时每个命中的 id。响应编码时才按主键类型做 `int()` / `str()`（错误在那里报）。
+    pub id_overrides: Option<Vec<crate::rerank::pyval::PyVal>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -144,6 +159,7 @@ struct FilterContext<'a> {
     range: Option<SearchRange>,
     group: Option<&'a GroupBy>,
     timezone: &'a crate::timezone::TimezoneSource<'a>,
+    boost: Option<&'a BoostPlan>,
 }
 
 impl ReadSnapshot {
@@ -218,6 +234,30 @@ impl ReadSnapshot {
                 range,
                 group: group.as_ref(),
                 timezone,
+                boost: None,
+            },
+        )
+    }
+
+    /// 同 [`Self::search_grouped_in`]，候选先过 boost（0026）：窗口放大，boost 之后再分组、切 offset。
+    pub fn search_boosted_in(
+        &self,
+        req: SearchRequest,
+        compute: &Compute,
+        filter: BoostedFilter<'_>,
+        boost: &BoostPlan,
+    ) -> Result<SearchResult> {
+        let rows_per_block = (BLOCK_ELEMS / field_dim(&self.schema.fields[self.vector_pos])).max(1);
+        self.search_filtered_in_blocks(
+            req,
+            compute,
+            rows_per_block,
+            FilterContext {
+                expr: filter.expr,
+                range: filter.range,
+                group: filter.group.as_ref(),
+                timezone: filter.timezone,
+                boost: Some(boost),
             },
         )
     }
@@ -237,6 +277,7 @@ impl ReadSnapshot {
                 range: None,
                 group: None,
                 timezone: &crate::timezone::TimezoneSource::none(),
+                boost: None,
             },
         )
     }
@@ -253,6 +294,7 @@ impl ReadSnapshot {
             range,
             group,
             timezone,
+            boost,
         } = filter;
         let projection = Projection::new(&self.schema, &req.output_fields, ApiKind::Search);
         // 3.x：没有查询向量时在一切检查之前返回空结果。
@@ -296,10 +338,15 @@ impl ReadSnapshot {
         let range = range.filter(|r| r.radius.is_some() || r.range_filter.is_some());
         let end = req.limit.saturating_add(req.offset);
         // 3.x 只在有限近邻窗口内做范围过滤，不能在扫描时提前筛掉范围外候选。
-        let take = match group {
-            Some(g) => group_window(end, g.size, range.is_some()),
-            None if range.is_some() => end.saturating_mul(5),
-            None => end,
+        let take = match (boost, group) {
+            (Some(_), _) => crate::rerank::window::search_boost(
+                i64::try_from(end).unwrap_or(i64::MAX),
+                group.map(|g| g.size),
+                range.is_some(),
+            ),
+            (None, Some(g)) => group_window(end, g.size, range.is_some()),
+            (None, None) if range.is_some() => end.saturating_mul(5),
+            (None, None) => end,
         };
         // 3.x 编译过滤后才处理 topk<=0，但此时不会进入数据求值或数值转换。
         let chunks = if take > 0 {
@@ -356,6 +403,44 @@ impl ReadSnapshot {
                 }
             }
         }
+        if let Some(plan) = boost {
+            // 3.x 在范围过滤之后才构造 BoostOp：过滤表达式的错误晚于前面所有校验，没有候选也要报。
+            let id_key_visible = dynamic_key_visible(&self.schema, &projection, ID_FIELD);
+            let compiled = CompiledBoost::new(&plan.spec, metric, |expr| {
+                crate::filter::RowFilter::compile(
+                    &crate::filter::ParsedFilter::parse_with(expr, timezone)?,
+                    &self.schema,
+                    id_key_visible,
+                )
+            })?;
+            let ranked = tops
+                .into_iter()
+                .map(|top| {
+                    let mut ranked = top.finish();
+                    if let Some(range) = range {
+                        ranked.retain(|(score, _)| range.contains(metric, *score));
+                        ranked.truncate(take);
+                    }
+                    ranked
+                })
+                .collect();
+            let hits = self.boosted_hits(BoostInput {
+                ranked,
+                compiled,
+                metric,
+                projection: &projection,
+                group: group.zip(group_pos),
+                end,
+                offset: req.offset,
+                limit: req.limit,
+                keep: plan.keep,
+            })?;
+            return Ok(SearchResult {
+                projection,
+                metric: Some(metric),
+                hits,
+            });
+        }
         let hits = tops
             .into_iter()
             .map(|top| {
@@ -364,30 +449,41 @@ impl ReadSnapshot {
                     ranked.retain(|(score, _)| range.contains(metric, *score));
                     ranked.truncate(end);
                 }
-                let grouped: Vec<(f32, RankedRow)>;
-                let kept: &[(f32, RankedRow)] = match (group, group_pos) {
+                let grouped: Vec<RowRef>;
+                let kept: Vec<(f32, RowRef)> = match (group, group_pos) {
                     (Some(g), Some(pos)) => {
-                        grouped =
-                            group_order(&self.chunks, &ranked, pos, g, end, req.offset, req.limit)
-                                .into_iter()
-                                .map(|i| ranked[i])
-                                .collect();
-                        &grouped
+                        grouped = ranked.iter().map(|(_, r)| r.at).collect();
+                        group_order(
+                            &self.chunks,
+                            &grouped,
+                            pos,
+                            g,
+                            GroupWindow {
+                                groups: end,
+                                offset: req.offset,
+                                limit: req.limit,
+                                blank: false,
+                            },
+                        )
+                        .into_iter()
+                        .map(|i| (ranked[i].0, grouped[i]))
+                        .collect()
                     }
-                    _ => ranked.get(req.offset..).unwrap_or(&[]),
+                    _ => ranked
+                        .get(req.offset..)
+                        .unwrap_or(&[])
+                        .iter()
+                        .map(|(score, r)| (*score, r.at))
+                        .collect(),
                 };
-                let refs: Vec<RowRef> = kept.iter().map(|(_, r)| r.at).collect();
-                let group_values = group_pos.map(|pos| {
-                    let mut column = ColumnData::empty(&self.schema.fields[pos]);
-                    for r in &refs {
-                        column.push_row(&self.chunks[r.chunk].columns[pos], r.row);
-                    }
-                    column
-                });
+                let refs: Vec<RowRef> = kept.iter().map(|(_, r)| *r).collect();
+                let group_values = group_pos.map(|pos| self.group_column(&refs, pos));
                 Hits {
                     scores: kept.iter().map(|(s, _)| *s).collect(),
                     rows: self.gather(&refs, &projection),
                     group_values,
+                    public_scores: None,
+                    id_overrides: None,
                 }
             })
             .collect();
@@ -396,6 +492,164 @@ impl ReadSnapshot {
             metric: Some(metric),
             hits,
         })
+    }
+
+    fn group_column(&self, refs: &[RowRef], pos: usize) -> ColumnData {
+        let mut column = ColumnData::empty(&self.schema.fields[pos]);
+        for r in refs {
+            column.push_row(&self.chunks[r.chunk].columns[pos], r.row);
+        }
+        column
+    }
+
+    /// boost 链（3.x `apply_boost_ranker` 之后的 `Collection.search`）：全部查询逐行 boost → 全部排序 →
+    /// 分组、切 offset → 转成对外分数。各阶段都可能报错，先后要与 3.x 相同，所以分成几轮循环。
+    fn boosted_hits(&self, input: BoostInput<'_>) -> Result<Vec<Hits>> {
+        let BoostInput {
+            ranked,
+            compiled,
+            metric,
+            projection,
+            group,
+            end,
+            offset,
+            limit,
+            keep,
+        } = input;
+        let schema_field = |name: &str| {
+            self.schema
+                .fields
+                .iter()
+                .position(|f| f.name == name && !f.is_primary)
+        };
+        let id_field = schema_field(ID_FIELD);
+        let distance_field = schema_field(DISTANCE_FIELD);
+        let id_key = dynamic_key_visible(&self.schema, projection, ID_FIELD);
+        let distance_key = dynamic_key_visible(&self.schema, projection, DISTANCE_FIELD);
+        // 同名字段盖掉虚拟值：schema 字段总在（boost 把全部非主键字段注入投影），动态键要在投影内。
+        let overriding = |field: Option<usize>, key: Option<&str>, at: RowRef| -> Result<_> {
+            let chunk = &self.chunks[at.chunk];
+            if let Some(pos) = field {
+                return PyVal::from_field(&self.schema.fields[pos], &chunk.columns[pos], at.row)
+                    .map(Some);
+            }
+            Ok(key.and_then(|key| {
+                chunk
+                    .meta
+                    .as_ref()
+                    .and_then(|meta| meta[at.row].get(key))
+                    .map(PyVal::from_json)
+            }))
+        };
+        let mut queries = Vec::with_capacity(ranked.len());
+        let mut any_id_override = false;
+        for candidates in &ranked {
+            let mut rows = Vec::with_capacity(candidates.len());
+            for (index, (score, candidate)) in candidates.iter().enumerate() {
+                let at = candidate.at;
+                let chunk = &self.chunks[at.chunk];
+                let id_value = overriding(id_field, id_key.then_some(ID_FIELD), at)?;
+                any_id_override |= id_value.is_some();
+                let mut row = boost::Row {
+                    id: id_value.unwrap_or_else(|| {
+                        match pk_at(&chunk.columns[self.pk_pos], at.row) {
+                            Pk::Int64(i) => PyVal::Int(i),
+                            Pk::VarChar(s) => PyVal::Str(s),
+                        }
+                    }),
+                    distance: overriding(
+                        distance_field,
+                        distance_key.then_some(DISTANCE_FIELD),
+                        at,
+                    )?
+                    .unwrap_or_else(|| PyVal::Float(f64::from(metric.internal(*score)))),
+                    index,
+                };
+                compiled.apply(&mut row.distance, |filter| {
+                    let meta = chunk.meta.as_ref().map(|meta| &meta[at.row]);
+                    filter.matches(&chunk.columns, at.row, meta)
+                })?;
+                rows.push(row);
+            }
+            queries.push(rows);
+        }
+        let mut sorted = Vec::with_capacity(queries.len());
+        for rows in queries {
+            sorted.push(crate::rerank::try_sort_by(rows, &mut boost::sort_order)?);
+        }
+        let mut kept = Vec::with_capacity(sorted.len());
+        for (mut rows, candidates) in sorted.into_iter().zip(&ranked) {
+            let refs: Vec<RowRef> = rows.iter().map(|r| candidates[r.index].1.at).collect();
+            let order: Vec<usize> = match group {
+                Some((g, pos)) => {
+                    // 同名字段已从 entity 剥掉：分组时取不到值，全部落入一个空值组（0026 第 7 节）。
+                    let blank = !self.schema.fields[pos].is_primary
+                        && matches!(g.field.as_str(), ID_FIELD | DISTANCE_FIELD);
+                    group_order(
+                        &self.chunks,
+                        &refs,
+                        pos,
+                        g,
+                        GroupWindow {
+                            groups: end,
+                            offset,
+                            limit,
+                            blank,
+                        },
+                    )
+                }
+                None => (offset..rows.len()).collect(),
+            };
+            let order: Vec<usize> = order.into_iter().take(keep).collect();
+            let picked: Vec<RowRef> = order.iter().map(|&i| refs[i]).collect();
+            let mut taken: Vec<Option<boost::Row>> = rows.drain(..).map(Some).collect();
+            let rows: Vec<boost::Row> = order.iter().filter_map(|&i| taken[i].take()).collect();
+            kept.push((rows, picked));
+        }
+        let mut public = Vec::with_capacity(kept.len());
+        for (rows, _) in &kept {
+            let mut scores = Vec::with_capacity(rows.len());
+            for row in rows {
+                scores.push(boost::public_score(&row.distance, metric)?);
+            }
+            public.push(scores);
+        }
+        let hits = kept
+            .into_iter()
+            .zip(public)
+            .map(|((rows, refs), public)| {
+                let mut gathered = self.gather(&refs, projection);
+                // 虚拟列排序后从 entity 剥掉：同名的 schema 字段输出空值占位，动态键不再出现。
+                for (name, column) in &mut gathered.fields {
+                    if matches!(name.as_str(), ID_FIELD | DISTANCE_FIELD)
+                        && let Some(field) = self.schema.field(name)
+                        && !field.is_primary
+                    {
+                        *column = ColumnData::nulls(field, refs.len());
+                    }
+                }
+                for meta in gathered.meta.iter_mut().flatten() {
+                    meta.shift_remove(ID_FIELD);
+                    meta.shift_remove(DISTANCE_FIELD);
+                }
+                let group_values = group.map(|(g, pos)| {
+                    let field = &self.schema.fields[pos];
+                    if !field.is_primary && matches!(g.field.as_str(), ID_FIELD | DISTANCE_FIELD) {
+                        ColumnData::nulls(field, refs.len())
+                    } else {
+                        self.group_column(&refs, pos)
+                    }
+                });
+                Hits {
+                    scores: public.iter().map(|s| *s as f32).collect(),
+                    rows: gathered,
+                    group_values,
+                    public_scores: Some(public),
+                    id_overrides: any_id_override.then(|| rows.into_iter().map(|r| r.id).collect()),
+                }
+            })
+            .collect();
+        Ok(hits)
     }
 
     fn filtered_chunks_parsed(
@@ -3295,6 +3549,33 @@ fn group_window(end: usize, size: i64, ranged: bool) -> usize {
     usize::try_from(window.max(0)).unwrap_or(usize::MAX)
 }
 
+/// 动态键 `key` 是否在投影内：只有这时才进候选行，才可能盖掉同名的虚拟列。
+fn dynamic_key_visible(schema: &CollectionSchema, projection: &Projection, key: &str) -> bool {
+    schema.enable_dynamic_field
+        && (projection.all_dynamic || projection.dynamic_keys.iter().any(|k| k == key))
+}
+
+/// [`group_order`] 的范围参数：`blank` 时每行都按空值分组（同名字段已被 boost 链剥掉）。
+struct GroupWindow {
+    groups: usize,
+    offset: usize,
+    limit: usize,
+    blank: bool,
+}
+
+/// [`ReadSnapshot::boosted_hits`] 的输入。
+struct BoostInput<'a> {
+    ranked: Vec<Vec<(f32, RankedRow)>>,
+    compiled: CompiledBoost<'a>,
+    metric: Metric,
+    projection: &'a Projection,
+    group: Option<(&'a GroupBy, usize)>,
+    end: usize,
+    offset: usize,
+    limit: usize,
+    keep: usize,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum GroupKey<'a> {
     Null,
@@ -3324,19 +3605,26 @@ fn group_key(column: &ColumnData, row: usize) -> GroupKey<'_> {
 /// 空值是独立的一组。`size` 不为正时每组都留不下命中，结果为空。
 fn group_order(
     chunks: &[Chunk],
-    ranked: &[(f32, RankedRow)],
+    ranked: &[RowRef],
     pos: usize,
     group: &GroupBy,
-    groups: usize,
-    offset: usize,
-    limit: usize,
+    window: GroupWindow,
 ) -> Vec<usize> {
+    let GroupWindow {
+        groups,
+        offset,
+        limit,
+        blank,
+    } = window;
     let size = i128::from(group.size);
     let mut index: HashMap<GroupKey<'_>, usize> = HashMap::new();
     let mut members: Vec<Vec<usize>> = Vec::new();
-    for (i, (_, ranked_row)) in ranked.iter().enumerate() {
-        let at = ranked_row.at;
-        let key = group_key(&chunks[at.chunk].columns[pos], at.row);
+    for (i, at) in ranked.iter().enumerate() {
+        let key = if blank {
+            GroupKey::Null
+        } else {
+            group_key(&chunks[at.chunk].columns[pos], at.row)
+        };
         let slot = *index.entry(key).or_insert_with(|| {
             members.push(Vec::new());
             members.len() - 1
@@ -4010,6 +4298,480 @@ fn check_loaded(name: &str, state: LoadState, deleted: bool, unusable: bool) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 0026：Search + boost 的引擎路径。1 维向量 `[i]`，查询 `[0]`：L2 的内部距离就是 `i`，对外分数是 `i²`。
+    mod boosted {
+        use super::*;
+        use crate::rerank::boost::{BoostFunction, BoostSpec, Mode};
+        use crate::timezone::TimezoneSource;
+
+        fn schema(dynamic: bool, extra: Vec<FieldSchema>) -> CollectionSchema {
+            let mut fields = vec![
+                FieldSchema {
+                    is_primary: true,
+                    ..FieldSchema::new("id", DataType::Int64)
+                },
+                FieldSchema {
+                    dim: Some(1),
+                    ..FieldSchema::new("v", DataType::FloatVector)
+                },
+                FieldSchema::new("cat", DataType::Int64),
+            ];
+            fields.extend(extra);
+            CollectionSchema {
+                fields,
+                enable_dynamic_field: dynamic,
+                properties: Vec::new(),
+            }
+        }
+
+        fn loaded(
+            schema: CollectionSchema,
+            rows: usize,
+            extra: Vec<(String, InputValues)>,
+        ) -> Collection {
+            let mut c = Collection::new("c", schema).unwrap();
+            let mut columns = vec![
+                (
+                    "id".to_owned(),
+                    InputValues::Int((0..rows as i64).collect()),
+                ),
+                (
+                    "v".to_owned(),
+                    InputValues::FloatVector {
+                        dim: 1,
+                        values: (0..rows).map(|i| i as f32).collect(),
+                    },
+                ),
+                (
+                    "cat".to_owned(),
+                    InputValues::Int((0..rows as i64).map(|i| i % 3).collect()),
+                ),
+            ];
+            columns.extend(extra);
+            c.insert(InsertBatch {
+                num_rows: rows,
+                columns,
+            })
+            .unwrap();
+            c.load().unwrap();
+            c
+        }
+
+        fn weight(weight: f64, filter: Option<&str>) -> BoostFunction {
+            BoostFunction {
+                weight,
+                filter: filter.map(str::to_owned),
+                random_score: false,
+            }
+        }
+
+        fn plan(functions: Vec<BoostFunction>, keep: usize) -> BoostPlan {
+            BoostPlan {
+                spec: BoostSpec {
+                    functions,
+                    boost_mode: Mode::Multiply,
+                    function_mode: Mode::Multiply,
+                },
+                keep,
+            }
+        }
+
+        struct Call {
+            limit: usize,
+            offset: usize,
+            group: Option<GroupBy>,
+            range: Option<SearchRange>,
+            output: Vec<String>,
+            metric: &'static str,
+        }
+
+        impl Default for Call {
+            fn default() -> Self {
+                Self {
+                    limit: 3,
+                    offset: 0,
+                    group: None,
+                    range: None,
+                    output: Vec::new(),
+                    metric: "L2",
+                }
+            }
+        }
+
+        fn search(c: &Collection, plan: &BoostPlan, call: Call) -> Result<SearchResult> {
+            let compute = Compute::new(std::num::NonZeroUsize::MIN).unwrap();
+            c.read_snapshot().search_boosted_in(
+                SearchRequest {
+                    anns_field: None,
+                    vectors: QueryVectors::Dense(vec![vec![0.0]]),
+                    metric_type: Some(call.metric.to_owned()),
+                    limit: call.limit,
+                    offset: call.offset,
+                    output_fields: call.output,
+                },
+                &compute,
+                BoostedFilter {
+                    expr: "",
+                    range: call.range,
+                    group: call.group,
+                    timezone: &TimezoneSource::none(),
+                },
+                plan,
+            )
+        }
+
+        fn ids(result: &SearchResult) -> Vec<i64> {
+            result.hits[0]
+                .rows
+                .pks
+                .iter()
+                .map(|pk| match pk {
+                    Pk::Int64(i) => *i,
+                    Pk::VarChar(_) => panic!("varchar"),
+                })
+                .collect()
+        }
+
+        #[test]
+        fn l2_weight_multiplies_the_square_root_and_converts_once() {
+            let c = loaded(schema(false, vec![]), 8, vec![]);
+            let result = search(
+                &c,
+                &plan(vec![weight(0.5, Some("id > 1"))], 3),
+                Call::default(),
+            )
+            .unwrap();
+            // 内部距离 0, 1, 1(=2·0.5), 1.5(=3·0.5)：平局按 $id。
+            assert_eq!(ids(&result), [0, 1, 2]);
+            let hits = &result.hits[0];
+            assert_eq!(hits.public_scores.as_deref(), Some(&[0.0, 1.0, 1.0][..]));
+            assert_eq!(hits.scores, [0.0, 1.0, 1.0]);
+            assert!(hits.id_overrides.is_none());
+        }
+
+        #[test]
+        fn window_is_ten_times_the_end() {
+            let c = loaded(schema(false, vec![]), 30, vec![]);
+            // 权重 0 把第 19 名（id=19）提到最前：limit=2 的窗口是 20，第 20 名（id=20）不在窗口内。
+            let inside = plan(vec![weight(0.0, Some("id == 19"))], 2);
+            let call = || Call {
+                limit: 2,
+                ..Call::default()
+            };
+            assert_eq!(ids(&search(&c, &inside, call()).unwrap()), [0, 19]);
+            let outside = plan(vec![weight(0.0, Some("id == 20"))], 2);
+            assert_eq!(ids(&search(&c, &outside, call()).unwrap()), [0, 1]);
+            // offset 计入窗口。
+            let with_offset = plan(vec![weight(0.0, Some("id == 20"))], 2);
+            let result = search(
+                &c,
+                &with_offset,
+                Call {
+                    limit: 2,
+                    offset: 1,
+                    ..Call::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(ids(&result), [20, 1]);
+        }
+
+        #[test]
+        fn keep_is_independent_of_limit_plus_offset() {
+            let c = loaded(schema(false, vec![]), 30, vec![]);
+            // 负 offset：`limit` 已缩小为 top_k + offset，窗口按它算，返回数仍按 top_k。
+            let result = search(
+                &c,
+                &plan(vec![weight(1.0, None)], 4),
+                Call {
+                    limit: 3,
+                    ..Call::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(ids(&result), [0, 1, 2, 3]);
+            // 窗口为 0 时没有候选。
+            let result = search(
+                &c,
+                &plan(vec![weight(1.0, None)], 4),
+                Call {
+                    limit: 0,
+                    ..Call::default()
+                },
+            )
+            .unwrap();
+            assert!(ids(&result).is_empty());
+        }
+
+        #[test]
+        fn grouping_happens_after_boost_and_flattened_hits_are_cut_to_keep() {
+            let c = loaded(schema(false, vec![]), 30, vec![]);
+            let group = |size| GroupBy {
+                field: "cat".to_owned(),
+                size,
+                strict: false,
+            };
+            // boost 改变分组前的顺序：id=2、5 的距离变成 0，与 id=0 并列，按 $id 排序后 cat=2 成为第二组。
+            let boosted = |keep| plan(vec![weight(0.0, Some("id in [2, 5]"))], keep);
+            let call = || Call {
+                limit: 2,
+                group: Some(group(3)),
+                ..Call::default()
+            };
+            let result = search(&c, &boosted(6), call()).unwrap();
+            assert_eq!(ids(&result), [0, 3, 6, 2, 5, 8]);
+            // 展平后再按 hits[:top_k] 截断（3.x 同）。
+            let result = search(&c, &boosted(2), call()).unwrap();
+            assert_eq!(ids(&result), [0, 3]);
+            assert_eq!(
+                result.hits[0].group_values,
+                Some(ColumnData::Int64(vec![0, 0]))
+            );
+            // offset 为正时切展平后的命中。
+            let result = search(
+                &c,
+                &plan(vec![weight(1.0, None)], 2),
+                Call {
+                    limit: 2,
+                    offset: 1,
+                    group: Some(group(2)),
+                    ..Call::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(ids(&result), [3, 1]);
+            // 负 group_size：每组留不下命中。
+            let result = search(
+                &c,
+                &plan(vec![weight(1.0, None)], 2),
+                Call {
+                    limit: 2,
+                    group: Some(group(-1)),
+                    ..Call::default()
+                },
+            )
+            .unwrap();
+            assert!(ids(&result).is_empty());
+        }
+
+        #[test]
+        fn same_named_fields_override_then_get_stripped() {
+            let extra = vec![
+                FieldSchema::new("$distance", DataType::Int64),
+                FieldSchema::new("$id", DataType::Int64),
+            ];
+            let c = loaded(
+                schema(false, extra),
+                4,
+                vec![
+                    (
+                        "$distance".to_owned(),
+                        InputValues::Int(vec![30, 20, 10, 40]),
+                    ),
+                    ("$id".to_owned(), InputValues::Int(vec![100, 100, 200, 300])),
+                ],
+            );
+            let result = search(
+                &c,
+                &plan(vec![weight(2.0, Some("id == 3"))], 4),
+                Call {
+                    limit: 4,
+                    output: vec!["$distance".to_owned(), "cat".to_owned()],
+                    ..Call::default()
+                },
+            )
+            .unwrap();
+            let hits = &result.hits[0];
+            // 距离来自同名字段；过滤里的主键同样是盖掉后的值，`id == 3` 不命中。
+            assert_eq!(ids(&result), [2, 1, 0, 3]);
+            assert_eq!(
+                hits.public_scores.as_deref(),
+                Some(&[100.0, 400.0, 900.0, 1600.0][..])
+            );
+            assert_eq!(
+                hits.id_overrides,
+                Some(vec![
+                    PyVal::Int(200),
+                    PyVal::Int(100),
+                    PyVal::Int(100),
+                    PyVal::Int(300)
+                ])
+            );
+            // 输出里同名字段是空值占位，其余字段不受影响。
+            let distance = &hits
+                .rows
+                .fields
+                .iter()
+                .find(|(n, _)| n == "$distance")
+                .unwrap()
+                .1;
+            assert!((0..4).all(|row| distance.is_null(row)));
+            let cat = &hits.rows.fields.iter().find(|(n, _)| n == "cat").unwrap().1;
+            assert!(!cat.is_null(0));
+        }
+
+        #[test]
+        fn engine_group_on_stripped_fields_is_one_null_group() {
+            let c = loaded(
+                schema(false, vec![FieldSchema::new("$id", DataType::Int64)]),
+                4,
+                vec![("$id".to_owned(), InputValues::Int(vec![7, 8, 9, 10]))],
+            );
+            let result = search(
+                &c,
+                &plan(vec![weight(1.0, None)], 4),
+                Call {
+                    limit: 4,
+                    group: Some(GroupBy {
+                        field: "$id".to_owned(),
+                        size: 1,
+                        strict: false,
+                    }),
+                    ..Call::default()
+                },
+            )
+            .unwrap();
+            let hits = &result.hits[0];
+            assert_eq!(hits.id_overrides, Some(vec![PyVal::Int(7)]));
+            let values = hits.group_values.as_ref().unwrap();
+            assert_eq!(values.len(), 1);
+            assert!(values.is_null(0));
+        }
+
+        #[test]
+        fn dynamic_keys_override_only_inside_the_projection() {
+            let c = loaded(
+                schema(true, vec![]),
+                3,
+                vec![(
+                    META_FIELD.to_owned(),
+                    InputValues::Json(vec![
+                        br#"{"$distance":5,"x":1}"#.to_vec(),
+                        br#"{"$distance":1,"x":2}"#.to_vec(),
+                        br#"{"$distance":3,"x":3}"#.to_vec(),
+                    ]),
+                )],
+            );
+            let boost = plan(vec![weight(1.0, Some("dyn_key > 0"))], 3);
+            // 默认投影含全部动态键：距离被盖掉，输出时键被剥掉。
+            let result = search(
+                &c,
+                &boost,
+                Call {
+                    metric: "IP",
+                    ..Call::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(ids(&result), [1, 2, 0]);
+            assert_eq!(
+                result.hits[0].public_scores.as_deref(),
+                Some(&[-1.0, -3.0, -5.0][..])
+            );
+            let meta = result.hits[0].rows.meta.as_ref().unwrap();
+            assert!(meta.iter().all(|m| !m.contains_key("$distance")));
+            assert!(meta.iter().all(|m| m.contains_key("x")));
+            // 投影外的动态键不覆盖。
+            let result = search(
+                &c,
+                &boost,
+                Call {
+                    metric: "L2",
+                    output: vec!["cat".to_owned()],
+                    ..Call::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(ids(&result), [0, 1, 2]);
+            assert_eq!(
+                result.hits[0].public_scores.as_deref(),
+                Some(&[0.0, 1.0, 4.0][..])
+            );
+        }
+
+        #[test]
+        fn filter_errors_are_reported_even_without_candidates() {
+            let c = loaded(schema(false, vec![]), 3, vec![]);
+            let boost = plan(vec![weight(1.0, Some("nosuch > 1"))], 0);
+            let error = search(
+                &c,
+                &boost,
+                Call {
+                    limit: 0,
+                    ..Call::default()
+                },
+            )
+            .unwrap_err();
+            assert!(
+                matches!(&error, EngineError::SchemaValidation(m) if m.contains("unknown field 'nosuch'")),
+                "{error}"
+            );
+            // 空结果时 random_score 用不到，不报 UNIMPLEMENTED。
+            let mut random = weight(1.0, None);
+            random.random_score = true;
+            let empty = search(
+                &c,
+                &plan(vec![random.clone()], 0),
+                Call {
+                    limit: 0,
+                    ..Call::default()
+                },
+            )
+            .unwrap();
+            assert!(ids(&empty).is_empty());
+            // 过滤不命中时同样用不到；命中才报。
+            random.filter = Some("id > 100".to_owned());
+            assert!(search(&c, &plan(vec![random.clone()], 3), Call::default()).is_ok());
+            random.filter = Some("id == 1".to_owned());
+            assert!(matches!(
+                search(&c, &plan(vec![random], 3), Call::default()),
+                Err(EngineError::Unsupported { .. })
+            ));
+        }
+
+        #[test]
+        fn range_filter_keeps_the_boost_window() {
+            let c = loaded(schema(false, vec![]), 30, vec![]);
+            // 范围内 id <= 12；3.x 按窗口（limit=2 时 20）而不是 limit 截断范围结果。
+            let result = search(
+                &c,
+                &plan(vec![weight(0.0, Some("id == 12"))], 2),
+                Call {
+                    limit: 2,
+                    range: Some(SearchRange {
+                        radius: Some(150.0),
+                        range_filter: None,
+                    }),
+                    ..Call::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(ids(&result), [0, 12]);
+        }
+
+        #[test]
+        fn plain_search_does_not_report_rerank_fields() {
+            let c = loaded(schema(false, vec![]), 3, vec![]);
+            let compute = Compute::new(std::num::NonZeroUsize::MIN).unwrap();
+            let result = c
+                .read_snapshot()
+                .search(
+                    SearchRequest {
+                        anns_field: None,
+                        vectors: QueryVectors::Dense(vec![vec![0.0]]),
+                        metric_type: Some("L2".to_owned()),
+                        limit: 2,
+                        offset: 0,
+                        output_fields: Vec::new(),
+                    },
+                    &compute,
+                )
+                .unwrap();
+            assert!(result.hits[0].public_scores.is_none());
+            assert!(result.hits[0].id_overrides.is_none());
+        }
+    }
 
     #[test]
     fn creation_reads_the_database_zone_once_for_validation_and_normalization() {

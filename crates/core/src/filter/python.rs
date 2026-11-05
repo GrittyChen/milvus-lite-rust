@@ -234,7 +234,7 @@ impl Value<'_> {
     }
 }
 
-pub(super) fn int_cmp(a: &str, b: &str) -> Ordering {
+pub(crate) fn int_cmp(a: &str, b: &str) -> Ordering {
     fn split(raw: &str) -> (bool, &str) {
         let digits = raw.trim_start_matches('-').trim_start_matches('0');
         (raw.starts_with('-') && !digits.is_empty(), digits)
@@ -247,7 +247,7 @@ pub(super) fn int_cmp(a: &str, b: &str) -> Ordering {
     let order = a.len().cmp(&b.len()).then_with(|| a.cmp(b));
     if an { order.reverse() } else { order }
 }
-pub(super) fn int_float_cmp(integer: &str, float: f64) -> Option<Ordering> {
+pub(crate) fn int_float_cmp(integer: &str, float: f64) -> Option<Ordering> {
     if float.is_nan() {
         return None;
     }
@@ -483,6 +483,7 @@ fn column_value(column: &ColumnData, index: usize) -> Result<Value<'_>> {
 fn operand<'a>(op: &'a Operand, row: &DynamicRow<'a>) -> Result<Value<'a>> {
     Ok(match op {
         Operand::Literal(l) => return from_literal(l),
+        Operand::Absent => Value::Null,
         Operand::Dynamic(key) => row
             .meta
             .and_then(|m| m.get(key))

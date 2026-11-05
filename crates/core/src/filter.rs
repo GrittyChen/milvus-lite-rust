@@ -13,6 +13,7 @@ mod tree_tests;
 mod unicode;
 pub(crate) use dynamic::DynamicRow;
 pub(crate) use eval::Predicate;
+pub(crate) use python::{int_cmp, int_float_cmp};
 
 /// 错误字符串与词法必须使用同一版 Unicode 属性，避免未分配码位的 repr 漂移。
 pub(crate) fn printable_char(c: char) -> bool {
@@ -87,6 +88,102 @@ impl ParsedFilter {
             }
         }
         Some(out)
+    }
+}
+
+/// boost 过滤（0026）：3.x 用 `compile_filter` + `_eval_row` 逐行求值，不走普通过滤按整条表达式选路线的规则，
+/// 所以一律构造布尔树、一律走 Python 路线。行里只有 schema 字段，动态字段不可见（`meta = None`）。
+///
+/// 3.x 求值前令 `row[pk] = row.get(pk, row.get("$id"))`，同名字段盖掉 `$id` 后，过滤看到的主键是那个值，
+/// 类型也不再是主键列的类型。这里把主键操作数改绑到值的真实来源，不经任何中间表示：NaN、`datetime`
+/// 这些值换一种表示就会改变 `is null`、比较与 `in` 的结果。语义检查发生在改绑之前，仍按主键的 schema 类型。
+pub(crate) struct RowFilter {
+    tree: tree::Tree,
+    /// 动态键 `$id` 盖掉主键的行用这棵树：主键读这个键，其余动态字段读不到。
+    /// 只有表达式引用了主键且 `$id` 键在投影内时才有。
+    dynamic_id: Option<tree::Tree>,
+}
+
+impl RowFilter {
+    /// 表达式为空时返回 None（3.x 的 `if filt:`）。范围外构造优先 UNIMPLEMENTED，与普通过滤相同。
+    /// `id_key_visible`：动态键 `$id` 是否在这次检索的投影内。
+    pub(crate) fn compile(
+        parsed: &ParsedFilter,
+        schema: &crate::schema::CollectionSchema,
+        id_key_visible: bool,
+    ) -> Result<Option<Self>> {
+        use crate::rerank::boost::ID_FIELD;
+        use crate::schema::DataType;
+        use eval::Operand;
+        let Some(ast) = &parsed.ast else {
+            return Ok(None);
+        };
+        if eval::general_arithmetic(ast, schema) {
+            return Err(eval::unsupported());
+        }
+        let pk = schema.fields.iter().position(|f| f.is_primary);
+        let is_pk = |op: &Operand| matches!(op, Operand::Column(i) if Some(*i) == pk);
+        let mut tree = tree::Tree::compile(parsed, schema)?;
+        // 同名的 schema 字段每行都在，直接改绑到这一列。
+        let id_field = schema
+            .fields
+            .iter()
+            .position(|f| f.name == ID_FIELD && !f.is_primary);
+        if let Some(pos) = id_field {
+            let bound = if schema.fields[pos].data_type == DataType::Timestamptz {
+                Operand::Timestamp(pos)
+            } else {
+                Operand::Column(pos)
+            };
+            for op in tree.operands.iter_mut().flatten() {
+                if is_pk(op) {
+                    *op = bound.clone();
+                }
+            }
+            return Ok(Some(Self {
+                tree,
+                dynamic_id: None,
+            }));
+        }
+        let dynamic_id = if id_key_visible && tree.operands.iter().flatten().any(is_pk) {
+            let mut rebound = tree::Tree::compile(parsed, schema)?;
+            for op in rebound.operands.iter_mut().flatten() {
+                if matches!(op, Operand::Dynamic(_)) {
+                    *op = Operand::Absent;
+                } else if is_pk(op) {
+                    *op = Operand::Dynamic(ID_FIELD.to_owned());
+                }
+            }
+            Some(rebound)
+        } else {
+            None
+        };
+        Ok(Some(Self { tree, dynamic_id }))
+    }
+
+    /// `meta` 是这一行完整的动态字段，只用来读 `$id`；求值结果为空值时不命中（3.x `_row_matches_filter`）。
+    pub(crate) fn matches(
+        &self,
+        columns: &[crate::data::ColumnData],
+        row: usize,
+        meta: Option<&serde_json::Map<String, serde_json::Value>>,
+    ) -> Result<bool> {
+        let (tree, meta) = match (&self.dynamic_id, meta) {
+            (Some(tree), Some(meta)) if meta.contains_key(crate::rerank::boost::ID_FIELD) => {
+                (tree, Some(meta))
+            }
+            _ => (&self.tree, None),
+        };
+        let bits = python::evaluate_tree(
+            tree,
+            &[DynamicRow {
+                columns,
+                meta,
+                row,
+                sequence: None,
+            }],
+        )?;
+        Ok(bits.get(0))
     }
 }
 
@@ -274,6 +371,231 @@ mod tests {
         ];
         for expr in cases {
             assert_eq!(p(expr), None, "{expr:?}");
+        }
+    }
+
+    mod row_filter {
+        use super::super::*;
+        use crate::data::ColumnData;
+        use crate::error::EngineError;
+        use crate::schema::{CollectionSchema, DataType, FieldSchema};
+        use crate::timezone::TimezoneSource;
+        use serde_json::json;
+
+        fn schema(dynamic: bool) -> CollectionSchema {
+            let mut id = FieldSchema::new("id", DataType::Int64);
+            id.is_primary = true;
+            let mut v = FieldSchema::new("v", DataType::FloatVector);
+            v.dim = Some(1);
+            let mut opt = FieldSchema::new("opt", DataType::Int32);
+            opt.nullable = true;
+            CollectionSchema {
+                fields: vec![
+                    id,
+                    v,
+                    FieldSchema::new("age", DataType::Int32),
+                    FieldSchema::new("name", DataType::VarChar),
+                    FieldSchema::new("j", DataType::Json),
+                    opt,
+                    FieldSchema::new("ts", DataType::Timestamptz),
+                ],
+                enable_dynamic_field: dynamic,
+                properties: Vec::new(),
+            }
+        }
+
+        fn columns() -> Vec<ColumnData> {
+            vec![
+                ColumnData::Int64(vec![1, 2, 3]),
+                ColumnData::FloatVector {
+                    dim: 1,
+                    values: vec![0.0, 0.0, 0.0],
+                },
+                ColumnData::Int32(vec![1, 5, 9]),
+                ColumnData::VarChar(vec!["ab".into(), "ac".into(), "b".into()]),
+                ColumnData::Json(vec![
+                    br#"{"k":1}"#.to_vec(),
+                    br#"{"k":2}"#.to_vec(),
+                    br#"{"x":1}"#.to_vec(),
+                ]),
+                ColumnData::Int32(vec![7, 0, 7]).with_validity(&[true, false, true]),
+                // 2025-01-01T00:00:00Z 与它前后各一秒。
+                ColumnData::Int64(vec![
+                    1_735_689_599_000_000,
+                    1_735_689_600_000_000,
+                    1_735_689_601_000_000,
+                ]),
+            ]
+        }
+
+        fn filter(expr: &str, dynamic: bool) -> Result<Option<RowFilter>> {
+            let parsed = ParsedFilter::parse_with(expr, &TimezoneSource::none())?;
+            RowFilter::compile(&parsed, &schema(dynamic), dynamic)
+        }
+
+        fn hits(expr: &str, dynamic: bool) -> Vec<bool> {
+            let f = filter(expr, dynamic).unwrap().unwrap();
+            let columns = columns();
+            (0..3)
+                .map(|row| f.matches(&columns, row, None).unwrap())
+                .collect()
+        }
+
+        #[test]
+        fn evaluates_every_shape_row_by_row() {
+            // 主键 in 与简单比较在普通过滤里走快路径，这里同样必须走 Python 路线。
+            for (expr, want) in [
+                ("age > 1", [false, true, true]),
+                ("id in [1, 3]", [true, false, true]),
+                ("id == 2 and age == 5", [false, true, false]),
+                ("age == id", [true, false, false]),
+                ("name like 'a%'", [true, true, false]),
+                ("age not in [5]", [true, false, true]),
+                ("j['k'] == 1", [true, false, false]),
+                ("exists j['k']", [true, true, false]),
+                ("opt is null", [false, true, false]),
+                ("opt is not null", [true, false, true]),
+                ("opt > 1", [true, false, true]),
+                ("ts >= ISO '2025-01-01T00:00:00Z'", [false, true, true]),
+            ] {
+                assert_eq!(hits(expr, false), want, "{expr}");
+                assert_eq!(hits(expr, true), want, "{expr}");
+            }
+        }
+
+        #[test]
+        fn dynamic_fields_are_invisible() {
+            for expr in [
+                "dyn > 5",
+                "$meta['x'] > 1",
+                "dyn is not null",
+                "nosuch == 1",
+            ] {
+                assert_eq!(hits(expr, true), [false; 3], "{expr}");
+            }
+        }
+
+        #[test]
+        fn dynamic_disabled_rejects_unknown_fields() {
+            let code6 = |expr: &str, want: &str| match filter(expr, false) {
+                Err(EngineError::SchemaValidation(message)) => {
+                    assert!(message.contains(want), "{expr}: {message}");
+                }
+                other => panic!("{expr}: {:?}", other.map(|f| f.is_some())),
+            };
+            code6("nosuch == 1", "unknown field 'nosuch'");
+            code6(
+                "$meta['x'] > 1",
+                "$meta access requires schema enable_dynamic_field=True",
+            );
+        }
+
+        #[test]
+        fn out_of_scope_constructs_stay_unimplemented() {
+            for dynamic in [false, true] {
+                for expr in ["age + 1 > 5", "text_match(name, 'a')"] {
+                    assert!(
+                        matches!(filter(expr, dynamic), Err(EngineError::Unsupported { .. })),
+                        "{expr}"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn empty_expression_is_no_filter() {
+            assert!(filter("", true).unwrap().is_none());
+        }
+
+        fn map(value: serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
+            value.as_object().unwrap().clone()
+        }
+
+        #[test]
+        fn dynamic_id_key_overrides_the_primary_key_only() {
+            let columns = columns();
+            let meta = map(json!({"$id": 100, "pk": 5, "dyn": 9}));
+            let f = filter("id == 100", true).unwrap().unwrap();
+            assert!(!f.matches(&columns, 0, None).unwrap());
+            assert!(
+                !f.matches(&columns, 0, Some(&map(json!({"dyn": 9}))))
+                    .unwrap()
+            );
+            assert!(f.matches(&columns, 0, Some(&meta)).unwrap());
+            // 覆盖时其余动态字段（包括名字就叫 pk 的键与 `$meta['$id']`）仍然不可见。
+            for expr in [
+                "pk > 0",
+                "id > 10 and pk > 0",
+                "$meta['pk'] > 0",
+                "$meta['$id'] > 0",
+            ] {
+                let f = filter(expr, true).unwrap().unwrap();
+                assert!(!f.matches(&columns, 0, Some(&meta)).unwrap(), "{expr}");
+            }
+            // 字符串覆盖整数主键：语义检查仍按 INT64，求值时比较不成立。
+            let f = filter("id == 1", true).unwrap().unwrap();
+            assert!(
+                !f.matches(&columns, 0, Some(&map(json!({"$id": "1"}))))
+                    .unwrap()
+            );
+            // 值为 null 时键存在：主键读到空值。
+            let f = filter("id is null", true).unwrap().unwrap();
+            assert!(
+                f.matches(&columns, 0, Some(&map(json!({"$id": null}))))
+                    .unwrap()
+            );
+            assert!(!f.matches(&columns, 0, None).unwrap());
+            // 键不在投影内时不覆盖。
+            let parsed = ParsedFilter::parse_with("id == 100", &TimezoneSource::none()).unwrap();
+            let f = RowFilter::compile(&parsed, &schema(true), false)
+                .unwrap()
+                .unwrap();
+            assert!(!f.matches(&columns, 0, Some(&meta)).unwrap());
+        }
+
+        #[test]
+        fn schema_id_field_overrides_with_its_native_value() {
+            let schema_with = |data_type| {
+                let mut s = schema(false);
+                s.fields.push(FieldSchema::new("$id", data_type));
+                s
+            };
+            let hits = |expr: &str, data_type, column: ColumnData| -> Vec<bool> {
+                let parsed = ParsedFilter::parse_with(expr, &TimezoneSource::none()).unwrap();
+                let f = RowFilter::compile(&parsed, &schema_with(data_type), false)
+                    .unwrap()
+                    .unwrap();
+                let mut all = columns();
+                all.push(column);
+                (0..3)
+                    .map(|row| f.matches(&all, row, None).unwrap())
+                    .collect()
+            };
+            let doubles = || ColumnData::Double(vec![f64::NAN, f64::INFINITY, 3.0]);
+            // NaN 与无穷不是空值。
+            assert_eq!(hits("id is null", DataType::Double, doubles()), [false; 3]);
+            assert_eq!(
+                hits("id is not null", DataType::Double, doubles()),
+                [true; 3]
+            );
+            assert_eq!(
+                hits("id > 2", DataType::Double, doubles()),
+                [false, true, true]
+            );
+            // 真正的空值。
+            let nullable =
+                ColumnData::Double(vec![0.0, 1.0, 2.0]).with_validity(&[false, true, true]);
+            assert_eq!(
+                hits("id is null", DataType::Double, nullable),
+                [true, false, false]
+            );
+            // 时间戳是 datetime：与整数比较不成立。
+            let times = || ColumnData::Int64(vec![1, 2, 3]);
+            assert_eq!(hits("id == 2", DataType::Timestamptz, times()), [false; 3]);
+            assert_eq!(
+                hits("id is null", DataType::Timestamptz, times()),
+                [false; 3]
+            );
         }
     }
 

@@ -247,7 +247,7 @@ fn field_data(
             if data_type == DataType::FloatVector {
                 let values = parts
                     .iter()
-                    .flat_map(|c| match c {
+                    .flat_map(|c| match c.values() {
                         ColumnData::FloatVector { values, .. } => values.as_slice(),
                         _ => unreachable!("{MISMATCH}"),
                     })

@@ -21,14 +21,15 @@ pub use maintenance::{
 mod partition_key;
 pub mod projection;
 pub mod pyjson;
+pub mod rerank;
 pub mod schema;
 pub mod storage;
 pub mod timestamptz;
 pub mod timezone;
 
 pub use collection::{
-    Collection, GetSnapshot, GroupBy, Hits, LoadState, QueryResult, QueryVectors, ReadSnapshot,
-    SearchRange, SearchRequest, SearchResult,
+    BoostedFilter, Collection, GetSnapshot, GroupBy, Hits, LoadState, QueryResult, QueryVectors,
+    ReadSnapshot, SearchRange, SearchRequest, SearchResult,
 };
 pub use compute::{Compute, ComputeError};
 pub use data::{ColumnData, InputValues, InsertBatch, META_FIELD, Pk, Rows};

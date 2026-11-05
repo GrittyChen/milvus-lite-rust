@@ -4,10 +4,13 @@
 
 use std::collections::HashMap;
 
-use milvus_lite_core::error::py_json_repr;
+use milvus_lite_core::error::{py_json_repr, py_repr};
+use milvus_lite_core::rerank::boost::{BoostPlan, BoostSpec};
+use milvus_lite_core::rerank::pyval::PyVal;
 use milvus_lite_core::timezone::TimezoneSource;
 use milvus_lite_core::{
-    Compute, EngineError, GroupBy, Metric, QueryVectors, ReadSnapshot, SearchRange, SearchRequest,
+    BoostedFilter, Compute, EngineError, GroupBy, Metric, Pk, QueryVectors, ReadSnapshot,
+    SearchRange, SearchRequest,
 };
 use prost::Message;
 use serde_json::Value;
@@ -18,7 +21,7 @@ use crate::pb::schema as pb;
 use crate::pb::service as svc;
 use crate::pyint::{self, PyError};
 use crate::schema::{truthy, unsupported};
-use crate::{insert, status};
+use crate::{function_score, insert, status};
 
 const PLACEHOLDER_FLOAT_VECTOR: i32 = 101;
 const PLACEHOLDER_SPARSE_FLOAT_VECTOR: i32 = 104;
@@ -36,6 +39,7 @@ pub(crate) struct Parsed {
     group: Option<GroupBy>,
     unsupported: Option<&'static str>,
     expr: String,
+    boost: Option<BoostSpec>,
     /// 请求里的 `timezone` / `time_fields`（空串与非字符串视为没有，同 3.x `translators/search.py`）。
     timezone: Option<String>,
     time_fields: Option<String>,
@@ -58,8 +62,8 @@ pub(crate) fn search(
     // 二者之和不为正时结果为空。
     let end = parsed.top_k.saturating_add(parsed.offset).max(0);
     let mut skip = parsed.offset.max(0);
-    // 负 topk 加正 offset 时结果必为空，但范围候选窗仍须按真实 end 决定是否求值过滤。
-    if parsed.range.is_some() && end < skip {
+    // 负 topk 加正 offset 时结果必为空，但范围与 boost 的候选窗仍须按真实 end 决定是否求值。
+    if (parsed.range.is_some() || parsed.boost.is_some()) && end < skip {
         skip = end;
     }
     let limit = usize::try_from(end.saturating_sub(skip).max(0)).unwrap_or(usize::MAX);
@@ -69,21 +73,43 @@ pub(crate) fn search(
         c.schema().timezone().map(str::to_owned),
         database_timezone,
     );
-    let result = c.search_grouped_in(
-        SearchRequest {
-            anns_field: parsed.anns_field,
-            vectors: parsed.vectors,
-            metric_type: parsed.metric_type,
-            limit,
-            offset: usize::try_from(skip).unwrap_or(usize::MAX),
-            output_fields,
-        },
-        compute,
-        &parsed.expr,
-        parsed.range,
-        parsed.group,
-        &timezone,
-    )?;
+    let request = SearchRequest {
+        anns_field: parsed.anns_field,
+        vectors: parsed.vectors,
+        metric_type: parsed.metric_type,
+        limit,
+        offset: usize::try_from(skip).unwrap_or(usize::MAX),
+        output_fields,
+    };
+    let mut result = match parsed.boost {
+        Some(spec) => c.search_boosted_in(
+            request,
+            compute,
+            BoostedFilter {
+                expr: &parsed.expr,
+                range: parsed.range,
+                group: parsed.group,
+                timezone: &timezone,
+            },
+            // 3.x：offset 为正时 `hits[offset : offset + top_k]`，否则 `hits[:top_k]`。
+            &BoostPlan {
+                spec,
+                keep: if parsed.offset > 0 {
+                    limit
+                } else {
+                    usize::try_from(parsed.top_k.max(0)).unwrap_or(usize::MAX)
+                },
+            },
+        )?,
+        None => c.search_grouped_in(
+            request,
+            compute,
+            &parsed.expr,
+            parsed.range,
+            parsed.group,
+            &timezone,
+        )?,
+    };
     // 响应编码处再校验一次请求时区（3.x 的第二个校验点）：空表达式、空结果也会在这里报错。
     timezone.next_phase();
     timezone.validate_request()?;
@@ -97,11 +123,31 @@ pub(crate) fn search(
     let mut scores = Vec::new();
     let mut pks = Vec::new();
     let mut topks = Vec::with_capacity(result.hits.len());
-    for hits in &result.hits {
+    let mut null_pks = Vec::new();
+    for hits in &mut result.hits {
+        // 3.x 在响应编码时才对命中的 id 做 `int()` / `str()`；响应的主键列用同一个值。
+        match hits.id_overrides.take() {
+            Some(ids) => {
+                hits.rows.pks = ids
+                    .iter()
+                    .map(|id| pk_from_override(id, varchar))
+                    .collect::<Result<_, _>>()?;
+                null_pks.extend(ids.iter().map(|id| *id == PyVal::None));
+            }
+            None => null_pks.resize(null_pks.len() + hits.rows.pks.len(), false),
+        }
         topks.push(i64::try_from(hits.scores.len()).unwrap_or(i64::MAX));
         pks.extend(hits.rows.pks.iter().cloned());
-        match result.metric {
-            Some(metric) if parsed.round_decimal >= 0 => {
+        match (&hits.public_scores, result.metric) {
+            // rerank 的分数已经是 float64 对外分数，不能再经过 `round_score` 的换算。
+            (Some(public), _) if parsed.round_decimal >= 0 => {
+                scores.extend(
+                    public
+                        .iter()
+                        .map(|s| py_round(*s, parsed.round_decimal) as f32),
+                );
+            }
+            (None, Some(metric)) if parsed.round_decimal >= 0 => {
                 scores.extend(
                     hits.scores
                         .iter()
@@ -112,17 +158,17 @@ pub(crate) fn search(
         }
     }
     let rows: Vec<_> = result.hits.iter().map(|h| &h.rows).collect();
+    let mut fields_data =
+        output::fields_data(schema, &result.projection, &rows, time_fields.as_ref())?;
+    if null_pks.contains(&true) {
+        blank_null_pks(&mut fields_data, &pk.name, &null_pks);
+    }
     Ok(svc::SearchResults {
         status: Some(status::success()),
         results: Some(pb::SearchResultData {
             num_queries: i64::try_from(result.hits.len()).unwrap_or(i64::MAX),
             top_k: parsed.top_k,
-            fields_data: output::fields_data(
-                schema,
-                &result.projection,
-                &rows,
-                time_fields.as_ref(),
-            )?,
+            fields_data,
             scores,
             ids: Some(insert::pb_ids(&pks, varchar)),
             topks,
@@ -145,6 +191,65 @@ pub(crate) fn search(
         collection_name: c.name().to_owned(),
         ..Default::default()
     })
+}
+
+/// 3.x `build_search_result_data` 的 `int(p)` / `str(p)`，`p` 是盖掉 `$id` 的同名字段值。
+fn pk_from_override(id: &PyVal, varchar: bool) -> Result<Pk, EngineError> {
+    if varchar {
+        return Ok(Pk::VarChar(id.py_str()));
+    }
+    let wrong = |e: PyError| EngineError::InvalidArgument(e.message().to_owned());
+    Ok(Pk::Int64(match id {
+        PyVal::Float(f) if f.is_nan() => {
+            return Err(EngineError::InvalidArgument(
+                "cannot convert float NaN to integer".to_owned(),
+            ));
+        }
+        PyVal::Float(f) if f.is_infinite() => {
+            return Err(EngineError::InvalidArgument(
+                "cannot convert float infinity to integer".to_owned(),
+            ));
+        }
+        PyVal::Float(f) => {
+            let number = serde_json::Number::from_f64(*f)
+                .ok_or_else(|| EngineError::Storage("finite float lost".to_owned()))?;
+            pyint::proto_integer(&Value::Number(number)).map_err(wrong)?
+        }
+        PyVal::Str(s) => pyint::proto_integer(&Value::String(s.clone())).map_err(wrong)?,
+        PyVal::Bool(b) => i64::from(*b),
+        PyVal::Int(i) => *i,
+        // Python 的 int() 成功，写进 protobuf 的 int64 时才越界。
+        PyVal::BigInt(text) => {
+            return Err(EngineError::InvalidArgument(format!(
+                "Value out of range: {text}"
+            )));
+        }
+        PyVal::None | PyVal::List(_) | PyVal::Dict(_) | PyVal::DateTime(_) => {
+            return Err(EngineError::InvalidArgument(format!(
+                "int() argument must be a string, a bytes-like object or a real number, not {}",
+                py_repr(id.type_name())
+            )));
+        }
+    }))
+}
+
+/// 3.x 的主键列直接编码命中的值，所以 `$id` 盖成 `None` 时这一格是空值，而 ids 里是 `str(None)`。
+/// 主键列的类型决定它不会有别的空值来源，这里只处理 VARCHAR 主键（整数主键在 `int(None)` 已报错）。
+fn blank_null_pks(fields: &mut [pb::FieldData], pk: &str, nulls: &[bool]) {
+    let Some(field) = fields.iter_mut().find(|f| f.field_name == pk) else {
+        return;
+    };
+    if let Some(pb::field_data::Field::Scalars(pb::ScalarField {
+        data: Some(pb::scalar_field::Data::StringData(strings)),
+    })) = &mut field.field
+    {
+        for (value, null) in strings.data.iter_mut().zip(nulls) {
+            if *null {
+                value.clear();
+            }
+        }
+        field.valid_data = nulls.iter().map(|null| !null).collect();
+    }
 }
 
 /// 3.x 对 float64 对外分数做 Python `round(x, ndigits)`（按十进制正确舍入、同距取偶），再存为 float32。
@@ -246,6 +351,8 @@ pub(crate) fn parse(req: &svc::SearchRequest) -> Result<Parsed, EngineError> {
         }),
         _ => None,
     };
+    // 3.x 在 `int(offset)` 与 `int(round_decimal)` 之前解码 function_score。
+    let decoded = function_score::decode(req.function_score.as_ref())?;
     let offset = match raw.get("offset") {
         None => 0,
         Some(v) => {
@@ -259,13 +366,16 @@ pub(crate) fn parse(req: &svc::SearchRequest) -> Result<Parsed, EngineError> {
         }
     };
 
-    if req
-        .function_score
-        .as_ref()
-        .is_some_and(|f| !f.functions.is_empty())
-        || !req.function_chains.is_empty()
-    {
-        note("rerank and function chains");
+    if !req.function_chains.is_empty() {
+        if req.function_score.is_some() {
+            return Err(EngineError::SchemaValidation(
+                "function_score and function_chains cannot be used together".to_owned(),
+            ));
+        }
+        note("function chains");
+    }
+    if decoded.has_l2 {
+        note("L2 rerank functions");
     }
     Ok(Parsed {
         vectors,
@@ -278,6 +388,7 @@ pub(crate) fn parse(req: &svc::SearchRequest) -> Result<Parsed, EngineError> {
         group,
         unsupported: unsupported_feature,
         expr: req.dsl.clone(),
+        boost: decoded.boost,
         timezone: non_empty_string(raw.get("timezone")),
         time_fields: non_empty_string(raw.get("time_fields")),
     })

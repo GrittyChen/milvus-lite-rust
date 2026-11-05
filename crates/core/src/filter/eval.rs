@@ -12,6 +12,8 @@ pub(super) enum Operand {
     Timestamp(usize),
     Dynamic(String),
     Literal(Literal),
+    /// 读不到的字段，值是空值：[`super::RowFilter`] 读真实 meta 时用它挡住其余动态字段。
+    Absent,
 }
 #[derive(Debug, Clone)]
 pub(super) enum Term {
@@ -73,7 +75,7 @@ pub(super) fn unsupported() -> EngineError {
     )
 }
 /// 含范围外构造，或含不涉及时间戳的算术：时间戳 / 区间的加减由求值器支持，其余算术仍是范围外。
-fn general_arithmetic(ast: &Ast, schema: &CollectionSchema) -> bool {
+pub(super) fn general_arithmetic(ast: &Ast, schema: &CollectionSchema) -> bool {
     // 子节点总先于父节点创建，顺序扫描即可得到每个子树是否含时间值。
     let mut temporal = vec![false; ast.nodes.len()];
     for (id, node) in ast.nodes.iter().enumerate() {

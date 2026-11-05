@@ -49,6 +49,27 @@ impl Metric {
         }
     }
 
+    /// 对外分数 → 内部 float32 距离（越小越好）；boost 只在这个空间里计算（0026）。
+    /// 与引擎打分时的内部距离逐位相同（`flat` 的分数只是它的另一种写法，单测逐位核对），所以不必在
+    /// 扫描路径上多带一列。与 3.x 的差别只来自 float32 的求和顺序，见 0004「决策」。
+    pub(crate) fn internal(self, score: f32) -> f32 {
+        match self {
+            Self::L2 => score.sqrt(),
+            Self::Cosine => 1.0 - score,
+            Self::Ip => -score,
+        }
+    }
+
+    /// 内部距离 → 对外分数（3.x `_internal_distance_to_milvus_distance`）。只用于 boost 之后的 float64 距离；
+    /// 普通检索的 `score` 已是对外分数，走 [`Self::public_f64`]。
+    pub(crate) fn public_from_internal(self, distance: f64) -> f64 {
+        match self {
+            Self::L2 => distance * distance,
+            Self::Cosine => 1.0 - distance,
+            Self::Ip => -distance,
+        }
+    }
+
     /// 对外分数是否越大越相似（COSINE / IP 返回相似度，L2 返回平方距离）。
     pub fn higher_is_better(self) -> bool {
         !matches!(self, Self::L2)

@@ -241,7 +241,14 @@ impl ColumnData {
             DataType::VarChar => Self::VarChar(vec![String::new(); n]),
             DataType::Json => Self::Json(vec![b"null".to_vec(); n]),
             DataType::Array => Self::Array(ArrayData::empty_rows(field, n)),
-            DataType::FloatVector => unreachable!("nullable vector schema is rejected"),
+            // schema 拒绝可空向量，存储层到不了这里；只有 boost 剥掉同名字段时输出占位（0026）。
+            DataType::FloatVector => {
+                let dim = field_dim(field);
+                Self::FloatVector {
+                    dim,
+                    values: vec![0.0; dim.saturating_mul(n)],
+                }
+            }
         };
         values.with_validity(&vec![false; n])
     }

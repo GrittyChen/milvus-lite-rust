@@ -3,6 +3,7 @@
 //! （非数字字符串、null、列表、对象），NaN、Infinity、非 ASCII 数字与超出 int64 的值见 0004「决策」。
 
 use milvus_lite_core::error::{py_json_repr, py_repr};
+use milvus_lite_core::rerank::pyval::{float_str, strip_number};
 use serde_json::Value;
 
 /// Python 异常的种类与信息。3.x 按种类决定错误码，例如 topk 的 TypeError / ValueError 报 code 6，
@@ -194,24 +195,6 @@ pub(crate) fn int_str(s: &str) -> Option<i64> {
     )
 }
 
-/// 去掉数字之间的单个下划线；下划线出现在开头、结尾、连续出现或不在两个数字之间时不合法。
-fn strip_number(s: &str) -> Option<String> {
-    let bytes = s.as_bytes();
-    let mut out = String::with_capacity(s.len());
-    for (i, c) in s.char_indices() {
-        if c == '_' {
-            let prev_digit = i > 0 && bytes[i - 1].is_ascii_digit();
-            let next_digit = bytes.get(i + 1).is_some_and(u8::is_ascii_digit);
-            if !(prev_digit && next_digit) {
-                return None;
-            }
-        } else {
-            out.push(c);
-        }
-    }
-    Some(out)
-}
-
 /// Python `float(v)`，v 为 `json.loads` 的结果。
 pub(crate) fn float(v: &Value) -> Result<f64, PyError> {
     match v {
@@ -226,16 +209,6 @@ pub(crate) fn float(v: &Value) -> Result<f64, PyError> {
             py_repr(type_name(other))
         ))),
     }
-}
-
-fn float_str(s: &str) -> Option<f64> {
-    let t = strip_number(s.trim())?;
-    let body = t.trim_start_matches(['+', '-']);
-    // Rust 的 f64 解析还接受 "infinity" 等 Python 同样接受的写法；Python 不接受十六进制与空串。
-    if body.is_empty() || body.starts_with("0x") || body.starts_with("0X") {
-        return None;
-    }
-    t.parse::<f64>().ok()
 }
 
 /// serde_json 解析失败的文本是否可能被 Python 的 `json.loads` 解析为对象或数组：Python 还接受

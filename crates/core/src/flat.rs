@@ -219,6 +219,43 @@ fn product_lanes_batch(qs: &[&[f32]; BATCH], b: &[f32]) -> [Lanes; BATCH] {
 mod tests {
     use super::*;
 
+    /// boost 由分数还原内部距离（`Metric::internal`）。这里证明还原结果与引擎的内部距离逐位相同：
+    /// 3.x 的内部距离 COSINE 是 `max(1 - sim, 0)`、L2 是平方和开方、IP 是负点积。
+    #[test]
+    fn internal_distance_is_recovered_bit_exactly_from_the_score() {
+        let q = Query::new(Metric::Cosine, &[1.0]);
+        // 按步长抽样约 100 万个 f32 位模式（含非规格化数、极大值、无穷与 NaN）。
+        for bits in (0..=u32::MAX).step_by(4099) {
+            let sim = f32::from_bits(bits);
+            let internal = if sim.is_nan() {
+                sim
+            } else {
+                (1.0 - sim).max(0.0)
+            };
+            let score = if sim.is_nan() { sim } else { 1.0 - internal };
+            let recovered = Metric::Cosine.internal(score);
+            if sim.is_nan() {
+                assert!(recovered.is_nan());
+            } else {
+                assert_eq!(
+                    recovered.to_bits(),
+                    internal.to_bits(),
+                    "sim bits {bits:#x}"
+                );
+            }
+            let dot = sim;
+            if !dot.is_nan() {
+                assert_eq!(Metric::Ip.internal(dot).to_bits(), (-dot).to_bits());
+            }
+            if sim >= 0.0 {
+                assert_eq!(Metric::L2.internal(sim).to_bits(), sim.sqrt().to_bits());
+            }
+        }
+        // 真实打分路径：分数里的 sim 由 to_score 得到，与上面的公式一致。
+        assert_eq!(q.score(&[1.0], 1.0), 1.0);
+        assert_eq!(Metric::Cosine.internal(q.score(&[1.0], 1.0)), 0.0);
+    }
+
     fn score(metric: Metric, q: &[f32], c: &[f32]) -> f32 {
         Query::new(metric, q).score(c, norm(c))
     }
