@@ -1,6 +1,6 @@
 # 0026：HybridSearch 与 rerank 实施验收
 
-- 状态：设计评审通过；第 1 步（Search 的 boost）、第 2 步（Search 的 L2 rerank）、第 3 步（HybridSearch）各自评审通过并提交到本地；本记录随第 4 步（差分、参照用例、文档与验收）提交。**未推送、未发布**。
+- 状态：设计评审通过；第 1 步（Search 的 boost）、第 2 步（Search 的 L2 rerank）、第 3 步（HybridSearch）各自评审通过并提交；本记录随第 4 步（差分、参照用例、文档与验收）提交为 `da8689f`；临时分支上 CI 与 Compare 全部通过后快进合入 main（`b9a64ee..da8689f`），之后补记本节「CI 验收」。**未发布**。
 - 日期：2026-11-06
 - 合同与设计：[0026](../decisions/0026-rerank-and-hybrid-search.md)，继承 0004、0005、0006、0017（分区可见性）、0024（引擎分组）、0025（时区）。
 - 仓库基线：0025 合入后的 `b9a64ee`；本地提交依次为 `c0be6ec`（设计）、`813b511`（第 1 步）、`6a34aa9`（0025 的时区名小修）、`18215dd`（第 2 步）、`18ffcaa`（第 3 步）。
@@ -125,11 +125,23 @@ wheel 由 `18ffcaa` 之上的工作区构建，产品源码与 `18ffcaa` 相同�
 - 建议，已采纳：`test_rerank_scenarios.py` 在启动 3.x 服务前清除 `COHERE_API_KEY`，保证 model 场景不调用付费外部服务；登记差异与 0004 的场景另外断言错误一侧没有命中、记下的原始响应都是错误状态且不带任何结果数据（ids、scores、topks、字段、组值与有效位，复审 r1 补全）；引擎分组补充场景的 ARRAY 组值改为逐个展开比较（当前 ARRAY 分组都在类型校验处报 6，结果不变）；变异汇总补记 m07 的补测重做。
 - 修复后 `test_rerank_scenarios.py` 在 3.0.2 与 2.6.17 两条线各 2 通过。
 
+## CI 验收（合入前）
+
+临时分支 `ci/0026-rerank` 指向 `da8689f`（0026 的 6 个提交）：
+
+| 运行 | 结果 |
+| --- | --- |
+| CI `42241735092` | attempt 1：Linux 的 job 全部通过；macOS 的 rust、python-3.0.2、python-2.6.17 因托管执行机容量不足未被分配（“not acquired by Runner of type hosted”）而取消。attempt 2 只重跑这三个与汇总，全部通过，`ci-pass` 成功 |
+| Compare `42241735118` | attempt 1：diff-3.0.2 的 Linux x86_64、Linux arm64、macOS 与 diff-2.6.17 的两个 Linux 通过；macOS 的 diff-2.6.17 与 interop 同样因容量取消。attempt 2 重跑后全部通过，`compare-pass` 成功 |
+| main CI `42249396307`（快进之后，`da8689f`） | attempt 1 全部通过（12 个 job），`ci-pass` 成功 |
+
+`da8689f` 上 23 项检查全部成功。由此补齐的本机未覆盖项：13 个 `tie *` 场景（在 `test_rerank_scenarios.py` 与各步的差分里）在 Linux x86_64、Linux arm64、macOS 的 diff-3.0.2 上严格通过；2.6.17 线的差分全量与两条 SDK 线的 Python 全量在三个平台通过；差分 472 / 118 与 Python 564 的预期计数由分片核对确认。
+
+首次推送（提交 `50642fc`，临时分支 `ci/0026-rerank-hybrid`，CI `42238913775`）在 python-2.6.17 的两个 Linux 架构各失败 1 条：第 3 步加的 `test_grpc_translation.py::test_hybrid_search_rank_params_and_function_score` 用 `request.function_chains.add()` 改写请求，pymilvus 2.6 的 proto 没有这个字段，客户端就抛 AttributeError；差分 `test_hybrid_search.py` 的同一写法在 2.6 线上两边同错，没有失败但也没测到。两处改为按字段号（`HybridSearchRequest.function_chains` 为 15）追加一个空的 `FunctionChain`，两条 SDK 线发出相同的请求，服务端返回 3.x 的 code 6。修复按负责人要求并入第 4 步的提交（`da8689f`），旧分支删除、旧运行取消。
+
 ## 残余风险与未覆盖
 
-- **13 个平局场景的三平台 CI 未执行**：本机（macOS arm64）全部严格通过，设计要求的 Linux x86_64、Linux arm64 与 macOS 各一次需要推送临时分支，等负责人授权。在这之前，Linux 上的并列次序没有实测。
-- **平台**：其余结果也全部在 macOS arm64 本机得出；预期计数（差分 472）须在下次 Compare 与 CI 运行时确认。
-- **2.6.17 线**：只跑了 rerank 相关的差分文件与改动的 translation 用例，差分与 Python 的全量未在这条线上跑。
+- **平台**：13 个平局场景与全量差分在 CI 的三个平台（Linux x86_64、Linux arm64、macOS arm64）各通过一次；Intel Mac 不在 CI 的对照层，只在发行工作流中验收。探针对跑、固定统计与变异验证只在 macOS arm64 本机执行。
 - **参照环境**：全量差分只在未装 tzdata 的 3.x 参照环境跑了一次（第 3 步已在装与不装两种环境各跑一次；本批新增的场景不涉及随 tzdata 变化的时区名）。
 - **差分容差**：分数按 1e-5 比较，小于它的数值差别（如只差一次 float32 舍入）不由差分发现；变异验证暴露了 `round_decimal` 这一处，已补精确断言，其他同量级的差别没有逐项证明。
 - **性能**：本切片不声称性能提升，没有做基准。Hybrid 的各路在 RPC 线程上顺序执行（0005），路数多时的耗时没有测量。
@@ -138,4 +150,4 @@ wheel 由 `18ffcaa` 之上的工作区构建，产品源码与 `18ffcaa` 相同�
 
 ## 证据类别
 
-仓库内可重跑：上述测试命令、`tests/differential/rerank_cases.py` 与 `test_rerank_scenarios.py`（转入的 2986 个场景与分类断言）、各步的差分文件、`test_grpc_translation.py`、`scorecard.py` 与工作流中的预期计数。本地留存：五份探针脚本与 3.x 原始输出（共 4452 个场景）及最终构建上的重跑结果、第 4 步动手前冻结的对照集合与判定（含变更记录）、变异验证的脚本与每项的 diff 和日志、固定统计的原始输出与环境、开发 wheel、2.6.17 线的运行环境、各步骤评审时冻结的 diff。以上结果均未推送，第三方在推送之前无法核对本记录所指的提交。
+仓库内可重跑：上述测试命令、`tests/differential/rerank_cases.py` 与 `test_rerank_scenarios.py`（转入的 2986 个场景与分类断言）、各步的差分文件、`test_grpc_translation.py`、`scorecard.py` 与工作流中的预期计数。本地留存：五份探针脚本与 3.x 原始输出（共 4452 个场景）及最终构建上的重跑结果、第 4 步动手前冻结的对照集合与判定（含变更记录）、变异验证的脚本与每项的 diff 和日志、固定统计的原始输出与环境、开发 wheel、2.6.17 线的运行环境、各步骤评审时冻结的 diff。提交与 CI 运行已在公开仓库，可按上表的运行 ID 核对；本地留存部分只有负责人能复核。

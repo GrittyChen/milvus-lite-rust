@@ -1,8 +1,8 @@
 # 0026：HybridSearch 与 rerank（RRF / Weighted / boost / decay）
 
-状态：设计评审通过；第 1 步（Search 的 boost 与 `function_score` 解码）与第 2 步（Search 的 L2：rrf / weighted / decay、`GroupByOp`、rerank 后的 `round_decimal`）已实施并评审通过；第 3 步（HybridSearch：`rank_params`、顶层与子请求的 `function_score`、分区、分组、时区与 `time_fields`）已实施并评审通过；第 4 步（差分、参照用例、文档与验收）已实施待评审，开发验收见[验收记录](../testing/0026-rerank-hybrid-acceptance.md)。对照版本为 3.x v3.2.1（`43d1257`）。
+状态：设计评审通过；第 1 步（Search 的 boost 与 `function_score` 解码）与第 2 步（Search 的 L2：rrf / weighted / decay、`GroupByOp`、rerank 后的 `round_decimal`）已实施并评审通过；第 3 步（HybridSearch：`rank_params`、顶层与子请求的 `function_score`、分区、分组、时区与 `time_fields`）已实施并评审通过；第 4 步（差分、参照用例、文档与验收）已实施并评审通过；四步均已合入 main（`da8689f`），开发与 CI 验收见[验收记录](../testing/0026-rerank-hybrid-acceptance.md)。对照版本为 3.x v3.2.1（`43d1257`）。
 
-尚未完成的验收：13 个 `tie *` 的三平台 CI（本机已全部验收：第 1 步 5 个，第 2 步 2 个 Search + decay，第 3 步 6 个 Hybrid；需推送临时分支，不能免除）。变异验证已在第 4 步完成；本切片不声称性能提升，不做性能基准。
+13 个 `tie *` 的三平台验收已在合入前的 CI 完成（Compare 的 diff-3.0.2 在 Linux x86_64、Linux arm64、macOS 各一次，见[验收记录](../testing/0026-rerank-hybrid-acceptance.md#ci-验收合入前)）。变异验证已在第 4 步完成；本切片不声称性能提升，不做性能基准。
 
 ## 背景与目标
 
