@@ -25,10 +25,11 @@ ROWS = [
 ]
 NAIVE = "ts >= ISO '2025-01-01T08:00:00'"
 # 各平台的 3.x 结果相同的时区名与路径形态：只取 zone.tab 里列出的区域与 `Etc/`、`UTC`（发行版会把旧别名拆进 tzdata-legacy），
-# 以及不论平台都不存在或不合规范的写法。
+# 以及不论平台都不存在或不合规范的写法。tzdata 目录名（如 `America`）与含 NUL 的名字不在其中：3.x 装了 PyPI `tzdata`
+# 包时这两类报 1，见 test_platform_dependent_zone_names。
 PORTABLE_ZONES = [
     None, "UTC", "Asia/Shanghai", "America/New_York", "Etc/GMT+8", "Asia/Kolkata", "", " UTC", "UTC ",
-    "Nope/Zone", "../etc/passwd", "/etc/localtime", "America", "Asia/Shanghai/", "America//New_York", "UTC\x00", "Z", "+08:00",
+    "Nope/Zone", "../etc/passwd", "/etc/localtime", "Asia/Shanghai/", "America//New_York", "Z", "+08:00",
 ]
 
 
@@ -91,7 +92,8 @@ def test_request_timezone_applies_to_every_read_request_like_3x(pair):
 
 
 def test_platform_dependent_zone_names(pair):
-    """3.x 一侧随平台变化的时区名（0025 差异表「时区库」）：只断言本实现，名字大小写不敏感，平台文件按找不到。"""
+    """3.x 一侧随平台或参照环境是否安装 PyPI `tzdata` 包变化的时区名（0025 差异表「时区库」「tzdata 的目录名」）：
+    只断言本实现，名字大小写不敏感，平台文件、目录名与含 NUL 的名字按找不到。"""
     d = pair.open()
     d.step("create", lambda c: table(c))
     expected = rows(d.rust, "t", NAIVE, timezone="Asia/Shanghai")
@@ -100,9 +102,9 @@ def test_platform_dependent_zone_names(pair):
         assert rows(d.rust, "t", NAIVE, timezone=zone) == expected
     assert rows(d.rust, "t", NAIVE, timezone="utc") == rows(d.rust, "t", NAIVE, timezone="UTC")
     assert rows(d.rust, "t", NAIVE, timezone="Asia/Calcutta") == rows(d.rust, "t", NAIVE, timezone="Asia/Kolkata")
-    for name in ("zone.tab", "tzdata.zi", "posixrules", "localtime"):
+    for name in ("zone.tab", "tzdata.zi", "posixrules", "localtime", "America", "Etc", "UTC\x00"):
         outcome = run(lambda c, n=name: rows(c, "t", NAIVE, timezone=n), d.rust)
-        assert outcome[:2] == ("err", 6) and outcome[3] == f"unknown timezone '{name}'", outcome
+        assert outcome[:2] == ("err", 6) and outcome[3] == f"unknown timezone {name!r}", outcome
     # tzdata 里的 `Factory` 是真实的区域（偏移 -00），内置库收录。
     assert run(lambda c: rows(c, "t", NAIVE, timezone="Factory"), d.rust)[0] == "ok"
 

@@ -175,6 +175,7 @@ Query、Search 输出支持（Hybrid 随 HybridSearch）；非 TIMESTAMPTZ 字�
 | 超出 int64 的 JSON 整数默认值 | 经 protobuf 的 int64 字段无法产生，只可能来自手改的 `schema.json` | 创建 / 打开报 1 `Python int too large to convert to C long` | 不可达的输入，沿用 Python 的文案 |
 | 时区库 | 运行平台的系统 tzdata，路径不区分大小写与否随平台，`posixrules` / `localtime` 等平台文件可用与否随平台 | 内置 tzdata（jiff），名字大小写不敏感（与 macOS 一致、含 Linux 上 3.x 拒绝的大小写变体），不含 `posixrules` / `localtime` | 不依赖运行环境，同一个数据目录行为确定；tzdata 版本不同时个别历史 / 未来规则可能不同，已知并登记 |
 | 找不到的时区名 | 找不到 6；指向非 TZif 文件 1；其余路径错误 1 | 找不到（含 `zone.tab` 等）6；三种路径格式错误 1（文案同 3.x） | 非 TZif 文件的报错依赖平台文件，不复刻 |
+| tzdata 的目录名（`America`、`Etc` 等）与含 NUL 的名字（`UTC\x00`） | 系统 tzdata 里找不到时，若装了 PyPI `tzdata` 包，zoneinfo 回退到包内资源：目录名报 1（`IsADirectoryError`），含 NUL 报 1 `embedded null byte`；没装该包时两类都报 6 `unknown timezone '...'` | 一律 6 `unknown timezone '...'` | 取决于参照环境是否装了 `tzdata` 包，不复刻；差分不比较这类名字，只断言本实现（`test_platform_dependent_zone_names`） |
 | 高端边界附近（`9999-12-29` 起）无偏移时间的换算 | 由 zoneinfo 精确换算 | 用 `9999-12-30T22:00Z` 处的偏移补算（该处没有偏移变换），结果与 3.x 一致，越界同样报 1 | jiff 的 `Timestamp` 上界比 Python 低约 26 小时 |
 | ARRAY 的 TIMESTAMPTZ 元素 | 能建表（pymilvus 无法写入元素，数据为空） | 创建 UNIMPLEMENTED；打开含该字段的 3.x 目录时，访问该集合 fail-closed 为带明确文案的 UNIMPLEMENTED（不是 100），其他集合不受影响，互通用例钉住 | 范围外，需要时单独做 |
 | 区间微秒超出 int64 | 1 `Python int too large to convert to C long` | 同 3.x | 复刻 |
