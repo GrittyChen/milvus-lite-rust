@@ -110,6 +110,10 @@ impl PyVal {
     }
 
     /// Python `repr(v)`。不经 JSON：JSON 写不出 NaN、无穷和宽整数，而它们都能出现在 ARRAY 或动态字段里。
+    pub(crate) fn repr(&self) -> String {
+        self.py_repr()
+    }
+
     fn py_repr(&self) -> String {
         match self {
             Self::None => "None".to_owned(),
@@ -252,6 +256,118 @@ fn big_to_float(text: &str) -> Result<f64> {
         .ok_or_else(|| EngineError::invalid(TOO_LARGE))
 }
 
+/// Python `int(v)`，结果还要能写进 protobuf 的整数槽。
+fn py_int(value: &PyVal) -> Result<i64> {
+    let out_of_range = |text: String| EngineError::invalid(format!("Value out of range: {text}"));
+    match value {
+        PyVal::Bool(b) => Ok(i64::from(*b)),
+        PyVal::Int(i) => Ok(*i),
+        PyVal::BigInt(text) => Err(out_of_range(text.clone())),
+        PyVal::Float(f) if f.is_nan() => {
+            Err(EngineError::invalid("cannot convert float NaN to integer"))
+        }
+        PyVal::Float(f) if f.is_infinite() => Err(EngineError::invalid(
+            "cannot convert float infinity to integer",
+        )),
+        PyVal::Float(f) => {
+            let truncated = f.trunc();
+            if truncated.abs() < 9.2e18 {
+                Ok(truncated as i64)
+            } else {
+                Err(out_of_range(format!("{truncated:.0}")))
+            }
+        }
+        PyVal::Str(s) => strip_number(s.trim())
+            .and_then(|t| t.parse::<i64>().ok())
+            .ok_or_else(|| {
+                EngineError::invalid(format!(
+                    "invalid literal for int() with base 10: {}",
+                    py_repr(s)
+                ))
+            }),
+        other => Err(EngineError::invalid(format!(
+            "int() argument must be a string, a bytes-like object or a real number, not {}",
+            py_repr(other.type_name())
+        ))),
+    }
+}
+
+fn unsupported_cell(field: &FieldSchema) -> EngineError {
+    EngineError::Unsupported {
+        feature: "rerank values written into this field type",
+        reason: format!(
+            "field {} of type {} cannot hold a computed rerank value in this build of milvus-lite-rust yet",
+            py_repr(&field.name),
+            field.data_type.name()
+        ),
+    }
+}
+
+/// 承载链算出的值（得分、组得分、因子）的空列。INT8 / INT16 用 int32：3.x 把 `int(v)` 直接写进
+/// protobuf 的 int32 槽，不按字段类型收窄（组得分 25600 写进 INT8 字段仍是 25600）。
+pub(crate) fn python_column(field: &FieldSchema) -> ColumnData {
+    match field.data_type {
+        DataType::Int8 | DataType::Int16 => ColumnData::Int32(Vec::new()),
+        _ => ColumnData::empty(field),
+    }
+}
+
+/// 3.x `_build_field_data` 的 `_coerce_for`：把候选行里的值写成该字段类型的一格（`None` 是空值占位），
+/// 列的表示与 [`python_column`] 相同。只有虚拟列才需要它，普通字段直接复制存储列。
+pub(crate) fn python_cell(field: &FieldSchema, value: &PyVal) -> Result<ColumnData> {
+    if *value == PyVal::None {
+        return Ok(match field.data_type {
+            DataType::Int8 | DataType::Int16 => ColumnData::Int32(vec![0]).with_validity(&[false]),
+            _ => ColumnData::nulls(field, 1),
+        });
+    }
+    let narrow = |n: i64| -> Result<i32> {
+        i32::try_from(n).map_err(|_| EngineError::invalid(format!("Value out of range: {n}")))
+    };
+    Ok(match field.data_type {
+        DataType::Bool => ColumnData::Bool(vec![match value {
+            PyVal::Bool(b) => *b,
+            PyVal::Int(i) => *i != 0,
+            PyVal::Float(f) => *f != 0.0,
+            PyVal::Str(s) => !s.is_empty(),
+            PyVal::List(items) => !items.is_empty(),
+            PyVal::Dict(items) => !items.is_empty(),
+            PyVal::BigInt(_) | PyVal::DateTime(_) => true,
+            PyVal::None => false,
+        }]),
+        DataType::Int8 | DataType::Int16 | DataType::Int32 => {
+            ColumnData::Int32(vec![narrow(py_int(value)?)?])
+        }
+        DataType::Int64 => ColumnData::Int64(vec![py_int(value)?]),
+        DataType::Float => ColumnData::Float(vec![value.to_float()? as f32]),
+        DataType::Double => ColumnData::Double(vec![value.to_float()?]),
+        DataType::VarChar => ColumnData::VarChar(vec![value.py_str()]),
+        DataType::Json => ColumnData::Json(vec![match value {
+            PyVal::Str(s) => s.as_bytes().to_vec(),
+            PyVal::Bool(true) => b"true".to_vec(),
+            PyVal::Bool(false) => b"false".to_vec(),
+            PyVal::Int(i) => i.to_string().into_bytes(),
+            PyVal::BigInt(text) => text.clone().into_bytes(),
+            // `json.dumps` 的非有限浮点是 NaN / Infinity / -Infinity，不是 `repr` 的 nan / inf。
+            PyVal::Float(f) if f.is_nan() => b"NaN".to_vec(),
+            PyVal::Float(f) if f.is_infinite() => {
+                if *f > 0.0 {
+                    b"Infinity".to_vec()
+                } else {
+                    b"-Infinity".to_vec()
+                }
+            }
+            PyVal::Float(f) => crate::error::py_float_repr(*f).into_bytes(),
+            _ => return Err(unsupported_cell(field)),
+        }]),
+        DataType::Timestamptz => match value {
+            PyVal::DateTime(micros) => ColumnData::Int64(vec![*micros]),
+            _ => return Err(unsupported_cell(field)),
+        },
+        DataType::Array | DataType::FloatVector => return Err(unsupported_cell(field)),
+    })
+}
+
 /// 去掉数字之间的单个下划线；下划线出现在开头、结尾、连续出现或不在两个数字之间时不合法。
 pub fn strip_number(s: &str) -> Option<String> {
     let bytes = s.as_bytes();
@@ -303,6 +419,39 @@ mod tests {
         match result.unwrap_err() {
             EngineError::InvalidArgument(message) => message,
             other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn computed_cells_follow_coerce_for() {
+        // INT8 / INT16 不收窄：3.x 把 int(v) 直接写进 int32 槽。
+        for data_type in [DataType::Int8, DataType::Int16] {
+            let field = FieldSchema::new("$group_score", data_type);
+            let mut column = python_column(&field);
+            column.append_column(&python_cell(&field, &PyVal::Float(25600.7)).unwrap());
+            column.append_column(&python_cell(&field, &PyVal::None).unwrap());
+            assert_eq!(column.values(), &ColumnData::Int32(vec![25600, 0]));
+            assert!(column.is_null(1) && !column.is_null(0));
+        }
+        assert_eq!(
+            message(python_cell(
+                &FieldSchema::new("x", DataType::Int8),
+                &PyVal::Float(3e9)
+            )),
+            "Value out of range: 3000000000"
+        );
+        // JSON 用 json.dumps 的写法。
+        let json_field = FieldSchema::new("x", DataType::Json);
+        for (value, text) in [
+            (f64::NAN, "NaN"),
+            (f64::INFINITY, "Infinity"),
+            (f64::NEG_INFINITY, "-Infinity"),
+            (0.5, "0.5"),
+        ] {
+            assert_eq!(
+                python_cell(&json_field, &PyVal::Float(value)).unwrap(),
+                ColumnData::Json(vec![text.as_bytes().to_vec()])
+            );
         }
     }
 

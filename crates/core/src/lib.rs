@@ -29,7 +29,7 @@ pub mod timezone;
 
 pub use collection::{
     BoostedFilter, Collection, GetSnapshot, GroupBy, Hits, LoadState, QueryResult, QueryVectors,
-    ReadSnapshot, SearchRange, SearchRequest, SearchResult,
+    ReadSnapshot, Rerank, SearchRange, SearchRequest, SearchResult,
 };
 pub use compute::{Compute, ComputeError};
 pub use data::{ColumnData, InputValues, InsertBatch, META_FIELD, Pk, Rows};

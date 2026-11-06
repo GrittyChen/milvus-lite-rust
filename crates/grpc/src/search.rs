@@ -6,10 +6,11 @@ use std::collections::HashMap;
 
 use milvus_lite_core::error::{py_json_repr, py_repr};
 use milvus_lite_core::rerank::boost::{BoostPlan, BoostSpec};
+use milvus_lite_core::rerank::chain::L2Function;
 use milvus_lite_core::rerank::pyval::PyVal;
 use milvus_lite_core::timezone::TimezoneSource;
 use milvus_lite_core::{
-    BoostedFilter, Compute, EngineError, GroupBy, Metric, Pk, QueryVectors, ReadSnapshot,
+    BoostedFilter, Compute, EngineError, GroupBy, Metric, Pk, QueryVectors, ReadSnapshot, Rerank,
     SearchRange, SearchRequest,
 };
 use prost::Message;
@@ -40,6 +41,7 @@ pub(crate) struct Parsed {
     unsupported: Option<&'static str>,
     expr: String,
     boost: Option<BoostSpec>,
+    l2: Option<L2Function>,
     /// 请求里的 `timezone` / `time_fields`（空串与非字符串视为没有，同 3.x `translators/search.py`）。
     timezone: Option<String>,
     time_fields: Option<String>,
@@ -81,16 +83,29 @@ pub(crate) fn search(
         offset: usize::try_from(skip).unwrap_or(usize::MAX),
         output_fields,
     };
-    let mut result = match parsed.boost {
-        Some(spec) => c.search_boosted_in(
+    let filter = BoostedFilter {
+        expr: &parsed.expr,
+        range: parsed.range,
+        group: parsed.group,
+        timezone: &timezone,
+    };
+    let mut result = match (&parsed.l2, parsed.boost) {
+        // 3.x 的 Search + L2：候选窗口、分组与 offset 都交给 rerank 链（0026 第 6、7 节）。
+        (Some(function), boost) => c.search_reranked_in(
             request,
             compute,
-            BoostedFilter {
-                expr: &parsed.expr,
-                range: parsed.range,
-                group: parsed.group,
-                timezone: &timezone,
+            filter,
+            boost.as_ref(),
+            Rerank {
+                function,
+                limit: parsed.top_k,
+                offset: parsed.offset,
             },
+        )?,
+        (None, Some(spec)) => c.search_boosted_in(
+            request,
+            compute,
+            filter,
             // 3.x：offset 为正时 `hits[offset : offset + top_k]`，否则 `hits[:top_k]`。
             &BoostPlan {
                 spec,
@@ -101,13 +116,13 @@ pub(crate) fn search(
                 },
             },
         )?,
-        None => c.search_grouped_in(
+        (None, None) => c.search_grouped_in(
             request,
             compute,
-            &parsed.expr,
-            parsed.range,
-            parsed.group,
-            &timezone,
+            filter.expr,
+            filter.range,
+            filter.group,
+            filter.timezone,
         )?,
     };
     // 响应编码处再校验一次请求时区（3.x 的第二个校验点）：空表达式、空结果也会在这里报错。
@@ -374,9 +389,6 @@ pub(crate) fn parse(req: &svc::SearchRequest) -> Result<Parsed, EngineError> {
         }
         note("function chains");
     }
-    if decoded.has_l2 {
-        note("L2 rerank functions");
-    }
     Ok(Parsed {
         vectors,
         top_k,
@@ -389,6 +401,7 @@ pub(crate) fn parse(req: &svc::SearchRequest) -> Result<Parsed, EngineError> {
         unsupported: unsupported_feature,
         expr: req.dsl.clone(),
         boost: decoded.boost,
+        l2: decoded.l2,
         timezone: non_empty_string(raw.get("timezone")),
         time_fields: non_empty_string(raw.get("time_fields")),
     })

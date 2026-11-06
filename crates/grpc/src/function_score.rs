@@ -7,7 +7,8 @@ use std::collections::HashMap;
 use milvus_lite_core::EngineError;
 use milvus_lite_core::error::py_repr;
 use milvus_lite_core::rerank::boost::{BoostFunction, BoostSpec, Mode};
-use serde_json::Value;
+use milvus_lite_core::rerank::chain::L2Function;
+use serde_json::{Map, Value};
 
 use crate::pb::common::KeyValuePair;
 use crate::pb::schema as pb;
@@ -16,8 +17,8 @@ use crate::schema::truthy;
 
 pub(crate) struct Decoded {
     pub(crate) boost: Option<BoostSpec>,
-    /// 是否有 L2 函数。解码期的校验已经做完。
-    pub(crate) has_l2: bool,
+    /// 最多一个 L2 函数，解码期的规整与校验已经做完；其余校验在检索之后（3.x `_validate_rerank_func`）。
+    pub(crate) l2: Option<L2Function>,
 }
 
 fn schema_error(message: String) -> EngineError {
@@ -110,52 +111,75 @@ fn boost_function(
     })
 }
 
-/// 3.x `_normalize_l2_params`：只校验会在解码期报错的部分，decay 的参数在这里不看。
-fn check_l2_params(reranker: &str, params: &HashMap<&str, Value>) -> Result<(), EngineError> {
-    match reranker {
-        "rrf" => {
-            if let Some(k) = params.get("k") {
-                py_float(k)?;
-            }
-        }
+/// 3.x `_normalize_l2_params` 与 `_get_reranker_type`：rrf 的 `k`、weighted 的 `weights` 元素在这里经过
+/// `float()`，`norm_score` 规整为布尔；decay 与 model 的参数原样保留。
+fn l2_function(
+    reranker: &str,
+    function: &pb::FunctionSchema,
+    params: &HashMap<&str, Value>,
+) -> Result<L2Function, EngineError> {
+    let owned = || -> Map<String, Value> {
+        params
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), v.clone()))
+            .collect()
+    };
+    Ok(match reranker {
+        "rrf" => L2Function::Rrf {
+            k: params.get("k").map(py_float).transpose()?.unwrap_or(60.0),
+        },
         "weighted" => {
-            if let Some(weights) = params.get("weights") {
+            let mut weights = Vec::new();
+            if let Some(value) = params.get("weights") {
                 let not_array =
                     || schema_error("Weighted reranker params.weights must be an array".to_owned());
                 let parsed;
-                let weights = match weights {
+                let value = match value {
                     Value::String(text) => {
                         parsed = serde_json::from_str::<Value>(text).map_err(|_| not_array())?;
                         &parsed
                     }
                     other => other,
                 };
-                let Value::Array(weights) = weights else {
+                let Value::Array(items) = value else {
                     return Err(not_array());
                 };
-                for weight in weights {
-                    py_float(weight)?;
+                for item in items {
+                    weights.push(py_float(item)?);
                 }
             }
-            if let Some(norm_score) = params.get("norm_score") {
-                let valid = match norm_score {
-                    Value::Bool(_) => true,
-                    Value::String(text) => matches!(text.to_lowercase().as_str(), "true" | "false"),
-                    _ => false,
-                };
-                if !valid {
+            let normalize = match params.get("norm_score") {
+                None => false,
+                Some(Value::Bool(b)) => *b,
+                Some(Value::String(text)) if text.eq_ignore_ascii_case("true") => true,
+                Some(Value::String(text)) if text.eq_ignore_ascii_case("false") => false,
+                Some(_) => {
                     return Err(schema_error(
                         "Weighted reranker params.norm_score must be bool".to_owned(),
                     ));
                 }
+            };
+            L2Function::Weighted { weights, normalize }
+        }
+        "decay" => {
+            // 3.x 的规整不看类型：带 `provider` 的 decay 也要先通过 `queries` 的校验。
+            if params.get("provider").is_some_and(truthy) {
+                check_model_queries(params)?;
+            }
+            L2Function::Decay {
+                inputs: function.input_field_names.clone(),
+                params: owned(),
             }
         }
-        _ if reranker == "model" || params.get("provider").is_some_and(truthy) => {
+        // `reranker` 是 model，或不在已知类型里但带 `provider`。
+        _ => {
             check_model_queries(params)?;
+            L2Function::Model {
+                inputs: function.input_field_names.clone(),
+                params: owned(),
+            }
         }
-        _ => {}
-    }
-    Ok(())
+    })
 }
 
 fn check_model_queries(params: &HashMap<&str, Value>) -> Result<(), EngineError> {
@@ -200,7 +224,7 @@ pub(crate) fn decode(function_score: Option<&pb::FunctionScore>) -> Result<Decod
     let boost_mode = mode(&score_params, "boost_mode")?;
     let function_mode = mode(&score_params, "function_mode")?;
     let mut boost = Vec::new();
-    let mut has_l2 = false;
+    let mut l2 = None;
     for function in functions {
         let params = decode_kv_pairs(&function.params);
         let reranker = params
@@ -211,7 +235,7 @@ pub(crate) fn decode(function_score: Option<&pb::FunctionScore>) -> Result<Decod
             boost.push(boost_function(function, &params)?);
             continue;
         }
-        if has_l2 {
+        if l2.is_some() {
             return Err(schema_error(
                 "Hybrid FunctionScore supports at most one non-boost rerank function".to_owned(),
             ));
@@ -224,8 +248,7 @@ pub(crate) fn decode(function_score: Option<&pb::FunctionScore>) -> Result<Decod
                 py_repr(&reranker)
             )));
         }
-        has_l2 = true;
-        check_l2_params(&reranker, &params)?;
+        l2 = Some(l2_function(&reranker, function, &params)?);
     }
     Ok(Decoded {
         boost: (!boost.is_empty()).then_some(BoostSpec {
@@ -233,7 +256,7 @@ pub(crate) fn decode(function_score: Option<&pb::FunctionScore>) -> Result<Decod
             boost_mode,
             function_mode,
         }),
-        has_l2,
+        l2,
     })
 }
 
@@ -287,7 +310,7 @@ mod tests {
     fn absent_and_empty_function_score_decode_to_nothing() {
         for input in [None, Some(&pb::FunctionScore::default())] {
             let decoded = decode(input).unwrap();
-            assert!(decoded.boost.is_none() && !decoded.has_l2);
+            assert!(decoded.boost.is_none() && decoded.l2.is_none());
         }
     }
 
@@ -408,8 +431,45 @@ mod tests {
     #[test]
     fn l2_selection_and_decode_time_errors() {
         let l2 = |params: &[(&str, &str)]| decode(Some(&score(vec![function(params)], &[])));
-        assert!(l2(&[("reranker", "RRF")]).unwrap().has_l2);
-        assert!(l2(&[("reranker", "decay")]).unwrap().has_l2);
+        assert_eq!(
+            l2(&[("reranker", "RRF")]).unwrap().l2,
+            Some(L2Function::Rrf { k: 60.0 })
+        );
+        assert_eq!(
+            l2(&[("reranker", "rrf"), ("k", "\" 5 \"")]).unwrap().l2,
+            Some(L2Function::Rrf { k: 5.0 })
+        );
+        assert_eq!(
+            l2(&[
+                ("reranker", "weighted"),
+                ("weights", "\"[0.7, \\\"1\\\"]\""),
+                ("norm_score", "\"TRUE\"")
+            ])
+            .unwrap()
+            .l2,
+            Some(L2Function::Weighted {
+                weights: vec![0.7, 1.0],
+                normalize: true
+            })
+        );
+        assert_eq!(
+            l2(&[("reranker", "weighted")]).unwrap().l2,
+            Some(L2Function::Weighted {
+                weights: vec![],
+                normalize: false
+            })
+        );
+        assert!(matches!(
+            l2(&[("reranker", "decay"), ("scale", "x")]).unwrap().l2,
+            Some(L2Function::Decay { params, .. }) if params["scale"] == "x"
+        ));
+        assert_eq!(
+            error(
+                vec![function(&[("reranker", "decay"), ("provider", "x")])],
+                &[]
+            ),
+            (6, "Model reranker requires params.queries".into())
+        );
         assert_eq!(
             error(vec![function(&[("strategy", "rrf")])], &[]),
             (6, "Unsupported Hybrid FunctionScore reranker ''".into())
@@ -505,7 +565,8 @@ mod tests {
                 &[]
             )))
             .unwrap()
-            .has_l2
+            .l2
+            .is_some()
         );
     }
 }

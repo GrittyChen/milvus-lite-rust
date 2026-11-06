@@ -4,6 +4,7 @@
 //! 按 Python 的动态类型规则复现（包括抛出的异常文案），而不是按 schema 的静态类型。
 
 pub mod boost;
+pub mod chain;
 pub mod pyval;
 pub mod window;
 

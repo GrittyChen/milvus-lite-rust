@@ -181,11 +181,11 @@ pub(crate) fn group_by_field_data(
     .map(Some)
 }
 
-/// 3.x 以 `json.dumps` 输出每行的动态字段：显式请求的 key 按请求顺序，否则按 key 排序
-/// （3.x 保存 `$meta` 时 `sort_keys=True`）。
+/// 3.x 以 `json.dumps` 输出每行的动态字段：显式请求的 key 按请求顺序，否则按 dict 的顺序（引擎已按
+/// 3.x 读回的顺序排好顶层 key，见 `ReadSnapshot::gather`）；嵌套对象排序（3.x 保存时 `sort_keys=True`）。
 fn meta_json(projection: &Projection, meta: &Map<String, Value>) -> String {
     if projection.all_dynamic {
-        pyjson::dumps(&Value::Object(meta.clone()))
+        pyjson::dumps_object(meta.iter().map(|(k, v)| (k.as_str(), v)))
     } else {
         pyjson::dumps_object(
             projection
@@ -379,14 +379,25 @@ fn scalar(
         DataType::Bool => Data::BoolData(pb::BoolArray {
             data: collect!(Bool, |v| *v),
         }),
-        DataType::Int8 => Data::IntData(pb::IntArray {
-            data: collect!(Int8, |v| i32::from(*v)),
-        }),
-        DataType::Int16 => Data::IntData(pb::IntArray {
-            data: collect!(Int16, |v| i32::from(*v)),
-        }),
-        DataType::Int32 => Data::IntData(pb::IntArray {
-            data: collect!(Int32, |v| *v),
+        // rerank 链算出的值写进 INT8 / INT16 字段时由 int32 列承载（3.x 不按字段类型收窄），
+        // 存储列仍是字段自己的宽度，两种都写进 protobuf 的 int32 槽。
+        DataType::Int8 | DataType::Int16 | DataType::Int32 => Data::IntData(pb::IntArray {
+            data: parts
+                .iter()
+                .flat_map(|c| {
+                    let values: Vec<i32> = match c.values() {
+                        ColumnData::Int8(v) => v.iter().map(|x| i32::from(*x)).collect(),
+                        ColumnData::Int16(v) => v.iter().map(|x| i32::from(*x)).collect(),
+                        ColumnData::Int32(v) => v.clone(),
+                        _ => unreachable!("{MISMATCH}"),
+                    };
+                    values
+                        .into_iter()
+                        .enumerate()
+                        .map(|(row, value)| if c.is_null(row) { 0 } else { value })
+                        .collect::<Vec<_>>()
+                })
+                .collect(),
         }),
         DataType::Int64 => Data::LongData(pb::LongArray {
             data: collect!(Int64, |v| *v),

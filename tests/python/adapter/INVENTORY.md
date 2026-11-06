@@ -6,16 +6,16 @@
 
 | 状态 | 含义 | 条数 |
 | --- | --- | --- |
-| 已复制 | 原样复制到本目录 | 247 |
+| 已复制 | 原样复制到本目录 | 248 |
 | 改后复制 | 仅按 0004「验收」第 2 项与 0006 第 25 项授权的条件替换，逐条说明改动 | 0 |
-| 范围外 | 用到当前切片不支持的功能，不复制；未实现能力的代表性入口见「范围外功能的 `UNIMPLEMENTED` 断言」 | 51 |
+| 范围外 | 用到当前切片不支持的功能，不复制；未实现能力的代表性入口见「范围外功能的 `UNIMPLEMENTED` 断言」 | 58 |
 | 待复用 | 原功能阻断已解除，尚未复制到本地默认套件；0015 的条目已通过固定外部套件验收 | 53 |
-| 依赖内部模块 | 导入或使用 3.x 的内部模块、内部对象，换成本实现后无法运行 | 39 |
+| 依赖内部模块 | 导入或使用 3.x 的内部模块、内部对象，换成本实现后无法运行 | 50 |
 | 不运行 | 上游被同名定义覆盖，上游自己也不运行 | 1 |
 
-以上是逐条列出的 28 个文件中的 391 条；其余 19 个文件的 246 条整个文件记一行原因，见「整个文件不复用的文件」。
+以上是逐条列出的 29 个文件中的 410 条；其余 18 个文件的 227 条整个文件记一行原因，见「整个文件不复用的文件」。
 
-「已复制」与「改后复制」共 247 个用例函数，参数化展开后 290 条（0026 第 1 步新增 8 个函数、10 条：Search 的 boost 7 个函数 9 条，动态字段 `["*"]` 随 boost 返回 1 条；0025 新增 22 个函数、22 条：TIMESTAMPTZ 的 16 个与数据库 `timezone` 属性的 6 个；0024 新增 6 个函数、6 条：分组检索 5 个与动态字段 `["*"]` 随分组返回 1 个；0023 B 新增 19 个函数、31 条：数据库用例 17 个函数 29 条，加两个按数据库隔离的用例）。S1 恢复 [test_grpc_crud.py](test_grpc_crud.py) 中的原过滤表达式，并纳入除 LIKE 外的全部 19 条；它们在本实现与真实 3.x 上的两条客户端线均作为 S1 验收。随后迁移全部 40 条待复用用例，恢复此前为绕过过滤限制而替换的原表达式；顶层动态字段切片另加入原样的 TestDynamicField 用例。0014 已恢复原 HNSW 定义，并新增创建 HNSW、DropIndex 和 describe 参数的原用例；检索仍按 FLAT 执行。
+「已复制」与「改后复制」共 248 个用例函数，参数化展开后 291 条（0026 第 2 步新增 1 个函数、1 条：Search 的 decay；0026 第 1 步新增 8 个函数、10 条：Search 的 boost 7 个函数 9 条，动态字段 `["*"]` 随 boost 返回 1 条；0025 新增 22 个函数、22 条：TIMESTAMPTZ 的 16 个与数据库 `timezone` 属性的 6 个；0024 新增 6 个函数、6 条：分组检索 5 个与动态字段 `["*"]` 随分组返回 1 个；0023 B 新增 19 个函数、31 条：数据库用例 17 个函数 29 条，加两个按数据库隔离的用例）。S1 恢复 [test_grpc_crud.py](test_grpc_crud.py) 中的原过滤表达式，并纳入除 LIKE 外的全部 19 条；它们在本实现与真实 3.x 上的两条客户端线均作为 S1 验收。随后迁移全部 40 条待复用用例，恢复此前为绕过过滤限制而替换的原表达式；顶层动态字段切片另加入原样的 TestDynamicField 用例。0014 已恢复原 HNSW 定义，并新增创建 HNSW、DropIndex 和 describe 参数的原用例；检索仍按 FLAT 执行。
 
 历史的 HNSW→FLAT 授权替换按 0014 恢复原定义；`== N` 换成 `in [N]` 的条件见 0004「验收」第 2 项及 0006 第 25 项。已接通 S1 的 CRUD 副本不再替换表达式或读回方式。其余副本只删去随范围外用例一起不再使用的 import、helper 与空的分节标题；上游用于跳过的 `importorskip` 改为直接导入（本仓不允许因缺依赖静默跳过），上游因 HNSW 需要 faiss 而加的 `skipif` 随 HNSW 一起去掉。起服务的 fixture 与清理见 [conftest.py](conftest.py)。
 
@@ -563,6 +563,32 @@
 | `test_search_boost_ranker_score_affected` | 已复制 | 第 1 步 |
 | `test_search_boost_ranker_invalid_params`（参数化 3 条） | 已复制 | 第 1 步 |
 
+### [test_hybrid_search.py](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_hybrid_search.py)（0026）
+
+19 条：已复制 1，范围外 7，依赖内部模块 11。
+
+| 用例 | 状态 | 说明 |
+| --- | --- | --- |
+| [`test_weighted_basic`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_hybrid_search.py#L101) | 依赖内部模块 | `TestRerankerUnit`：导入 3.x 的 `milvus_lite.adapter.grpc.reranker` |
+| [`test_rrf_basic`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_hybrid_search.py#L119) | 依赖内部模块 | 同上 |
+| [`test_weighted_empty`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_hybrid_search.py#L134) | 依赖内部模块 | 同上 |
+| [`test_rrf_single_route`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_hybrid_search.py#L139) | 依赖内部模块 | 同上 |
+| [`test_offset`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_hybrid_search.py#L149) | 依赖内部模块 | 同上 |
+| [`test_chain_score_conversion_keeps_ip_direction`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_hybrid_search.py#L159) | 依赖内部模块 | 导入 3.x 的 `servicer._hit_score_for_chain` |
+| [`test_hybrid_weighted_dense_bm25`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_hybrid_search.py#L172) | 依赖内部模块 | 导入 3.x 的 `milvus_lite.analyzer`；还用 BM25 |
+| [`test_hybrid_top_level_function_score_weighted`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_hybrid_search.py#L212) | 依赖内部模块 | 导入 3.x 的 `milvus_lite.analyzer`；还用 BM25 |
+| [`test_hybrid_top_level_decay_uses_hidden_input_field`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_hybrid_search.py#L252) | 范围外 | HybridSearch，0026 第 3 步 |
+| [`test_hybrid_top_level_model_uses_hidden_input_field`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_hybrid_search.py#L298) | 依赖内部模块 | 替换 3.x 的 `milvus_lite.rerank.factory.create_rerank_provider` |
+| [`test_search_top_level_decay_uses_hidden_input_field`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_hybrid_search.py#L359) | 已复制 | 第 2 步 |
+| [`test_search_top_level_model_uses_hidden_input_field`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_hybrid_search.py#L401) | 依赖内部模块 | 替换 3.x 的 `milvus_lite.rerank.factory.create_rerank_provider` |
+| [`test_hybrid_rrf_dense_bm25`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_hybrid_search.py#L458) | 依赖内部模块 | 导入 3.x 的 `milvus_lite.analyzer`；还用 BM25 |
+| [`test_hybrid_output_fields`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_hybrid_search.py#L495) | 范围外 | BM25 / text analyzer（全文检索切片） |
+| [`test_hybrid_group_by_hidden_field_not_output`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_hybrid_search.py#L521) | 范围外 | BM25 / text analyzer（全文检索切片） |
+| [`test_hybrid_with_filter`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_hybrid_search.py#L550) | 范围外 | BM25 / text analyzer（全文检索切片） |
+| [`test_hybrid_timestamptz_timezone_and_time_fields`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_hybrid_search.py#L576) | 范围外 | HybridSearch，0026 第 3 步 |
+| [`test_hybrid_single_route_same_as_search`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_hybrid_search.py#L623) | 范围外 | BM25 / text analyzer（全文检索切片） |
+| [`test_hybrid_bm25_no_explicit_metric`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_hybrid_search.py#L685) | 范围外 | BM25 / text analyzer（全文检索切片） |
+
 ### [test_group_by.py](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_group_by.py)（0024）
 
 11 条：已复制 5，依赖内部模块 6。
@@ -626,7 +652,7 @@
 | schema：GEOMETRY、`ARRAY<TIMESTAMPTZ>`、稀疏向量、nullable 向量、向量默认值、JSON/嵌套 ARRAY 元素、function、多向量字段、analyzer | `test_create_collection_remaining_unsupported`、`test_pymilvus_entry_points_remaining_unsupported` |
 | 写入 null 值 | `test_insert_m1_unsupported` |
 | 修改 schema | `test_pymilvus_entry_points_remaining_unsupported` |
-| HybridSearch、rerank（含与 group_by 同时出现） | `test_search_m1_unsupported`、`test_pymilvus_entry_points_remaining_unsupported` |
+| HybridSearch；rerank 的 model provider（含与 group_by 同时出现） | `test_search_m1_unsupported`、`test_pymilvus_entry_points_remaining_unsupported` |
 | FLAT、BRUTE_FORCE、AUTOINDEX 以外的索引类型 | `test_create_index_m1_unsupported` |
 | DropIndex | `test_pymilvus_entry_points_remaining_unsupported` |
 | GetCompactionPlans | [test_server_manager.py](../test_server_manager.py) 的 `test_unimplemented_rpc_reason` |
@@ -648,7 +674,6 @@
 | [test_grpc_translators_records.py](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_translators_records.py) | 26 | 全部依赖内部模块：3.x 翻译层的单元测试，[L21](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_translators_records.py#L21)–28 顶层导入 |
 | [test_grpc_translators_result.py](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_translators_result.py) | 1 | 依赖内部模块：3.x 翻译层的单元测试，[L3](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_translators_result.py#L3)–5 顶层导入 |
 | [test_grpc_translators_schema.py](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_translators_schema.py) | 16 | 全部依赖内部模块：3.x 翻译层的单元测试，[L14](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_translators_schema.py#L14)–19 顶层导入 |
-| [test_hybrid_search.py](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_hybrid_search.py) | 19 | hybrid search、rerank、BM25；其中 11 条依赖内部模块 |
 | [test_iterator.py](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_iterator.py) | 11 | 6 条 Query iterator 由 0016 在固定外部原始套件实跑，待复用；1 条 search iterator V1 由 0016 B 接续；4 条依赖内部模块 |
 | [test_json_field.py](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_json_field.py) | 21 | 共享 fixture 的 JSON 字段为 nullable，并写入了 null 值（[L18](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_json_field.py#L18)、L37）；多数用例还用 JSON 过滤表达式 |
 | [test_milvus_compat_partition_key.py](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat_partition_key.py) | 9 | partition key；其中 3 条只断言抛出异常，`UNIMPLEMENTED` 也会通过 |

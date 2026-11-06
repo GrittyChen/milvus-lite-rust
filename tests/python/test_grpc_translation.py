@@ -12,6 +12,7 @@ import struct
 import grpc
 import pytest
 from pymilvus import DataType, MilvusClient
+from pymilvus.exceptions import MilvusException
 from pymilvus.grpc_gen import common_pb2, milvus_pb2, milvus_pb2_grpc, schema_pb2
 
 from milvus_lite.server_manager import ServerManager
@@ -1224,8 +1225,17 @@ def test_pymilvus_entry_points_remaining_unsupported(env):
 
     rpc = "not implemented in this build of milvus-lite-rust yet"
     feature = "not supported in this build of milvus-lite-rust yet"
-    decay = Function(name="r", function_type=FunctionType.RERANK, input_field_names=["id"],
-                     params={"reranker": "decay", "function": "gauss", "origin": 0, "scale": 1})
+    # model 通过全部校验后才返回 UNIMPLEMENTED（0026 第 10 节），输入字段须是 VARCHAR。
+    model_schema = MilvusClient.create_schema()
+    model_schema.add_field("id", DataType.INT64, is_primary=True)
+    model_schema.add_field("v", DataType.FLOAT_VECTOR, dim=2)
+    model_schema.add_field("s", DataType.VARCHAR, max_length=8)
+    index = client.prepare_index_params()
+    index.add_index("v", index_type="FLAT", metric_type="COSINE")
+    client.create_collection("m", schema=model_schema, index_params=index)
+    client.insert("m", [{"id": i, "v": [1.0, i / 50], "s": f"s{i}"} for i in range(3)])
+    model = Function(name="r", function_type=FunctionType.RERANK, input_field_names=["s"],
+                     params={"reranker": "model", "provider": "cohere", "queries": ["q"]})
     cases = [
         (with_field("n", DataType.FLOAT_VECTOR, dim=2, nullable=True), f"nullable vectors: {feature}"),
         (with_field("v2", DataType.FLOAT_VECTOR, dim=2), "multiple vector fields: "),
@@ -1236,10 +1246,10 @@ def test_pymilvus_entry_points_remaining_unsupported(env):
         (lambda: client.hybrid_search("q", [AnnSearchRequest([[1, 0]], "vector", {}, 2)], RRFRanker(), limit=2),
          f"HybridSearch: {rpc}"),
         (lambda: client.search("q", [[1, 0]], filter="id + 1 > 0"), "filter expressions: arithmetic, text_match, and geometry predicates are not supported"),
-        (lambda: client.search("q", [[1, 0]], ranker=decay), f"L2 rerank functions: {feature}"),
-        # 分组检索已实现；与 rerank 同时出现时，rerank 的 UNIMPLEMENTED 不能被分组路径吞掉。
-        (lambda: client.search("q", [[1, 0]], ranker=decay, group_by_field="id"),
-         f"L2 rerank functions: {feature}"),
+        (lambda: client.search("m", [[1, 0]], ranker=model), f"rerank model providers: {feature}"),
+        # 与分组同时出现时，model 的 UNIMPLEMENTED 不能被分组路径吞掉。
+        (lambda: client.search("m", [[1, 0]], ranker=model, group_by_field="id"),
+         f"rerank model providers: {feature}"),
     ]
     for call, details in cases:
         with pytest.raises(grpc.RpcError) as info:
@@ -1268,6 +1278,48 @@ def test_pymilvus_entry_points_remaining_unsupported(env):
     assert len(it.next()) == 0
     it.close()
 
+
+def test_search_l2_rerank_functions(env):
+    """Search 的 L2 rerank（0026 第 2 步）：rrf / weighted / decay 在引擎候选之后执行，分组交给 rerank 链。"""
+    from pymilvus import Function, FunctionType
+
+    client, _, _ = env
+    schema = MilvusClient.create_schema()
+    schema.add_field("id", DataType.INT64, is_primary=True)
+    schema.add_field("v", DataType.FLOAT_VECTOR, dim=2)
+    schema.add_field("age", DataType.INT32)
+    schema.add_field("cat", DataType.VARCHAR, max_length=4)
+    index = client.prepare_index_params()
+    index.add_index("v", index_type="FLAT", metric_type="COSINE")
+    client.create_collection("l2", schema=schema, index_params=index)
+    client.insert("l2", [{"id": i, "v": [1.0, i / 50], "age": 10 - i, "cat": "ab"[i % 2]} for i in range(10)])
+
+    def ranker(reranker, inputs=(), **params):
+        return Function(name="r", function_type=FunctionType.RERANK, input_field_names=list(inputs),
+                        params={"reranker": reranker, **params})
+
+    def hits(**kwargs):
+        return [(h["id"], h["distance"]) for h in client.search("l2", [[1.0, 0.0]], limit=3, **kwargs)[0]]
+
+    # rrf：只看名次，`1 / (k + rank + 1)`。
+    assert hits(ranker=ranker("rrf", k=1)) == [(0, 0.5), (1, pytest.approx(1 / 3)), (2, 0.25)]
+    # weighted 不归一化：COSINE 降序，分数是权重乘相似度。
+    assert [i for i, _ in hits(ranker=ranker("weighted", weights=[0.5]))] == [0, 1, 2]
+    # decay 把年龄越接近 origin 的排在前面；`_decay_score` 不在请求的输出字段里时不出现。
+    result = client.search("l2", [[1.0, 0.0]], limit=3, output_fields=["age"],
+                           ranker=ranker("decay", ["age"], function="linear", origin=1, scale=100, decay=0.5))[0]
+    assert [h["id"] for h in result] == [9, 8, 7]
+    assert all(set(h["entity"]) == {"id", "age"} for h in result)
+    # 主键不在候选行里：decay 的因子恒为 0，全部同分，按 `$id` 升序（3.x 同）。
+    assert hits(ranker=ranker("decay", ["id"], function="gauss", origin=0, scale=1)) == [(0, 0.0), (1, 0.0), (2, 0.0)]
+    # 分组在 rerank 链里做：每组取前 group_size 个，组按组内最高分排序。
+    grouped = client.search("l2", [[1.0, 0.0]], limit=2, group_by_field="cat", group_size=2, output_fields=["cat"],
+                            ranker=ranker("rrf"))[0]
+    assert [h["entity"]["cat"] for h in grouped] == ["a", "a", "b", "b"]
+    # 链里的校验在检索之后、以 code 1 报出。
+    with pytest.raises(MilvusException) as info:
+        client.search("l2", [[1.0, 0.0]], ranker=ranker("rrf", k=0))
+    assert info.value.code == 1 and "The rank params k should be in range (0, 16384)" in info.value.message
 
 @pytest.mark.parametrize(
     "kind", ["AUTOINDEX", "HNSW", "HNSW_SQ", "IVF_FLAT", "IVF_SQ8"]

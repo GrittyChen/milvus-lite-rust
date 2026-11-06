@@ -153,6 +153,30 @@ impl GetSnapshot {
     }
 }
 
+/// 一个查询排好的命中，尚未按投影取列（L2 rerank 要先在它上面执行链）。
+struct Ranked {
+    refs: Vec<RowRef>,
+    scores: Vec<f32>,
+    group_values: Option<ColumnData>,
+    public: Option<Vec<f64>>,
+    ids: Option<Vec<PyVal>>,
+}
+
+/// 引擎检索的结果。`boosted` 时 `$id` / `$distance` 已从 entity 剥掉。
+struct Ranking {
+    projection: Projection,
+    metric: Option<Metric>,
+    queries: Vec<Ranked>,
+    boosted: bool,
+}
+
+/// [`ReadSnapshot::search_reranked_in`] 的 L2 函数与链尾参数。
+pub struct Rerank<'a> {
+    pub function: &'a crate::rerank::chain::L2Function,
+    pub limit: i64,
+    pub offset: i64,
+}
+
 /// 检索的过滤、范围、分组与时区来源，一起传给内部实现。
 struct FilterContext<'a> {
     expr: &'a str,
@@ -262,6 +286,240 @@ impl ReadSnapshot {
         )
     }
 
+    /// Search + L2（0026 第 6、7 节，3.x `servicer.Search` 的 `l2_func` 分支）：引擎按
+    /// `window::search_l2` 取候选（offset 为 0、分组关闭；有 boost 时引擎再按 boost 放大），再执行 L2 链。
+    /// `req.limit` / `req.offset` 不使用，由 `rerank` 给出；`filter.group` 交给链的 `GroupByOp`，
+    /// 不经过 0024 的字段校验，`strict` 被忽略。
+    pub fn search_reranked_in(
+        &self,
+        req: SearchRequest,
+        compute: &Compute,
+        filter: BoostedFilter<'_>,
+        boost: Option<&boost::BoostSpec>,
+        rerank: Rerank<'_>,
+    ) -> Result<SearchResult> {
+        use crate::rerank::chain::{
+            Chain, DECAY_SCORE_FIELD, GROUP_SCORE_FIELD, L2Function, SCORE_FIELD, Tail,
+        };
+        let BoostedFilter {
+            expr,
+            range,
+            group,
+            timezone,
+        } = filter;
+        let window = crate::rerank::window::search_l2(
+            rerank.limit,
+            rerank.offset,
+            group.as_ref().map(|g| g.size),
+        );
+        let top_k = usize::try_from(window.max(0)).unwrap_or(usize::MAX);
+        let requested = Projection::new(&self.schema, &req.output_fields, ApiKind::Search);
+        // 请求了输出字段时并上分组字段与 L2 的输入字段；没有请求时引擎本来就取全部字段。
+        let mut search_fields = req.output_fields.clone();
+        if !search_fields.is_empty() {
+            let inputs: &[String] = match rerank.function {
+                L2Function::Decay { inputs, .. } | L2Function::Model { inputs, .. } => inputs,
+                _ => &[],
+            };
+            for name in group.iter().map(|g| &g.field).chain(inputs) {
+                if !search_fields.contains(name) {
+                    search_fields.push(name.clone());
+                }
+            }
+        }
+        // 引擎路径的 offset 为 0：boost 之后是 `hits[:top_k]`。
+        let plan = boost.map(|spec| BoostPlan {
+            spec: spec.clone(),
+            keep: top_k,
+        });
+        let rows_per_block = (BLOCK_ELEMS / field_dim(&self.schema.fields[self.vector_pos])).max(1);
+        let ranking = self.rank_in_blocks(
+            SearchRequest {
+                limit: top_k,
+                offset: 0,
+                output_fields: search_fields,
+                ..req
+            },
+            compute,
+            rows_per_block,
+            FilterContext {
+                expr,
+                range,
+                group: None,
+                timezone,
+                boost: plan.as_ref(),
+            },
+        )?;
+        let Some(metric) = ranking.metric else {
+            return Ok(SearchResult {
+                projection: requested,
+                metric: None,
+                hits: Vec::new(),
+            });
+        };
+        let chain = Chain::build(
+            rerank.function,
+            &self.schema,
+            &[metric],
+            Tail {
+                limit: rerank.limit,
+                offset: rerank.offset,
+                group: group.as_ref().map(|g| (g.field.clone(), g.size)),
+            },
+        )?;
+        let pk_value = |at: RowRef| match pk_at(&self.chunks[at.chunk].columns[self.pk_pos], at.row)
+        {
+            Pk::Int64(i) => PyVal::Int(i),
+            Pk::VarChar(s) => PyVal::Str(s),
+        };
+        let mut queries = Vec::with_capacity(ranking.queries.len());
+        for q in &ranking.queries {
+            let mut rows = Vec::with_capacity(q.refs.len());
+            for (i, &at) in q.refs.iter().enumerate() {
+                let id = q
+                    .ids
+                    .as_ref()
+                    .map_or_else(|| pk_value(at), |ids| ids[i].clone());
+                // 链只消费 float64 对外分数（两空间契约）：没有 boost 时由 float32 分数按 3.x 的换算还原。
+                let public = q
+                    .public
+                    .as_ref()
+                    .map_or_else(|| metric.public_f64(q.scores[i]), |p| p[i]);
+                rows.push(chain.row(i, id, public, |name| {
+                    self.entity_value(at, name, &ranking.projection, ranking.boosted)
+                })?);
+            }
+            queries.push(vec![rows]);
+        }
+        let results = chain.execute(queries)?;
+
+        let group_pos = group
+            .as_ref()
+            .and_then(|g| self.schema.fields.iter().position(|f| f.name == g.field));
+        let decay_field = self
+            .schema
+            .field(DECAY_SCORE_FIELD)
+            .filter(|f| !f.is_primary);
+        let decay_key = chain.has_decay()
+            && self.schema.field(DECAY_SCORE_FIELD).is_none()
+            && dynamic_key_visible(&self.schema, &requested, DECAY_SCORE_FIELD);
+        let mut stripped = vec![ID_FIELD, SCORE_FIELD, GROUP_SCORE_FIELD];
+        if ranking.boosted {
+            stripped.push(DISTANCE_FIELD);
+        }
+        let mut hits = Vec::with_capacity(results.len());
+        for (rows, q) in results.into_iter().zip(&ranking.queries) {
+            let refs: Vec<RowRef> = rows.iter().map(|r| q.refs[r.source]).collect();
+            let public: Vec<f64> = rows
+                .iter()
+                .map(|r| match r.score {
+                    PyVal::Float(f) => f,
+                    _ => f64::NAN,
+                })
+                .collect();
+            let overridden =
+                q.ids.is_some() || rows.iter().zip(&refs).any(|(r, &at)| r.id != pk_value(at));
+            let group_values = match group_pos {
+                Some(pos) => {
+                    let field = &self.schema.fields[pos];
+                    let name = field.name.as_str();
+                    // 虚拟列、主键（不在 entity 里）与被 boost 剥掉的 `$distance` 取链里的值，其余复制存储列。
+                    let computed = field.is_primary
+                        || matches!(
+                            name,
+                            ID_FIELD | SCORE_FIELD | DECAY_SCORE_FIELD | GROUP_SCORE_FIELD
+                        )
+                        || (ranking.boosted && name == DISTANCE_FIELD);
+                    let mut column = if computed {
+                        crate::rerank::pyval::python_column(field)
+                    } else {
+                        ColumnData::empty(field)
+                    };
+                    for (row, &at) in rows.iter().zip(&refs) {
+                        if computed {
+                            column.append_column(&crate::rerank::pyval::python_cell(
+                                field,
+                                &chain.get(row, name),
+                            )?);
+                        } else {
+                            column.push_row(&self.chunks[at.chunk].columns[pos], at.row);
+                        }
+                    }
+                    Some(column)
+                }
+                None => None,
+            };
+            let mut out = self.gather(&refs, &requested);
+            self.strip(&mut out, &stripped);
+            if chain.has_decay() {
+                if let Some(field) = decay_field
+                    && let Some((_, column)) =
+                        out.fields.iter_mut().find(|(n, _)| n == DECAY_SCORE_FIELD)
+                {
+                    let mut factors = crate::rerank::pyval::python_column(field);
+                    for row in &rows {
+                        factors.append_column(&crate::rerank::pyval::python_cell(
+                            field,
+                            &chain.get(row, DECAY_SCORE_FIELD),
+                        )?);
+                    }
+                    *column = factors;
+                }
+                if decay_key {
+                    for (meta, row) in out.meta.iter_mut().flatten().zip(&rows) {
+                        if let PyVal::Float(factor) = chain.get(row, DECAY_SCORE_FIELD)
+                            && let Some(number) = serde_json::Number::from_f64(factor)
+                        {
+                            meta.insert(DECAY_SCORE_FIELD.to_owned(), Value::Number(number));
+                        }
+                    }
+                }
+            }
+            hits.push(Hits {
+                scores: public.iter().map(|s| *s as f32).collect(),
+                rows: out,
+                group_values,
+                public_scores: Some(public),
+                id_overrides: overridden.then(|| rows.into_iter().map(|r| r.id).collect()),
+            });
+        }
+        Ok(SearchResult {
+            projection: requested,
+            metric: Some(metric),
+            hits,
+        })
+    }
+
+    /// 候选行 entity 里名字 `name` 的值：投影内的非主键 schema 字段或可见的动态键；boost 剥掉的
+    /// `$id` / `$distance` 不在其中。
+    fn entity_value(
+        &self,
+        at: RowRef,
+        name: &str,
+        projection: &Projection,
+        boosted: bool,
+    ) -> Result<Option<PyVal>> {
+        if boosted && matches!(name, ID_FIELD | DISTANCE_FIELD) {
+            return Ok(None);
+        }
+        let chunk = &self.chunks[at.chunk];
+        if let Some(pos) = self.schema.fields.iter().position(|f| f.name == name) {
+            if self.schema.fields[pos].is_primary || !projection.schema_fields.contains(&pos) {
+                return Ok(None);
+            }
+            return PyVal::from_field(&self.schema.fields[pos], &chunk.columns[pos], at.row)
+                .map(Some);
+        }
+        if !dynamic_key_visible(&self.schema, projection, name) {
+            return Ok(None);
+        }
+        Ok(chunk
+            .meta
+            .as_ref()
+            .and_then(|meta| meta[at.row].get(name))
+            .map(PyVal::from_json))
+    }
+
     fn search_in_blocks(
         &self,
         req: SearchRequest,
@@ -289,6 +547,66 @@ impl ReadSnapshot {
         rows_per_block: usize,
         filter: FilterContext<'_>,
     ) -> Result<SearchResult> {
+        let ranking = self.rank_in_blocks(req, compute, rows_per_block, filter)?;
+        Ok(self.finish(ranking))
+    }
+
+    /// 按投影取列；boost 之后虚拟列从 entity 剥掉：同名的 schema 字段输出空值占位，动态键不再出现。
+    fn finish(&self, ranking: Ranking) -> SearchResult {
+        let Ranking {
+            projection,
+            metric,
+            queries,
+            boosted,
+        } = ranking;
+        let hits = queries
+            .into_iter()
+            .map(|q| {
+                let mut rows = self.gather(&q.refs, &projection);
+                if boosted {
+                    self.strip(&mut rows, &[ID_FIELD, DISTANCE_FIELD]);
+                }
+                Hits {
+                    scores: q.scores,
+                    rows,
+                    group_values: q.group_values,
+                    public_scores: q.public,
+                    id_overrides: q.ids,
+                }
+            })
+            .collect();
+        SearchResult {
+            projection,
+            metric,
+            hits,
+        }
+    }
+
+    /// 把 entity 里的这些名字去掉：同名的非主键 schema 字段换成空值占位，动态键删除。
+    fn strip(&self, rows: &mut Rows, names: &[&str]) {
+        let len = rows.len();
+        for (name, column) in &mut rows.fields {
+            if names.contains(&name.as_str())
+                && let Some(field) = self.schema.field(name)
+                && !field.is_primary
+            {
+                *column = ColumnData::nulls(field, len);
+            }
+        }
+        for meta in rows.meta.iter_mut().flatten() {
+            for name in names {
+                meta.shift_remove(*name);
+            }
+        }
+    }
+
+    fn rank_in_blocks(
+        &self,
+        req: SearchRequest,
+        compute: &Compute,
+        rows_per_block: usize,
+        filter: FilterContext<'_>,
+    ) -> Result<Ranking> {
         let FilterContext {
             expr,
             range,
@@ -299,10 +617,11 @@ impl ReadSnapshot {
         let projection = Projection::new(&self.schema, &req.output_fields, ApiKind::Search);
         // 3.x：没有查询向量时在一切检查之前返回空结果。
         if matches!(&req.vectors, QueryVectors::Dense(v) if v.is_empty()) {
-            return Ok(SearchResult {
+            return Ok(Ranking {
                 projection,
                 metric: None,
-                hits: Vec::new(),
+                queries: Vec::new(),
+                boosted: false,
             });
         }
         self.require_loaded()?;
@@ -424,7 +743,7 @@ impl ReadSnapshot {
                     ranked
                 })
                 .collect();
-            let hits = self.boosted_hits(BoostInput {
+            let queries = self.boosted_hits(BoostInput {
                 ranked,
                 compiled,
                 metric,
@@ -435,13 +754,14 @@ impl ReadSnapshot {
                 limit: req.limit,
                 keep: plan.keep,
             })?;
-            return Ok(SearchResult {
+            return Ok(Ranking {
                 projection,
                 metric: Some(metric),
-                hits,
+                queries,
+                boosted: true,
             });
         }
-        let hits = tops
+        let queries = tops
             .into_iter()
             .map(|top| {
                 let mut ranked = top.finish();
@@ -478,19 +798,20 @@ impl ReadSnapshot {
                 };
                 let refs: Vec<RowRef> = kept.iter().map(|(_, r)| *r).collect();
                 let group_values = group_pos.map(|pos| self.group_column(&refs, pos));
-                Hits {
+                Ranked {
                     scores: kept.iter().map(|(s, _)| *s).collect(),
-                    rows: self.gather(&refs, &projection),
+                    refs,
                     group_values,
-                    public_scores: None,
-                    id_overrides: None,
+                    public: None,
+                    ids: None,
                 }
             })
             .collect();
-        Ok(SearchResult {
+        Ok(Ranking {
             projection,
             metric: Some(metric),
-            hits,
+            queries,
+            boosted: false,
         })
     }
 
@@ -504,7 +825,7 @@ impl ReadSnapshot {
 
     /// boost 链（3.x `apply_boost_ranker` 之后的 `Collection.search`）：全部查询逐行 boost → 全部排序 →
     /// 分组、切 offset → 转成对外分数。各阶段都可能报错，先后要与 3.x 相同，所以分成几轮循环。
-    fn boosted_hits(&self, input: BoostInput<'_>) -> Result<Vec<Hits>> {
+    fn boosted_hits(&self, input: BoostInput<'_>) -> Result<Vec<Ranked>> {
         let BoostInput {
             ranked,
             compiled,
@@ -618,20 +939,6 @@ impl ReadSnapshot {
             .into_iter()
             .zip(public)
             .map(|((rows, refs), public)| {
-                let mut gathered = self.gather(&refs, projection);
-                // 虚拟列排序后从 entity 剥掉：同名的 schema 字段输出空值占位，动态键不再出现。
-                for (name, column) in &mut gathered.fields {
-                    if matches!(name.as_str(), ID_FIELD | DISTANCE_FIELD)
-                        && let Some(field) = self.schema.field(name)
-                        && !field.is_primary
-                    {
-                        *column = ColumnData::nulls(field, refs.len());
-                    }
-                }
-                for meta in gathered.meta.iter_mut().flatten() {
-                    meta.shift_remove(ID_FIELD);
-                    meta.shift_remove(DISTANCE_FIELD);
-                }
                 let group_values = group.map(|(g, pos)| {
                     let field = &self.schema.fields[pos];
                     if !field.is_primary && matches!(g.field.as_str(), ID_FIELD | DISTANCE_FIELD) {
@@ -640,12 +947,12 @@ impl ReadSnapshot {
                         self.group_column(&refs, pos)
                     }
                 });
-                Hits {
+                Ranked {
                     scores: public.iter().map(|s| *s as f32).collect(),
-                    rows: gathered,
+                    refs,
                     group_values,
-                    public_scores: Some(public),
-                    id_overrides: any_id_override.then(|| rows.into_iter().map(|r| r.id).collect()),
+                    public: Some(public),
+                    ids: any_id_override.then(|| rows.into_iter().map(|r| r.id).collect()),
                 }
             })
             .collect();
@@ -937,7 +1244,13 @@ impl ReadSnapshot {
                         .as_ref()
                         .and_then(|m| m.get(r.row));
                     match full {
-                        Some(full) if projection.all_dynamic => full.clone(),
+                        // 3.x 以 `sort_keys=True` 保存 `$meta`，读回的 dict 按 key 排序；rerank 链之后
+                        // 新写入的 key（`_decay_score`）排在最后，所以排序在这里做，输出保留顺序。
+                        Some(full) if projection.all_dynamic => {
+                            let mut sorted = full.clone();
+                            sorted.sort_keys();
+                            sorted
+                        }
                         Some(full) => projection
                             .dynamic_keys
                             .iter()
