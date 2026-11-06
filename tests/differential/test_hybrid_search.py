@@ -41,6 +41,12 @@ class HybridClients(Clients):
             self.mod = None
 
 
+# HybridSearchRequest.function_chains（字段 15）里追加一个空的 FunctionChain。pymilvus 2.6 的 proto 没有这个字段，
+# 直接按字段号写入字节：3.0 线解析成该字段，2.6 线作为未知字段原样发出，两条线发出的请求相同。
+def add_function_chain(request):
+    request.MergeFromString(bytes([15 << 3 | 2, 0]))
+
+
 def route(data=QUERY, limit=8, expr=None, metric=None):
     return AnnSearchRequest(data=data, anns_field="v", param={"metric_type": metric} if metric else {}, limit=limit,
                             expr=expr)
@@ -199,7 +205,7 @@ def test_hybrid_merges_windows_and_routes_match_3x(pair):
         ("fs decay field", [route()], decay("nosuch"), None),
         ("nq mismatch", [route([[1.0, 0.0], [0.0, 1.0]]), route()], WeightedRanker(0.5, 0.5), None),
         ("nq mismatch + weights length", [route([[1.0, 0.0], [0.0, 1.0]]), route()], WeightedRanker(0.2, 0.3, 0.5), None),
-        ("function_chains", [route()], RRFRanker(), lambda r: r.function_chains.add()),
+        ("function_chains", [route()], RRFRanker(), add_function_chain),
         ("no requests", [route()], RRFRanker(), lambda r: r.ClearField("requests")),
         ("no requests fs weighted", [route()], fn("weighted", weights=[0.5]), lambda r: r.ClearField("requests")),
     ]

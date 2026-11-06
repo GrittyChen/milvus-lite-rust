@@ -1314,10 +1314,36 @@ def test_search_l2_rerank_functions(env):
     grouped = client.search("l2", [[1.0, 0.0]], limit=2, group_by_field="cat", group_size=2, output_fields=["cat"],
                             ranker=ranker("rrf"))[0]
     assert [h["entity"]["cat"] for h in grouped] == ["a", "a", "b", "b"]
+    # rerank 的 float64 分数直接取整，不再经过度量换算（那会多一次 float32 舍入）：3.x 实测
+    # round(1/61, 9) 存成 float32 是 0.016393443569540977，先转 float32 再取整会得到 0.016393441706895828。
+    # SDK 只允许 round_decimal <= 6，这里改写发出的请求。
+    connection = client._get_connection()
+    inner, replies = connection._stub.Search, []
+
+    def nine_digits(request, *args, **kwargs):
+        for kv in request.search_params:
+            if kv.key == "round_decimal":
+                kv.value = "9"
+        replies.append(inner(request, *args, **kwargs))
+        return replies[-1]
+
+    connection._stub.Search = nine_digits
+    try:
+        client.search("l2", [[1.0, 0.0]], limit=2, round_decimal=6, ranker=ranker("rrf"))
+    finally:
+        connection._stub.Search = inner
+    assert list(replies[-1].results.scores) == [
+        struct.unpack("f", struct.pack("f", round(1 / (60 + rank), 9)))[0] for rank in (1, 2)]
     # 链里的校验在检索之后、以 code 1 报出。
     with pytest.raises(MilvusException) as info:
         client.search("l2", [[1.0, 0.0]], ranker=ranker("rrf", k=0))
     assert info.value.code == 1 and "The rank params k should be in range (0, 16384)" in info.value.message
+
+
+# HybridSearchRequest.function_chains（字段 15）里追加一个空的 FunctionChain。pymilvus 2.6 的 proto 没有这个字段，
+# 直接按字段号写入字节：3.0 线解析成该字段，2.6 线作为未知字段原样发出，两条线发出的请求相同。
+def add_function_chain(request):
+    request.MergeFromString(bytes([15 << 3 | 2, 0]))
 
 
 def test_hybrid_search_rank_params_and_function_score(env):
@@ -1393,7 +1419,7 @@ def test_hybrid_search_rank_params_and_function_score(env):
     with pytest.raises(MilvusException) as info:
         client.hybrid_search("nope", two, RRFRanker())
     assert info.value.code == 100
-    assert error(two, RRFRanker(), mod=lambda r: r.function_chains.add()) == (
+    assert error(two, RRFRanker(), mod=add_function_chain) == (
         6, "function_chains is not supported for hybrid search yet")
     assert error(two, RRFRanker(), mod=rank_param("limit", '"x"')) == (
         1, "invalid literal for int() with base 10: 'x'")

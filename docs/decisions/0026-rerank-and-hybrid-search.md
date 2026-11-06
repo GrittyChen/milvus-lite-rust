@@ -1,8 +1,8 @@
 # 0026：HybridSearch 与 rerank（RRF / Weighted / boost / decay）
 
-状态：设计评审通过；第 1 步（Search 的 boost 与 `function_score` 解码）与第 2 步（Search 的 L2：rrf / weighted / decay、`GroupByOp`、rerank 后的 `round_decimal`）已实施并评审通过；第 3 步（HybridSearch：`rank_params`、顶层与子请求的 `function_score`、分区、分组、时区与 `time_fields`）已实施待评审；第 4 步未开始。对照版本为 3.x v3.2.1（`43d1257`）。
+状态：设计评审通过；第 1 步（Search 的 boost 与 `function_score` 解码）与第 2 步（Search 的 L2：rrf / weighted / decay、`GroupByOp`、rerank 后的 `round_decimal`）已实施并评审通过；第 3 步（HybridSearch：`rank_params`、顶层与子请求的 `function_score`、分区、分组、时区与 `time_fields`）已实施并评审通过；第 4 步（差分、参照用例、文档与验收）已实施待评审，开发验收见[验收记录](../testing/0026-rerank-hybrid-acceptance.md)。对照版本为 3.x v3.2.1（`43d1257`）。
 
-第 1–3 步留下的风险：13 个 `tie *` 的三平台 CI 未执行（本机已全部验收：第 1 步 5 个，第 2 步 2 个 Search + decay，第 3 步 6 个 Hybrid；三平台统一在第 4 步执行，不能免除）；变异验证与性能基准未运行。
+尚未完成的验收：13 个 `tie *` 的三平台 CI（本机已全部验收：第 1 步 5 个，第 2 步 2 个 Search + decay，第 3 步 6 个 Hybrid；需推送临时分支，不能免除）。变异验证已在第 4 步完成；本切片不声称性能提升，不做性能基准。
 
 ## 背景与目标
 
@@ -31,8 +31,8 @@
 ### 不纳入
 
 - 公共 `function_chains`（9 条参照用例），另做 L2 算子切片。
-- model rerank（外部 provider）：遇到时返回带明确说明的 `UNIMPLEMENTED`，登记差异。
-- `random_score`：同样 `UNIMPLEMENTED` 并登记（3.x 用 sha256 派生随机数，纳入要新增 sha2 依赖）。
+- model rerank（外部 provider）：Search 与 HybridSearch 顶层的合法 model 通过全部校验后返回带明确说明的 `UNIMPLEMENTED`，登记差异；HybridSearch 子请求里的 model 与其他子请求 L2 一样只解码、被忽略，与 3.x 一样成功（第 10 节）。
+- `random_score`：候选行真正用到时（该函数的过滤命中）同样返回 `UNIMPLEMENTED` 并登记（3.x 用 sha256 派生随机数，纳入要新增 sha2 依赖）；没有候选行时与 3.x 一样成功（第 10 节）。
 - 多向量字段（schema 仍拒绝，另立切片）、BM25 / sparse / text analyzer（全文检索切片）。因此建表用了 BM25 的 Hybrid 用例仍会被 text analyzer 挡住，**不能用“Hybrid 全绿”作验收口径**。
 
 ### 目标用例计数
@@ -349,7 +349,7 @@ Search：collection 不存在（100）→ 解码 `function_score`（boost 参数
 
 只有下面几类。第 10 节里写“相同”的 model / `random_score` 场景不是差异，错误码与文案逐字一致。
 
-- 合法 model（`cohere`）通过全部校验后：`UNIMPLEMENTED`，3.x 是 code 1（缺 key）或调用外部服务。
+- Search 与 HybridSearch 顶层的合法 model（`cohere`）通过全部校验后：`UNIMPLEMENTED`，3.x 是 code 1（缺 key）或调用外部服务。HybridSearch 子请求里的 model 被忽略，两边都成功，不是差异。
 - 候选行真正用到的 `random_score`：`UNIMPLEMENTED`，3.x 成功。
 - 公共 `function_chains`（Search）：`UNIMPLEMENTED`。
 - boost 过滤中的算术表达式与 `text_match`：`UNIMPLEMENTED`（3.x 可用；等待过滤范围与全文检索切片）。
@@ -363,7 +363,7 @@ Search：collection 不存在（100）→ 解码 `function_score`（boost 参数
 
 ## 测试矩阵
 
-第 1 步已转入仓库的差分在 [test_rerank_boost.py](../../tests/differential/test_rerank_boost.py)，第 2 步的在 [test_rerank_l2.py](../../tests/differential/test_rerank_l2.py)（Search + L2 的三种函数、窗口、参数的原始 JSON 类型、错误先后、扁平模型与 2 个 Search + decay 平局场景），第 3 步的在 [test_hybrid_search.py](../../tests/differential/test_hybrid_search.py)（6 个 Hybrid 平局场景；rank_params 与 function_score 两条合并路径、混合度量、各路窗口、子请求的 boost 与 L2、rank_params 原始值、错误先后；宽整数 `$score` 的多路 `$id` 碰撞；时区与输出；NaN decay 因子写进动态 `$meta`，Search + L2 的同一场景在 test_rerank_l2.py），其余在第 4 步转入。第 3 步的对照集合是旧探针全部 2822 个场景加补充探针 `probe_s3x.py` 的 245 个（宽整数 `$score` 与 `$id` 碰撞下 decay 的 max / sum / avg、路由 search_params 里的其他键、nq=2 的多路、别名与数据库、partition key、过滤模板、跨路的错误先后、空的 requests、多路与空集合、rank_params 原始值、输出），实施后的差异只剩登记差异（过滤范围 6、model 4、`random_score` 4、0004 的维度文案 1、0024 的主键分组 41、超出 int64 的 rank_params 整数 4、子请求的非严格 JSON `params` 2）。第 2 步的对照集合是旧探针里 907 个 Search + L2 场景加补充探针 `probe_s2x.py` 的 366 个（rrf `k` / weighted `weights` 与 `norm_score` 的原始类型、Search 版 decay 参数类型与 `score_mode`、rrf / weighted 的切片与分组、boost + L2 窗口、超出 SDK 校验的 `round_decimal`、错误先后、没有命中），实施后除 3 个 model 登记差异外与 3.x 相同。探针共 2822 个场景，分类由归档里的 `classify.py` 机器生成，**不把全部场景写成通过**：
+第 1 步已转入仓库的差分在 [test_rerank_boost.py](../../tests/differential/test_rerank_boost.py)，第 2 步的在 [test_rerank_l2.py](../../tests/differential/test_rerank_l2.py)（Search + L2 的三种函数、窗口、参数的原始 JSON 类型、错误先后、扁平模型与 2 个 Search + decay 平局场景），第 4 步把设计阶段探针的 2822 个场景与 `probe_s4.py` 的 164 个场景整体转入 [rerank_cases.py](../../tests/differential/rerank_cases.py) 与 [test_rerank_scenarios.py](../../tests/differential/test_rerank_scenarios.py)，按下表的类别两边分别断言；第 3 步的在 [test_hybrid_search.py](../../tests/differential/test_hybrid_search.py)（6 个 Hybrid 平局场景；rank_params 与 function_score 两条合并路径、混合度量、各路窗口、子请求的 boost 与 L2、rank_params 原始值、错误先后；宽整数 `$score` 的多路 `$id` 碰撞；时区与输出；NaN decay 因子写进动态 `$meta`，Search + L2 的同一场景在 test_rerank_l2.py）。第 3 步的对照集合是旧探针全部 2822 个场景加补充探针 `probe_s3x.py` 的 245 个（宽整数 `$score` 与 `$id` 碰撞下 decay 的 max / sum / avg、路由 search_params 里的其他键、nq=2 的多路、别名与数据库、partition key、过滤模板、跨路的错误先后、空的 requests、多路与空集合、rank_params 原始值、输出），实施后的差异只剩登记差异（过滤范围 6、model 4、`random_score` 4、0004 的维度文案 1、0024 的主键分组 41、超出 int64 的 rank_params 整数 4、子请求的非严格 JSON `params` 2）。第 2 步的对照集合是旧探针里 907 个 Search + L2 场景加补充探针 `probe_s2x.py` 的 366 个（rrf `k` / weighted `weights` 与 `norm_score` 的原始类型、Search 版 decay 参数类型与 `score_mode`、rrf / weighted 的切片与分组、boost + L2 窗口、超出 SDK 校验的 `round_decimal`、错误先后、没有命中），实施后除 3 个 model 登记差异外与 3.x 相同。探针共 2822 个场景，分类由归档里的 `classify.py` 机器生成，**不把全部场景写成通过**：
 
 | 类别 | 数量 | 内容 | 断言 |
 | --- | --- | --- | --- |
