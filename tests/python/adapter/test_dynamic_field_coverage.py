@@ -4,7 +4,15 @@
 
 import pytest
 
-from pymilvus import DataType, Function, FunctionScore, FunctionType, MilvusClient
+from pymilvus import (
+    AnnSearchRequest,
+    DataType,
+    Function,
+    FunctionScore,
+    FunctionType,
+    MilvusClient,
+    RRFRanker,
+)
 
 
 def _create_dynamic_collection(client, name):
@@ -232,6 +240,31 @@ def test_dynamic_star_survives_grpc_ranker(milvus_client):
         ranker=ranker,
     )
 
+    assert all("page" in hit["entity"] for hit in results[0])
+    assert all("source" in hit["entity"] for hit in results[0])
+    milvus_client.drop_collection(name)
+
+
+def test_dynamic_star_survives_hybrid_search_group_by(milvus_client):
+    name = _create_dynamic_collection(milvus_client, "dynamic_hybrid")
+    request = AnnSearchRequest(
+        data=[[0.0, 0.0]],
+        anns_field="vec",
+        param={"metric_type": "L2"},
+        limit=3,
+    )
+
+    results = milvus_client.hybrid_search(
+        name,
+        reqs=[request, request],
+        ranker=RRFRanker(),
+        limit=2,
+        group_by_field="bucket",
+        group_size=1,
+        output_fields=["*"],
+    )
+
+    assert len({hit["entity"]["bucket"] for hit in results[0]}) == 2
     assert all("page" in hit["entity"] for hit in results[0])
     assert all("source" in hit["entity"] for hit in results[0])
     milvus_client.drop_collection(name)

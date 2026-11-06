@@ -10,7 +10,7 @@ use std::collections::HashMap;
 
 use serde_json::{Map, Value};
 
-use super::boost::{ID_FIELD, python_sum};
+use super::boost::ID_FIELD;
 use super::pyval::PyVal;
 use super::try_sort_by;
 use crate::error::{EngineError, Result, py_repr};
@@ -123,10 +123,13 @@ fn resolve(
     (positive == metrics.len(), vec![None; metrics.len()])
 }
 
+/// `k` 与 `weights` 保留 Python 值：`rank_params` 路径不校验，参与运算时才按 Python 的规则报错
+/// （`function_score` 路径已校验成浮点）。
 #[derive(Debug)]
 enum Merge {
-    Rrf(f64),
-    Weighted(Vec<f64>),
+    Rrf(PyVal),
+    /// `len()` 与 `list()` 在执行时才做（3.x `MergeOp.execute_multi` / `_merge_weighted`）。
+    Weighted(PyVal),
     /// decay 的 `score_mode`：校验时取小写，合并时用原值（`"MAX"` 通过校验、合并时才报错）。
     Simple(PyVal),
 }
@@ -187,6 +190,22 @@ pub(crate) struct Chain {
     tail: Tail,
     /// 候选行需要从 entity 取值的非虚拟名字。
     names: Vec<String>,
+}
+
+/// 候选行要从 entity 取值的非虚拟名字：分组字段与 decay 的输入字段。
+fn tail_names(tail: &Tail, decay_input: Option<&str>) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for name in tail
+        .group
+        .iter()
+        .map(|(field, _)| field.as_str())
+        .chain(decay_input)
+    {
+        if !is_virtual(name) && !names.iter().any(|n| n == name) {
+            names.push(name.to_owned());
+        }
+    }
+    names
 }
 
 fn is_virtual(name: &str) -> bool {
@@ -367,7 +386,7 @@ impl Chain {
                 if *k <= 0.0 || *k >= 16384.0 {
                     return Err(invalid("The rank params k should be in range (0, 16384)"));
                 }
-                (Merge::Rrf(*k), false, false, None)
+                (Merge::Rrf(PyVal::Float(*k)), false, false, None)
             }
             L2Function::Weighted { weights, normalize } => {
                 if weights.is_empty() {
@@ -381,7 +400,14 @@ impl Chain {
                 if weights.iter().any(|w| *w < 0.0 || *w > 1.0) {
                     return Err(invalid("rank param weight should be in range [0, 1]"));
                 }
-                (Merge::Weighted(weights.clone()), *normalize, false, None)
+                (
+                    Merge::Weighted(PyVal::List(
+                        weights.iter().map(|w| PyVal::Float(*w)).collect(),
+                    )),
+                    *normalize,
+                    false,
+                    None,
+                )
             }
             L2Function::Decay { inputs, params } => {
                 if inputs.len() != 1 {
@@ -441,17 +467,7 @@ impl Chain {
             Merge::Rrf(_) => (true, Vec::new()),
             _ => resolve(normalize, force_descending, metrics),
         };
-        let mut names = Vec::new();
-        for name in tail
-            .group
-            .iter()
-            .map(|(field, _)| field.as_str())
-            .chain(decay.iter().map(|(input, _)| input.as_str()))
-        {
-            if !is_virtual(name) && !names.iter().any(|n| n == name) {
-                names.push(name.to_owned());
-            }
-        }
+        let names = tail_names(&tail, decay.as_ref().map(|(input, _)| input.as_str()));
         Ok(Self {
             merge,
             norms,
@@ -460,6 +476,77 @@ impl Chain {
             tail,
             names,
         })
+    }
+
+    /// HybridSearch 的 `rank_params`（3.x `build_hybrid_rerank_chain`，检索之后才构造）：`strategy` 与
+    /// `params` 是 `json.loads` 的原值，缺省分别为 `"rrf"` 与 `{}`。`k` / `weights` / `norm_score` 不校验，
+    /// 原值参与运算（设计第 3 节）。
+    pub(crate) fn rank_params(
+        strategy: &PyVal,
+        params: &PyVal,
+        metrics: &[Metric],
+        tail: Tail,
+    ) -> Result<Self> {
+        let get = |key: &str| -> Result<Option<PyVal>> {
+            match params {
+                PyVal::Dict(items) => {
+                    Ok(items.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone()))
+                }
+                other => Err(invalid(format!(
+                    "{} object has no attribute 'get'",
+                    py_repr(other.type_name())
+                ))),
+            }
+        };
+        let (merge, descending, norms) = match strategy {
+            PyVal::Str(s) if s == "rrf" => (
+                Merge::Rrf(get("k")?.unwrap_or(PyVal::Float(60.0))),
+                true,
+                Vec::new(),
+            ),
+            PyVal::Str(s) if s == "weighted" => {
+                let weights = get("weights")?.unwrap_or(PyVal::List(Vec::new()));
+                let normalize = get("norm_score")?.is_some_and(|v| truthy(&v));
+                let (descending, norms) = resolve(normalize, false, metrics);
+                (Merge::Weighted(weights), descending, norms)
+            }
+            other => {
+                return Err(invalid(format!(
+                    "Unsupported hybrid rerank strategy: {}",
+                    other.repr()
+                )));
+            }
+        };
+        Ok(Self {
+            merge,
+            norms,
+            descending,
+            decay: None,
+            names: tail_names(&tail, None),
+            tail,
+        })
+    }
+
+    /// 3.x `MergeOp.execute_multi` 在逐个查询合并之前的检查：`nqs` 是每一路的查询数。
+    pub(crate) fn check_inputs(&self, nqs: &[usize]) -> Result<()> {
+        let Some(&first) = nqs.first() else {
+            return Err(invalid("MergeOp requires at least one input"));
+        };
+        if let Some((i, n)) = nqs.iter().enumerate().skip(1).find(|(_, n)| **n != first) {
+            return Err(invalid(format!(
+                "MergeOp requires all inputs to have the same number of chunks: input 0 has {first}, input {i} has {n}"
+            )));
+        }
+        if let Merge::Weighted(weights) = &self.merge {
+            let len = py_len(weights)?;
+            if len != nqs.len() {
+                return Err(invalid(format!(
+                    "weighted merge requires {} weights, got {len}",
+                    nqs.len()
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// 一个候选行：`entity(name)` 是投影内同名字段或动态键的值（没有则为 None）。
@@ -559,11 +646,7 @@ impl Chain {
                 for route in &routes {
                     for (rank, row) in route.iter().enumerate() {
                         let (i, new) = slot(row, &mut order)?;
-                        let denominator = k + rank as f64 + 1.0;
-                        if denominator == 0.0 {
-                            return Err(invalid("float division by zero"));
-                        }
-                        let rrf = 1.0 / denominator;
+                        let rrf = rrf_term(k, rank)?;
                         if new {
                             scores.push(0.0 + rrf);
                         } else {
@@ -576,6 +659,7 @@ impl Chain {
                 }
             }
             Merge::Weighted(weights) => {
+                let weights = py_list(weights);
                 let mut route_scores: Vec<Vec<Option<PyVal>>> = Vec::new();
                 for (r, route) in routes.iter().enumerate() {
                     for row in route {
@@ -594,10 +678,10 @@ impl Chain {
                             continue;
                         };
                         let value = match self.norms.get(r).copied().flatten() {
-                            Some(norm) => weights[r] * norm.apply(score)?,
-                            None => multiply(weights[r], score)?,
+                            Some(norm) => py_mul(&weights[r], &PyVal::Float(norm.apply(score)?))?,
+                            None => py_mul(&weights[r], score)?,
                         };
-                        total += value;
+                        total = add_to_float(total, &value)?;
                     }
                     row.score = PyVal::Float(total);
                 }
@@ -769,6 +853,10 @@ fn combine(score: &PyVal, factor: f64) -> Result<f64> {
         PyVal::Float(f) if f.is_finite() => *f,
         _ => return Err(not_numeric()),
     };
+    // 3.x 先检查这一行的每个值（分数与因子）都是有限数，再相乘；NaN 因子报的是这一条。
+    if !factor.is_finite() {
+        return Err(not_numeric());
+    }
     let result = 1.0 * value * factor;
     if !result.is_finite() {
         return Err(invalid("num_combine produced a non-finite result"));
@@ -776,17 +864,101 @@ fn combine(score: &PyVal, factor: f64) -> Result<f64> {
     Ok(result)
 }
 
-/// Python `float * value`（weighted 不归一化时的权重乘分数）。
-fn multiply(weight: f64, value: &PyVal) -> Result<f64> {
-    match value {
-        PyVal::Bool(_) | PyVal::Int(_) | PyVal::BigInt(_) | PyVal::Float(_) => {
-            Ok(weight * value.to_float()?)
+/// 3.x RRF 的一项 `1.0 / (k + rank + 1)`：整数 `k` 先精确相加再转浮点，浮点 `k` 逐步相加；
+/// 其他类型是 Python `+` 的异常。
+fn rrf_term(k: &PyVal, rank: usize) -> Result<f64> {
+    if let Some(k) = Wide::of(k) {
+        let sum = k.add(&Wide::parse(&(rank as u64 + 1).to_string()));
+        if sum.digits.is_empty() {
+            return Err(invalid("float division by zero"));
         }
-        PyVal::Str(_) | PyVal::List(_) => Err(invalid(
-            "can't multiply sequence by non-int of type 'float'",
-        )),
+        return Ok(1.0 / sum.to_float()?);
+    }
+    let denominator = match k {
+        PyVal::Float(k) => *k + rank as f64 + 1.0,
+        PyVal::Str(_) => return Err(invalid("can only concatenate str (not \"int\") to str")),
+        PyVal::List(_) => return Err(invalid("can only concatenate list (not \"int\") to list")),
+        other => {
+            return Err(invalid(format!(
+                "unsupported operand type(s) for +: {} and 'int'",
+                py_repr(other.type_name())
+            )));
+        }
+    };
+    if denominator == 0.0 {
+        return Err(invalid("float division by zero"));
+    }
+    Ok(1.0 / denominator)
+}
+
+/// Python `len(v)`。
+fn py_len(value: &PyVal) -> Result<usize> {
+    match value {
+        PyVal::List(items) => Ok(items.len()),
+        PyVal::Dict(items) => Ok(items.len()),
+        PyVal::Str(s) => Ok(s.chars().count()),
         other => Err(invalid(format!(
-            "unsupported operand type(s) for *: 'float' and {}",
+            "object of type {} has no len()",
+            py_repr(other.type_name())
+        ))),
+    }
+}
+
+/// Python `list(v)`：字符串拆成字符，dict 取键；只在 [`py_len`] 通过之后调用。
+fn py_list(value: &PyVal) -> Vec<PyVal> {
+    match value {
+        PyVal::List(items) => items.clone(),
+        PyVal::Dict(items) => items.iter().map(|(k, _)| PyVal::Str(k.clone())).collect(),
+        PyVal::Str(s) => s.chars().map(|c| PyVal::Str(c.to_string())).collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn is_int(value: &PyVal) -> bool {
+    matches!(value, PyVal::Bool(_) | PyVal::Int(_) | PyVal::BigInt(_))
+}
+
+fn is_sequence(value: &PyVal) -> bool {
+    matches!(value, PyVal::Str(_) | PyVal::List(_))
+}
+
+/// Python `a * b`（weighted 的权重乘分数）。整数相乘是精确的 Python 整数；序列乘整数是重复，
+/// 结果仍是同类型的序列，内容这里用不到（下一步与浮点相加必然报错），所以返回空序列。
+fn py_mul(a: &PyVal, b: &PyVal) -> Result<PyVal> {
+    let non_int = |other: &PyVal| {
+        invalid(format!(
+            "can't multiply sequence by non-int of type {}",
+            py_repr(other.type_name())
+        ))
+    };
+    if let (Some(x), Some(y)) = (Wide::of(a), Wide::of(b)) {
+        return Ok(x.mul(&y).into_pyval());
+    }
+    match (a, b) {
+        (PyVal::Float(x), PyVal::Float(y)) => Ok(PyVal::Float(x * y)),
+        (PyVal::Float(x), y) if is_int(y) => Ok(PyVal::Float(x * y.to_float()?)),
+        (x, PyVal::Float(y)) if is_int(x) => Ok(PyVal::Float(x.to_float()? * y)),
+        (s, n) | (n, s) if is_sequence(s) && is_int(n) => Ok(match s {
+            PyVal::Str(_) => PyVal::Str(String::new()),
+            _ => PyVal::List(Vec::new()),
+        }),
+        (s, other) if is_sequence(s) => Err(non_int(other)),
+        (other, s) if is_sequence(s) => Err(non_int(other)),
+        _ => Err(invalid(format!(
+            "unsupported operand type(s) for *: {} and {}",
+            py_repr(a.type_name()),
+            py_repr(b.type_name())
+        ))),
+    }
+}
+
+/// Python 的 `total += value`，`total` 是浮点。
+fn add_to_float(total: f64, value: &PyVal) -> Result<f64> {
+    match value {
+        PyVal::Float(f) => Ok(total + f),
+        v if is_int(v) => Ok(total + v.to_float()?),
+        other => Err(invalid(format!(
+            "unsupported operand type(s) for +=: 'float' and {}",
             py_repr(other.type_name())
         ))),
     }
@@ -806,70 +978,294 @@ fn py_max(values: Vec<PyVal>) -> Result<PyVal> {
     Ok(best)
 }
 
-/// Python `sum(values)`（起始值是整数 0）。全是整数时精确求和，结果仍是整数；有浮点时按 CPython 3.12 的
-/// 补偿求和。超出 i128 的整数只在单个值时原样保留，多个这样的值相加按浮点近似（只能由多个同名字段
-/// 盖成同一 `$id` 的宽整数 `$score` 触发）。
-fn py_sum(values: &[PyVal]) -> Result<PyVal> {
-    let mut left = "int";
-    let mut any_float = false;
-    let mut integer: Option<i128> = Some(0);
-    let mut floats = Vec::with_capacity(values.len());
-    for value in values {
+/// Python 整数（任意精度）：符号加 10⁹ 进制的小端绝对值，零是空且非负。只做 `sum` 与 `/` 用到的运算。
+#[derive(Debug, Clone, PartialEq)]
+struct Wide {
+    negative: bool,
+    digits: Vec<u32>,
+}
+
+const WIDE_BASE: u64 = 1_000_000_000;
+
+impl Wide {
+    fn of(value: &PyVal) -> Option<Self> {
         match value {
-            PyVal::Bool(b) => {
-                integer = integer.and_then(|n| n.checked_add(i128::from(*b)));
-                floats.push(f64::from(u8::from(*b)));
-            }
-            PyVal::Int(i) => {
-                integer = integer.and_then(|n| n.checked_add(i128::from(*i)));
-                floats.push(*i as f64);
-            }
-            PyVal::BigInt(text) => {
-                integer = integer
-                    .zip(text.parse::<i128>().ok())
-                    .and_then(|(n, v)| n.checked_add(v));
-                floats.push(value.to_float().unwrap_or(f64::INFINITY));
-            }
-            PyVal::Float(f) => {
-                any_float = true;
-                left = "float";
-                floats.push(*f);
-            }
-            other => {
-                return Err(invalid(format!(
-                    "unsupported operand type(s) for +: {} and {}",
-                    py_repr(left),
-                    py_repr(other.type_name())
-                )));
-            }
+            PyVal::Bool(b) => Some(Self::parse(if *b { "1" } else { "0" })),
+            PyVal::Int(i) => Some(Self::parse(&i.to_string())),
+            PyVal::BigInt(text) => Some(Self::parse(text)),
+            _ => None,
         }
     }
-    if any_float {
-        if floats.iter().any(|f| f.is_infinite())
-            && values.iter().any(|v| matches!(v, PyVal::BigInt(_)))
-        {
-            return Err(invalid("int too large to convert to float"));
+
+    /// 十进制文本（可带符号）；`BigInt` 的文本来自 JSON 整数或本类型的输出，总是合法。
+    fn parse(text: &str) -> Self {
+        let (negative, body) = match text.as_bytes().first() {
+            Some(b'-') => (true, &text[1..]),
+            Some(b'+') => (false, &text[1..]),
+            _ => (false, text),
+        };
+        let bytes = body.as_bytes();
+        let mut digits = Vec::with_capacity(bytes.len() / 9 + 1);
+        let mut end = bytes.len();
+        while end > 0 {
+            let start = end.saturating_sub(9);
+            let chunk = bytes[start..end]
+                .iter()
+                .fold(0u32, |acc, b| acc * 10 + u32::from(b.wrapping_sub(b'0')));
+            digits.push(chunk);
+            end = start;
         }
-        // 起始的整数 0 先转成 0.0：`sum([-0.0])` 是 0.0。
-        return Ok(PyVal::Float(0.0 + python_sum(&floats)));
+        Self::normalized(negative, digits)
     }
-    match integer {
-        Some(n) => Ok(i64::try_from(n).map_or_else(|_| PyVal::BigInt(n.to_string()), PyVal::Int)),
-        None if values.len() == 1 => Ok(values[0].clone()),
-        None => Ok(PyVal::Float(python_sum(&floats))),
+
+    fn normalized(negative: bool, mut digits: Vec<u32>) -> Self {
+        while digits.last() == Some(&0) {
+            digits.pop();
+        }
+        let negative = negative && !digits.is_empty();
+        Self { negative, digits }
+    }
+
+    fn magnitude_cmp(a: &[u32], b: &[u32]) -> Ordering {
+        a.len()
+            .cmp(&b.len())
+            .then_with(|| a.iter().rev().cmp(b.iter().rev()))
+    }
+
+    fn add(&self, other: &Self) -> Self {
+        let (a, b) = (&self.digits, &other.digits);
+        if self.negative == other.negative {
+            let mut out = Vec::with_capacity(a.len().max(b.len()) + 1);
+            let mut carry = 0u64;
+            for i in 0..a.len().max(b.len()) {
+                let sum =
+                    u64::from(*a.get(i).unwrap_or(&0)) + u64::from(*b.get(i).unwrap_or(&0)) + carry;
+                out.push((sum % WIDE_BASE) as u32);
+                carry = sum / WIDE_BASE;
+            }
+            if carry > 0 {
+                out.push(carry as u32);
+            }
+            return Self::normalized(self.negative, out);
+        }
+        // 符号不同：大减小，符号随绝对值大的一方。
+        let (big, small, negative) = match Self::magnitude_cmp(a, b) {
+            Ordering::Less => (b, a, other.negative),
+            _ => (a, b, self.negative),
+        };
+        let mut out = Vec::with_capacity(big.len());
+        let mut borrow = 0i64;
+        for (i, digit) in big.iter().enumerate() {
+            let mut d = i64::from(*digit) - i64::from(*small.get(i).unwrap_or(&0)) - borrow;
+            borrow = i64::from(d < 0);
+            if d < 0 {
+                d += WIDE_BASE as i64;
+            }
+            out.push(d as u32);
+        }
+        Self::normalized(negative, out)
+    }
+
+    fn mul(&self, other: &Self) -> Self {
+        let mut out = vec![0u64; self.digits.len() + other.digits.len() + 1];
+        for (i, a) in self.digits.iter().enumerate() {
+            let mut carry = 0u64;
+            for (j, b) in other.digits.iter().enumerate() {
+                let cell = out[i + j] + u64::from(*a) * u64::from(*b) + carry;
+                out[i + j] = cell % WIDE_BASE;
+                carry = cell / WIDE_BASE;
+            }
+            let mut k = i + other.digits.len();
+            while carry > 0 {
+                let cell = out[k] + carry;
+                out[k] = cell % WIDE_BASE;
+                carry = cell / WIDE_BASE;
+                k += 1;
+            }
+        }
+        Self::normalized(
+            self.negative != other.negative,
+            out.into_iter().map(|d| d as u32).collect(),
+        )
+    }
+
+    fn text(&self) -> String {
+        let Some((top, rest)) = self.digits.split_last() else {
+            return "0".to_owned();
+        };
+        let mut out = String::with_capacity(self.digits.len() * 9 + 1);
+        if self.negative {
+            out.push('-');
+        }
+        out.push_str(&top.to_string());
+        for chunk in rest.iter().rev() {
+            out.push_str(&format!("{chunk:09}"));
+        }
+        out
+    }
+
+    fn into_pyval(self) -> PyVal {
+        let text = self.text();
+        text.parse()
+            .map_or_else(|_| PyVal::BigInt(text), PyVal::Int)
+    }
+
+    /// Python `float(int)`：正确舍入，舍入后超出 float64 是 OverflowError。
+    fn to_float(&self) -> Result<f64> {
+        PyVal::BigInt(self.text()).to_float()
+    }
+
+    /// Python `int / n` 的真除法：商正确舍入（不是先转浮点再除），超出 float64 是 OverflowError。
+    fn true_divide(&self, n: u64) -> Result<f64> {
+        let n = u128::from(n);
+        let mut quotient = vec![0u32; self.digits.len()];
+        let mut remainder = 0u128;
+        for (i, d) in self.digits.iter().enumerate().rev() {
+            let current = remainder * u128::from(WIDE_BASE) + u128::from(*d);
+            // 商的这一位小于 10⁹：remainder < n，所以 current < n·10⁹。
+            quotient[i] = (current / n) as u32;
+            remainder = current % n;
+        }
+        let mut text = Self::normalized(false, quotient).text();
+        if self.negative {
+            text.insert(0, '-');
+        }
+        // 小数部分写到 400 位，余数仍非零时再补一位 1 作为粘滞位：被除数在 float64 范围内时，相邻浮点之间的
+        // 中点最多有几十位小数，截断再加粘滞位不会越过中点，所以解析结果就是正确舍入的商。
+        if remainder != 0 {
+            text.push('.');
+            for _ in 0..400 {
+                remainder *= 10;
+                text.push(char::from(b'0' + (remainder / n) as u8));
+                remainder %= n;
+            }
+            if remainder != 0 {
+                text.push('1');
+            }
+        }
+        text.parse::<f64>()
+            .ok()
+            .filter(|v| v.is_finite())
+            .ok_or_else(|| invalid("integer division result too large for a float"))
     }
 }
 
-/// `sum(...) / len(...)`：Python 的真除法。
-fn py_divide(total: &PyVal, n: usize) -> Result<PyVal> {
-    let value = match total {
-        PyVal::Float(f) => *f,
-        // 整数的真除法：超出 float64 的被除数在 3.x 是 OverflowError。
-        other => other
-            .to_float()
-            .map_err(|_| invalid("integer division result too large for a float"))?,
+/// `sum` 的累加结果：Python 的 `int` 或 `float`。
+enum Total {
+    Int(Wide),
+    Float(f64),
+}
+
+impl Total {
+    fn type_name(&self) -> &'static str {
+        match self {
+            Self::Int(_) => "int",
+            Self::Float(_) => "float",
+        }
+    }
+
+    /// Python 的 `total + item`（通用路径，不补偿）。
+    fn add(self, item: &PyVal) -> Result<Self> {
+        let unsupported = |left: &str| {
+            invalid(format!(
+                "unsupported operand type(s) for +: {} and {}",
+                py_repr(left),
+                py_repr(item.type_name())
+            ))
+        };
+        match (self, item) {
+            (Self::Float(f), PyVal::Float(x)) => Ok(Self::Float(f + x)),
+            (Self::Int(n), PyVal::Float(x)) => Ok(Self::Float(n.to_float()? + x)),
+            (total, other) => match (total, Wide::of(other)) {
+                (Self::Int(n), Some(b)) => Ok(Self::Int(n.add(&b))),
+                (Self::Float(f), Some(b)) => Ok(Self::Float(f + b.to_float()?)),
+                (total, None) => Err(unsupported(total.type_name())),
+            },
+        }
+    }
+}
+
+/// `PyLong_AsLongAndOverflow`：int 与 bool 且在 C long（64 位平台为 i64）范围内。
+fn small_int(value: &PyVal) -> Option<i64> {
+    match value {
+        PyVal::Bool(b) => Some(i64::from(*b)),
+        PyVal::Int(i) => Some(*i),
+        PyVal::BigInt(text) => text.parse().ok(),
+        _ => None,
+    }
+}
+
+/// Python `sum(values)`（起始值是整数 0），照 CPython 3.12 `builtin_sum_impl` 的三段：
+/// 1. 整数快路径：在 i64 内累加；遇到非整数或溢出时，用 Python 加法并入这一项后离开。
+/// 2. 结果是浮点时进入浮点路径：浮点按 Neumaier 补偿求和，i64 范围内的整数直接加、**不补偿**；
+///    其他值先把补偿加回，再用 Python 加法并入后离开。
+/// 3. 通用路径：逐项 Python 加法，整数精确、浮点不补偿。
+///
+/// 所以宽整数相加是精确的 Python 整数（保留符号），之后再遇到浮点才转换。
+fn py_sum(values: &[PyVal]) -> Result<PyVal> {
+    let mut items = values.iter();
+    let mut small = 0i64;
+    let mut total = loop {
+        let Some(item) = items.next() else {
+            return Ok(PyVal::Int(small));
+        };
+        if let Some(sum) = small_int(item).and_then(|b| small.checked_add(b)) {
+            small = sum;
+            continue;
+        }
+        break Total::Int(Wide::parse(&small.to_string())).add(item)?;
     };
-    Ok(PyVal::Float(value / n as f64))
+    if let Total::Float(start) = total {
+        let (mut sum, mut compensation) = (start, 0.0_f64);
+        let settle = |sum: f64, compensation: f64| {
+            if compensation != 0.0 && compensation.is_finite() {
+                sum + compensation
+            } else {
+                sum
+            }
+        };
+        total = loop {
+            let Some(item) = items.next() else {
+                return Ok(PyVal::Float(settle(sum, compensation)));
+            };
+            if let PyVal::Float(x) = item {
+                let next = sum + x;
+                if sum.abs() >= x.abs() {
+                    compensation += (sum - next) + x;
+                } else {
+                    compensation += (x - next) + sum;
+                }
+                sum = next;
+                continue;
+            }
+            if let Some(value) = small_int(item) {
+                sum += value as f64;
+                continue;
+            }
+            break Total::Float(settle(sum, compensation)).add(item)?;
+        };
+    }
+    for item in items {
+        total = total.add(item)?;
+    }
+    Ok(match total {
+        Total::Int(n) => n.into_pyval(),
+        Total::Float(f) => PyVal::Float(f),
+    })
+}
+
+/// `sum(...) / len(...)`：Python 的真除法；整数被除数按整数真除法正确舍入。
+fn py_divide(total: &PyVal, n: usize) -> Result<PyVal> {
+    if let PyVal::Float(f) = total {
+        return Ok(PyVal::Float(f / n as f64));
+    }
+    let Some(wide) = Wide::of(total) else {
+        return Err(invalid(format!(
+            "unsupported operand type(s) for /: {} and 'int'",
+            py_repr(total.type_name())
+        )));
+    };
+    Ok(PyVal::Float(wide.true_divide(n as u64)?))
 }
 
 /// Python 的哈希相等：`True`、`1`、`1.0` 是同一个键；每个 NaN 是不同的对象，各自成键；
@@ -960,7 +1356,7 @@ mod tests {
 
     #[test]
     fn rrf_scores_follow_rank_and_ties_break_on_id() {
-        let c = chain(Merge::Rrf(1.0), true, tail(10, 0));
+        let c = chain(Merge::Rrf(PyVal::Float(1.0)), true, tail(10, 0));
         let out = c
             .execute(vec![vec![vec![row(5, 0.9), row(3, 0.8), row(4, 0.1)]]])
             .unwrap();
@@ -980,9 +1376,11 @@ mod tests {
     fn limit_uses_python_slices() {
         let rows = || vec![vec![(0..6).map(|i| row(i, 10.0 - i as f64)).collect()]];
         let run = |limit, offset| {
-            ids(&chain(Merge::Rrf(60.0), true, tail(limit, offset))
-                .execute(rows())
-                .unwrap()[0])
+            ids(
+                &chain(Merge::Rrf(PyVal::Float(60.0)), true, tail(limit, offset))
+                    .execute(rows())
+                    .unwrap()[0],
+            )
         };
         assert_eq!(run(3, 2), vec![2, 3, 4]);
         // limit <= 0 不切片。
@@ -995,7 +1393,7 @@ mod tests {
     #[test]
     fn group_slices_and_scores_like_python() {
         let mut c = chain(
-            Merge::Rrf(60.0),
+            Merge::Rrf(PyVal::Float(60.0)),
             true,
             Tail {
                 limit: 2,
@@ -1138,7 +1536,11 @@ mod tests {
 
     #[test]
     fn weighted_skips_routes_whose_score_is_none() {
-        let mut c = chain(Merge::Weighted(vec![0.5]), true, tail(10, 0));
+        let mut c = chain(
+            Merge::Weighted(PyVal::List(vec![PyVal::Float(0.5)])),
+            true,
+            tail(10, 0),
+        );
         let mut none = row(1, 0.0);
         none.score = PyVal::None;
         let out = c.execute(vec![vec![vec![row(0, 0.8), none]]]).unwrap();
@@ -1203,6 +1605,106 @@ mod tests {
         assert!(py_sum(&[huge, PyVal::Float(1.0)]).is_err());
     }
 
+    /// 期望值取自 CPython 3.12.14（3.x 参照环境）的 `sum(v)` 与 `sum(v) / len(v)`。
+    #[test]
+    fn sum_and_average_follow_cpython() {
+        let big = |text: &str| PyVal::BigInt(text.to_owned());
+        let p64 = || big("18446744073709551616");
+        let n64 = || big("-18446744073709551616");
+        let huge = || big(&format!("1{}", "0".repeat(400)));
+        let neg_huge = || big(&format!("-1{}", "0".repeat(400)));
+        let ok = |values: &[PyVal]| py_sum(values).unwrap();
+        let err = |values: &[PyVal]| py_sum(values).unwrap_err().to_string();
+        let f = PyVal::Float;
+
+        // 多个宽整数：精确求和、保留符号。
+        assert_eq!(ok(&[p64(), p64()]), big("36893488147419103232"));
+        assert_eq!(ok(&[n64(), n64()]), big("-36893488147419103232"));
+        assert_eq!(ok(&[huge(), neg_huge()]), PyVal::Int(0));
+        assert_eq!(
+            ok(&[huge(), PyVal::Int(1)]),
+            big(&format!("1{}1", "0".repeat(399)))
+        );
+        assert_eq!(ok(&[PyVal::Bool(true), p64()]), big("18446744073709551617"));
+        assert_eq!(ok(&[n64(), p64(), PyVal::Int(-5)]), PyVal::Int(-5));
+        // 溢出 i64 后走通用路径：浮点不再补偿。
+        assert_eq!(ok(&[p64(), f(0.5), f(1e-30), n64()]), f(0.0));
+        assert_eq!(
+            ok(&[f(0.5), p64(), f(1e-30), f(1e-30)]),
+            f(1.8446744073709552e19)
+        );
+        assert_eq!(
+            ok(&[PyVal::Int(i64::MAX), PyVal::Int(1), f(0.1)]),
+            f(9.223372036854776e18)
+        );
+        assert_eq!(ok(&[PyVal::Int(i64::MAX), f(1.5)]), f(9.223372036854776e18));
+        // 浮点路径里 i64 范围内的整数直接加，不补偿。
+        assert_eq!(ok(&[f(1e16), PyVal::Int(1), f(1.0)]), f(1e16));
+        assert_eq!(ok(&[f(1e16), f(1.0), f(1.0)]), f(1.0000000000000002e16));
+        assert_eq!(
+            ok(&[f(0.1), PyVal::Int(2), f(0.2), PyVal::Bool(true), f(0.3)]),
+            f(3.6)
+        );
+        assert_eq!(ok(&[f(-0.0)]), f(0.0));
+        // 转不成 float64 的整数遇到浮点。
+        assert_eq!(
+            err(&[huge(), f(0.5)]),
+            invalid("int too large to convert to float").to_string()
+        );
+        assert_eq!(
+            err(&[f(0.5), huge()]),
+            invalid("int too large to convert to float").to_string()
+        );
+        // 类型错误的左操作数是当时的累加类型。
+        let unsupported = |left: &str, right: &str| {
+            invalid(format!(
+                "unsupported operand type(s) for +: '{left}' and '{right}'"
+            ))
+            .to_string()
+        };
+        assert_eq!(
+            err(&[p64(), PyVal::Str("a".into())]),
+            unsupported("int", "str")
+        );
+        assert_eq!(
+            err(&[f(0.5), PyVal::Str("a".into())]),
+            unsupported("float", "str")
+        );
+        assert_eq!(err(&[PyVal::None]), unsupported("int", "NoneType"));
+        assert_eq!(
+            err(&[f(0.5), p64(), PyVal::None]),
+            unsupported("float", "NoneType")
+        );
+
+        // 平均：整数的真除法正确舍入，不是 float(sum) / n。
+        let avg = |values: Vec<PyVal>| {
+            let n = values.len();
+            py_divide(&py_sum(&values)?, n)
+        };
+        assert_eq!(
+            avg(vec![
+                big("23086038869017488826317"),
+                big("3771551294065249164509"),
+                big("36858321200630379061502"),
+            ])
+            .unwrap(),
+            f(2.1238637121237707e22)
+        );
+        let e309 = || big(&format!("1{}", "0".repeat(309)));
+        assert_eq!(
+            avg(vec![e309(), e309()]).unwrap_err().to_string(),
+            invalid("integer division result too large for a float").to_string()
+        );
+        assert_eq!(
+            avg(vec![e309(), big(&format!("-9{}", "0".repeat(308)))]).unwrap(),
+            f(5e307)
+        );
+        assert_eq!(
+            avg(vec![n64(), n64(), PyVal::Int(1)]).unwrap(),
+            f(-1.2297829382473034e19)
+        );
+    }
+
     #[test]
     fn python_arithmetic_on_overridden_scores() {
         assert_eq!(py_sum(&[PyVal::Float(-0.0)]).unwrap(), PyVal::Float(0.0));
@@ -1217,13 +1719,13 @@ mod tests {
                 .contains("'int' and 'str'")
         );
         assert!(
-            multiply(0.5, &PyVal::Str("a".into()))
+            py_mul(&PyVal::Float(0.5), &PyVal::Str("a".into()))
                 .unwrap_err()
                 .to_string()
                 .contains("can't multiply sequence")
         );
         assert!(
-            multiply(0.5, &PyVal::None)
+            py_mul(&PyVal::Float(0.5), &PyVal::None)
                 .unwrap_err()
                 .to_string()
                 .contains("'float' and 'NoneType'")
@@ -1238,5 +1740,15 @@ mod tests {
         assert_eq!(combine(&PyVal::None, 0.5).unwrap(), 0.0);
         assert!(combine(&PyVal::Bool(true), 0.5).is_err());
         assert!(combine(&PyVal::Float(f64::INFINITY), 0.5).is_err());
+        // 因子非有限时报行值检查（3.x NumCombineExpr），分数为 None 时仍是 0。
+        for factor in [f64::NAN, f64::INFINITY] {
+            assert!(
+                combine(&PyVal::Float(0.5), factor)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("row values must be finite numeric non-bool values")
+            );
+            assert_eq!(combine(&PyVal::None, factor).unwrap(), 0.0);
+        }
     }
 }

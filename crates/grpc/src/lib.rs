@@ -3,6 +3,7 @@
 
 mod function_score;
 mod guard;
+mod hybrid;
 mod index;
 mod insert;
 mod output;

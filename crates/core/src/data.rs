@@ -268,6 +268,23 @@ impl ColumnData {
         }
     }
 
+    /// 把 `blank` 为真的行换成空值占位，其余行复制（HybridSearch 里只有经过 boost 的那些路剥掉同名字段）。
+    pub(crate) fn blank_rows(&self, field: &FieldSchema, blank: &[bool]) -> Self {
+        let mut out = Self::Nullable {
+            values: Box::new(Self::empty(field)),
+            validity: Validity::from_bools(&[]),
+        };
+        let null = Self::nulls(field, 1);
+        for (row, &b) in blank.iter().enumerate() {
+            if b {
+                out.push_row(&null, 0);
+            } else {
+                out.push_row(self, row);
+            }
+        }
+        out
+    }
+
     pub(crate) fn empty(field: &FieldSchema) -> Self {
         match field.data_type {
             DataType::Bool => Self::Bool(Vec::new()),
@@ -401,6 +418,10 @@ pub struct Rows {
     pub fields: Vec<(String, ColumnData)>,
     /// 开启动态字段时每行一个对象（按投影过滤后，可能为空对象）；未开启时为 None。
     pub meta: Option<Vec<Map<String, Value>>>,
+    /// rerank 链写进 `$meta` 的浮点 key（decay 的 `_decay_score`）与每行的值。`meta` 里同名 key 只占位置
+    /// （3.x 的 dict 赋值：原有 key 原位替换，否则追加在末尾），值在输出时按 `json.dumps` 的浮点规则写出：
+    /// `serde_json` 的数字表示不了 NaN。
+    pub meta_float: Option<(String, Vec<f64>)>,
 }
 
 impl Rows {

@@ -42,6 +42,7 @@ const IMPLEMENTED_METHODS: &[&str] = &[
     "GetCompactionState",
     "Query",
     "Search",
+    "HybridSearch",
     "CreateAlias",
     "AlterAlias",
     "DropAlias",

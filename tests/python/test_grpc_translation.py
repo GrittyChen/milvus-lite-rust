@@ -1210,7 +1210,7 @@ def test_upsert_field_ops_is_explicitly_unsupported(env):
 
 def test_pymilvus_entry_points_remaining_unsupported(env):
     """当前范围外的功能各取 pymilvus 的一个入口：客户端不得吞掉 UNIMPLEMENTED。"""
-    from pymilvus import AnnSearchRequest, Function, FunctionType, RRFRanker
+    from pymilvus import Function, FunctionType
 
     client, _, _ = env
     client.create_collection("q", dimension=2)
@@ -1243,8 +1243,6 @@ def test_pymilvus_entry_points_remaining_unsupported(env):
         (with_field("g", DataType.GEOMETRY), f"GEOMETRY fields: {feature}"),
         # pymilvus 3.0 先发 AlterCollectionSchema，收到 UNIMPLEMENTED 后回退到 AddCollectionField。
         (lambda: client.add_collection_field("q", "x", DataType.INT64, nullable=True), f"AddCollectionField: {rpc}"),
-        (lambda: client.hybrid_search("q", [AnnSearchRequest([[1, 0]], "vector", {}, 2)], RRFRanker(), limit=2),
-         f"HybridSearch: {rpc}"),
         (lambda: client.search("q", [[1, 0]], filter="id + 1 > 0"), "filter expressions: arithmetic, text_match, and geometry predicates are not supported"),
         (lambda: client.search("m", [[1, 0]], ranker=model), f"rerank model providers: {feature}"),
         # 与分组同时出现时，model 的 UNIMPLEMENTED 不能被分组路径吞掉。
@@ -1320,6 +1318,93 @@ def test_search_l2_rerank_functions(env):
     with pytest.raises(MilvusException) as info:
         client.search("l2", [[1.0, 0.0]], ranker=ranker("rrf", k=0))
     assert info.value.code == 1 and "The rank params k should be in range (0, 16384)" in info.value.message
+
+
+def test_hybrid_search_rank_params_and_function_score(env):
+    """HybridSearch（0026 第 3 步）：rank_params 与顶层 function_score 两条合并路径、路由的分区、
+    子请求的 boost，以及 3.x 的错误先后。"""
+    from pymilvus import AnnSearchRequest, Function, FunctionType, RRFRanker, WeightedRanker
+
+    client, _, _ = env
+    schema = MilvusClient.create_schema()
+    schema.add_field("id", DataType.INT64, is_primary=True)
+    schema.add_field("v", DataType.FLOAT_VECTOR, dim=2)
+    schema.add_field("age", DataType.INT32)
+    schema.add_field("cat", DataType.VARCHAR, max_length=4)
+    index = client.prepare_index_params()
+    index.add_index("v", index_type="FLAT", metric_type="COSINE")
+    client.create_collection("hy", schema=schema, index_params=index)
+    client.insert("hy", [{"id": i, "v": [1.0, i / 50], "age": 10 - i, "cat": "ab"[i % 2]} for i in range(10)])
+    conn = client._get_connection()
+    original = conn._stub.HybridSearch
+
+    def route(q, limit=5, **kwargs):
+        return AnnSearchRequest([q], "v", {}, limit, **kwargs)
+
+    def hybrid(reqs, ranker, mod=None, **kwargs):
+        def spy(request, *args, **kw):
+            if mod is not None:
+                mod(request)
+            return original(request, *args, **kw)
+
+        conn._stub.HybridSearch = spy
+        try:
+            return client.hybrid_search("hy", reqs, ranker, **kwargs)
+        finally:
+            conn._stub.HybridSearch = original
+
+    def error(*args, **kwargs):
+        with pytest.raises(MilvusException) as info:
+            hybrid(*args, **kwargs)
+        return info.value.code, info.value.message
+
+    def rank_param(key, value):
+        return lambda request: request.rank_params.append(common_pb2.KeyValuePair(key=key, value=value))
+
+    two = [route([1.0, 0.0]), route([1.0, 0.2])]
+    # rrf：第一路的名次是 0..4，第二路是 9..5；同分按 `$id` 升序。
+    result = hybrid(two, RRFRanker(k=1), limit=3)[0]
+    assert [(h["id"], h["distance"]) for h in result] == [(0, 0.5), (9, 0.5), (1, pytest.approx(1 / 3))]
+    # weighted 不归一化：第二路权重为 0，只剩第一路的相似度。
+    assert [h["id"] for h in hybrid(two, WeightedRanker(1.0, 0.0, norm_score=False), limit=3)[0]] == [0, 1, 2]
+    # 顶层 function_score 的 decay 用隐藏的输入字段，不出现在输出里。
+    decay = Function("d", FunctionType.RERANK, ["age"],
+                     params={"reranker": "decay", "function": "linear", "origin": 10, "scale": 100})
+    result = hybrid(two, decay, limit=3, output_fields=["cat"])[0]
+    assert result[0]["id"] == 0 and all(set(h["entity"]) == {"id", "cat"} for h in result)
+    # 分组在 rerank 链里做。
+    grouped = hybrid(two, RRFRanker(), limit=1, group_by_field="cat", group_size=2, output_fields=["cat"])[0]
+    assert [h["entity"]["cat"] for h in grouped] == ["a", "a"]
+    # 路由的分区优先于顶层：路由写了 `_default` 时，顶层的不存在分区不报错。
+    in_default = lambda request: request.requests[0].partition_names.append("_default")
+    assert len(hybrid([route([1.0, 0.0])], RRFRanker(), mod=in_default, limit=2, partition_names=["nope"])[0]) == 2
+    # 子请求里的 boost 只作用在它那一路：第二路把 id 3 提到第一名。
+    boosted = route([1.0, 0.2])
+    boosted_mod = lambda request: request.requests[1].function_score.CopyFrom(
+        schema_pb2.FunctionScore(functions=[schema_pb2.FunctionSchema(
+            name="b", type=schema_pb2.FunctionType.Rerank,
+            params=[common_pb2.KeyValuePair(key="reranker", value="boost"),
+                    common_pb2.KeyValuePair(key="weight", value="10"),
+                    common_pb2.KeyValuePair(key="filter", value="id == 3")])]))
+    assert hybrid([route([1.0, 0.0]), boosted], RRFRanker(k=1), mod=boosted_mod, limit=1)[0][0]["id"] == 3
+
+    # 错误先后：function_chains 先于 collection 是否存在；rank_params 的 int() 是 code 1；
+    # strategy 在各路检索之后才检查；没有子请求时不检查 load 状态，合并时报错。
+    with pytest.raises(MilvusException) as info:
+        client.hybrid_search("nope", two, RRFRanker())
+    assert info.value.code == 100
+    assert error(two, RRFRanker(), mod=lambda r: r.function_chains.add()) == (
+        6, "function_chains is not supported for hybrid search yet")
+    assert error(two, RRFRanker(), mod=rank_param("limit", '"x"')) == (
+        1, "invalid literal for int() with base 10: 'x'")
+    assert error(two, RRFRanker(), mod=rank_param("strategy", '"foo"')) == (
+        1, "Unsupported hybrid rerank strategy: 'foo'")
+    assert error([route([1.0, 0.0], expr="age ==")], RRFRanker(), mod=rank_param("strategy", '"foo"'))[0] == 6
+    client.release_collection("hy")
+    assert error(two, RRFRanker(), mod=lambda r: r.ClearField("requests")) == (
+        1, "MergeOp requires at least one input")
+    assert error(two, RRFRanker())[0] == 101
+
 
 @pytest.mark.parametrize(
     "kind", ["AUTOINDEX", "HNSW", "HNSW_SQ", "IVF_FLAT", "IVF_SQ8"]

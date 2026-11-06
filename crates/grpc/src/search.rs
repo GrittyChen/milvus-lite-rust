@@ -30,21 +30,21 @@ const PLACEHOLDER_VARCHAR: i32 = 21;
 
 /// 解析出的请求。M1 不支持的参数只记录是否出现，在 load 状态检查之后才报告（0004「决策」）。
 pub(crate) struct Parsed {
-    vectors: QueryVectors,
-    top_k: i64,
-    metric_type: Option<String>,
-    anns_field: Option<String>,
+    pub(crate) vectors: QueryVectors,
+    pub(crate) top_k: i64,
+    pub(crate) metric_type: Option<String>,
+    pub(crate) anns_field: Option<String>,
     offset: i64,
     round_decimal: i64,
     range: Option<SearchRange>,
     group: Option<GroupBy>,
-    unsupported: Option<&'static str>,
-    expr: String,
-    boost: Option<BoostSpec>,
+    pub(crate) unsupported: Option<&'static str>,
+    pub(crate) expr: String,
+    pub(crate) boost: Option<BoostSpec>,
     l2: Option<L2Function>,
     /// 请求里的 `timezone` / `time_fields`（空串与非字符串视为没有，同 3.x `translators/search.py`）。
-    timezone: Option<String>,
-    time_fields: Option<String>,
+    pub(crate) timezone: Option<String>,
+    pub(crate) time_fields: Option<String>,
 }
 
 /// `parsed` 由 [`parse`] 在取 collection 读锁之前得到。
@@ -89,7 +89,7 @@ pub(crate) fn search(
         group: parsed.group,
         timezone: &timezone,
     };
-    let mut result = match (&parsed.l2, parsed.boost) {
+    let result = match (&parsed.l2, parsed.boost) {
         // 3.x 的 Search + L2：候选窗口、分组与 offset 都交给 rerank 链（0026 第 6、7 节）。
         (Some(function), boost) => c.search_reranked_in(
             request,
@@ -130,7 +130,27 @@ pub(crate) fn search(
     timezone.validate_request()?;
     let time_fields = TimeFields::new(parsed.time_fields.as_deref(), &timezone);
 
-    let schema = c.schema();
+    encode(
+        c.schema(),
+        c.name(),
+        result,
+        parsed.top_k,
+        parsed.round_decimal,
+        group_field.as_deref(),
+        time_fields.as_ref(),
+    )
+}
+
+/// 3.x `build_search_result_data`：Search 与 HybridSearch 共用。`round_decimal` 小于 0 时不取整。
+pub(crate) fn encode(
+    schema: &milvus_lite_core::CollectionSchema,
+    collection_name: &str,
+    mut result: milvus_lite_core::SearchResult,
+    top_k: i64,
+    round_decimal: i64,
+    group_field: Option<&str>,
+    time_fields: Option<&TimeFields>,
+) -> Result<svc::SearchResults, EngineError> {
     let pk = schema.fields.iter().find(|f| f.is_primary).ok_or_else(|| {
         EngineError::SchemaValidation("schema has no primary key field".to_owned())
     })?;
@@ -155,26 +175,21 @@ pub(crate) fn search(
         pks.extend(hits.rows.pks.iter().cloned());
         match (&hits.public_scores, result.metric) {
             // rerank 的分数已经是 float64 对外分数，不能再经过 `round_score` 的换算。
-            (Some(public), _) if parsed.round_decimal >= 0 => {
-                scores.extend(
-                    public
-                        .iter()
-                        .map(|s| py_round(*s, parsed.round_decimal) as f32),
-                );
+            (Some(public), _) if round_decimal >= 0 => {
+                scores.extend(public.iter().map(|s| py_round(*s, round_decimal) as f32));
             }
-            (None, Some(metric)) if parsed.round_decimal >= 0 => {
+            (None, Some(metric)) if round_decimal >= 0 => {
                 scores.extend(
                     hits.scores
                         .iter()
-                        .map(|s| round_score(metric, *s, parsed.round_decimal)),
+                        .map(|s| round_score(metric, *s, round_decimal)),
                 );
             }
             _ => scores.extend_from_slice(&hits.scores),
         }
     }
     let rows: Vec<_> = result.hits.iter().map(|h| &h.rows).collect();
-    let mut fields_data =
-        output::fields_data(schema, &result.projection, &rows, time_fields.as_ref())?;
+    let mut fields_data = output::fields_data(schema, &result.projection, &rows, time_fields)?;
     if null_pks.contains(&true) {
         blank_null_pks(&mut fields_data, &pk.name, &null_pks);
     }
@@ -182,14 +197,14 @@ pub(crate) fn search(
         status: Some(status::success()),
         results: Some(pb::SearchResultData {
             num_queries: i64::try_from(result.hits.len()).unwrap_or(i64::MAX),
-            top_k: parsed.top_k,
+            top_k,
             fields_data,
             scores,
             ids: Some(insert::pb_ids(&pks, varchar)),
             topks,
             output_fields: result.projection.output_fields(schema, false),
             primary_field_name: pk.name.clone(),
-            group_by_field_value: match &group_field {
+            group_by_field_value: match group_field {
                 Some(name) => output::group_by_field_data(
                     schema,
                     name,
@@ -203,7 +218,7 @@ pub(crate) fn search(
             },
             ..Default::default()
         }),
-        collection_name: c.name().to_owned(),
+        collection_name: collection_name.to_owned(),
         ..Default::default()
     })
 }
@@ -283,6 +298,16 @@ fn py_round(x: f64, ndigits: i64) -> f64 {
 }
 
 pub(crate) fn parse(req: &svc::SearchRequest) -> Result<Parsed, EngineError> {
+    parse_request(req, false)
+}
+
+/// HybridSearch 的子请求：与 Search 相同的 3.x `parse_search_request`，但子请求的 `function_chains`
+/// 被忽略（3.x 只在 servicer.Search 里检查它）。
+pub(crate) fn parse_route(req: &svc::SearchRequest) -> Result<Parsed, EngineError> {
+    parse_request(req, true)
+}
+
+fn parse_request(req: &svc::SearchRequest, route: bool) -> Result<Parsed, EngineError> {
     let vectors = placeholders(req)?;
     // 每个值先按 JSON 解析，失败时保留原字符串；同名 key 以后出现者为准。
     let raw: HashMap<&str, Value> = req
@@ -381,7 +406,7 @@ pub(crate) fn parse(req: &svc::SearchRequest) -> Result<Parsed, EngineError> {
         }
     };
 
-    if !req.function_chains.is_empty() {
+    if !route && !req.function_chains.is_empty() {
         if req.function_score.is_some() {
             return Err(EngineError::SchemaValidation(
                 "function_score and function_chains cannot be used together".to_owned(),

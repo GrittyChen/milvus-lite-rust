@@ -296,3 +296,27 @@ def test_l2_computed_values_match_3x(pair):
                 output_fields=["$score"], mod=setp("norm_score", "true"))
         total += 1
     c.finish(total)
+
+
+def test_l2_non_finite_decay_factor_in_meta_match_3x(pair):
+    """Search + decay：NaN 因子写进动态 `$meta` 的 `_decay_score` 时是 `NaN`（`json.dumps`），不是丢掉这个 key。"""
+    c = L2Clients(pair.open())
+    rows = []
+    for i in range(8):
+        row = {"id": i, "v": vector(i), "age": 0, "x": float("inf") if i % 2 else float(i)}
+        if i % 2:
+            row["$score"] = None
+        if i == 3:
+            row["_decay_score"] = 7
+        rows.append(row)
+    name = c.create([("x", DataType.DOUBLE, {})], rows, dynamic=True, pk=DataType.INT64)
+    ranker = decay("x", origin=0, scale=1e308)
+    total = 0
+    for fields in (["*"], ["_decay_score"], ["$score", "_decay_score"], ["$score", "_decay_score", "x"], None):
+        kwargs = {} if fields is None else {"output_fields": fields}
+        c.check(f"output {fields}", name, data=QUERY, limit=8, ranker=ranker, **kwargs)
+        c.check(f"output {fields} group", name, data=QUERY, limit=8, ranker=ranker, group_by_field="age", group_size=8,
+                **kwargs)
+        total += 2
+    c.finish(total)
+

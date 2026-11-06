@@ -29,6 +29,39 @@ pub fn dumps_object<'a>(entries: impl IntoIterator<Item = (&'a str, &'a Value)>)
     out
 }
 
+/// 同 [`dumps_object`]，但名为 `float.0` 的 key 写成浮点 `float.1`（Python `json.dumps` 的浮点：
+/// 有限值是 `repr`，非有限值是 `NaN` / `Infinity` / `-Infinity`）。
+pub fn dumps_object_with_float<'a>(
+    entries: impl IntoIterator<Item = (&'a str, &'a Value)>,
+    float: (&str, f64),
+) -> String {
+    let mut out = String::from("{");
+    for (i, (key, value)) in entries.into_iter().enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        write_str(&mut out, key, true);
+        out.push_str(": ");
+        if key == float.0 {
+            write_float(&mut out, float.1);
+        } else {
+            write_value(&mut out, value, true, true);
+        }
+    }
+    out.push('}');
+    out
+}
+
+fn write_float(out: &mut String, value: f64) {
+    if value.is_nan() {
+        out.push_str("NaN");
+    } else if value.is_infinite() {
+        out.push_str(if value > 0.0 { "Infinity" } else { "-Infinity" });
+    } else {
+        out.push_str(&py_float_repr(value));
+    }
+}
+
 /// JSON 字段落盘：`json.dumps(value, ensure_ascii=False)`，保留输入对象的键序。
 pub fn dumps_unicode(value: &Value) -> String {
     let mut out = String::new();
@@ -60,15 +93,7 @@ fn write_value(out: &mut String, value: &Value, ensure_ascii: bool, sort_keys: b
         Value::Number(n) => {
             let raw = n.to_string();
             if let Some(value) = json_float_text(&raw) {
-                if value.is_infinite() {
-                    out.push_str(if value.is_sign_positive() {
-                        "Infinity"
-                    } else {
-                        "-Infinity"
-                    });
-                } else {
-                    out.push_str(&py_float_repr(value));
-                }
+                write_float(out, value);
             } else if raw == "-0" {
                 out.push('0');
             } else {
@@ -178,6 +203,27 @@ fn write_str(out: &mut String, s: &str, ensure_ascii: bool) {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn computed_float_key_uses_python_float_text() {
+        // 期望值取自 Python 3.12 的 `json.dumps({"a": 1, "_decay_score": x})`。
+        let a = json!(1);
+        let placeholder = Value::Null;
+        let entries = || [("a", &a), ("_decay_score", &placeholder)];
+        for (x, text) in [
+            (f64::NAN, "NaN"),
+            (f64::INFINITY, "Infinity"),
+            (f64::NEG_INFINITY, "-Infinity"),
+            (0.5, "0.5"),
+            (1e-300, "1e-300"),
+            (1.0, "1.0"),
+        ] {
+            assert_eq!(
+                dumps_object_with_float(entries(), ("_decay_score", x)),
+                format!("{{\"a\": 1, \"_decay_score\": {text}}}")
+            );
+        }
+    }
 
     #[test]
     fn matches_python_json_dumps() {

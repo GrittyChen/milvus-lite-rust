@@ -9,7 +9,7 @@ use tonic::{Request, Response, Status};
 use crate::pb::common::{self, LoadState as PbLoadState};
 use crate::pb::service::{self as svc, milvus_service_server::MilvusService as Service};
 use crate::status::{self as st, Branch, Reply};
-use crate::{MAX_MESSAGE_SIZE, index, insert, query, schema, search};
+use crate::{MAX_MESSAGE_SIZE, hybrid, index, insert, query, schema, search};
 
 #[cfg(test)]
 #[derive(Clone, Default)]
@@ -700,6 +700,30 @@ impl Service for MilvusService {
                 &|| db.database_timezone(&database),
                 parsed,
                 req.output_fields,
+            )
+        })
+        .await
+    }
+
+    async fn hybrid_search(
+        &self,
+        request: Request<svc::HybridSearchRequest>,
+    ) -> Result<Response<svc::SearchResults>, Status> {
+        let database = database(&request, |r| &r.db_name);
+        let req = request.into_inner();
+        self.run(Branch::Engine, move |db| {
+            // 3.x 在找 collection 之前就拒绝 function_chains。
+            if !req.function_chains.is_empty() {
+                return Err(EngineError::SchemaValidation(
+                    "function_chains is not supported for hybrid search yet".to_owned(),
+                ));
+            }
+            let handle = db.collection(&database, &req.collection_name)?;
+            hybrid::hybrid_search(
+                &handle,
+                db.compute(),
+                &|| db.database_timezone(&database),
+                &req,
             )
         })
         .await

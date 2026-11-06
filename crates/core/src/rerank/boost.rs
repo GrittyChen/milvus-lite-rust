@@ -115,7 +115,7 @@ fn combine(values: &[f64], mode: Mode) -> f64 {
 }
 
 /// CPython 3.12 的 `sum()`：浮点累加带 Neumaier 补偿，结果可能与逐项相加差一个 ulp，会影响并列。
-pub(crate) fn python_sum(values: &[f64]) -> f64 {
+fn python_sum(values: &[f64]) -> f64 {
     let (mut total, mut compensation) = (0.0_f64, 0.0_f64);
     for &value in values {
         let next = total + value;

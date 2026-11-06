@@ -1,8 +1,8 @@
 # 0026：HybridSearch 与 rerank（RRF / Weighted / boost / decay）
 
-状态：设计评审通过；第 1 步（Search 的 boost 与 `function_score` 解码）已实施并评审通过；第 2 步（Search 的 L2：rrf / weighted / decay、`GroupByOp`、rerank 后的 `round_decimal`）已实施待评审；第 3、4 步未开始。对照版本为 3.x v3.2.1（`43d1257`）。
+状态：设计评审通过；第 1 步（Search 的 boost 与 `function_score` 解码）与第 2 步（Search 的 L2：rrf / weighted / decay、`GroupByOp`、rerank 后的 `round_decimal`）已实施并评审通过；第 3 步（HybridSearch：`rank_params`、顶层与子请求的 `function_score`、分区、分组、时区与 `time_fields`）已实施待评审；第 4 步未开始。对照版本为 3.x v3.2.1（`43d1257`）。
 
-第 1、2 步留下的风险：13 个 `tie *` 的三平台 CI 未执行（本机已验收 7 个 Search 侧场景：第 1 步 5 个，第 2 步 2 个 Search + decay；6 个 Hybrid 随第 3 步，三平台统一在第 4 步执行，不能免除）；变异验证与性能基准未运行。
+第 1–3 步留下的风险：13 个 `tie *` 的三平台 CI 未执行（本机已全部验收：第 1 步 5 个，第 2 步 2 个 Search + decay，第 3 步 6 个 Hybrid；三平台统一在第 4 步执行，不能免除）；变异验证与性能基准未运行。
 
 ## 背景与目标
 
@@ -127,13 +127,13 @@ pymilvus 3.0.2 的可达面比协议窄，影响差分用例怎么写：
 **decay**（`function_score` 的 L2）：
 
 - 先用 `score_mode`（`max` / `sum` / `avg`，缺省 `max`，其他值 code 1 `unsupported score_mode: only supports [max, sum, avg]`）合并各路，每路得分先按 `norm_score` 归一化，不归一化时按 `force_descending` 的方向转换（L2 类 `1 − 2·atan(d)/π`，正相关不变）。因此**单路 Search 的 L2 度量 + decay 也会把距离转成上表的方向分数**。
-- 衰减因子（`DecayReranker.compute_factor`）：`d = max(0, |v − origin| − offset)`，`d == 0` 为 1；`gauss`：`exp(d² · ln(decay) / scale²)`；`exp`：`exp(ln(decay) · d / scale)`；`linear`：`max(0, 1 − (1 − decay)/scale · d)`。字段值为空 → 因子 0；最终得分 = 合并得分 × 因子。
+- 衰减因子（`DecayReranker.compute_factor`）：`d = max(0, |v − origin| − offset)`，`d == 0` 为 1；`gauss`：`exp(d² · ln(decay) / scale²)`；`exp`：`exp(ln(decay) · d / scale)`；`linear`：`max(0, 1 − (1 − decay)/scale · d)`。字段值为空 → 因子 0；最终得分 = 合并得分 × 因子；相乘前先检查这一行的分数与因子都是有限数（合并得分为 `None` 时直接得 0），所以因子为 NaN 时报的是下面的 `num_combine row values must be finite numeric non-bool values`。
 - **`norm_score` 的 Python 真值陷阱**：decay 的 `norm_score` 不经规整，pymilvus 把布尔写成字符串 `"True"` / `"False"`，`"False"` 是非空字符串，因此真值为真。探针：`norm_score=False` 与 `True` 结果相同。
 - 参数校验（code 1，顺序即报错顺序）：输入字段数必须为 1（`decay reranker requires exactly 1 input field`）、`score_mode`、输入字段存在（`input field <f> not found in collection schema`，动态字段同样不算）、字段类型必须是 INT8 / 16 / 32 / 64、FLOAT、DOUBLE（`decay input field <f> must be numeric, got <类型>`，BOOL、VARCHAR、JSON、向量、TIMESTAMPTZ 均拒绝）；然后是 `function` / `origin` / `scale` 缺失（code 1，消息是 `'<key>'` 的 `KeyError`）、`function` 必须是 `gauss` / `exp` / `linear`（区分大小写）、`scale > 0`、`offset >= 0`、`0 < decay < 1`（文案见 `rerank/decay.py`，类型不对时是 Python 的 `TypeError` / `ValueError` 文案）。
 - 参数的 JSON 类型（探针 `decay param *`，文案逐字复现，code 均为 1）：`origin` 经 `float()`（`"5"`、`true` 可用；`null` / `[1]` 报 `float() argument must be a string or a real number, not '<类型>'`；`"x"` 报 `could not convert string to float: 'x'`）；`scale`、`offset`、`decay` 先比较后转换（字符串、`null`、列表报 `'<=' / '<' not supported between instances of ...`；`true` 按 1，所以 `decay=true` 报 `decay must be 0 < decay < 1, got True`）；`scale=1e400` 是无穷大，因子恒为 1；`function` 非字符串报 `decay: invalid function <repr>, ...`。
 - `score_mode` 校验时取小写、合并时用原值：`"MAX"` / `"Sum"` 通过校验，在合并第一个候选时报 code 1 `Unknown merge strategy: MAX`（没有候选时成功）；`5`、`null` 报 `unsupported score_mode`。
 - 输入字段是隐藏字段：用户 `output_fields` 里没有也要取，响应前剔除。整数主键能通过类型校验，但候选行里**没有主键列**，值恒为空、因子恒为 0，得分全部为 0，结果按 `$id` 升序（探针 `s l2 decay field id`、`pk rr_pki s l2 decay on pk`）；VARCHAR 主键报类型错误。
-- 数值边界（探针 `num *`）：字段值 NaN 时 `d = max(0, NaN) = 0`，因子为 1；`scale` 极小使 `scale²` 为 0 时，gauss 对 `d != 0` 的行报 code 1 `float division by zero`（`exp` / `linear` 不报）。合并得分与因子相乘前逐行检查：任一非有限值报 code 1 `num_combine row values must be finite numeric non-bool values`（探针：boost 的 `inf` 进入窗口后接 decay 报错；空值的因子已是 0，不触发），NaN 行若被 boost 排序截断在窗口外就不会触发（探针 `num boost nan + decay` 成功）。
+- 数值边界（探针 `num *`）：字段值 NaN 时 `d = max(0, NaN) = 0`，因子为 1；`scale` 极小使 `scale²` 为 0 时，gauss 对 `d != 0` 的行报 code 1 `float division by zero`（`exp` / `linear` 不报）。合并得分与因子相乘前逐行检查：合并得分为 `None` 时这一行直接得 0；否则分数与因子都必须是有限数，任一非有限报 code 1 `num_combine row values must be finite numeric non-bool values`（探针：boost 的 `inf` 进入窗口后接 decay 报错；字段值为空时因子是 0，不触发），NaN 行若被 boost 排序截断在窗口外就不会触发（探针 `num boost nan + decay` 成功）。
 
 **weighted / rrf 的 `function_score` 路径校验**（code 1，先于计算）：`rrf` 的 `k` 必须在 `(0, 16384)`（`The rank params k should be in range (0, 16384)`）；`weighted` 的 `weights` 必填且非空（`weighted reranker requires weights parameter`）、个数等于路由数（`the length of weights param mismatch with ann search requests`）、每个在 `[0, 1]`（`rank param weight should be in range [0, 1]`）。这与 `rank_params` 路径的无校验不同，**必须分开实现**。
 
@@ -277,10 +277,11 @@ Search 的分组有两条路径，字段校验不同：
 - Search 的 rerank 路径：`round_decimal >= 0` 时，**rerank 之后**对最终公共分数做 Python `round`（再存为 f32）；Hybrid 服务端忽略 `round_decimal`。
 - 输出字段：boost 把全部非主键 schema 字段与请求字段一起取出再剔除；L2 的隐藏输入字段与分组字段同理。`output_fields` 里的不存在字段不报错。
 - Hybrid 的分区：每路用该路 `partition_names`，没有才用顶层 `partition_names`（探针：顶层写了不存在的分区、路由写了 `_default` 时成功；两层都写则以路由为准）。
+- Hybrid 的子请求不做范围检索：3.x 调用 `col.search` 时不传 `radius` / `range_filter`，子请求里的这两个参数（`params` 对象里或顶层）只在解析时经过 `float()` 校验，不过滤候选、也不放大窗口（补充探针 `s3 route0 range_filter=0.9`、`s3 route radius boost`）。子请求的 `offset`、`round_decimal`、`group_by_field` / `group_size` / `strict_group_size` 同样只解析、不生效（非整数照样报 code 1）；子请求的 `function_chains` 被忽略（3.x 只在 servicer.Search 里检查它）。
 - Hybrid 的子请求自带 `function_score`：**只做解码期校验**，只取其中的 boost 并入该路，L2 不构建、不校验（探针 `route fs *`）。解码期会报错的：未知 `reranker`（6）、两个 L2（6）、`norm_score` 与 `weights` 形态错（6）、`k` / 权重元素转换失败（1）、model 缺 `queries`（6）、boost 参数错（6）。解码期不报错、被静默忽略的：`k=0`、`weights=[]`、权重个数或范围不对、decay 的任何参数、合法 model。子请求的 boost 过滤语法错误照样在应用时报 6；子请求的 `random_score` 按 boost 使用。子请求的 `output_fields` 被忽略。顶层与路由的 boost 合并，函数按“路由在前、顶层在后”，`boost_mode` / `function_mode` 在顶层有 boost 时取顶层的（没写就是缺省 `multiply`，不继承路由的），否则取路由的。
 - 顶层 `function_score` 有 L2 时，**忽略 `rank_params` 的 `strategy` / `params`**（探针：`strategy="foo"` 不报错）；只有 boost 没有 L2 时仍按 `rank_params`（缺省 RRF）合并。`limit` / `offset` / 分组仍取自 `rank_params`。
 - 隐藏字段与响应：`group_by_field_value` 来自 rerank 链的行（不依赖用户 `output_fields`）。
-- decay 链把因子写进行的 `_decay_score`：同名的非主键 schema 字段输出因子（按字段类型转换）；没有同名字段时，投影包含全部动态字段（`output_fields` 为空、`*`、`$meta`）或显式请求了 `_decay_score` 时，它出现在 `$meta` 里，**排在原有 key 之后**（3.x 读回的 `$meta` 按 key 排序，链新写入的 key 追加在末尾；原本就有这个 key 时保持原位）。本实现在取列时按 3.x 读回的顺序排好顶层 key，输出保留这个顺序（补充探针 `s2 decay output empty list`、旧探针 `cf dyn s decay *`）。
+- decay 链把因子写进行的 `_decay_score`：同名的非主键 schema 字段输出因子（按字段类型转换）；没有同名字段时，投影包含全部动态字段（`output_fields` 为空、`*`、`$meta`）或显式请求了 `_decay_score` 时，它出现在 `$meta` 里，**排在原有 key 之后**（3.x 读回的 `$meta` 按 key 排序，链新写入的 key 追加在末尾；原本就有这个 key 时保持原位）。本实现在取列时按 3.x 读回的顺序排好顶层 key，输出保留这个顺序（补充探针 `s2 decay output empty list`、旧探针 `cf dyn s decay *`）。写进 `$meta` 的因子按 `json.dumps` 输出，非有限值是 `NaN` / `Infinity` / `-Infinity`（字段值为 +inf、`scale=1e308` 时因子为 NaN）；因子由链单独带到输出，`$meta` 里的同名 key 只占位置，因为 JSON 数字表示不了 NaN。
 - Hybrid 的时区：输出用的 `timezone` / `time_fields` 取 `rank_params` 里的，没有则取第一个带它的路由；路由过滤与 boost 过滤用的时区是 `路由的 || rank_params 的`；两个校验点都在（未知时区 code 6 `unknown timezone '<名>'`；`time_fields` 非法 code 6）。**decay 的输入字段不能是 TIMESTAMPTZ**（上面的类型校验），公共 `function_chains` 里的 TIMESTAMPTZ decay 不在本切片。
 
 ### 9. 错误先后
@@ -332,10 +333,10 @@ Search：collection 不存在（100）→ 解码 `function_score`（boost 参数
 ### core：`rerank` 模块
 
 - `rerank::boost`：`BoostSpec { functions, boost_mode, function_mode }`。过滤表达式只编译一次；**求值入口写死**：`ParsedFilter::parse_with` → `Tree::compile`（对所有形状都构造 `Tree`，包括普通搜索会走 legacy 快路径的简单表达式）→ `python::evaluate_tree`，每个候选一行 `DynamicRow`（`columns` 是候选的 schema 字段列，含主键；`meta = None`，即没有动态字段）。在 `filter` 模块新增一个 `pub(crate)` 入口封装这一步，**不改变普通搜索过滤的静态选路与现有快路径**。实现第 1 步先写最小测试证明该入口：schema 字段比较、JSON 路径、`like`、`in`、null、时间戳字面量，并断言动态字段开启 / 关闭时未知字段分别“不命中”与 code 6、`age + 1 > 5` 与 `text_match` 返回 `UNIMPLEMENTED`。
-- `rerank::chain`（第 2 步实现，一个模块）：合并（RRF；Weighted 含三类度量的归一化与方向转换；decay 用的 `max` / `sum` / `avg`）、decay 的三条曲线与因子、`SortOp` / `LimitOp` / `GroupByOp`（稳定排序、Python 切片语义）；`GroupByOp` 是独立实现，不复用 0024 的 `group_order`。rrf 的 MergeOp 在 3.x 里构造时不传度量，所以总是降序、不归一化；weighted 的某一路分数被同名字段盖成 `None` 时按缺席处理（3.x 的 `is not None`）。组键写成 `GroupKey` 枚举，按第 7 节的合同比较，不用 `serde_json::Value` 或 `f64` 的位比较：`Null`；`Num`（BOOL、整数、FLOAT、DOUBLE 与动态数字共用一个变体，比较沿用 `filter::python` 里已有的 Python 数值规则，包括整数与浮点的精确比较和宽整数；`-0.0 == 0.0`；NaN 不等于任何值，含自身，所以各自成组）；`Str`；`JsonText`（schema JSON 的存储文本，只与同类相等）；TIMESTAMPTZ 列是 `ColumnData::Int64` 的 UTC 微秒，走 `Num`（同列内比较，不会与其他类型混合）；不可哈希的值构造时直接返回 `unhashable type` 错误。组的查找用线性探测的小表或按 `GroupKey` 派生的规范键加 NaN 特判，不能依赖 `f64` 位比较的 `HashMap`。
+- `rerank::chain`（第 2 步实现，一个模块）：合并（RRF；Weighted 含三类度量的归一化与方向转换；decay 用的 `max` / `sum` / `avg`）、decay 的三条曲线与因子、`SortOp` / `LimitOp` / `GroupByOp`（稳定排序、Python 切片语义）；`GroupByOp` 是独立实现，不复用 0024 的 `group_order`。decay 的 `sum` / `avg` 照 CPython 3.12 `sum()` 的三段（i64 快路径、浮点的 Neumaier 补偿且整数不补偿、溢出后的通用路径）求和，宽整数是精确的 Python 整数，平均是整数真除法的正确舍入；rrf 的 MergeOp 在 3.x 里构造时不传度量，所以总是降序、不归一化；weighted 的某一路分数被同名字段盖成 `None` 时按缺席处理（3.x 的 `is not None`）。组键写成 `GroupKey` 枚举，按第 7 节的合同比较，不用 `serde_json::Value` 或 `f64` 的位比较：`Null`；`Num`（BOOL、整数、FLOAT、DOUBLE 与动态数字共用一个变体，比较沿用 `filter::python` 里已有的 Python 数值规则，包括整数与浮点的精确比较和宽整数；`-0.0 == 0.0`；NaN 不等于任何值，含自身，所以各自成组）；`Str`；`JsonText`（schema JSON 的存储文本，只与同类相等）；TIMESTAMPTZ 列是 `ColumnData::Int64` 的 UTC 微秒，走 `Num`（同列内比较，不会与其他类型混合）；不可哈希的值构造时直接返回 `unhashable type` 错误。组的查找用线性探测的小表或按 `GroupKey` 派生的规范键加 NaN 特判，不能依赖 `f64` 位比较的 `HashMap`。
 - 候选窗口：Search + boost、Search + L2、Hybrid 三组公式各写成独立函数并单测（含溢出、负值、0）。**不复用 0024 的 `group_window`**：rerank 的分组窗口是 `limit · group_size · 3`（不含 offset），与它的 `(limit + offset)` 形式不同。
 - 输入输出分层：rerank 入口显式携带“用户 `output_fields`”与“内部注入字段”（boost 过滤用的全部非主键 schema 字段、decay 输入字段、分组字段），候选行按内部集合取列，响应只按用户集合编码；分组字段值作为独立列从 rerank 链带到响应（`Hits.group_values` 现在只覆盖引擎分组，这里为链式分组补一条来源，与引擎分组共用响应编码）。组值编码复用 [output.rs](../../crates/grpc/src/output.rs) 的 `group_by_field_data` / `field_data`（已覆盖全部类型与 TIMESTAMPTZ 的 UTC 文本）；需要补的是：主键组值是全空列（字段本身不可空），`valid_data` 按“这一页有空值才写”，动态字段与未知字段不写。
-- Hybrid 入口：接收若干路的请求（各自的分区、过滤、`anns_field`、度量、`limit`、时区）与合并规格，按上面的窗口规则取每路候选，合并后返回命中。每路 `partition_names` 为空时用顶层的。
+- Hybrid 入口（第 3 步实现）：gRPC 层逐路依次执行“子请求解析 → 取这一路分区的读快照 → load 状态 → `ReadSnapshot::rank_route`（窗口来自 `window::hybrid_route`，boost 是路由与顶层合并后的）”，保持第 9 节的错误先后；各路的读快照可以不同（分区选择集决定可见性，见 0017），候选行记住来自哪一路，取列时从各自的快照读。全部路由完成后 `hybrid_merge` 构造合并链（顶层 `function_score` 有 L2 时用 `Chain::build`，否则用 `Chain::rank_params`，后者保留 `k` / `weights` / `norm_score` 的原始值），检查各路查询数，执行链并取列；Search + L2 与它共用同一个链执行与取列函数。没有子请求时不检查 load 状态，合并时报 `MergeOp requires at least one input`。
 - **并发**：沿用 0005——`Compute::for_each` 只能从计算池之外调用，所以 Hybrid 的各路在 RPC 阻塞线程上**顺序**执行，每路内部按现有方式并行；合并、boost、排序、分组在 RPC 线程上单线程完成；**禁止在一次 `for_each` 的叶子任务里再提交下一层**。测试覆盖多路 × 多 nq × 并发请求，debug 下不触发 `current_thread_index` 断言。不新增锁。
 
 ### grpc
@@ -355,14 +356,14 @@ Search：collection 不存在（100）→ 解码 `function_score`（boost 参数
 - 路由查询向量维度或度量非法：沿用 [0004](0004-m1-scope.md#决策) 的严格校验文案（已登记），3.x 是 numpy 原始报错。
 - 引擎分组（普通 Search 与 Search + boost）的两个 3.x 缺陷：沿用 [0024](0024-group-by-search.md) 已登记的“不复制”。主键名不是 `id` 时按主键分组变成单个空值组；可空字段叫 `distance` / `id` 时取错值（探针还看到 `id` 字段配 VARCHAR 主键时 3.x 报 `invalid literal for int()`）。**链式分组按 3.x**：主键（除与虚拟列同名）不在候选行，是单个空值组，不是差异；只有非主键字段名为 `id` / `distance` 的引擎错值在链式路径不存在。
 - `GroupByOp` 的排序键含 NaN 时（`weight` 为 `nan` 的行进入分组且落在窗口内）：3.x 的结果依赖 Timsort 的比较序列，不逐位复现，本实现把 NaN 排在该序列的末尾。无分组路径的 NaN 按 `SortOp` 复现，不在此列。
-- 参数里的 JSON 非标准字面量（Python `json.loads` 接受的 `NaN`、`Infinity`）与超出 f64 的整数参数：本实现按字符串或溢出处理，不逐一复现。
-- decay `sum` / `avg` 合并多个超出 i128 的整数分数（同名字段把宽整数 `$score` 盖到同一个 `$id` 上）：3.x 是精确的 Python 整数求和，本实现按浮点近似，且负的这类整数当前取到正无穷。Search + L2 是单路，每个 `$id` 只有一个分数，**第 2 步不可达**；第 3 步 HybridSearch 的多路合并会走到，届时须按 Python 整数语义修正（保留符号、精确求和）并加多路 `$id` 碰撞、宽整数 `$score`、`sum` / `avg` 的测试，不能沿用这条近似。
-- 第 3 节清单之外的极少见参数类型组合的 Python 异常文案（只登记没有逐一复现的组合，附场景）。
+- 参数里的 JSON 非标准字面量（Python `json.loads` 接受的 `NaN`、`Infinity`）与超出 f64 的整数参数：本实现按字符串或溢出处理，不逐一复现。`rank_params` 的 `limit` / `offset` / `group_size` 超出 int64 时沿用 0004 的饱和规则：3.x 的 `limit` 在响应编码 `top_k` 时报 `Value out of range`，带分组或 boost 时各路窗口由 numpy 报 `Maximum allowed dimension exceeded`，`group_size` 同样由 numpy 报错，本实现按饱和值执行并成功；`offset` 两边都返回空结果（补充探针 `s3 rank * huge`）。
+- 子请求的 `params` 不是严格 JSON（如 `{'nprobe': 10}`）：与 Search 相同，沿用 0004 / 0016 已登记的拒绝（UNIMPLEMENTED）；3.x 把它当字符串忽略（补充探针 `s3 route* params={'nprobe': 10}`）。
+- 第 3 节清单之外的极少见参数类型组合的 Python 异常文案（只登记没有逐一复现的组合，附场景）。`rank_params` 的 weighted 里，字符串或列表权重遇到被同名字段盖成整数的分数时，3.x 先做序列重复再在累加时报 `unsupported operand type(s) for +=`，本实现直接给出同一条累加错误，不构造重复后的序列（重复次数极大时 3.x 另报 OverflowError / MemoryError）。
 - 链算出的值（得分、组得分、decay 因子）写进 TIMESTAMPTZ、ARRAY 或向量类型的同名字段时（字段名是 `$score`、`$group_score`、`_decay_score`，或主键叫这些名字并按它分组）：本实现返回 UNIMPLEMENTED。3.x 按各自的转换得到依赖实现细节的结果（ARRAY 写成空数组、向量报 `len()` 的类型错误等），没有逐一复现。
 
 ## 测试矩阵
 
-第 1 步已转入仓库的差分在 [test_rerank_boost.py](../../tests/differential/test_rerank_boost.py)，第 2 步的在 [test_rerank_l2.py](../../tests/differential/test_rerank_l2.py)（Search + L2 的三种函数、窗口、参数的原始 JSON 类型、错误先后、扁平模型与 2 个 Search + decay 平局场景），其余在第 4 步转入。第 2 步的对照集合是旧探针里 907 个 Search + L2 场景加补充探针 `probe_s2x.py` 的 366 个（rrf `k` / weighted `weights` 与 `norm_score` 的原始类型、Search 版 decay 参数类型与 `score_mode`、rrf / weighted 的切片与分组、boost + L2 窗口、超出 SDK 校验的 `round_decimal`、错误先后、没有命中），实施后除 3 个 model 登记差异外与 3.x 相同。探针共 2822 个场景，分类由归档里的 `classify.py` 机器生成，**不把全部场景写成通过**：
+第 1 步已转入仓库的差分在 [test_rerank_boost.py](../../tests/differential/test_rerank_boost.py)，第 2 步的在 [test_rerank_l2.py](../../tests/differential/test_rerank_l2.py)（Search + L2 的三种函数、窗口、参数的原始 JSON 类型、错误先后、扁平模型与 2 个 Search + decay 平局场景），第 3 步的在 [test_hybrid_search.py](../../tests/differential/test_hybrid_search.py)（6 个 Hybrid 平局场景；rank_params 与 function_score 两条合并路径、混合度量、各路窗口、子请求的 boost 与 L2、rank_params 原始值、错误先后；宽整数 `$score` 的多路 `$id` 碰撞；时区与输出；NaN decay 因子写进动态 `$meta`，Search + L2 的同一场景在 test_rerank_l2.py），其余在第 4 步转入。第 3 步的对照集合是旧探针全部 2822 个场景加补充探针 `probe_s3x.py` 的 245 个（宽整数 `$score` 与 `$id` 碰撞下 decay 的 max / sum / avg、路由 search_params 里的其他键、nq=2 的多路、别名与数据库、partition key、过滤模板、跨路的错误先后、空的 requests、多路与空集合、rank_params 原始值、输出），实施后的差异只剩登记差异（过滤范围 6、model 4、`random_score` 4、0004 的维度文案 1、0024 的主键分组 41、超出 int64 的 rank_params 整数 4、子请求的非严格 JSON `params` 2）。第 2 步的对照集合是旧探针里 907 个 Search + L2 场景加补充探针 `probe_s2x.py` 的 366 个（rrf `k` / weighted `weights` 与 `norm_score` 的原始类型、Search 版 decay 参数类型与 `score_mode`、rrf / weighted 的切片与分组、boost + L2 窗口、超出 SDK 校验的 `round_decimal`、错误先后、没有命中），实施后除 3 个 model 登记差异外与 3.x 相同。探针共 2822 个场景，分类由归档里的 `classify.py` 机器生成，**不把全部场景写成通过**：
 
 | 类别 | 数量 | 内容 | 断言 |
 | --- | --- | --- | --- |

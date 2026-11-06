@@ -17,7 +17,7 @@ from test_reopen import pair  # noqa: F401  （fixture）
 def install_spy(client):
     connection = client._get_connection()
     raw = []
-    search, insert = connection._stub.Search, connection._stub.Insert
+    insert = connection._stub.Insert
     meta_patch = {}
 
     def values(scalars):
@@ -26,8 +26,8 @@ def install_spy(client):
             return kind
         return [v.decode() if isinstance(v, bytes) else v for v in getattr(scalars, kind).data]
 
-    def spy(request, *args, **kwargs):
-        reply = search(request, *args, **kwargs)
+    def spy(request, *args, _rpc, **kwargs):
+        reply = _rpc(request, *args, **kwargs)
         data, group = reply.results, reply.results.group_by_field_value
         fields = []
         for f in data.fields_data:
@@ -59,7 +59,10 @@ def install_spy(client):
                     f.scalars.json_data.data.extend(patched)
         return insert(*args, **kwargs)
 
-    connection._stub.Search = spy
+    # Search 与 HybridSearch 的响应是同一种消息，记录方式相同。
+    for name in ("Search", "HybridSearch"):
+        rpc = getattr(connection._stub, name)
+        setattr(connection._stub, name, lambda request, *a, _rpc=rpc, **k: spy(request, *a, _rpc=_rpc, **k))
     connection._stub.Insert = insert_spy
     return raw, meta_patch
 
@@ -88,6 +91,8 @@ def normalized(outcome):
 
 
 class Clients:
+    method = "search"
+
     def __init__(self, diff):
         self.clients = [diff.rust, diff.ref]
         self.spies = [install_spy(c) for c in self.clients]
@@ -121,7 +126,7 @@ class Clients:
         for client, (raw, _) in zip(self.clients, self.spies):
             raw.clear()
             try:
-                client.search(*args, **kwargs)
+                getattr(client, self.method)(*args, **kwargs)
                 outcomes.append(raw[-1])
             except MilvusException as e:
                 outcomes.append({"error": [e.code, str(e.message)]})

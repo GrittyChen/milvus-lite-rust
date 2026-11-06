@@ -138,11 +138,16 @@ pub(crate) fn fields_data(
         )?);
     }
     if schema.enable_dynamic_field {
-        let json = rows
-            .iter()
-            .flat_map(|r| r.meta.iter().flatten())
-            .map(|m| meta_json(projection, m).into_bytes())
-            .collect();
+        let mut json = Vec::new();
+        for r in rows {
+            for (i, meta) in r.meta.iter().flatten().enumerate() {
+                let float = r
+                    .meta_float
+                    .as_ref()
+                    .map(|(key, values)| (key.as_str(), values[i]));
+                json.push(meta_json(projection, meta, float).into_bytes());
+            }
+        }
         out.push(pb::FieldData {
             r#type: milvus_type(DataType::Json),
             field_name: META_FIELD.to_owned(),
@@ -183,16 +188,24 @@ pub(crate) fn group_by_field_data(
 
 /// 3.x 以 `json.dumps` 输出每行的动态字段：显式请求的 key 按请求顺序，否则按 dict 的顺序（引擎已按
 /// 3.x 读回的顺序排好顶层 key，见 `ReadSnapshot::gather`）；嵌套对象排序（3.x 保存时 `sort_keys=True`）。
-fn meta_json(projection: &Projection, meta: &Map<String, Value>) -> String {
-    if projection.all_dynamic {
-        pyjson::dumps_object(meta.iter().map(|(k, v)| (k.as_str(), v)))
+/// `float` 是 rerank 链算出的浮点 key 与这一行的值（见 [`Rows::meta_float`]）。
+fn meta_json(
+    projection: &Projection,
+    meta: &Map<String, Value>,
+    float: Option<(&str, f64)>,
+) -> String {
+    let entries: Vec<(&str, &Value)> = if projection.all_dynamic {
+        meta.iter().map(|(k, v)| (k.as_str(), v)).collect()
     } else {
-        pyjson::dumps_object(
-            projection
-                .dynamic_keys
-                .iter()
-                .filter_map(|k| meta.get(k).map(|v| (k.as_str(), v))),
-        )
+        projection
+            .dynamic_keys
+            .iter()
+            .filter_map(|k| meta.get(k).map(|v| (k.as_str(), v)))
+            .collect()
+    };
+    match float {
+        Some(float) => pyjson::dumps_object_with_float(entries, float),
+        None => pyjson::dumps_object(entries),
     }
 }
 

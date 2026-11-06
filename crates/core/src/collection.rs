@@ -177,6 +177,313 @@ pub struct Rerank<'a> {
     pub offset: i64,
 }
 
+/// HybridSearch 一路排好的候选，合并之前不取列。
+pub struct RouteRanking(Ranking);
+
+/// [`ReadSnapshot::rank_route`] 的过滤、时区与 boost（路由与顶层合并后的）。没有范围参数：3.x 的路由调用
+/// `col.search` 时不传 radius / range_filter，子请求里的范围参数只在解析时做 float() 校验。
+pub struct RouteFilter<'a> {
+    pub expr: &'a str,
+    pub timezone: &'a crate::timezone::TimezoneSource<'a>,
+    pub boost: Option<&'a boost::BoostSpec>,
+}
+
+/// HybridSearch 的合并：顶层 `function_score` 有 L2 时用它，否则按 `rank_params`。
+pub enum HybridMerge<'a> {
+    /// `strategy` 与 `params` 是 `json.loads` 的原值（缺省分别为 `"rrf"` 与 `{}`）。
+    RankParams {
+        strategy: &'a Value,
+        params: &'a Value,
+    },
+    Function(&'a crate::rerank::chain::L2Function),
+}
+
+/// 合并各路候选并执行 rerank 链（3.x `HybridSearch` 检索之后的部分）：先构造链（校验），再检查各路的
+/// 查询数，然后合并、排序或分组、切片，按 `output_fields` 取列。`schema` 在没有任何一路时也要用来校验
+/// L2 函数。
+pub fn hybrid_merge(
+    schema: &CollectionSchema,
+    routes: &[(&ReadSnapshot, &RouteRanking)],
+    merge: HybridMerge<'_>,
+    tail: crate::rerank::chain::Tail,
+    output_fields: &[String],
+) -> Result<SearchResult> {
+    use crate::rerank::chain::Chain;
+    // 查询向量为空的路没有度量；gRPC 解码已拒绝空的 placeholder，这里只占位。
+    let metrics: Vec<Metric> = routes
+        .iter()
+        .map(|(_, r)| r.0.metric.unwrap_or(Metric::Cosine))
+        .collect();
+    let group = tail.group.as_ref().map(|(field, _)| field.clone());
+    let chain = match merge {
+        HybridMerge::RankParams { strategy, params } => Chain::rank_params(
+            &PyVal::from_json(strategy),
+            &PyVal::from_json(params),
+            &metrics,
+            tail,
+        )?,
+        HybridMerge::Function(function) => Chain::build(function, schema, &metrics, tail)?,
+    };
+    let routes: Vec<(&ReadSnapshot, &Ranking)> = routes.iter().map(|(s, r)| (*s, &r.0)).collect();
+    run_chain(
+        schema,
+        &routes,
+        &chain,
+        Projection::new(schema, output_fields, ApiKind::Search),
+        group.as_deref(),
+    )
+}
+
+/// 在各路排好的候选上执行 L2 链并取列（Search + L2 只有一路）。候选行是扁平模型（设计第 7 节）：
+/// entity 是这一路的投影，经过 boost 的路已剥掉 `$id` / `$distance`；合并时 entity 取第一次出现的那一路。
+fn run_chain(
+    schema: &CollectionSchema,
+    routes: &[(&ReadSnapshot, &Ranking)],
+    chain: &crate::rerank::chain::Chain,
+    requested: Projection,
+    group: Option<&str>,
+) -> Result<SearchResult> {
+    use crate::rerank::chain::{DECAY_SCORE_FIELD, GROUP_SCORE_FIELD, SCORE_FIELD};
+    let nqs: Vec<usize> = routes.iter().map(|(_, r)| r.queries.len()).collect();
+    chain.check_inputs(&nqs)?;
+    let pk_value = |snapshot: &ReadSnapshot, at: RowRef| match pk_at(
+        &snapshot.chunks[at.chunk].columns[snapshot.pk_pos],
+        at.row,
+    ) {
+        Pk::Int64(i) => PyVal::Int(i),
+        Pk::VarChar(s) => PyVal::Str(s),
+    };
+    let nq = nqs.first().copied().unwrap_or(0);
+    // 每个查询的候选来源：（第几路, 行），链里的 `source` 是这里的下标。
+    let mut picks: Vec<Vec<(usize, RowRef)>> = Vec::with_capacity(nq);
+    let mut queries = Vec::with_capacity(nq);
+    for q in 0..nq {
+        let mut sources = Vec::new();
+        let mut per_route = Vec::with_capacity(routes.len());
+        for (r, (snapshot, ranking)) in routes.iter().enumerate() {
+            let query = &ranking.queries[q];
+            let metric = ranking.metric.unwrap_or(Metric::Cosine);
+            let mut rows = Vec::with_capacity(query.refs.len());
+            for (i, &at) in query.refs.iter().enumerate() {
+                let id = query
+                    .ids
+                    .as_ref()
+                    .map_or_else(|| pk_value(snapshot, at), |ids| ids[i].clone());
+                // 链只消费 float64 对外分数（两空间契约）：没有 boost 时由 float32 分数按 3.x 的换算还原。
+                let public = query
+                    .public
+                    .as_ref()
+                    .map_or_else(|| metric.public_f64(query.scores[i]), |p| p[i]);
+                rows.push(chain.row(sources.len(), id, public, |name| {
+                    snapshot.entity_value(at, name, &ranking.projection, ranking.boosted)
+                })?);
+                sources.push((r, at));
+            }
+            per_route.push(rows);
+        }
+        picks.push(sources);
+        queries.push(per_route);
+    }
+    let results = chain.execute(queries)?;
+
+    let group_pos = group.and_then(|g| schema.fields.iter().position(|f| f.name == g));
+    let decay_field = schema.field(DECAY_SCORE_FIELD).filter(|f| !f.is_primary);
+    let decay_key = chain.has_decay()
+        && schema.field(DECAY_SCORE_FIELD).is_none()
+        && dynamic_key_visible(schema, &requested, DECAY_SCORE_FIELD);
+    let mut hits = Vec::with_capacity(results.len());
+    for (rows, sources) in results.into_iter().zip(&picks) {
+        let chosen: Vec<(&ReadSnapshot, RowRef, bool)> = rows
+            .iter()
+            .map(|r| {
+                let (route, at) = sources[r.source];
+                (routes[route].0, at, routes[route].1.boosted)
+            })
+            .collect();
+        let public: Vec<f64> = rows
+            .iter()
+            .map(|r| match r.score {
+                PyVal::Float(f) => f,
+                _ => f64::NAN,
+            })
+            .collect();
+        let overridden = routes
+            .iter()
+            .any(|(_, r)| r.queries.iter().any(|q| q.ids.is_some()))
+            || rows
+                .iter()
+                .zip(&chosen)
+                .any(|(r, (snapshot, at, _))| r.id != pk_value(snapshot, *at));
+        let group_values = match group_pos {
+            Some(pos) => {
+                let field = &schema.fields[pos];
+                let name = field.name.as_str();
+                // 虚拟列与主键（不在 entity 里）取链里的值，其余复制存储列；被 boost 剥掉的 `$distance` 是空值。
+                let computed = field.is_primary
+                    || matches!(
+                        name,
+                        ID_FIELD | SCORE_FIELD | DECAY_SCORE_FIELD | GROUP_SCORE_FIELD
+                    );
+                let mut column = if computed {
+                    crate::rerank::pyval::python_column(field)
+                } else {
+                    ColumnData::empty(field)
+                };
+                for (row, (snapshot, at, boosted)) in rows.iter().zip(&chosen) {
+                    if computed {
+                        column.append_column(&crate::rerank::pyval::python_cell(
+                            field,
+                            &chain.get(row, name),
+                        )?);
+                    } else if *boosted && name == DISTANCE_FIELD {
+                        column.push_row(&ColumnData::nulls(field, 1), 0);
+                    } else {
+                        column.push_row(&snapshot.chunks[at.chunk].columns[pos], at.row);
+                    }
+                }
+                Some(column)
+            }
+            None => None,
+        };
+        let mut out = gather_rows(
+            schema,
+            &requested,
+            chosen
+                .iter()
+                .map(|(snapshot, at, _)| (&snapshot.chunks[at.chunk], at.row, snapshot.pk_pos)),
+        );
+        strip_rows(
+            schema,
+            &mut out,
+            &[ID_FIELD, SCORE_FIELD, GROUP_SCORE_FIELD],
+            None,
+        );
+        // boost 只剥掉经过它的那些路的 `$distance`（Search + L2 只有一路，要么全剥要么不剥）。
+        let boosted: Vec<bool> = chosen.iter().map(|(_, _, b)| *b).collect();
+        if boosted.iter().all(|b| *b) {
+            strip_rows(schema, &mut out, &[DISTANCE_FIELD], None);
+        } else if boosted.contains(&true) {
+            strip_rows(schema, &mut out, &[DISTANCE_FIELD], Some(&boosted));
+        }
+        if chain.has_decay() {
+            if let Some(field) = decay_field
+                && let Some((_, column)) =
+                    out.fields.iter_mut().find(|(n, _)| n == DECAY_SCORE_FIELD)
+            {
+                let mut factors = crate::rerank::pyval::python_column(field);
+                for row in &rows {
+                    factors.append_column(&crate::rerank::pyval::python_cell(
+                        field,
+                        &chain.get(row, DECAY_SCORE_FIELD),
+                    )?);
+                }
+                *column = factors;
+            }
+            if decay_key {
+                let mut factors = Vec::with_capacity(rows.len());
+                for (meta, row) in out.meta.iter_mut().flatten().zip(&rows) {
+                    // decay 链给每一行都写了浮点因子（可能是 NaN）。
+                    let factor = match chain.get(row, DECAY_SCORE_FIELD) {
+                        PyVal::Float(f) => f,
+                        _ => f64::NAN,
+                    };
+                    meta.insert(DECAY_SCORE_FIELD.to_owned(), Value::Null);
+                    factors.push(factor);
+                }
+                out.meta_float = Some((DECAY_SCORE_FIELD.to_owned(), factors));
+            }
+        }
+        hits.push(Hits {
+            scores: public.iter().map(|s| *s as f32).collect(),
+            rows: out,
+            group_values,
+            public_scores: Some(public),
+            id_overrides: overridden.then(|| rows.into_iter().map(|r| r.id).collect()),
+        });
+    }
+    Ok(SearchResult {
+        projection: requested,
+        metric: routes.first().and_then(|(_, r)| r.metric),
+        hits,
+    })
+}
+
+/// 把 entity 里的这些名字去掉：同名的非主键 schema 字段换成空值占位，动态键删除。`only` 给出时只作用在
+/// 为真的行上。
+fn strip_rows(schema: &CollectionSchema, rows: &mut Rows, names: &[&str], only: Option<&[bool]>) {
+    let len = rows.len();
+    for (name, column) in &mut rows.fields {
+        if names.contains(&name.as_str())
+            && let Some(field) = schema.field(name)
+            && !field.is_primary
+        {
+            *column = match only {
+                Some(mask) => column.blank_rows(field, mask),
+                None => ColumnData::nulls(field, len),
+            };
+        }
+    }
+    for (i, meta) in rows.meta.iter_mut().flatten().enumerate() {
+        if only.is_some_and(|mask| !mask[i]) {
+            continue;
+        }
+        for name in names {
+            meta.shift_remove(*name);
+        }
+    }
+}
+
+/// 按投影取列；`rows` 是（块, 行, 主键列位置），可以来自不同的读快照（HybridSearch 各路的分区不同）。
+fn gather_rows<'c>(
+    schema: &CollectionSchema,
+    projection: &Projection,
+    rows: impl Iterator<Item = (&'c Chunk, usize, usize)> + Clone,
+) -> Rows {
+    let pks = rows
+        .clone()
+        .map(|(chunk, row, pk_pos)| pk_at(&chunk.columns[pk_pos], row))
+        .collect();
+    let fields = projection
+        .schema_fields
+        .iter()
+        .map(|&i| {
+            let field = &schema.fields[i];
+            let mut column = ColumnData::empty(field);
+            for (chunk, row, _) in rows.clone() {
+                column.push_row(&chunk.columns[i], row);
+            }
+            (field.name.clone(), column)
+        })
+        .collect();
+    let meta = schema.enable_dynamic_field.then(|| {
+        rows.map(|(chunk, row, _)| {
+            let full = chunk.meta.as_ref().and_then(|m| m.get(row));
+            match full {
+                // 3.x 以 `sort_keys=True` 保存 `$meta`，读回的 dict 按 key 排序；rerank 链之后
+                // 新写入的 key（`_decay_score`）排在最后，所以排序在这里做，输出保留顺序。
+                Some(full) if projection.all_dynamic => {
+                    let mut sorted = full.clone();
+                    sorted.sort_keys();
+                    sorted
+                }
+                Some(full) => projection
+                    .dynamic_keys
+                    .iter()
+                    .filter_map(|k| full.get(k).map(|v| (k.clone(), v.clone())))
+                    .collect(),
+                None => Map::new(),
+            }
+        })
+        .collect()
+    });
+    Rows {
+        pks,
+        fields,
+        meta,
+        meta_float: None,
+    }
+}
+
 /// 检索的过滤、范围、分组与时区来源，一起传给内部实现。
 struct FilterContext<'a> {
     expr: &'a str,
@@ -298,9 +605,7 @@ impl ReadSnapshot {
         boost: Option<&boost::BoostSpec>,
         rerank: Rerank<'_>,
     ) -> Result<SearchResult> {
-        use crate::rerank::chain::{
-            Chain, DECAY_SCORE_FIELD, GROUP_SCORE_FIELD, L2Function, SCORE_FIELD, Tail,
-        };
+        use crate::rerank::chain::{Chain, L2Function, Tail};
         let BoostedFilter {
             expr,
             range,
@@ -367,127 +672,42 @@ impl ReadSnapshot {
                 group: group.as_ref().map(|g| (g.field.clone(), g.size)),
             },
         )?;
-        let pk_value = |at: RowRef| match pk_at(&self.chunks[at.chunk].columns[self.pk_pos], at.row)
-        {
-            Pk::Int64(i) => PyVal::Int(i),
-            Pk::VarChar(s) => PyVal::Str(s),
-        };
-        let mut queries = Vec::with_capacity(ranking.queries.len());
-        for q in &ranking.queries {
-            let mut rows = Vec::with_capacity(q.refs.len());
-            for (i, &at) in q.refs.iter().enumerate() {
-                let id = q
-                    .ids
-                    .as_ref()
-                    .map_or_else(|| pk_value(at), |ids| ids[i].clone());
-                // 链只消费 float64 对外分数（两空间契约）：没有 boost 时由 float32 分数按 3.x 的换算还原。
-                let public = q
-                    .public
-                    .as_ref()
-                    .map_or_else(|| metric.public_f64(q.scores[i]), |p| p[i]);
-                rows.push(chain.row(i, id, public, |name| {
-                    self.entity_value(at, name, &ranking.projection, ranking.boosted)
-                })?);
-            }
-            queries.push(vec![rows]);
-        }
-        let results = chain.execute(queries)?;
+        run_chain(
+            &self.schema,
+            &[(self, &ranking)],
+            &chain,
+            requested,
+            group.as_ref().map(|g| g.field.as_str()),
+        )
+    }
 
-        let group_pos = group
-            .as_ref()
-            .and_then(|g| self.schema.fields.iter().position(|f| f.name == g.field));
-        let decay_field = self
-            .schema
-            .field(DECAY_SCORE_FIELD)
-            .filter(|f| !f.is_primary);
-        let decay_key = chain.has_decay()
-            && self.schema.field(DECAY_SCORE_FIELD).is_none()
-            && dynamic_key_visible(&self.schema, &requested, DECAY_SCORE_FIELD);
-        let mut stripped = vec![ID_FIELD, SCORE_FIELD, GROUP_SCORE_FIELD];
-        if ranking.boosted {
-            stripped.push(DISTANCE_FIELD);
-        }
-        let mut hits = Vec::with_capacity(results.len());
-        for (rows, q) in results.into_iter().zip(&ranking.queries) {
-            let refs: Vec<RowRef> = rows.iter().map(|r| q.refs[r.source]).collect();
-            let public: Vec<f64> = rows
-                .iter()
-                .map(|r| match r.score {
-                    PyVal::Float(f) => f,
-                    _ => f64::NAN,
-                })
-                .collect();
-            let overridden =
-                q.ids.is_some() || rows.iter().zip(&refs).any(|(r, &at)| r.id != pk_value(at));
-            let group_values = match group_pos {
-                Some(pos) => {
-                    let field = &self.schema.fields[pos];
-                    let name = field.name.as_str();
-                    // 虚拟列、主键（不在 entity 里）与被 boost 剥掉的 `$distance` 取链里的值，其余复制存储列。
-                    let computed = field.is_primary
-                        || matches!(
-                            name,
-                            ID_FIELD | SCORE_FIELD | DECAY_SCORE_FIELD | GROUP_SCORE_FIELD
-                        )
-                        || (ranking.boosted && name == DISTANCE_FIELD);
-                    let mut column = if computed {
-                        crate::rerank::pyval::python_column(field)
-                    } else {
-                        ColumnData::empty(field)
-                    };
-                    for (row, &at) in rows.iter().zip(&refs) {
-                        if computed {
-                            column.append_column(&crate::rerank::pyval::python_cell(
-                                field,
-                                &chain.get(row, name),
-                            )?);
-                        } else {
-                            column.push_row(&self.chunks[at.chunk].columns[pos], at.row);
-                        }
-                    }
-                    Some(column)
-                }
-                None => None,
-            };
-            let mut out = self.gather(&refs, &requested);
-            self.strip(&mut out, &stripped);
-            if chain.has_decay() {
-                if let Some(field) = decay_field
-                    && let Some((_, column)) =
-                        out.fields.iter_mut().find(|(n, _)| n == DECAY_SCORE_FIELD)
-                {
-                    let mut factors = crate::rerank::pyval::python_column(field);
-                    for row in &rows {
-                        factors.append_column(&crate::rerank::pyval::python_cell(
-                            field,
-                            &chain.get(row, DECAY_SCORE_FIELD),
-                        )?);
-                    }
-                    *column = factors;
-                }
-                if decay_key {
-                    for (meta, row) in out.meta.iter_mut().flatten().zip(&rows) {
-                        if let PyVal::Float(factor) = chain.get(row, DECAY_SCORE_FIELD)
-                            && let Some(number) = serde_json::Number::from_f64(factor)
-                        {
-                            meta.insert(DECAY_SCORE_FIELD.to_owned(), Value::Number(number));
-                        }
-                    }
-                }
-            }
-            hits.push(Hits {
-                scores: public.iter().map(|s| *s as f32).collect(),
-                rows: out,
-                group_values,
-                public_scores: Some(public),
-                id_overrides: overridden.then(|| rows.into_iter().map(|r| r.id).collect()),
-            });
-        }
-        Ok(SearchResult {
-            projection: requested,
-            metric: Some(metric),
-            hits,
-        })
+    /// HybridSearch 的一路（3.x `HybridSearch` 循环里的 `col.search`）：`req.limit` 是
+    /// `window::hybrid_route` 给出的窗口，offset 为 0、不分组；有 boost 时引擎再放大，boost 之后取
+    /// `hits[:limit]`。`req.output_fields` 是这一路的投影（用户字段并上分组字段与 L2 输入字段）。
+    pub fn rank_route(
+        &self,
+        req: SearchRequest,
+        compute: &Compute,
+        filter: RouteFilter<'_>,
+    ) -> Result<RouteRanking> {
+        let plan = filter.boost.map(|spec| BoostPlan {
+            spec: spec.clone(),
+            keep: req.limit,
+        });
+        let rows_per_block = (BLOCK_ELEMS / field_dim(&self.schema.fields[self.vector_pos])).max(1);
+        let ranking = self.rank_in_blocks(
+            SearchRequest { offset: 0, ..req },
+            compute,
+            rows_per_block,
+            FilterContext {
+                expr: filter.expr,
+                range: None,
+                group: None,
+                timezone: filter.timezone,
+                boost: plan.as_ref(),
+            },
+        )?;
+        Ok(RouteRanking(ranking))
     }
 
     /// 候选行 entity 里名字 `name` 的值：投影内的非主键 schema 字段或可见的动态键；boost 剥掉的
@@ -582,22 +802,8 @@ impl ReadSnapshot {
         }
     }
 
-    /// 把 entity 里的这些名字去掉：同名的非主键 schema 字段换成空值占位，动态键删除。
     fn strip(&self, rows: &mut Rows, names: &[&str]) {
-        let len = rows.len();
-        for (name, column) in &mut rows.fields {
-            if names.contains(&name.as_str())
-                && let Some(field) = self.schema.field(name)
-                && !field.is_primary
-            {
-                *column = ColumnData::nulls(field, len);
-            }
-        }
-        for meta in rows.meta.iter_mut().flatten() {
-            for name in names {
-                meta.shift_remove(*name);
-            }
-        }
+        strip_rows(&self.schema, rows, names, None);
     }
 
     fn rank_in_blocks(
@@ -1220,48 +1426,12 @@ impl ReadSnapshot {
     }
 
     fn gather(&self, refs: &[RowRef], projection: &Projection) -> Rows {
-        let pks = refs
-            .iter()
-            .map(|r| pk_at(&self.chunks[r.chunk].columns[self.pk_pos], r.row))
-            .collect();
-        let fields = projection
-            .schema_fields
-            .iter()
-            .map(|&i| {
-                let field = &self.schema.fields[i];
-                let mut column = ColumnData::empty(field);
-                for r in refs {
-                    column.push_row(&self.chunks[r.chunk].columns[i], r.row);
-                }
-                (field.name.clone(), column)
-            })
-            .collect();
-        let meta = self.schema.enable_dynamic_field.then(|| {
+        gather_rows(
+            &self.schema,
+            projection,
             refs.iter()
-                .map(|r| {
-                    let full = self.chunks[r.chunk]
-                        .meta
-                        .as_ref()
-                        .and_then(|m| m.get(r.row));
-                    match full {
-                        // 3.x 以 `sort_keys=True` 保存 `$meta`，读回的 dict 按 key 排序；rerank 链之后
-                        // 新写入的 key（`_decay_score`）排在最后，所以排序在这里做，输出保留顺序。
-                        Some(full) if projection.all_dynamic => {
-                            let mut sorted = full.clone();
-                            sorted.sort_keys();
-                            sorted
-                        }
-                        Some(full) => projection
-                            .dynamic_keys
-                            .iter()
-                            .filter_map(|k| full.get(k).map(|v| (k.clone(), v.clone())))
-                            .collect(),
-                        None => Map::new(),
-                    }
-                })
-                .collect()
-        });
-        Rows { pks, fields, meta }
+                .map(|r| (&self.chunks[r.chunk], r.row, self.pk_pos)),
+        )
     }
 }
 

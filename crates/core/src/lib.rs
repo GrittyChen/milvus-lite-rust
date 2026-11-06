@@ -28,8 +28,9 @@ pub mod timestamptz;
 pub mod timezone;
 
 pub use collection::{
-    BoostedFilter, Collection, GetSnapshot, GroupBy, Hits, LoadState, QueryResult, QueryVectors,
-    ReadSnapshot, Rerank, SearchRange, SearchRequest, SearchResult,
+    BoostedFilter, Collection, GetSnapshot, GroupBy, Hits, HybridMerge, LoadState, QueryResult,
+    QueryVectors, ReadSnapshot, Rerank, RouteFilter, RouteRanking, SearchRange, SearchRequest,
+    SearchResult, hybrid_merge,
 };
 pub use compute::{Compute, ComputeError};
 pub use data::{ColumnData, InputValues, InsertBatch, META_FIELD, Pk, Rows};
