@@ -570,7 +570,7 @@
 4. `DropDatabase`；
 5. 文档同步（0002 布局与保证、0006 第 15 项与差异表、0007 清扫与锁表、0023 状态、README 支持范围与回退说明、AGENTS 架构地图与索引、INVENTORY、互通 README）、补测、三组统计与 `docs/testing/0023-b-acceptance.md`。
 
-第 1 步之后每步单独评审。回退到 0.3.0rc3 及更早：旧版对已有的非默认库返回 UNIMPLEMENTED、不触碰其内容，`.database-staging/` 仍在打开时清空；发行说明写明回退后数据库内的集合不可访问但数据保留。
+第 1 步之后每步单独评审。回退到 0.3.0rc3 及更早：旧版的数据库 RPC 返回 UNIMPLEMENTED；带 `db_name` 访问已有的非默认库时，旧版报「数据库不存在」（`0.3.0rc3` 实测：DescribeCollection、Query 为 code 6，ShowCollections 为 code 1），不触碰其内容；`.database-staging/` 仍在打开时清空。发行说明写明回退后数据库内的集合不可访问但数据保留。
 
 ### 已确认的取舍（B）
 
