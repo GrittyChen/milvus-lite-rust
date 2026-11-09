@@ -141,6 +141,7 @@ pub struct WalWriter {
     file: File,
     stream: StreamWriter<Vec<u8>>,
     poisoned: bool,
+    bytes_written: u64,
 }
 
 impl WalWriter {
@@ -171,11 +172,16 @@ impl WalWriter {
             file,
             stream,
             poisoned: false,
+            bytes_written: 0,
         })
     }
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    pub(crate) fn bytes_written(&self) -> u64 {
+        self.bytes_written
     }
 
     pub fn append(&mut self, batch: &RecordBatch) -> Result<(), WalError> {
@@ -236,6 +242,7 @@ impl WalWriter {
                 source,
             });
         }
+        self.bytes_written += encoded.len() as u64;
         #[cfg(feature = "fault-injection")]
         if let Err(error) = after_append_io() {
             // 已完整写出后不能伪造普通 I/O 失败；断连属于测试中断，走 panic 协议。

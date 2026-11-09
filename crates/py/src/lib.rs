@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use milvus_lite_grpc::{Server, ServerConfig};
+use milvus_lite_grpc::{FlushBudgets, Server, ServerConfig, configure_flush_budgets as configure};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 
@@ -205,8 +205,17 @@ fn error_chain(err: &dyn std::error::Error) -> String {
     msg
 }
 
+#[pyfunction]
+fn configure_flush_budgets(memtable_bytes: u64, wal_bytes: u64) {
+    configure(FlushBudgets {
+        memtable_bytes,
+        wal_bytes,
+    });
+}
+
 #[pymodule]
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<NativeServer>()?;
+    m.add_function(wrap_pyfunction!(configure_flush_budgets, m)?)?;
     Ok(())
 }

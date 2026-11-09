@@ -78,7 +78,7 @@ $W/v3/bin/python benchmarks/baseline/summarize.py $W/m1.jsonl
 - **server 模式的退出**：辅助进程收到 stdin EOF 后正常停止；3.x 的 gRPC stop 与 db.close、Rust NativeServer.stop 的错误均使辅助进程非零退出，本轮不输出结果行。2.5.1 沿用它的 Server.stop。
 - **内存**：3.x 与 Rust 的 `inproc` RSS 含客户端及测试数据，不用于内存目标判断。`server` 下 3.x/Rust 统计辅助进程及其后代、2.5.1 只统计 C++ 子进程，均不含发请求的客户端；Python 进程内服务不可分离的解释器/绑定开销计入 RSS，不减空进程基线。RSS 用 MiB（1024² 字节），页缓存不计入；查询预热后取样。
 - **reopen**：新起进程后执行 `load_collection`。`reopen_total_to_ready_s` = `connect_s`（含拉起服务端子进程）+ `reopen_load_s`，不含首次检索（首次检索单列为 `first_search_ms`）。页缓存仍是热的，测到的是进程级冷启动，不是磁盘冷启动。3.x 会在这一阶段为末尾未建索引的 segment 补建索引。
-- **N 的取值**：3.x 每 1 万行 flush 一次 memtable。N 不是 1 万的整数倍时，build 阶段有部分数据留在 memtable，检索会明显变慢，不同 N 之间不能直接比较。
+- **N 的取值**：3.x v3.2.1 每 1 万行 flush 一次 memtable，v3.2.2 起与本实现都按字节预算触发（见 [0027](../../docs/decisions/0027-reference-3.2.2-upgrade.md)）。下述规律只适用于 v3.2.1。N 不是 1 万的整数倍时，build 阶段有部分数据留在 memtable，检索会明显变慢，不同 N 之间不能直接比较。
 - **数据**：均匀随机向量。它对 ANN 索引是最坏情况，召回偏低，因此不同 ANN 索引之间的延迟不可直接比较；FLAT 对 FLAT 与召回无关的操作可以直接比较。
 - **索引参数**：HNSW `M=16, efConstruction=200, ef=64`；IVF_FLAT `nlist=1024, nprobe=16`，build 与 reopen 两阶段相同。2.5.1 不支持 HNSW；据 2.5.1 的 README，其 IVF_FLAT 在不足 10 万行时内部退回 FLAT。3.x 的 `create_index` 会原样登记未知的 `index_type`，要到某个 segment 需要建索引时才报错；数据还在 memtable 时，build 阶段会按暴力检索跑完。因此 `bench.py` 只接受 2.5.1 的 FLAT / IVF_FLAT 与 3.x 的 FLAT / HNSW / IVF_FLAT，并核对服务端登记的索引（结果里的 `index_described`）。
 - **`create_index_s`**：pymilvus 以 0.5 秒为间隔轮询建索引进度，分辨率约 0.5 秒。

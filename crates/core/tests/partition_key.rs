@@ -13,6 +13,18 @@ fn open(root: &Path) -> Arc<Db> {
     )
     .unwrap()
 }
+#[cfg(feature = "fault-injection")]
+fn open_flushing_after_every_write(root: &Path) -> Arc<Db> {
+    Db::with_flush_budgets(
+        DataDir::open(root).unwrap(),
+        Compute::new(std::num::NonZeroUsize::MIN).unwrap(),
+        milvus_lite_core::flush_budget::FlushBudgets {
+            memtable_bytes: 1,
+            wal_bytes: 1 << 60,
+        },
+    )
+    .unwrap()
+}
 fn schema(key: bool) -> CollectionSchema {
     CollectionSchema {
         fields: vec![
@@ -226,7 +238,7 @@ fn threshold_is_checked_after_the_entire_key_request_in_one_wal_generation() {
     use std::sync::mpsc::channel;
     use std::time::Duration;
     let root = tempfile::tempdir().unwrap();
-    let db = open(root.path());
+    let db = open_flushing_after_every_write(root.path());
     db.create_collection("", "c", schema(true)).unwrap();
     let mut keys = vec![0; 10_000];
     keys.push(1);
@@ -274,7 +286,7 @@ fn key_rows_remain_acknowledged_when_automatic_flush_fails_and_retry_preserves_a
     use milvus_lite_core::storage::{flush, fs_commit};
     for fault in ["before-replace", "after-replace", "wal-cleanup"] {
         let root = tempfile::tempdir().unwrap();
-        let db = open(root.path());
+        let db = open_flushing_after_every_write(root.path());
         db.create_collection("", "c", schema(true)).unwrap();
         match fault {
             "before-replace" => {

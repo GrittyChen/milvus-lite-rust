@@ -10,6 +10,7 @@ pub mod db;
 pub mod error;
 pub mod filter;
 mod flat;
+pub mod flush_budget;
 pub mod index;
 pub mod lock_order;
 mod maintenance;

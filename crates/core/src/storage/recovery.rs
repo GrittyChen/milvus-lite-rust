@@ -106,6 +106,7 @@ pub struct RecoveredCollection {
     pub next_wal_number: u64,
     pub wal_warnings: Vec<String>,
     pub(crate) retained_old_wal: bool,
+    pub(crate) recovered_wal_bytes: u64,
     pub(crate) committed_deletes: HashMap<Pk, u64>,
 }
 
@@ -383,7 +384,7 @@ fn sidecar_source_stem(name: &str) -> Option<&str> {
 }
 
 enum WalOperation {
-    Data(DecodedData, arrow_data::PartitionLabels),
+    Data(DecodedData, arrow_data::PartitionLabels, u64),
     Delete(DecodedDelta, arrow_data::PartitionLabels),
 }
 
@@ -578,6 +579,7 @@ pub fn load_committed(collection_dir: &Path) -> Result<RecoveredCollection, Reco
     let committed_deletes = visibility.delete_snapshot();
     let mut wal_warnings = Vec::new();
     let mut retained_old_wal = false;
+    let mut recovered_wal_bytes = 0u64;
     let wal_paths = scan_wal(&collection_dir.join("wal"))?;
     // 无 WAL 文件就不会回放，不需要复制提交态的全量主键判定表。
     let committed = (!wal_paths.is_empty()).then(|| visibility.clone());
@@ -590,22 +592,28 @@ pub fn load_committed(collection_dir: &Path) -> Result<RecoveredCollection, Reco
             let mut operations = Vec::new();
             if let Some(path) = data_path {
                 regular_file(&path)?;
+                recovered_wal_bytes += wal_file_bytes(&path)?;
                 let recovered = wal::read_prefix(&path)?;
                 if let Some(reason) = recovered.stopped_at {
                     wal_warnings.push(format!("{path:?}: {reason}"));
                 }
                 for batch in recovered.batches {
+                    let insert_bytes = arrow_data::batch_buffer_bytes(&batch).map_err(|error| {
+                        RecoveryError::Unsupported(format!("WAL batch size: {error}"))
+                    })?;
                     let (decoded, labels) =
                         arrow_data::decode_partitioned_wal_data(&schema, &batch)?;
                     validate_wal_labels(&labels, decoded.seqs.len(), false)?;
                     retained_old_wal |= decoded.seqs.iter().any(|seq| *seq <= manifest.current_seq);
                     if let Some(&first_seq) = decoded.seqs.first() {
-                        operations.push((first_seq, WalOperation::Data(decoded, labels)));
+                        operations
+                            .push((first_seq, WalOperation::Data(decoded, labels, insert_bytes)));
                     }
                 }
             }
             if let Some(path) = delta_path {
                 regular_file(&path)?;
+                recovered_wal_bytes += wal_file_bytes(&path)?;
                 let recovered = wal::read_prefix(&path)?;
                 if let Some(reason) = recovered.stopped_at {
                     wal_warnings.push(format!("{path:?}: {reason}"));
@@ -624,7 +632,7 @@ pub fn load_committed(collection_dir: &Path) -> Result<RecoveredCollection, Reco
             operations.sort_by_key(|(first_seq, _)| *first_seq);
             for (_, operation) in operations {
                 match operation {
-                    WalOperation::Data(decoded, labels) => {
+                    WalOperation::Data(decoded, labels, insert_bytes) => {
                         let (filtered, selected) =
                             filter_committed_rows(&schema, decoded, &committed)?;
                         if !filtered.seqs.is_empty() {
@@ -658,6 +666,7 @@ pub fn load_committed(collection_dir: &Path) -> Result<RecoveredCollection, Reco
                                 &mut visibility,
                                 &ids,
                             )?;
+                            active_memtable.add_insert_bytes(insert_bytes);
                         }
                     }
                     WalOperation::Delete(delta, labels) => {
@@ -715,6 +724,7 @@ pub fn load_committed(collection_dir: &Path) -> Result<RecoveredCollection, Reco
         next_wal_number,
         wal_warnings,
         retained_old_wal,
+        recovered_wal_bytes,
         committed_deletes,
     })
 }
@@ -774,6 +784,15 @@ pub(crate) fn scan_wal(wal_dir: &Path) -> Result<BTreeMap<u64, WalPaths>, Recove
         }
     }
     Ok(paths)
+}
+
+fn wal_file_bytes(path: &Path) -> Result<u64, RecoveryError> {
+    Ok(fs::symlink_metadata(path)
+        .map_err(|source| RecoveryError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?
+        .len())
 }
 
 fn regular_file(path: &Path) -> Result<(), RecoveryError> {

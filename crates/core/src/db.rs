@@ -754,6 +754,7 @@ pub struct Db {
     compute: Compute,
     /// 数据根目录；各数据库的根、staging 根与 `databases/` 都由它推导。
     data_root: PathBuf,
+    flush_budgets: crate::flush_budget::FlushBudgets,
     namespace: OrderedMutex<(), 2>,
     /// 注册表：打开时枚举 `databases/` 建立，运行期只由数据库的 Create / Drop 在独占许可下增删。
     /// 叶子锁，取出 `Arc` 即放。
@@ -821,6 +822,14 @@ impl Drop for Db {
 
 impl Db {
     pub fn new(data_dir: DataDir, compute: Compute) -> Result<Arc<Self>> {
+        Self::with_flush_budgets(data_dir, compute, crate::flush_budget::process())
+    }
+
+    pub fn with_flush_budgets(
+        data_dir: DataDir,
+        compute: Compute,
+        flush_budgets: crate::flush_budget::FlushBudgets,
+    ) -> Result<Arc<Self>> {
         let data_root = data_dir.path().to_path_buf();
         let databases = open_databases(&data_root)?;
         let db = Arc::new(Self {
@@ -842,6 +851,7 @@ impl Db {
             maintenance: crate::maintenance::Maintenance::new(),
             namespace_waiters: AtomicUsize::new(0),
             shutdown_failed: AtomicBool::new(false),
+            flush_budgets,
             #[cfg(feature = "fault-injection")]
             partition_pause: Mutex::new(None),
         });
@@ -2217,13 +2227,14 @@ impl Db {
         };
         let auto_flush = collection
             .persistent()
-            .is_some_and(|p| p.should_auto_flush());
+            .is_some_and(|p| p.should_auto_flush(self.flush_budgets));
         if auto_flush
             && let Err(error) = state_change(&mut collection, |collection| {
+                // 超预算的可能只是 WAL（例如只有 delta），活跃表为空时同样要提交一代才能回收。
                 collection
                     .persistent_mut()
                     .ok_or_else(|| storage("persistent state missing"))?
-                    .freeze_active(false)
+                    .freeze_active(true)
                     .map_err(storage)?;
                 Ok(())
             })
@@ -2414,6 +2425,17 @@ impl Db {
     }
 
     fn flush_handle(&self, handle: &CollectionHandle, include_active: bool) -> Result<()> {
+        self.flush_handle_with(handle, include_active, true)
+    }
+
+    /// `schedule` 为假用于尚未注册的句柄：打开失败时这个句柄被丢弃，重试会建出新实例；
+    /// 若它留在维护队列里，后台合并会拿旧 manifest 覆盖新实例的提交。
+    fn flush_handle_with(
+        &self,
+        handle: &CollectionHandle,
+        include_active: bool,
+        schedule: bool,
+    ) -> Result<()> {
         let lock = handle
             .read()
             .persistent()
@@ -2454,12 +2476,13 @@ impl Db {
                 })?;
             }
             if include_active {
+                let budgets = self.flush_budgets;
                 state_change(&mut collection, |collection| {
-                    collection
+                    let persistent = collection
                         .persistent_mut()
-                        .ok_or_else(|| storage("persistent state missing"))?
-                        .freeze_active(false)
-                        .map_err(storage)?;
+                        .ok_or_else(|| storage("persistent state missing"))?;
+                    let over_budget = persistent.should_auto_flush(budgets);
+                    persistent.freeze_active(over_budget).map_err(storage)?;
                     Ok(())
                 })?;
             }
@@ -2495,7 +2518,7 @@ impl Db {
                     let mut collection = handle.write();
                     let post_commit = publish_flushed(&mut collection, &work, outcome)?;
                     drop(collection);
-                    if work.table.size() > 0 {
+                    if schedule && work.table.size() > 0 {
                         self.schedule_maintenance(handle);
                     }
                     if let Some(error) = post_commit {
@@ -3014,6 +3037,14 @@ impl Db {
             eprintln!("collection {name:?} orphan cleanup deferred: {warning}");
         }
         let handle = Arc::new(RwLock::new(collection));
+        // 旧版本留下的积压在提供服务之前修复，只读使用也能回收；失败不缓存，下次访问重试（3.x 同样让打开失败）。
+        let over_budget = handle
+            .read()
+            .persistent()
+            .is_some_and(|p| p.should_auto_flush(self.flush_budgets));
+        if over_budget {
+            self.flush_handle_with(&handle, true, false)?;
+        }
         self.collections
             .write()
             .insert(key.clone(), Arc::clone(&handle));

@@ -600,7 +600,16 @@ fn automatic_freeze_panic_does_not_turn_an_accepted_insert_into_an_error() {
     let _case = CASE_LOCK.lock();
     use milvus_lite_core::db::{StatePanicPoint, inject_state_panic_once};
     let root = tempfile::tempdir().unwrap();
-    let db = open(root.path());
+    // 预算取 1 字节：任何一次写入都会走到自动 freeze。
+    let db = Db::with_flush_budgets(
+        DataDir::open(root.path()).unwrap(),
+        Compute::new(std::num::NonZeroUsize::new(2).unwrap()).unwrap(),
+        milvus_lite_core::flush_budget::FlushBudgets {
+            memtable_bytes: 1,
+            wal_bytes: 1 << 60,
+        },
+    )
+    .unwrap();
     db.create_collection("", "c", schema()).unwrap();
     let old = db.collection("", "c").unwrap().read().read_snapshot();
     let n = 10_000;

@@ -11,6 +11,7 @@ use serde_json::{Map, Value};
 
 use crate::data::ColumnData;
 use crate::data::Pk;
+use crate::flush_budget::FlushBudgets;
 use crate::schema::CollectionSchema;
 use crate::storage::arrow_data::{self, DecodedData};
 use crate::storage::flush::{self, FlushError};
@@ -179,6 +180,8 @@ pub struct PersistentCollection {
     pub(crate) data_sources: BTreeMap<(String, String), SourceId>,
     pub(crate) pinned_files: crate::storage::snapshot::PinnedFiles,
     retained_old_wal: bool,
+    /// 打开时已有的 WAL 文件大小，下一次冻结前一直计入预算。
+    recovered_wal_bytes: u64,
     pub(crate) maintenance_status: Arc<crate::maintenance::Status>,
     pub(crate) compaction_cleanup: Vec<PathBuf>,
     pub(crate) partition_cleanup: bool,
@@ -234,6 +237,7 @@ impl PersistentCollection {
             data_sources: BTreeMap::new(),
             pinned_files: Default::default(),
             retained_old_wal: false,
+            recovered_wal_bytes: 0,
             maintenance_status: Arc::new(Default::default()),
             compaction_cleanup: Vec::new(),
             partition_cleanup: false,
@@ -270,6 +274,7 @@ impl PersistentCollection {
             data_sources,
             pinned_files: recovered.pinned_files,
             retained_old_wal: recovered.retained_old_wal,
+            recovered_wal_bytes: recovered.recovered_wal_bytes,
             maintenance_status: Arc::new(Default::default()),
             compaction_cleanup: Vec::new(),
             partition_cleanup: false,
@@ -542,6 +547,8 @@ impl PersistentCollection {
         if self.truncate_cleanup.is_some() {
             return Err(TRUNCATE_CLEANUP_PENDING.to_owned());
         }
+        // 在追加之前计算：WAL 一旦写入，这里的错误就不能再让本次写入失败。
+        let insert_bytes = arrow_data::batch_buffer_bytes(&batch).map_err(err)?;
         if self.data_wal.is_none() {
             let wal_dir = self.dir.join("wal");
             fs_commit::create_dir_synced(&wal_dir).map_err(err)?;
@@ -569,6 +576,7 @@ impl PersistentCollection {
             self.poisoned = true;
             return Err(error.to_string());
         }
+        self.active.add_insert_bytes(insert_bytes);
         Ok(())
     }
 
@@ -642,8 +650,15 @@ impl PersistentCollection {
         Ok(())
     }
 
-    pub fn should_auto_flush(&self) -> bool {
-        self.active.size() >= 10_000
+    /// 按字节预算判断（3.x `_should_flush`），不按行数：反复改写少量主键时，行数不增长而批次与 WAL 持续增长。
+    pub fn should_auto_flush(&self, budgets: FlushBudgets) -> bool {
+        let wal_bytes = [&self.data_wal, &self.delta_wal]
+            .into_iter()
+            .flatten()
+            .map(WalWriter::bytes_written)
+            .sum::<u64>()
+            .saturating_add(self.recovered_wal_bytes);
+        self.active.retained_bytes() >= budgets.memtable_bytes || wal_bytes >= budgets.wal_bytes
     }
 
     pub fn freeze_active(&mut self, even_if_empty: bool) -> Result<(), String> {
@@ -695,6 +710,8 @@ impl PersistentCollection {
             wal_files: Mutex::new(wal_files),
         }));
         self.generation = next_generation;
+        // 恢复出的 WAL 已归这一代，由它的提交（失败时的重试）负责，不再计入预算。
+        self.recovered_wal_bytes = 0;
         Ok(())
     }
 

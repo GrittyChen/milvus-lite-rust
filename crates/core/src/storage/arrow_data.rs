@@ -55,6 +55,13 @@ pub struct DecodedData {
     pub meta: Option<Vec<Map<String, Value>>>,
 }
 
+/// 与 pyarrow 的 `RecordBatch.get_total_buffer_size` 同口径：列的数据、偏移与有效位缓冲区字节。
+pub(crate) fn batch_buffer_bytes(batch: &RecordBatch) -> Result<u64, arrow_schema::ArrowError> {
+    batch.columns().iter().try_fold(0, |total, column| {
+        Ok(total + column.to_data().get_slice_memory_size()? as u64)
+    })
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct DecodedDelta {
     pub pks: Vec<Pk>,

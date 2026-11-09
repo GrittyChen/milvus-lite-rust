@@ -16,6 +16,9 @@ mod server;
 mod service;
 mod status;
 
+pub use milvus_lite_core::flush_budget::{
+    FlushBudgets, configure_process as configure_flush_budgets,
+};
 #[cfg(feature = "fault-injection")]
 pub use milvus_lite_core::{CompactionFault, CompactionPausePoint};
 pub use server::{Server, ServerConfig, ServerError};

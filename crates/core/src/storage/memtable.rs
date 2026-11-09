@@ -73,6 +73,20 @@ pub struct MemTable {
     next_position: u64,
     next_tombstone_position: u64,
     max_seq: u64,
+    /// flush 预算的估算：保留批次（含已被覆盖的行）的 Arrow 缓冲区字节，加当前 tombstone 的估算。
+    retained_bytes: u64,
+}
+
+/// 3.x `_delete_entry_bytes` 按 CPython 对象大小估算一条 tombstone：二元组、`_seq` 整数与 `_all` 字符串。
+/// 取相同的量级，重复删除时才能与 3.x 在相近的位置 flush。
+const TOMBSTONE_ENTRY_BYTES: u64 = 56 + 32 + 45;
+
+fn tombstone_bytes(pk: &Pk) -> u64 {
+    TOMBSTONE_ENTRY_BYTES
+        + match pk {
+            Pk::Int64(_) => 32,
+            Pk::VarChar(value) => 41 + value.len() as u64,
+        }
 }
 
 /// 冻结时固定的行可见性；新一代写入只改变全局位图，不改变这一代写出的数据。
@@ -144,11 +158,21 @@ impl MemTable {
             next_position: 0,
             next_tombstone_position: 0,
             max_seq: 0,
+            retained_bytes: 0,
         }
     }
 
     pub fn size(&self) -> usize {
         self.active.len() + self.tombstones.len()
+    }
+
+    pub(crate) fn retained_bytes(&self) -> u64 {
+        self.retained_bytes
+    }
+
+    /// 由持有 WAL batch 的调用方记入；批次保留到 flush，被覆盖的行也不减。
+    pub(crate) fn add_insert_bytes(&mut self, bytes: u64) {
+        self.retained_bytes += bytes;
     }
 
     pub fn physical_rows(&self) -> usize {
@@ -249,7 +273,9 @@ impl MemTable {
                     .ok_or(MemTableError::PositionExhausted)?;
                 position
             };
-            self.tombstones.remove(&pk);
+            if self.tombstones.remove(&pk).is_some() {
+                self.retained_bytes = self.retained_bytes.saturating_sub(tombstone_bytes(&pk));
+            }
             let partition = partitions[if partitions.len() == 1 { 0 } else { row }];
             visibility.apply_partition_row(pk.clone(), seq, self.source, global_row, partition)?;
             self.max_seq = self.max_seq.max(seq);
@@ -365,14 +391,20 @@ impl MemTable {
             self.active.remove(pk);
             visibility.apply_local_delete(self.source, pk.clone(), seq)?;
             self.max_seq = self.max_seq.max(seq);
-            self.tombstones.insert(
-                pk.clone(),
-                Tombstone {
-                    seq,
-                    position,
-                    target,
-                },
-            );
+            if self
+                .tombstones
+                .insert(
+                    pk.clone(),
+                    Tombstone {
+                        seq,
+                        position,
+                        target,
+                    },
+                )
+                .is_none()
+            {
+                self.retained_bytes += tombstone_bytes(pk);
+            }
         }
         Ok(())
     }
