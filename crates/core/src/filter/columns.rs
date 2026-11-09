@@ -8,6 +8,7 @@ use crate::data::ColumnData;
 use crate::error::{EngineError, Result};
 use crate::storage::visibility::SourceBits;
 use std::borrow::Cow;
+use std::collections::HashSet;
 use std::ops::Index;
 
 enum Failure {
@@ -548,6 +549,7 @@ fn evaluate(
                 | Kind::Like { value: child, .. }
                 | Kind::IsNull { value: child, .. }
                 | Kind::In { field: child, .. } => work.push((*child, false)),
+                Kind::TextMatch { .. } => return Err(kernel("unknown AST node: TextMatchOp")),
                 _ => {
                     return Err(Failure::Fatal(EngineError::Storage(
                         "Python-only node reached column route".into(),
@@ -667,10 +669,22 @@ fn evaluate(
     Ok(matching)
 }
 pub(super) fn evaluate_rows(tree: &Tree, rows: &[DynamicRow<'_>]) -> Result<SourceBits> {
+    // text_match 的字段只在逐行回退里读取，不必物化；按节点排除，同一列被别的节点引用时仍要保留。
+    let text_fields: HashSet<usize> = tree
+        .ast
+        .nodes
+        .iter()
+        .filter_map(|node| match node.kind {
+            Kind::TextMatch { field, .. } => Some(field),
+            _ => None,
+        })
+        .collect();
     let referenced = tree
         .operands
         .iter()
-        .flatten()
+        .enumerate()
+        .filter(|(id, _)| !text_fields.contains(id))
+        .filter_map(|(_, operand)| operand.as_ref())
         .filter_map(|operand| {
             if let Operand::Column(i) | Operand::Timestamp(i) = operand {
                 Some(*i)

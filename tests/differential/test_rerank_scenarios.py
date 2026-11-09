@@ -20,11 +20,9 @@ MODEL_RUST = [UNIMPLEMENTED, "MilvusLite does not support rerank model providers
 RANDOM = {"s boost random_score", "s boost random_score noseed", "s random_score valid", "route fs boost random"}
 RANDOM_RUST = [UNIMPLEMENTED,
                "MilvusLite does not support random_score in boost functions: not supported in this build of milvus-lite-rust yet"]
-FILTER_RANGE = {"s boost filter arithmetic", "s boost filter text_match", "dyn boost filter age + 1 > 5",
-                "dyn boost filter text_match(name, 'n1')", "nodyn boost filter age + 1 > 5",
-                "nodyn boost filter text_match(name, 'n1')"}
+FILTER_RANGE = {"s boost filter arithmetic", "dyn boost filter age + 1 > 5", "nodyn boost filter age + 1 > 5"}
 FILTER_RUST = [UNIMPLEMENTED,
-               "MilvusLite does not support filter expressions: arithmetic, text_match, and geometry predicates are not supported"]
+               "MilvusLite does not support filter expressions: arithmetic and geometry predicates are not supported"]
 # 0004：本实现按严格的维度校验报错；3.x 的文案来自 numpy，不比较。
 DIM = "h bad dim"
 DIM_RUST = [1, "query vector has dim 2, but field 'v' expects dim 4"]
@@ -222,8 +220,8 @@ def test_rerank_probe_scenarios_match_3x(pair, monkeypatch):
     monkeypatch.delenv("COHERE_API_KEY", raising=False)
     d = pair.open()
     sdk = compare(cases.collect(d.rust), cases.collect(d.ref),
-                  {"pass": 2752 - len(SDK_ONLY), "setup": 13, "sdk": len(SDK_ONLY), "model": 4, "random_score": 4,
-                   "filter": 6, "0004": 1, "0024": 42})
+                  {"pass": 2755 - len(SDK_ONLY), "setup": 13, "sdk": len(SDK_ONLY), "model": 4, "random_score": 4,
+                   "filter": 3, "0004": 1, "0024": 42})
     assert sdk == SDK_ONLY
 
 

@@ -335,7 +335,6 @@ def test_create_collection_remaining_unsupported(env):
     nullable = field("v", DataType.FLOAT_VECTOR, dim=2)
     nullable.nullable = True
     unimplemented(create, stub, "c", pk, nullable)
-    unimplemented(create, stub, "c", pk, v, field("t", DataType.VARCHAR, max_length=8, enable_analyzer="True"))
     unimplemented(create, stub, "c", pk, v, field("t", DataType.VARCHAR, max_length=8,
                                                   analyzer_params='{"type": "english", "x": NaN}'))
     # 集合的 timezone 属性随 TIMESTAMPTZ 一起接入（0025）：合法值保存，坏值 6 且不创建。
@@ -1253,7 +1252,7 @@ def test_pymilvus_entry_points_remaining_unsupported(env):
         (with_field("g", DataType.GEOMETRY), f"GEOMETRY fields: {feature}"),
         # pymilvus 3.0 先发 AlterCollectionSchema，收到 UNIMPLEMENTED 后回退到 AddCollectionField。
         (lambda: client.add_collection_field("q", "x", DataType.INT64, nullable=True), f"AddCollectionField: {rpc}"),
-        (lambda: client.search("q", [[1, 0]], filter="id + 1 > 0"), "filter expressions: arithmetic, text_match, and geometry predicates are not supported"),
+        (lambda: client.search("q", [[1, 0]], filter="id + 1 > 0"), "filter expressions: arithmetic and geometry predicates are not supported"),
         (lambda: client.search("m", [[1, 0]], ranker=model), f"rerank model providers: {feature}"),
         # 与分组同时出现时，model 的 UNIMPLEMENTED 不能被分组路径吞掉。
         (lambda: client.search("m", [[1, 0]], ranker=model, group_by_field="id"),

@@ -83,6 +83,63 @@ class TestSearchPagination:
 # ===========================================================================
 
 
+class TestSearchTextMatch:
+    @pytest.fixture(autouse=True)
+    def _setup(self, milvus_client):
+        self.client = milvus_client
+        schema = MilvusClient.create_schema(auto_id=False)
+        schema.add_field("id", DataType.INT64, is_primary=True)
+        schema.add_field("vec", DataType.FLOAT_VECTOR, dim=DIM)
+        schema.add_field("text", DataType.VARCHAR, max_length=1024,
+                         enable_analyzer=True, enable_match=True,
+                         analyzer_params={"tokenizer": "standard"})
+
+        idx = milvus_client.prepare_index_params()
+        idx.add_index(field_name="vec", index_type="FLAT", metric_type="COSINE")
+        milvus_client.create_collection("tm_s", schema=schema, index_params=idx)
+        milvus_client.insert("tm_s", [
+            {"id": 1, "vec": [1.0] + [0.0] * (DIM - 1),
+             "text": "python programming language"},
+            {"id": 2, "vec": [0.0, 1.0] + [0.0] * (DIM - 2),
+             "text": "java programming language"},
+            {"id": 3, "vec": [0.0, 0.0, 1.0] + [0.0] * (DIM - 3),
+             "text": "machine learning algorithms"},
+            {"id": 4, "vec": [0.0] * (DIM - 1) + [1.0],
+             "text": "deep learning neural networks"},
+        ])
+        milvus_client.load_collection("tm_s")
+
+    def test_search_with_text_match_single_token(self):
+        q = [[1.0] + [0.0] * (DIM - 1)]
+        res = self.client.search("tm_s", data=q, limit=10,
+                                 filter='text_match(text, "python")',
+                                 output_fields=["text"])
+        assert len(res[0]) == 1
+        assert res[0][0]["id"] == 1
+
+    def test_search_with_text_match_multi_token(self):
+        q = [[1.0] + [0.0] * (DIM - 1)]
+        res = self.client.search("tm_s", data=q, limit=10,
+                                 filter='text_match(text, "programming")',
+                                 output_fields=["text"])
+        ids = {h["id"] for h in res[0]}
+        assert ids == {1, 2}
+
+    def test_query_with_text_match(self):
+        res = self.client.query("tm_s",
+                                filter='text_match(text, "learning")',
+                                output_fields=["text"], limit=10)
+        ids = {r["id"] for r in res}
+        assert ids == {3, 4}
+
+    def test_search_text_match_combined_with_scalar(self):
+        q = [[1.0] + [0.0] * (DIM - 1)]
+        res = self.client.search("tm_s", data=q, limit=10,
+                                 filter='text_match(text, "learning") and id >= 4',
+                                 output_fields=["text"])
+        assert len(res[0]) == 1
+        assert res[0][0]["id"] == 4
+
 
 # ===========================================================================
 # Partial update via gRPC upsert

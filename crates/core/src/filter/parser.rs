@@ -81,6 +81,11 @@ pub(super) enum Kind {
         negate: bool,
     },
     List(Vec<usize>),
+    /// 字段保留为子节点：boost 里 `$id` 改绑后，要按改绑的值分词。
+    TextMatch {
+        field: usize,
+        query: String,
+    },
     Path {
         base: usize,
         parts: Vec<PathPart>,
@@ -997,7 +1002,20 @@ impl Parser<'_> {
                 };
                 return Err(self.error(m, self.peek().pos, 1, None));
             }
-            self.take();
+            let query = self.take();
+            if name == "text_match" {
+                self.required(")", &format!("{display}: expected ')'"))?;
+                let Some(Literal::String(query)) = query.lit else {
+                    return Err(EngineError::Storage("string token lost its value".into()));
+                };
+                return Ok(self.node(
+                    Kind::TextMatch {
+                        field: value,
+                        query,
+                    },
+                    tok.pos,
+                ));
+            }
             if matches!(name.as_str(), "st_dwithin" | "geometry_dwithin") {
                 self.required(",", &format!("{}: expected ',' after WKT string", tok.text))?;
                 let d = self.unary()?;

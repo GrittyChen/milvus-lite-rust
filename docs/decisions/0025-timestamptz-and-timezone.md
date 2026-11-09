@@ -183,7 +183,7 @@ Query、Search 输出支持（Hybrid 随 HybridSearch）；非 TIMESTAMPTZ 字�
 | 数据库 `database_properties.json` 不可读时的 naive 时间字符串 / `time_fields` / naive 默认值 | 数据库打开时已经读过该文件，损坏的库根本打不开 | 只有这些操作报 1/0 存储错误，零写入；其余操作不读该文件 | 0023 B 已登记「集合操作不读属性」，只对需要时区的操作例外 |
 | 手改的 `schema.json` 里 TIMESTAMPTZ 的字符串默认值 | 打开时按集合、数据库时区规范化 | 该集合按范围外 schema 处理（fail-closed）：`DescribeCollection` 返回 UNIMPLEMENTED，`DropCollection`、别名与改名可用，清空与改属性按 0023 的差异表拒绝，不会半打开 | 3.x 只会写出微秒整数，字符串只可能来自手改文件；打开路径没有数据库时区上下文 |
 | type 21 字符串需要数据库时区而属性文件不可读 | 库打不开 | 报存储错误（1/0），零写入；其余行为同 3.x | 本实现不读无关的数据库属性（0023 B） |
-| 读取 3.x 毒化目录（越界整数微秒） | 任何读到这些行的查询整体报 1 | 同样报 1 `date value out of range`，不 panic | 一致；本实现只是不再能写出这样的目录 |
+| 读取 3.x 毒化目录（越界整数微秒） | 任何读到这些行的查询整体报 1 | 同样报 1 `date value out of range`，不 panic | 一致；本实现只是不再能写出这样的目录。例外是 `text_match`：3.x 回退路线全表 `to_pylist()` 会报错，本实现按列求值，不读无关的时间列（[0029](0029-text-match.md)） |
 | 手改的数据库 `database_properties.json` 里 `timezone` 取值不合法（路径形态、未知名字、空串），操作本身不需要时区（带偏移的字符串、原始整数微秒的写入，Load，不涉及 `time_fields` 的读取，绝对时间的过滤） | 3.x 加载属性就校验，打开该库的任何集合（含 Load）都报同一个错误（路径形态 1，未知名字 6，空串 6 `timezone property must be a non-empty string`）；写入里不合法或越界的时间字符串也先报这个错误 | 这些操作照常成功；数据本身的错误先于属性错误：不合法的时间字符串（type 21 与 type 26）报 6 `does not match dtype` / `is not a valid ISO 8601 timestamp`，带偏移但越界的值报 1 `date value out of range`；`DescribeDatabase`、任何 `AlterDatabase` 与需要时区的操作（无偏移字符串、`time_fields` 的默认时区、naive 默认值）报与 3.x 相同的错误；校验不过的加载不缓存，所有读取数据库时区的路径共用同一个加载器，文件修正后下次调用重新读取 | 0023 B 已登记「集合操作不读无关属性」；3.x 只会写出校验过的值，不可达的输入；差分 `test_invalid_stored_database_zone_follows_the_registered_rule` 对三种取值钉住两边各自的表现，核心测试 `invalid_stored_zone_fails_every_zone_read_and_is_not_cached` 钉住不缓存 |
 
 ## 测试矩阵

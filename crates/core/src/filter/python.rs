@@ -590,6 +590,7 @@ pub(super) fn evaluate_tree(tree: &Tree, rows: &[DynamicRow<'_>]) -> Result<Sour
                                 | Kind::Like { value, .. }
                                 | Kind::Length(value)
                                 | Kind::IsNull { value, .. }
+                                | Kind::TextMatch { field: value, .. }
                                 | Kind::In { field: value, .. } => tasks.push(Task::Visit(*value)),
                                 Kind::Path { base, .. } => tasks.push(Task::Visit(*base)),
                                 _ => return Err(super::eval::unsupported()),
@@ -759,6 +760,17 @@ pub(super) fn evaluate_tree(tree: &Tree, rows: &[DynamicRow<'_>]) -> Result<Sour
                             ),
                             _ => Value::Bool(false),
                         },
+                        Kind::TextMatch { field, .. } => {
+                            let query = tree.text_queries[id].as_ref().ok_or_else(|| {
+                                EngineError::Storage("text_match lost its query".into())
+                            })?;
+                            // 3.x 只对 str 分词；NULL 和其他类型都是 False，不是未知。
+                            let value = node_value(&values, *field)?;
+                            Value::Bool(match value.atom()? {
+                                Atom::Text(text) => query.matches(&text),
+                                _ => false,
+                            })
+                        }
                         Kind::Path { base, parts } => {
                             let mut value = node_value(&values, *base)?.parsed()?;
                             for part in parts {

@@ -340,7 +340,7 @@ def test_filter_errors_and_full_syntax_before_unsupported(diff):
         diff.step(expr, lambda c: c.query(name, filter=expr))
     for expr in ["true and missing>1", "active and missing>1", "array_length(age) > 0"]:
         diff.step(expr, lambda c: c.query(name, filter=expr), error=True)
-    for expr in ["age + 1 > 0", "text_match(title, 'x')"]:
+    for expr in ["age + 1 > 0", "geometry_contains(title, 'POINT (0 0)')"]:
         assert run(lambda c: c.query(name, filter=expr), diff.rust)[:2] == ("rpc", "UNIMPLEMENTED"), expr
     # 时间字面量的比较已支持（0025）：两边都求值。
     diff.step("iso_literals", lambda c: c.query(name, filter="ISO '2025-01-01T00:00:00Z' == ISO '2025-01-01T00:00:00Z'", output_fields=["id"]))

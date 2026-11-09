@@ -3,6 +3,7 @@
 use super::dynamic::DynamicRow;
 use super::eval::{self, Operand};
 use super::parser::{self, Ast, Kind};
+use crate::analyzer::TextQuery;
 use crate::error::{EngineError, Result, py_repr};
 use crate::schema::{CollectionSchema, DataType};
 use crate::storage::visibility::SourceBits;
@@ -21,6 +22,7 @@ pub(super) struct Tree {
     pub(super) names: Vec<String>,
     pub(super) backend: Backend,
     pub(super) patterns: Vec<Option<super::python::LikePattern>>,
+    pub(super) text_queries: Vec<Option<TextQuery>>,
 }
 
 fn numeric_operand(
@@ -135,6 +137,19 @@ impl Tree {
                         None,
                     ));
                 }
+                // 3.x 改写动态字段时跳过 TextMatchOp，schema 外的名字在动态集合里同样是未知字段。
+                if let Kind::TextMatch { field, .. } = &node.kind
+                    && let Kind::Field(name) = &ast.nodes[*field].kind
+                    && !matches!(name.as_str(), "_seq" | "_partition" | "$meta")
+                    && !schema.fields.iter().any(|f| &f.name == name)
+                {
+                    return Err(eval::field_error(
+                        name,
+                        ast.nodes[*field].pos,
+                        source,
+                        schema,
+                    ));
+                }
                 let children = match &node.kind {
                     Kind::And(ids) | Kind::Or(ids) => {
                         let operator = if matches!(node.kind, Kind::And(_)) {
@@ -158,6 +173,7 @@ impl Tree {
                     | Kind::IsNull { value, .. }
                     | Kind::Contains { value, .. } => vec![*value],
                     Kind::Path { base, .. } => vec![*base],
+                    Kind::TextMatch { field, .. } => vec![*field],
                     _ => Vec::new(),
                 };
                 if !children.is_empty() {
@@ -285,7 +301,7 @@ impl Tree {
                     }
                     "bool"
                 }
-                Kind::IsNull { .. } => "bool",
+                Kind::IsNull { .. } | Kind::TextMatch { .. } => "bool",
                 Kind::Path { .. } => "dynamic",
                 Kind::Contains { value, .. } | Kind::Length(value) => {
                     let is_json = matches!(&ast.nodes[*value].kind,Kind::Field(name) if schema.fields.iter().any(|f| &f.name==name && f.data_type==DataType::Json));
@@ -381,6 +397,14 @@ impl Tree {
                     Some(Operand::Dynamic(key.clone()))
                 }
                 Kind::Lit(l) => Some(Operand::Literal(l.clone())),
+                // 3.x 只把 text_match 标成 hybrid：先走列式，碰到它才回退逐行，
+                // 排在它前面的操作数可能先报错，所以不能直接选逐行路线。
+                Kind::TextMatch { .. } => {
+                    if backend == Backend::Arrow {
+                        backend = Backend::Hybrid;
+                    }
+                    None
+                }
                 Kind::Path { .. } | Kind::Contains { .. } | Kind::Length(_) => {
                     backend = Backend::Python;
                     None
@@ -396,12 +420,21 @@ impl Tree {
                 _ => None,
             })
             .collect();
+        let text_queries = ast
+            .nodes
+            .iter()
+            .map(|node| match &node.kind {
+                Kind::TextMatch { query, .. } => Some(TextQuery::new(query)),
+                _ => None,
+            })
+            .collect();
         Ok(Self {
             ast: ast.clone(),
             operands,
             names: schema.fields.iter().map(|f| f.name.clone()).collect(),
             backend,
             patterns,
+            text_queries,
         })
     }
 

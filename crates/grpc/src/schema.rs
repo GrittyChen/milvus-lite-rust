@@ -1,6 +1,8 @@
 //! CollectionSchema 在 Milvus proto 与引擎之间的转换，与 3.x `translators/schema.py` 一致。
 
 use milvus_lite_core::error::py_repr;
+use milvus_lite_core::filter::{AnalyzerParams, classify_analyzer_params};
+use milvus_lite_core::pyjson;
 use milvus_lite_core::{CollectionSchema, DataType, EngineError, FieldSchema};
 use prost::Message;
 use serde_json::Value;
@@ -190,21 +192,19 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<CollectionSchema, EngineError> {
         } else {
             None
         };
-        // 以下属性在 3.x 中按这些条件生效（`_decode_field`），M1 都不支持。
+        // 3.x 对任意字段类型都接受这三个属性（`_decode_field`）。
         let flag = |key: &str| param(key).is_some_and(|v| v.to_lowercase() == "true");
-        if flag("enable_analyzer") || flag("enable_match") {
-            note("text analyzer and text match");
-        }
-        if let Some(text) = param("analyzer_params").filter(|s| !s.is_empty()) {
-            // 3.x 只在能解析且为真值时使用；serde_json 解析不了但 Python 可能解析的也按使用处理。
-            let used = match serde_json::from_str::<Value>(text) {
-                Ok(v) => truthy(&v),
-                Err(_) => pyint::maybe_python_json_container(text),
-            };
-            if used {
-                note("text analyzer and text match");
+        let analyzer_params = match param("analyzer_params")
+            .filter(|s| !s.is_empty())
+            .map(classify_analyzer_params)
+        {
+            None | Some(AnalyzerParams::Unset) => None,
+            Some(AnalyzerParams::Keep(value)) => Some(value),
+            Some(AnalyzerParams::Unrepresentable) => {
+                note("analyzer_params that strict JSON cannot represent");
+                None
             }
-        }
+        };
         if f.nullable && data_type == Some(DataType::FloatVector) {
             note("nullable vectors");
         }
@@ -256,6 +256,9 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<CollectionSchema, EngineError> {
                 max_capacity,
                 nullable: f.nullable,
                 default_value,
+                enable_analyzer: flag("enable_analyzer"),
+                enable_match: flag("enable_match"),
+                analyzer_params,
                 ..FieldSchema::new(f.name.clone(), data_type)
             });
         }
@@ -329,6 +332,15 @@ pub(crate) fn encode(
                 .filter(|_| matches!(f.data_type, DataType::VarChar | DataType::Array))
             {
                 type_params.push(kv("max_length", max.to_string()));
+            }
+            if f.enable_analyzer {
+                type_params.push(kv("enable_analyzer", "true".to_owned()));
+            }
+            if f.enable_match {
+                type_params.push(kv("enable_match", "true".to_owned()));
+            }
+            if let Some(params) = &f.analyzer_params {
+                type_params.push(kv("analyzer_params", pyjson::dumps_unsorted(params)));
             }
             Ok(pb::FieldSchema {
                 name: f.name.clone(),

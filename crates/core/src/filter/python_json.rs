@@ -390,3 +390,206 @@ mod tests {
         assert!(object.get(&[0xdc00]).is_none());
     }
 }
+
+/// `analyzer_params` 文本的处理结果，判定规则见 [`classify_analyzer_params`]。
+#[derive(Debug, PartialEq)]
+pub enum AnalyzerParams {
+    /// 3.x 当作没有设置：解析失败或者是假值。
+    Unset,
+    Keep(serde_json::Value),
+    /// 3.x 能接受，但无法写成本实现重开时读得回的严格 JSON。
+    Unrepresentable,
+}
+
+/// `schema.json` 的字段比 `analyzer_params` 多包三层，serde_json 的递归上限在文件里只留下 124 层。
+const MAX_ANALYZER_PARAMS_DEPTH: usize = 124;
+/// 开启 arbitrary_precision 后，serde_json 把只含这个键的对象解析成数字，会静默改值。
+const SERDE_NUMBER_TOKEN: &str = "$serde_json::private::Number";
+
+fn exceeds_strict_json(value: &serde_json::Value, depth: usize) -> bool {
+    use serde_json::Value;
+    match value {
+        Value::Number(n) => {
+            crate::pyjson::json_float_text(&n.to_string()).is_some_and(f64::is_infinite)
+        }
+        Value::Array(items) => {
+            depth == MAX_ANALYZER_PARAMS_DEPTH
+                || items.iter().any(|v| exceeds_strict_json(v, depth + 1))
+        }
+        Value::Object(entries) => {
+            depth == MAX_ANALYZER_PARAMS_DEPTH
+                || entries.values().any(|v| exceeds_strict_json(v, depth + 1))
+        }
+        _ => false,
+    }
+}
+
+/// 3.x 的建表翻译：`json.loads` 成功且为真值才保存，`JSONDecodeError` / `ValueError` 当作没有设置。
+/// 判定用 Python 语义的解码器，取值用 serde_json，两者的分歧都落在 [`AnalyzerParams::Unrepresentable`]。
+pub fn classify_analyzer_params(text: &str) -> AnalyzerParams {
+    let input: Vec<u32> = text.chars().map(u32::from).collect();
+    let document = match decode(&input) {
+        Ok(Some(document)) => document,
+        Ok(None) => return AnalyzerParams::Unset,
+        // 只有递归深度错误，3.x 没有捕获它。
+        Err(_) => return AnalyzerParams::Unrepresentable,
+    };
+    let token: Vec<u32> = SERDE_NUMBER_TOKEN.chars().map(u32::from).collect();
+    if document
+        .nodes
+        .iter()
+        .any(|node| matches!(node, JsonNode::Object(object) if object.get(&token).is_some()))
+    {
+        return AnalyzerParams::Unrepresentable;
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
+        return AnalyzerParams::Unrepresentable;
+    };
+    if !crate::pyjson::python_truthy(&value) {
+        AnalyzerParams::Unset
+    } else if exceeds_strict_json(&value, 0) {
+        AnalyzerParams::Unrepresentable
+    } else {
+        AnalyzerParams::Keep(value)
+    }
+}
+
+#[cfg(test)]
+mod analyzer_params_tests {
+    use super::*;
+    use crate::storage::schema_file::SchemaFile;
+    use serde_json::json;
+
+    fn nested(depth: usize, object_at: impl Fn(usize) -> bool, inner: &str) -> String {
+        let mut text = inner.to_owned();
+        for level in 0..depth {
+            text = if object_at(level) {
+                format!("{{\"k\":{text}}}")
+            } else {
+                format!("[{text}]")
+            };
+        }
+        text
+    }
+
+    #[test]
+    fn unset_when_python_rejects_or_value_is_falsy() {
+        let wide = format!("{{\"a\":{}}}", "1".repeat(4301));
+        for text in [
+            "not json",
+            "{\"a\":1} x",
+            "{",
+            &wide,
+            "{}",
+            "[]",
+            "0",
+            "-0",
+            "0.0",
+            "-0.0",
+            "0e5",
+            "1e-999",
+            "-1e-999",
+            "\"\"",
+            "null",
+            "false",
+        ] {
+            assert_eq!(
+                classify_analyzer_params(text),
+                AnalyzerParams::Unset,
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn keeps_any_truthy_json_in_input_order() {
+        let keep = |text| match classify_analyzer_params(text) {
+            AnalyzerParams::Keep(value) => value,
+            other => panic!("{text}: {other:?}"),
+        };
+        assert_eq!(keep("[1]"), json!([1]));
+        assert_eq!(keep("\"x\""), json!("x"));
+        assert_eq!(keep("true"), json!(true));
+        assert_eq!(keep("5"), json!(5));
+        let wide = "1".repeat(400);
+        assert_eq!(keep(&wide).to_string(), wide);
+        let duplicate = keep("{\"b\":1,\"a\":2,\"b\":3}");
+        assert_eq!(
+            crate::pyjson::dumps_unsorted(&duplicate),
+            "{\"b\": 3, \"a\": 2}"
+        );
+        assert_eq!(
+            crate::pyjson::dumps_unsorted(&keep("{\"z\":1.0,\"y\":\"中\",\"x\":[1e5,null]}")),
+            "{\"z\": 1.0, \"y\": \"\\u4e2d\", \"x\": [100000.0, null]}"
+        );
+    }
+
+    #[test]
+    fn rejects_values_strict_json_cannot_hold() {
+        for text in [
+            "NaN",
+            "Infinity",
+            "-Infinity",
+            "{\"x\": NaN}",
+            "[Infinity]",
+            "1e999",
+            "{\"x\":-1e999}",
+            "\"\\ud800\"",
+            "{\"x\":\"\\ud800\"}",
+            "{\"$serde_json::private::Number\":\"1\"}",
+            "{\"x\":{\"$serde_json::private::Number\":\"1e5\"}}",
+            "{\"$serde_json::private::Number\":2,\"y\":1}",
+        ] {
+            assert_eq!(
+                classify_analyzer_params(text),
+                AnalyzerParams::Unrepresentable,
+                "{text}"
+            );
+        }
+        assert_eq!(
+            classify_analyzer_params(&"[".repeat(20000)),
+            AnalyzerParams::Unrepresentable
+        );
+    }
+
+    #[test]
+    fn deep_values_are_kept_only_while_schema_json_can_reopen() {
+        let shapes: [&dyn Fn(usize) -> bool; 3] = [&|_| false, &|_| true, &|level| level % 2 == 0];
+        for shape in shapes {
+            for inner in ["1", "[]", "{}"] {
+                // 最内层的空容器也算一层。
+                let extra = usize::from(inner != "1");
+                let text = nested(124 - extra, shape, inner);
+                let AnalyzerParams::Keep(value) = classify_analyzer_params(&text) else {
+                    panic!("depth 124 rejected: {inner}");
+                };
+                let mut field =
+                    crate::schema::FieldSchema::new("t", crate::schema::DataType::Int64);
+                field.is_primary = true;
+                field.analyzer_params = Some(value.clone());
+                let mut vector =
+                    crate::schema::FieldSchema::new("v", crate::schema::DataType::FloatVector);
+                vector.dim = Some(2);
+                let schema = crate::schema::CollectionSchema {
+                    fields: vec![field, vector],
+                    ..Default::default()
+                };
+                let bytes = SchemaFile::from_core("c", &schema).to_bytes().unwrap();
+                let reopened = SchemaFile::parse(&bytes).unwrap().to_core().unwrap();
+                assert_eq!(reopened.fields[0].analyzer_params, Some(value));
+                assert_eq!(
+                    classify_analyzer_params(&nested(125 - extra, shape, inner)),
+                    AnalyzerParams::Unrepresentable
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn syntax_errors_stay_unset_at_any_depth() {
+        assert_eq!(
+            classify_analyzer_params(&"[".repeat(5000)),
+            AnalyzerParams::Unset
+        );
+    }
+}

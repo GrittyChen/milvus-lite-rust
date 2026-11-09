@@ -264,7 +264,7 @@
 - 路径或 `$meta[...]` 出现在 `in` / `not in` 左侧，报 `left side of 'in' must be a field reference`；
 - `array_length` 的参数是路径，报 `array_length: expected ')'`。
 
-仍保持 UNIMPLEMENTED：算术运算（见[已确认的取舍](#已确认的取舍) 3）、ARRAY 字段（类型本身未接入）、`text_match`、几何谓词、TIMESTAMPTZ 与时间区间。
+仍保持 UNIMPLEMENTED：算术运算（见[已确认的取舍](#已确认的取舍) 3）、ARRAY 字段（类型本身未接入）、`text_match`（已由 [0029](0029-text-match.md) 接入）、几何谓词、TIMESTAMPTZ 与时间区间。
 
 ### 语义合同
 

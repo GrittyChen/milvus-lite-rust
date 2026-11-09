@@ -50,7 +50,7 @@ pub struct PersistedField {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub enable_analyzer: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub analyzer_params: Option<Map<String, Value>>,
+    pub analyzer_params: Option<Value>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub enable_match: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -107,9 +107,9 @@ impl SchemaFile {
                 max_capacity: field.max_capacity,
                 nullable: field.nullable,
                 default_value: field.default_value.clone(),
-                enable_analyzer: false,
-                analyzer_params: None,
-                enable_match: false,
+                enable_analyzer: field.enable_analyzer,
+                analyzer_params: field.analyzer_params.clone(),
+                enable_match: field.enable_match,
                 is_function_output: false,
                 is_partition_key: field.is_partition_key,
             })
@@ -188,9 +188,6 @@ impl SchemaFile {
                     && (field.nullable || field.default_value.is_some()))
                     || (field.dtype != "array"
                         && (field.element_type.is_some() || field.max_capacity.is_some()))
-                    || field.enable_analyzer
-                    || field.analyzer_params.is_some()
-                    || field.enable_match
                     || field.is_function_output
                 {
                     return Err(SchemaFileError::Unsupported(format!(
@@ -230,6 +227,12 @@ impl SchemaFile {
                     max_length: field.max_length,
                     element_type: field.element_type.as_deref().and_then(core_dtype),
                     max_capacity: field.max_capacity,
+                    enable_analyzer: field.enable_analyzer,
+                    enable_match: field.enable_match,
+                    analyzer_params: field
+                        .analyzer_params
+                        .clone()
+                        .filter(crate::pyjson::python_truthy),
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;

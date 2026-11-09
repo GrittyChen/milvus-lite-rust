@@ -14,6 +14,13 @@ pub fn dumps(value: &Value) -> String {
     out
 }
 
+/// `json.dumps(value)`：`ensure_ascii=True`，保留键序。
+pub fn dumps_unsorted(value: &Value) -> String {
+    let mut out = String::new();
+    write_value(&mut out, value, true, false);
+    out
+}
+
 /// `json.dumps(dict)`，顶层 key 按给定顺序输出，嵌套对象排序（例如动态字段输出）。
 pub fn dumps_object<'a>(entries: impl IntoIterator<Item = (&'a str, &'a Value)>) -> String {
     let mut out = String::from("{");
@@ -84,6 +91,25 @@ pub(crate) fn json_float_text(raw: &str) -> Option<f64> {
     raw.contains(['.', 'e', 'E'])
         .then(|| raw.parse::<f64>().ok())
         .flatten()
+}
+
+/// Python 的 `bool(value)`。数字按文本判断：`as_f64` 把宽整数和溢出的浮点数变成 inf 或丢失，
+/// `1e-999` 下溢为 0 是假值，`1e999` 是 inf，是真值。
+pub fn python_truthy(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::Bool(b) => *b,
+        Value::Number(n) => {
+            let raw = n.to_string();
+            match json_float_text(&raw) {
+                Some(float) => float != 0.0,
+                None => raw.trim_start_matches('-').bytes().any(|b| b != b'0'),
+            }
+        }
+        Value::String(s) => !s.is_empty(),
+        Value::Array(items) => !items.is_empty(),
+        Value::Object(entries) => !entries.is_empty(),
+    }
 }
 
 fn write_value(out: &mut String, value: &Value, ensure_ascii: bool, sort_keys: bool) {

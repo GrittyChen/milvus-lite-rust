@@ -151,7 +151,7 @@ pymilvus 3.0.2 的可达面比协议窄，影响差分用例怎么写：
 - 动态字段开启的集合：`dyn > 5`、`$meta['x'] > 1` 在任何 `output_fields` 下都从不命中，也不报错；未知字段名同样不命中、不报错；JSON 字段的 `j['k'] == 1` 可用。
 - **动态字段关闭的集合**（探针 `nodyn boost filter ...`）：未知字段按 `compile_filter` 报 code 6 `unknown field '<名>' at column 1 ... available fields: [...]`（与搜索自身过滤的未知字段同文案）；`$meta[...]` 报 code 6 `$meta access requires schema enable_dynamic_field=True`。
 - 语法 / 类型错误（code 6）在应用 boost 时报出：先于它的是 collection 不存在（100）、未加载（101）、`anns_field`、搜索自身过滤表达式的错误，**即使没有命中也会编译**。
-- 3.x 的 boost 过滤能用算术（`age + 1 > 5`）与 `text_match`；本实现的过滤范围（0006 / 0014）当前对二者返回 `UNIMPLEMENTED`，boost 过滤沿用这一范围，**登记为差异**（见“登记的差异”），不在本切片扩大过滤范围。
+- 3.x 的 boost 过滤能用算术（`age + 1 > 5`）；本实现的过滤范围（0006 / 0014）当前返回 `UNIMPLEMENTED`，boost 过滤沿用这一范围，**登记为差异**（见“登记的差异”），不在本切片扩大过滤范围。`text_match` 已由 [0029](0029-text-match.md) 接入。
 
 ### 6. 候选窗口（过取）
 
@@ -233,7 +233,7 @@ Search 的分组有两条路径，字段校验不同：
   - 组键是 `row.get(字段)` 的 **Python 值**，用 Python 的相等与哈希（`GroupKey` 合同，探针 `gk *` / `gk1 *`）：
     - schema 标量：INT / BOOL / VARCHAR 按值，空值是一个组；FLOAT / DOUBLE 按数值，`0.0` 与 `-0.0` 同组，**每个 NaN 各自成组**。
     - TIMESTAMPTZ：按时刻（UTC 微秒）相等，`2025-01-01T00:00:00Z` 与 `2025-01-01T08:00:00+08:00` 同组，相差 1 微秒不同组，空值是一个组，与请求或集合的 `timezone`、`time_fields` 无关（探针 `gt * ts *`）。
-    - schema JSON：按**存储的 JSON 文本**（不解析）。探针：`{"a":1,"b":2}` 与 `{"a": 1,  "b": 2}` 同组（写入时已规整），`{"b":2,"a":1}`（键序不同）、`{"a":1.0,"b":2}`（数字写法不同）各自成组。只覆盖可写入的 JSON：对象与数组（JSON 标量经 pymilvus 写入 3.x 会失败，不可达）。
+    - schema JSON：按**存储的 JSON 文本**（不解析）。探针：`{"a":1,"b":2}` 与 `{"a": 1,  "b": 2}` 同组（写入时已规整），`{"b":2,"a":1}`（键序不同）、`{"a":1.0,"b":2}`（数字写法不同）各自成组。只覆盖对象与数组。JSON 数字和布尔经 pymilvus 写入 3.x 会失败；字符串能写入，但存的是无引号文本，读回时 pymilvus 解析失败，本切片的探针没有覆盖。
     - 动态字段：按解码后的 Python 值。`True`、`1`、`1.0` 同组，`0`、`False`、`-0.0`、`0.0` 同组，整数与浮点**精确比较**（`2^53 + 1` 与 `2^53` 不同组，`2^53` 与 `9007199254740992.0` 同组），字符串按值且与数字不同组（`"1"` 独立），键缺失是空值组。NaN / inf 经 SDK 序列化后已是 `null`，落入空值组；原始请求写入的动态 NaN 沿用现有写入校验，不在本切片扩展。
     - 不可哈希：动态 dict → code 1 `unhashable type: 'dict'`；动态 list、向量、ARRAY 的非空 list → code 1 `unhashable type: 'list'`。ARRAY 的 `null` 是 `Null` 组，**全空时可以正常分组**（探针 `arr * all null filter`、`arr * window null`）。**只有候选行中的值参与**：不可哈希的值落在窗口外或被过滤掉时成功（探针 `arr s window null` 窗口 10 内全空成功，`arr s window mixed` 窗口 20 报错），没有候选时成功，且晚于 L2 的参数校验（探针 `gk unhashable + bad L2 s` 报 decay 错误）。
     - 未知字段、主键（候选行无主键列，任何主键类型；与虚拟列同名的主键见上表）：全部落入一个空值组。普通字段叫 `id`、`distance` 时没有特殊处理（探针 `pk field *`：链式分组下空值是一个组；引擎分组的同名缺陷见差异表）。
@@ -352,7 +352,7 @@ Search：collection 不存在（100）→ 解码 `function_score`（boost 参数
 - Search 与 HybridSearch 顶层的合法 model（`cohere`）通过全部校验后：`UNIMPLEMENTED`，3.x 是 code 1（缺 key）或调用外部服务。HybridSearch 子请求里的 model 被忽略，两边都成功，不是差异。
 - 候选行真正用到的 `random_score`：`UNIMPLEMENTED`，3.x 成功。
 - 公共 `function_chains`（Search）：`UNIMPLEMENTED`。
-- boost 过滤中的算术表达式与 `text_match`：`UNIMPLEMENTED`（3.x 可用；等待过滤范围与全文检索切片）。
+- boost 过滤中的算术表达式：`UNIMPLEMENTED`（3.x 可用；等待过滤范围切片）。`text_match` 已由 [0029](0029-text-match.md) 接入。
 - 路由查询向量维度或度量非法：沿用 [0004](0004-m1-scope.md#决策) 的严格校验文案（已登记），3.x 是 numpy 原始报错。
 - 引擎分组（普通 Search 与 Search + boost）的两个 3.x 缺陷：沿用 [0024](0024-group-by-search.md) 已登记的“不复制”。主键名不是 `id` 时按主键分组变成单个空值组；可空字段叫 `distance` / `id` 时取错值（探针还看到 `id` 字段配 VARCHAR 主键时 3.x 报 `invalid literal for int()`）。**链式分组按 3.x**：主键（除与虚拟列同名）不在候选行，是单个空值组，不是差异；只有非主键字段名为 `id` / `distance` 的引擎错值在链式路径不存在。
 - `GroupByOp` 的排序键含 NaN 时（`weight` 为 `nan` 的行进入分组且落在窗口内）：3.x 的结果依赖 Timsort 的比较序列，不逐位复现，本实现把 NaN 排在该序列的末尾。无分组路径的 NaN 按 `SortOp` 复现，不在此列。
@@ -367,10 +367,10 @@ Search：collection 不存在（100）→ 解码 `function_score`（boost 参数
 
 | 类别 | 数量 | 内容 | 断言 |
 | --- | --- | --- | --- |
-| 通过差分 | 2749 | 其余全部，包括错误场景（错误码与文案是断言的一部分）；第 10 节写“相同”的 model / `random_score` 场景在此 | 比较响应里的原始 `ids` / `scores`（不用 SDK 的 `Hit`：字段叫 `id` 时它的 `id` 键取到字段值；`distance` 又被客户端取整）：分数容差 1e-5、顺序逐项一致、`group_by_field_value` 的类型 / 数据 / `valid_data`、错误码与文案；`cf *`、`cfm *`、`sf *`、`st *`、`nv *`、`vc * star` 还严格比较 `fields_data` 每列的名字 / 类型 / 数据 / `valid_data`（同名字段的空值占位与主键值要能区分）。**13 个 `tie *` 场景全部严格断言 ids / scores / 顺序**，不使用 0024 的组级不变量（它只适用分组、不比分数、不容忍截断成员差）：引擎并列全序是“源内名次 → 原始 Parquet 行”，本机普通 Search 实测与 3.x 一致，已有跨平台精确并列差分作证；CI 的 Linux x86_64、Linux arm64、macOS 各跑一次作为验收。组值逐命中比较（同组内 `-0.0` / `0.0` 保留符号，比较时 `-0.0` 不等于 `0.0`）；`group_by_field_value` 里的 NaN 比较时全部视为相等（组键计数仍按每个 NaN 各自成组） |
+| 通过差分 | 2752 | 其余全部，包括错误场景（错误码与文案是断言的一部分）；第 10 节写“相同”的 model / `random_score` 场景在此 | 比较响应里的原始 `ids` / `scores`（不用 SDK 的 `Hit`：字段叫 `id` 时它的 `id` 键取到字段值；`distance` 又被客户端取整）：分数容差 1e-5、顺序逐项一致、`group_by_field_value` 的类型 / 数据 / `valid_data`、错误码与文案；`cf *`、`cfm *`、`sf *`、`st *`、`nv *`、`vc * star` 还严格比较 `fields_data` 每列的名字 / 类型 / 数据 / `valid_data`（同名字段的空值占位与主键值要能区分）。**13 个 `tie *` 场景全部严格断言 ids / scores / 顺序**，不使用 0024 的组级不变量（它只适用分组、不比分数、不容忍截断成员差）：引擎并列全序是“源内名次 → 原始 Parquet 行”，本机普通 Search 实测与 3.x 一致，已有跨平台精确并列差分作证；CI 的 Linux x86_64、Linux arm64、macOS 各跑一次作为验收。组值逐命中比较（同组内 `-0.0` / `0.0` 保留符号，比较时 `-0.0` 不等于 `0.0`）；`group_by_field_value` 里的 NaN 比较时全部视为相等（组键计数仍按每个 NaN 各自成组） |
 | 登记差异：model | 4 | `h model valid`、`s model valid`、`s l2 model`、`fs provider only` | 3.x 一侧断言 code 1 文案（测试环境不设 key），本实现一侧断言 `UNIMPLEMENTED` 与说明 |
 | 登记差异：`random_score` | 4 | `s boost random_score`、`s boost random_score noseed`、`s random_score valid`、`route fs boost random` | 3.x 一侧成功，本实现一侧断言 `UNIMPLEMENTED` 与说明 |
-| 登记差异：过滤范围 | 6 | `s boost filter arithmetic`、`s boost filter text_match`、`dyn boost filter age + 1 > 5`、`dyn boost filter text_match(...)`、`nodyn boost filter age + 1 > 5`、`nodyn boost filter text_match(...)` | 3.x 一侧成功，本实现一侧断言 `UNIMPLEMENTED` |
+| 登记差异：过滤范围 | 3 | `s boost filter arithmetic`、`dyn boost filter age + 1 > 5`、`nodyn boost filter age + 1 > 5`（三条 `text_match` 用例已由 [0029](0029-text-match.md) 转为两边对照） | 3.x 一侧成功，本实现一侧断言 `UNIMPLEMENTED` |
 | 沿用已有差异：0004 | 1 | `h bad dim` | 两边都是 code 1，文案按 0004 |
 | 沿用已有差异：0024 | 42 | `pk rr_pk*` / `pk rr_pki*` 的 `s plain group pk`、`s boost group pk`，`pk field distance s {plain,boost} gs*`、`pk field id s {plain,boost} gs*`，`sf * pk s {plain,boost} group *`，`st * pkV s boost group *` | 3.x 一侧断言其缺陷结果，本实现一侧断言 0024 的正确结果 |
 | 探针准备 | 13 | `sf create *`（12）、`cf dynamic insert` | 建表与写入的接受结果，用来固定冲突场景的前提，不是 rerank 断言 |

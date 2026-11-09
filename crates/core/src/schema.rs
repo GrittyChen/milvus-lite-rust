@@ -67,6 +67,10 @@ pub struct FieldSchema {
     pub max_length: Option<i64>,
     pub element_type: Option<DataType>,
     pub max_capacity: Option<i64>,
+    pub enable_analyzer: bool,
+    pub enable_match: bool,
+    /// 3.x 保存任意 JSON 真值，不要求是对象；只回显，`text_match` 不读它。
+    pub analyzer_params: Option<serde_json::Value>,
 }
 
 impl FieldSchema {
@@ -83,6 +87,9 @@ impl FieldSchema {
             max_length: None,
             element_type: None,
             max_capacity: None,
+            enable_analyzer: false,
+            enable_match: false,
+            analyzer_params: None,
         }
     }
 }

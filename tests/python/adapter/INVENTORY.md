@@ -6,16 +6,16 @@
 
 | 状态 | 含义 | 条数 |
 | --- | --- | --- |
-| 已复制 | 原样复制到本目录 | 255 |
+| 已复制 | 原样复制到本目录 | 259 |
 | 改后复制 | 仅按 0004「验收」第 2 项与 0006 第 25 项授权的条件替换，逐条说明改动 | 0 |
-| 范围外 | 用到当前切片不支持的功能，不复制；未实现能力的代表性入口见「范围外功能的 `UNIMPLEMENTED` 断言」 | 54 |
+| 范围外 | 用到当前切片不支持的功能，不复制；未实现能力的代表性入口见「范围外功能的 `UNIMPLEMENTED` 断言」 | 50 |
 | 待复用 | 原功能阻断已解除，尚未复制到本地默认套件；0015 的条目已通过固定外部套件验收 | 53 |
 | 依赖内部模块 | 导入或使用 3.x 的内部模块、内部对象，换成本实现后无法运行 | 50 |
 | 不运行 | 上游被同名定义覆盖，上游自己也不运行 | 1 |
 
 以上是逐条列出的 29 个文件中的 413 条（含 0027 从 `1320d26` 盘点的 3 条），其余 18 个文件的 227 条整个文件记一行原因，见「整个文件不复用的文件」。`1320d26` 新增的其余用例集中在稀疏向量，随稀疏向量切片盘点。
 
-「已复制」与「改后复制」共 255 个用例函数，参数化展开后 302 条（0028 新增 1 个函数、1 条：多向量字段；0027 新增 2 个函数、6 条，取自 `1320d26`：Search 的主键投影与带分区的 count(*)；上游同批新增的 `test_hybrid_search_honors_primary_key_projection` 依赖 BM25，属范围外；0026 第 3 步新增 4 个函数、4 条：HybridSearch 的顶层 decay、TIMESTAMPTZ 时区与 `time_fields`、顶层 boost，以及动态字段 `["*"]` 随 Hybrid 分组返回；0026 第 2 步新增 1 个函数、1 条：Search 的 decay；0026 第 1 步新增 8 个函数、10 条：Search 的 boost 7 个函数 9 条，动态字段 `["*"]` 随 boost 返回 1 条；0025 新增 22 个函数、22 条：TIMESTAMPTZ 的 16 个与数据库 `timezone` 属性的 6 个；0024 新增 6 个函数、6 条：分组检索 5 个与动态字段 `["*"]` 随分组返回 1 个；0023 B 新增 19 个函数、31 条：数据库用例 17 个函数 29 条，加两个按数据库隔离的用例）。S1 恢复 [test_grpc_crud.py](test_grpc_crud.py) 中的原过滤表达式，并纳入除 LIKE 外的全部 19 条；它们在本实现与真实 3.x 上的两条客户端线均作为 S1 验收。随后迁移全部 40 条待复用用例，恢复此前为绕过过滤限制而替换的原表达式；顶层动态字段切片另加入原样的 TestDynamicField 用例。0014 已恢复原 HNSW 定义，并新增创建 HNSW、DropIndex 和 describe 参数的原用例；检索仍按 FLAT 执行。
+「已复制」与「改后复制」共 259 个用例函数，参数化展开后 306 条（0029 新增 4 个函数、4 条：`text_match`；0028 新增 1 个函数、1 条：多向量字段；0027 新增 2 个函数、6 条，取自 `1320d26`：Search 的主键投影与带分区的 count(*)；上游同批新增的 `test_hybrid_search_honors_primary_key_projection` 依赖 BM25，属范围外；0026 第 3 步新增 4 个函数、4 条：HybridSearch 的顶层 decay、TIMESTAMPTZ 时区与 `time_fields`、顶层 boost，以及动态字段 `["*"]` 随 Hybrid 分组返回；0026 第 2 步新增 1 个函数、1 条：Search 的 decay；0026 第 1 步新增 8 个函数、10 条：Search 的 boost 7 个函数 9 条，动态字段 `["*"]` 随 boost 返回 1 条；0025 新增 22 个函数、22 条：TIMESTAMPTZ 的 16 个与数据库 `timezone` 属性的 6 个；0024 新增 6 个函数、6 条：分组检索 5 个与动态字段 `["*"]` 随分组返回 1 个；0023 B 新增 19 个函数、31 条：数据库用例 17 个函数 29 条，加两个按数据库隔离的用例）。S1 恢复 [test_grpc_crud.py](test_grpc_crud.py) 中的原过滤表达式，并纳入除 LIKE 外的全部 19 条；它们在本实现与真实 3.x 上的两条客户端线均作为 S1 验收。随后迁移全部 40 条待复用用例，恢复此前为绕过过滤限制而替换的原表达式；顶层动态字段切片另加入原样的 TestDynamicField 用例。0014 已恢复原 HNSW 定义，并新增创建 HNSW、DropIndex 和 describe 参数的原用例；检索仍按 FLAT 执行。
 
 历史的 HNSW→FLAT 授权替换按 0014 恢复原定义；`== N` 换成 `in [N]` 的条件见 0004「验收」第 2 项及 0006 第 25 项。已接通 S1 的 CRUD 副本不再替换表达式或读回方式。其余副本只删去随范围外用例一起不再使用的 import、helper 与空的分节标题；上游用于跳过的 `importorskip` 改为直接导入（本仓不允许因缺依赖静默跳过），上游因 HNSW 需要 faiss 而加的 `skipif` 随 HNSW 一起去掉。起服务的 fixture 与清理见 [conftest.py](conftest.py)。
 
@@ -409,7 +409,7 @@
 
 ### [test_milvus_compat_search.py](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat_search.py)
 
-16 条：已复制 3，范围外 9，待复用 4。
+16 条：已复制 7，范围外 5，待复用 4。
 
 | 用例 | 状态 | 说明 |
 | --- | --- | --- |
@@ -421,10 +421,10 @@
 | [`TestSearchPagination::test_search_offset_beyond_total`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat_search.py#L116) | 已复制 |  |
 | [`TestSearchPagination::test_search_pagination_with_filter`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat_search.py#L121) | 已复制 |  |
 | [`TestSearchPagination::test_search_pagination_in_partition`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat_search.py#L134) | 范围外 | 分区 |
-| [`TestSearchTextMatch::test_search_with_text_match_single_token`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat_search.py#L180) | 范围外 | 过滤表达式（`text_match(text, "python")`）、全文检索 |
-| [`TestSearchTextMatch::test_search_with_text_match_multi_token`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat_search.py#L188) | 范围外 | 过滤表达式（`text_match(text, "programming")`）、全文检索 |
-| [`TestSearchTextMatch::test_query_with_text_match`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat_search.py#L196) | 范围外 | 过滤表达式（`text_match(text, "learning")`）、全文检索 |
-| [`TestSearchTextMatch::test_search_text_match_combined_with_scalar`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat_search.py#L203) | 范围外 | 过滤表达式（`text_match(text, "learning") and id >= 4`）、全文检索 |
+| [`TestSearchTextMatch::test_search_with_text_match_single_token`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat_search.py#L180) | 已复制 |  |
+| [`TestSearchTextMatch::test_search_with_text_match_multi_token`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat_search.py#L188) | 已复制 |  |
+| [`TestSearchTextMatch::test_query_with_text_match`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat_search.py#L196) | 已复制 |  |
+| [`TestSearchTextMatch::test_search_text_match_combined_with_scalar`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat_search.py#L203) | 已复制 |  |
 | [`TestUpsertViaGRPC::test_upsert_overwrites`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat_search.py#L239) | 待复用 | 过滤表达式（`id == 1`）、upsert、nullable |
 | [`TestUpsertViaGRPC::test_upsert_new_pk_as_insert`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat_search.py#L250) | 待复用 | 过滤表达式（`id == 3`）、upsert、nullable |
 | [`TestUpsertViaGRPC::test_upsert_then_search`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat_search.py#L258) | 待复用 | upsert、nullable |
@@ -648,11 +648,11 @@
 
 | 功能 | 用例 |
 | --- | --- |
-| 0014 与 0025 之外的过滤构造（不涉及时间值的算术、text_match 与几何） | [test_grpc_translation.py](../test_grpc_translation.py) 的 `test_search_m1_unsupported`、`test_query_m1_unsupported`、`test_pymilvus_entry_points_remaining_unsupported` |
+| 0014 与 0025 之外的过滤构造（不涉及时间值的算术与几何） | [test_grpc_translation.py](../test_grpc_translation.py) 的 `test_search_m1_unsupported`、`test_query_m1_unsupported`、`test_pymilvus_entry_points_remaining_unsupported` |
 | Query / search iterator V1 | 0016 A / B 接续；V2 不增加服务端实现 |
 | 分区 RPC；写入、检索、查询指定 `_default` 以外的分区；partition key | `test_insert_m1_unsupported`、`test_search_m1_unsupported`、`test_query_m1_unsupported`、`test_pymilvus_entry_points_remaining_unsupported` |
 | 跨数据库改名（数据库 RPC 本身已由 0023 B 实现；数据库 `timezone` 属性已由 0025 实现） | 差分测试 `tests/differential/test_databases.py` 与 `test_rename.py` 的预期差异断言 |
-| schema：GEOMETRY、`ARRAY<TIMESTAMPTZ>`、稀疏向量、nullable 向量、向量默认值、JSON/嵌套 ARRAY 元素、function、analyzer | `test_create_collection_remaining_unsupported`、`test_pymilvus_entry_points_remaining_unsupported` |
+| schema：GEOMETRY、`ARRAY<TIMESTAMPTZ>`、稀疏向量、nullable 向量、向量默认值、JSON/嵌套 ARRAY 元素、function | `test_create_collection_remaining_unsupported`、`test_pymilvus_entry_points_remaining_unsupported` |
 | 写入 null 值 | `test_insert_m1_unsupported` |
 | 修改 schema | `test_pymilvus_entry_points_remaining_unsupported` |
 | rerank 的 model provider（含与 group_by 同时出现） | `test_search_m1_unsupported`、`test_pymilvus_entry_points_remaining_unsupported` |

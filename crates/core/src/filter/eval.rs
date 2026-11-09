@@ -71,7 +71,7 @@ pub(crate) struct Predicate {
 pub(super) fn unsupported() -> EngineError {
     EngineError::unsupported(
         "filter expressions",
-        "arithmetic, text_match, and geometry predicates are not supported",
+        "arithmetic and geometry predicates are not supported",
     )
 }
 /// 含范围外构造，或含不涉及时间戳的算术：时间戳 / 区间的加减由求值器支持，其余算术仍是范围外。

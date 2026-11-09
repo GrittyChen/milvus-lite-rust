@@ -10,10 +10,11 @@ pub(crate) mod temporal;
 mod tree;
 #[cfg(test)]
 mod tree_tests;
-mod unicode;
+pub(crate) mod unicode;
 pub(crate) use dynamic::DynamicRow;
 pub(crate) use eval::Predicate;
 pub(crate) use python::{int_cmp, int_float_cmp};
+pub use python_json::{AnalyzerParams, classify_analyzer_params};
 
 /// 错误字符串与词法必须使用同一版 Unicode 属性，避免未分配码位的 repr 漂移。
 pub(crate) fn printable_char(c: char) -> bool {
@@ -493,7 +494,7 @@ mod tests {
         #[test]
         fn out_of_scope_constructs_stay_unimplemented() {
             for dynamic in [false, true] {
-                for expr in ["age + 1 > 5", "text_match(name, 'a')"] {
+                for expr in ["age + 1 > 5", "geometry_contains(name, 'POINT (0 0)')"] {
                     assert!(
                         matches!(filter(expr, dynamic), Err(EngineError::Unsupported { .. })),
                         "{expr}"
