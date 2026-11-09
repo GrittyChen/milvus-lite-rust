@@ -270,13 +270,6 @@ impl CollectionSchema {
                 )));
             }
         }
-        // 3.x 接受多个 FLOAT_VECTOR；M1 只支持一个（0004「不支持」）。
-        if vectors > 1 {
-            return Err(EngineError::unsupported(
-                "multiple vector fields",
-                "only one FLOAT_VECTOR field per collection is supported in this build of milvus-lite-rust yet",
-            ));
-        }
         if self
             .fields
             .iter()
@@ -329,6 +322,22 @@ impl CollectionSchema {
     /// 第一个 FLOAT_VECTOR 字段，与 3.x 的 `_vector_name` 相同。
     pub fn vector_field(&self) -> Option<&FieldSchema> {
         self.fields.iter().find(|f| f.data_type.is_vector())
+    }
+
+    /// FLOAT_VECTOR 字段数，也是内存范数每行的个数（[0028](../../../docs/decisions/0028-multi-vector-fields.md)）。
+    pub(crate) fn vector_count(&self) -> usize {
+        self.fields
+            .iter()
+            .filter(|f| f.data_type == DataType::FloatVector)
+            .count()
+    }
+
+    /// `pos` 处的向量字段在所有 FLOAT_VECTOR 字段中的序号，即它在每行范数中的位置。
+    pub(crate) fn vector_ordinal(&self, pos: usize) -> usize {
+        self.fields[..pos]
+            .iter()
+            .filter(|f| f.data_type == DataType::FloatVector)
+            .count()
     }
 }
 
@@ -470,12 +479,14 @@ mod tests {
     }
 
     #[test]
-    fn multiple_vectors_are_unsupported_after_3x_checks() {
-        let e = schema(vec![pk("id"), vec("a", 2), vec("b", 2)])
-            .validate()
-            .unwrap_err();
-        assert!(matches!(e, EngineError::Unsupported { .. }), "{e}");
-        // 3.x 的校验先于 M1 的限制：没有主键时报 3.x 的错误。
+    fn multiple_vectors_are_accepted_and_numbered_in_schema_order() {
+        let s = schema(vec![vec("a", 2), pk("id"), vec("b", 8), vec("c", 4)]);
+        s.validate().unwrap();
+        assert_eq!(s.vector_count(), 3);
+        assert_eq!(s.vector_ordinal(0), 0);
+        assert_eq!(s.vector_ordinal(2), 1);
+        assert_eq!(s.vector_ordinal(3), 2);
+        assert_eq!(crate::data::max_vector_dim(&s), 8);
         let e = schema(vec![vec("a", 2), vec("b", 2)])
             .validate()
             .unwrap_err();

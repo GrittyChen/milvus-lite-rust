@@ -298,13 +298,7 @@ impl MemTable {
     }
 
     fn merge_tail(&mut self, schema: &CollectionSchema) -> Result<(), MemTableError> {
-        let dim = schema
-            .fields
-            .iter()
-            .find(|f| f.data_type == DataType::FloatVector)
-            .map_or(1, crate::data::field_dim)
-            .max(1);
-        let limit = (crate::collection::BLOCK_ELEMS / dim).max(1);
+        let limit = (crate::collection::BLOCK_ELEMS / crate::data::max_vector_dim(schema)).max(1);
         while self.batches.len() >= 2 {
             let right = self.batches.len() - 1;
             let left = right - 1;

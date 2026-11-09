@@ -500,10 +500,18 @@ impl ReadSnapshot {
     pub fn schema(&self) -> &CollectionSchema {
         &self.schema
     }
+
+    /// 只决定并行切分：`anns_field` 无效时检索流程会按 3.x 的先后报错，这里用默认字段即可。
+    fn rows_per_block(&self, anns_field: Option<&str>) -> usize {
+        let pos = resolve_anns_field(&self.schema, self.vector_pos, anns_field)
+            .unwrap_or(self.vector_pos);
+        (BLOCK_ELEMS / field_dim(&self.schema.fields[pos])).max(1)
+    }
+
     /// 在 `compute` 上并行计算（[0005](../../../docs/decisions/0005-search-thread-model.md)），
     /// 结果与串行计算逐位相同。
     pub fn search(&self, req: SearchRequest, compute: &Compute) -> Result<SearchResult> {
-        let rows_per_block = (BLOCK_ELEMS / field_dim(&self.schema.fields[self.vector_pos])).max(1);
+        let rows_per_block = self.rows_per_block(req.anns_field.as_deref());
         self.search_in_blocks(req, compute, rows_per_block)
     }
 
@@ -555,7 +563,7 @@ impl ReadSnapshot {
         group: Option<GroupBy>,
         timezone: &crate::timezone::TimezoneSource<'_>,
     ) -> Result<SearchResult> {
-        let rows_per_block = (BLOCK_ELEMS / field_dim(&self.schema.fields[self.vector_pos])).max(1);
+        let rows_per_block = self.rows_per_block(req.anns_field.as_deref());
         self.search_filtered_in_blocks(
             req,
             compute,
@@ -578,7 +586,7 @@ impl ReadSnapshot {
         filter: BoostedFilter<'_>,
         boost: &BoostPlan,
     ) -> Result<SearchResult> {
-        let rows_per_block = (BLOCK_ELEMS / field_dim(&self.schema.fields[self.vector_pos])).max(1);
+        let rows_per_block = self.rows_per_block(req.anns_field.as_deref());
         self.search_filtered_in_blocks(
             req,
             compute,
@@ -637,7 +645,7 @@ impl ReadSnapshot {
             spec: spec.clone(),
             keep: top_k,
         });
-        let rows_per_block = (BLOCK_ELEMS / field_dim(&self.schema.fields[self.vector_pos])).max(1);
+        let rows_per_block = self.rows_per_block(req.anns_field.as_deref());
         let ranking = self.rank_in_blocks(
             SearchRequest {
                 limit: top_k,
@@ -694,7 +702,7 @@ impl ReadSnapshot {
             spec: spec.clone(),
             keep: req.limit,
         });
-        let rows_per_block = (BLOCK_ELEMS / field_dim(&self.schema.fields[self.vector_pos])).max(1);
+        let rows_per_block = self.rows_per_block(req.anns_field.as_deref());
         let ranking = self.rank_in_blocks(
             SearchRequest { offset: 0, ..req },
             compute,
@@ -892,8 +900,10 @@ impl ReadSnapshot {
                 )));
             }
         }
-        // M1 只允许一个 FLOAT_VECTOR 字段，范数只为它计算。
-        debug_assert_eq!(field_pos, self.vector_pos);
+        let norm_slot = NormSlot {
+            ordinal: self.schema.vector_ordinal(field_pos),
+            stride: self.schema.vector_count(),
+        };
         let queries: Vec<flat::Query> = vectors
             .iter()
             .map(|v| flat::Query::new(metric, v))
@@ -916,7 +926,14 @@ impl ReadSnapshot {
                 compute.for_each(&mut leaves, |leaf| {
                     let queries = groups[leaf.group];
                     leaf.tops = queries.iter().map(|_| TopK::new(metric, take)).collect();
-                    scan(&chunks, leaf.block, field_pos, queries, &mut leaf.tops);
+                    scan(
+                        &chunks,
+                        leaf.block,
+                        field_pos,
+                        norm_slot,
+                        queries,
+                        &mut leaf.tops,
+                    );
                     leaf.tops.iter_mut().for_each(TopK::shrink);
                 });
                 for leaf in leaves {
@@ -1811,8 +1828,7 @@ impl Collection {
         orders: Option<Vec<u64>>,
     ) -> Result<()> {
         let n = decoded.seqs.len();
-        let (dim, vectors) = vector_values(&decoded.columns[self.vector_pos]);
-        let norms = vectors.chunks_exact(dim).map(flat::norm).collect();
+        let norms = flat::row_norms(&decoded.columns);
         let orders = if let Some(orders) = orders {
             orders
         } else {
@@ -1867,7 +1883,7 @@ impl Collection {
     }
 
     fn merge_tail(&mut self) {
-        let limit = (BLOCK_ELEMS / field_dim(&self.schema.fields[self.vector_pos])).max(1);
+        let limit = (BLOCK_ELEMS / crate::data::max_vector_dim(&self.schema)).max(1);
         loop {
             let mut tail = self.chunks.iter().rev();
             let Some((&right_id, right)) = tail.next() else {
@@ -1944,7 +1960,7 @@ impl Collection {
             if decoded.is_some() && rows == 0 {
                 return Err(EngineError::Storage("published data batch is empty".into()));
             }
-            if norms.len() != rows {
+            if norms.len() != rows * self.schema.vector_count() {
                 return Err(EngineError::Storage(
                     "published vector norms are incomplete".into(),
                 ));
@@ -2158,7 +2174,7 @@ impl Collection {
                         let data = &publication.data[index];
                         if *target >= data.data.seqs.len()
                             || seen[index][*target]
-                            || data.norms.len() != data.data.seqs.len()
+                            || data.norms.len() != data.data.seqs.len() * self.schema.vector_count()
                             || data.data.seqs[*target] != chunk.seqs[row]
                             || pk_at(&data.data.columns[self.pk_pos], *target) != pk
                         {
@@ -2945,6 +2961,7 @@ impl Collection {
         let mut fields: Vec<ColumnData> =
             self.schema.fields.iter().map(ColumnData::empty).collect();
         let mut array_inputs: HashMap<usize, Vec<Option<InputValues>>> = HashMap::new();
+        let mut other_vectors: HashMap<usize, Vec<Option<InputValues>>> = HashMap::new();
         let mut metas = Vec::with_capacity(n);
         for row in 0..n {
             let candidate = supplied
@@ -3019,6 +3036,14 @@ impl Collection {
                     array_inputs.entry(i).or_default().push(list);
                     continue;
                 }
+                // 和 ARRAY 一样要等全部行校验完：这里转换会抢先报错，维度不符时还无法拼进列。
+                if i != self.vector_pos && field.data_type == DataType::FloatVector {
+                    other_vectors
+                        .entry(i)
+                        .or_default()
+                        .push(present[i].then(|| values[i].clone()));
+                    continue;
+                }
                 let converted = convert_optional(field, present[i].then_some(&values[i]), 1)?;
                 fields[i].push_row(&converted, 0);
             }
@@ -3026,6 +3051,15 @@ impl Collection {
         }
         // 与参照一样，全部行的业务检查完成后才做 ARRAY 元素的 Arrow 转换。
         self.resolve_write_partition(partition)?;
+        self.check_other_vectors(n, |row, field| {
+            other_vectors.get(&field)?[row].as_ref().map(|v| (v, 0))
+        })?;
+        for (i, rows) in other_vectors {
+            for input in &rows {
+                let converted = convert_optional(&self.schema.fields[i], input.as_ref(), 1)?;
+                fields[i].push_row(&converted, 0);
+            }
+        }
         for (i, rows) in array_inputs {
             fields[i] =
                 convert_optional(&self.schema.fields[i], Some(&InputValues::Array(rows)), n)?;
@@ -3228,6 +3262,11 @@ impl Collection {
             self.validate_row(&by_name, &dynamic, row, &json_checks, row)?;
         }
         let partition = self.resolve_write_partition(partition)?;
+        self.check_other_vectors(n, |row, field| {
+            by_name
+                .get(self.schema.fields[field].name.as_str())
+                .map(|values| (*values, row))
+        })?;
 
         let pk_field = &self.schema.fields[self.pk_pos];
         let auto_pk = pk_field.auto_id && !by_name.contains_key(pk_field.name.as_str());
@@ -3286,9 +3325,7 @@ impl Collection {
         } else {
             &columns
         };
-        // schema 校验保证 dim > 0。
-        let (dim, values) = vector_values(&column_values[self.vector_pos]);
-        let norms = values.chunks_exact(dim).map(flat::norm).collect();
+        let norms = flat::row_norms(column_values);
         let meta = self.schema.enable_dynamic_field.then_some(dynamic.maps);
         let (source, row_start) = self.persistent.as_ref().map_or_else(
             || {
@@ -3748,6 +3785,49 @@ impl Collection {
         Ok(obj.into_iter().collect())
     }
 
+    /// 3.x 的 `validate_record` 只校验第一个向量字段，其余字段的问题到构建 Arrow 批次才暴露。因此这里在
+    /// 全部行校验之后执行，3.x 在 `validate_record` 阶段拒绝的输入报错不变。缺失或 None 的处理是登记的
+    /// 差异（0028）：3.x 接受，写入后读取出错。类型和维度的错误优先于任何字段的缺失，与 Arrow 转换失败先于
+    /// 这些行被接受一致。
+    fn check_other_vectors<'a>(
+        &self,
+        n: usize,
+        input: impl Fn(usize, usize) -> Option<(&'a InputValues, usize)>,
+    ) -> Result<()> {
+        let mut missing = None;
+        for (pos, field) in self.schema.fields.iter().enumerate() {
+            if pos == self.vector_pos || field.data_type != DataType::FloatVector {
+                continue;
+            }
+            let expected = field_dim(field);
+            for row in 0..n {
+                match input(row, pos) {
+                    Some((InputValues::FloatVector { dim, .. }, _)) if *dim != expected => {
+                        return Err(EngineError::invalid(format!(
+                            "Length of item not correct: expected {expected} but got array of size {dim}"
+                        )));
+                    }
+                    Some((InputValues::FloatVector { .. }, _)) => {}
+                    Some((values, index)) if !input_is_null(values, index) => {
+                        return Err(EngineError::schema(format!(
+                            "vector field {} must be list/tuple, got {}",
+                            py_repr(&field.name),
+                            py_type_name(values, index)
+                        )));
+                    }
+                    _ => missing = missing.or(Some(pos)),
+                }
+            }
+        }
+        match missing {
+            Some(pos) => Err(EngineError::schema(format!(
+                "vector field {} missing or None",
+                py_repr(&self.schema.fields[pos].name)
+            ))),
+            None => Ok(()),
+        }
+    }
+
     /// 与 3.x `validate_record` 的检查顺序一致：主键、向量、其余字段（schema 顺序）、多余字段。
     fn validate_row(
         &self,
@@ -3916,10 +3996,18 @@ struct Leaf<'a> {
 
 /// 为一个查询组（至多 [`flat::BATCH`] 条）扫描一个行块中的存活行，候选交给各自的 [`TopK`]。
 /// 组满 [`flat::BATCH`] 条时一起打分，共用读入的候选向量。
+/// 目标向量字段的范数在 `ChunkData.norms` 中的位置（`行号 * stride + ordinal`）。
+#[derive(Clone, Copy)]
+struct NormSlot {
+    ordinal: usize,
+    stride: usize,
+}
+
 fn scan(
     chunks: &[Chunk],
     block: &[Segment],
     field_pos: usize,
+    norms: NormSlot,
     queries: &[flat::Query],
     tops: &mut [TopK],
 ) {
@@ -3930,7 +4018,13 @@ fn scan(
             seg.rows
                 .clone()
                 .filter(|row| chunk.live.get(*row))
-                .map(|row| (row, &values[row * dim..(row + 1) * dim], chunk.norms[row]))
+                .map(|row| {
+                    (
+                        row,
+                        &values[row * dim..(row + 1) * dim],
+                        chunk.norms[row * norms.stride + norms.ordinal],
+                    )
+                })
         };
         let at = |row| RankedRow {
             source_rank: chunk.source_rank,

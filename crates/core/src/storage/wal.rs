@@ -133,6 +133,12 @@ pub enum WalError {
     },
     #[error("WAL writer at {path:?} cannot be reused after an append failure")]
     Poisoned { path: PathBuf },
+    #[error("WAL at {path:?} holds a null in a required column: {source}")]
+    NullInRequiredColumn {
+        path: PathBuf,
+        #[source]
+        source: ArrowError,
+    },
 }
 
 /// 每次 append 把该 batch 的全部新字节交给 OS；失败后不能再往该文件追加。
@@ -339,6 +345,12 @@ pub fn read_prefix(path: &Path) -> Result<RecoveredWal, WalError> {
                     stopped_at: None,
                 });
             }
+            Ok(Some(Err(source))) if is_null_in_required_column(&source) => {
+                return Err(WalError::NullInRequiredColumn {
+                    path: path.to_path_buf(),
+                    source,
+                });
+            }
             Ok(Some(Err(source))) => {
                 return Ok(RecoveredWal {
                     schema: Some(schema),
@@ -355,6 +367,13 @@ pub fn read_prefix(path: &Path) -> Result<RecoveredWal, WalError> {
             }
         }
     }
+}
+
+/// 这种批次完整且格式正确，不是截断：3.x 不校验非首向量字段，这样的行会写进 WAL（0028）。当作截断处理
+/// 会丢掉这一批及其后的全部写入，flush 之后 WAL 被清理，数据就永久丢失了。
+fn is_null_in_required_column(error: &ArrowError) -> bool {
+    matches!(error, ArrowError::InvalidArgumentError(message)
+        if message.contains("is declared as non-nullable but contains null values"))
 }
 
 #[cfg(test)]

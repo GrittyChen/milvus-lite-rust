@@ -411,6 +411,18 @@ pub(crate) fn field_dim(field: &FieldSchema) -> usize {
     field.dim.and_then(|d| usize::try_from(d).ok()).unwrap_or(0)
 }
 
+/// 所有 FLOAT_VECTOR 字段的最大维度，用于约束内存块的元素数；没有向量字段时为 1。
+pub(crate) fn max_vector_dim(schema: &crate::schema::CollectionSchema) -> usize {
+    schema
+        .fields
+        .iter()
+        .filter(|f| f.data_type == DataType::FloatVector)
+        .map(field_dim)
+        .max()
+        .unwrap_or(1)
+        .max(1)
+}
+
 /// 读取结果：主键列、按 schema 顺序的字段列，以及开启动态字段时每行的动态字段。
 #[derive(Debug, Clone, PartialEq)]
 pub struct Rows {

@@ -15,6 +15,7 @@
 
 use std::cmp::Ordering;
 
+use crate::data::ColumnData;
 use crate::index::Metric;
 
 const LANES: usize = 16;
@@ -118,6 +119,28 @@ pub(crate) fn score_batch(
 /// 向量的范数，与 COSINE 打分中的点积同一算法。
 pub(crate) fn norm(v: &[f32]) -> f32 {
     finish(product_lanes(v, v), v, v, product).sqrt()
+}
+
+/// 每行每个 FLOAT_VECTOR 列一个范数，按行展开：下标是 `行号 * 向量列数 + 向量列序号`。
+pub(crate) fn row_norms(columns: &[ColumnData]) -> Vec<f32> {
+    let vectors: Vec<(usize, &[f32])> = columns
+        .iter()
+        .filter_map(|column| match column {
+            ColumnData::FloatVector { dim, values } => Some((*dim, values.as_slice())),
+            _ => None,
+        })
+        .collect();
+    let Some(&(first_dim, first_values)) = vectors.first() else {
+        return Vec::new();
+    };
+    let rows = first_values.len().checked_div(first_dim).unwrap_or(0);
+    let mut norms = Vec::with_capacity(rows * vectors.len());
+    for row in 0..rows {
+        for (dim, values) in &vectors {
+            norms.push(norm(&values[row * dim..(row + 1) * dim]));
+        }
+    }
+    norms
 }
 
 fn diff_sq(a: f32, b: f32) -> f32 {

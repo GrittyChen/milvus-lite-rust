@@ -83,6 +83,7 @@
 | TIMESTAMPTZ 与 `timezone` 属性：3.x 实测的 UTC 微秒值、ISO 解析与输出、请求 / 集合 / 数据库时区的优先级与 `fold=0` 换算、`time_fields`、请求时区的两个校验点与错误先后、毒化整数的处理；设计评审通过，第 1 步（类型与存储）、第 2 步（过滤：ISO / INTERVAL 求值、三条求值路线的差异）与第 3 步（时区：内置 tzdata 的 `fold=0` 换算、请求 / 集合 / 数据库时区、`time_fields`、集合与数据库 `timezone` 属性）已实施；第 4 步（差分、参照用例、文档与验收）已实施待评审，开发验收见验收记录；采用内置 tzdata（jiff）的取舍已确认 | [0025](docs/decisions/0025-timestamptz-and-timezone.md)、[验收](docs/testing/0025-timestamptz-acceptance.md) |
 | HybridSearch 与 rerank（`rank_params` 的 RRF / Weighted，`function_score` 的 boost 与 rrf / weighted / decay）：三个协议表面、两空间分数契约、链式候选行的扁平模型与存在性表、`GroupByOp` 组键、三条路径的 `limit` / `offset` / `group_size`、候选窗口、错误先后；公共 `function_chains`、model、`random_score`、多向量字段不纳入；设计评审通过，第 1 步（Search 的 boost 与 `function_score` 解码）、第 2 步（Search 的 L2：rrf / weighted / decay、`GroupByOp`、rerank 后的 `round_decimal`）与第 3 步（HybridSearch：`rank_params`、顶层与子请求的 `function_score`、分区、分组、时区与 `time_fields`）已实施并评审通过；第 4 步（差分、参照用例、文档与验收）已实施并评审通过；四步均已合入 main（`da8689f`），开发与 CI 验收见验收记录 | [0026](docs/decisions/0026-rerank-and-hybrid-search.md)、[验收](docs/testing/0026-rerank-hybrid-acceptance.md) |
 | 参照从 v3.2.1 升级到 `1320d26`：对外行为差异、Search 主键投影、按目标字段解析度量与错误先后、带分区的 count(*)、flush 字节预算 | [0027](docs/decisions/0027-reference-3.2.2-upgrade.md) |
+| 多向量字段：按字段的内存范数、其余向量字段的写入检查、三项登记差异、WAL 中 null 行不按截断处理 | [0028](docs/decisions/0028-multi-vector-fields.md) |
 | 验收与调查记录引用的证据分哪几类、谁能复核（仓库内可重跑 / 公开产物 / 本地留存），以及验收与调查记录的写法约定 | [证据的存放与复核范围](docs/testing/README.md) |
 | 性能基线怎么测 / 口径 / 注意事项 | [benchmarks/baseline/README.md](benchmarks/baseline/README.md) |
 | 代码审查 / 修复复审（冻结合同、完整调用链、同类全域清扫、分级与证据门槛、二三阶影响矩阵） | [code-review-rules](.agents/skills/code-review-rules/SKILL.md)（Claude Code 经 `.claude/skills` 软链读取同一份） |
@@ -184,7 +185,7 @@ pymilvus ──server_manager──▶ adapter/grpc ──▶ db（多 collectio
 | 独立 CLI server | `.venv/bin/milvus-lite server --data-dir <data_dir> --host 127.0.0.1 --port 19530 --max-workers 10`；也可 `python -m milvus_lite server ...`，合同见 0012 |
 | 构建 wheel / sdist | `.venv/bin/maturin build --release -m crates/py/Cargo.toml` / `.venv/bin/maturin sdist -m crates/py/Cargo.toml` |
 | 核对依赖图中没有 C++ 构建与 protoc | `cargo tree --workspace -e all` |
-| 发行物与安装验收（本地诊断，候选以发行工作流为准；根配置；工作目录在仓库外） | `.venv/bin/python tests/packaging/run_acceptance.py --work-dir <work_dir> --constraints <constraints.txt> --suite --suite-expect 570`；约束文件与完整步骤见 [打包验收](tests/packaging/README.md) |
+| 发行物与安装验收（本地诊断，候选以发行工作流为准；根配置；工作目录在仓库外） | `.venv/bin/python tests/packaging/run_acceptance.py --work-dir <work_dir> --constraints <constraints.txt> --suite --suite-expect 571`；约束文件与完整步骤见 [打包验收](tests/packaging/README.md) |
 | 发行物/平台脚本自检 | `.venv/bin/python -m pytest tests/packaging tests/platform` |
 | CI 纯文档分类与汇总判定自检 | `.venv/bin/python -m pytest tests/ci` |
 | 发行工作流：演练 / 正式运行（0021；从以冻结提交为最新提交的已推送分支触发，正式运行引用同一提交含 PID 1 的成功演练） | `gh workflow run release.yml --repo <owner/repo> --ref <冻结分支> -f commit=<完整 SHA> -f version=<版本> -f dry_run=true`；正式运行改为 `-f dry_run=false -f pid1_dry_run=<演练运行 ID>.<attempt>` |

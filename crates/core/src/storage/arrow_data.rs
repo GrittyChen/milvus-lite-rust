@@ -907,6 +907,11 @@ fn decode_column(field: &FieldSchema, array: &ArrayRef) -> Result<ColumnData, Ar
             if Some(dim as i64) != field.dim {
                 return Err(bad());
             }
+            // 3.x 不校验非首向量字段，WAL 里可能有 null 行（0028「与 3.x 的差异」）；Parquet 里
+            // 这种行是全 null 的子元素，由下面的子列检查拒绝。
+            if array.null_count() != 0 {
+                return Err(bad());
+            }
             // Parquet 读出的 list 子字段名可为 `element`，WAL 中为 `item`；只校验值的类型与维度。
             let floats = list.values();
             let floats = floats

@@ -50,6 +50,38 @@ def test_dynamic_field_query_output(milvus_client):
 # #2: Multiple FLOAT_VECTOR fields
 # ---------------------------------------------------------------------------
 
+def test_multi_vector_fields(milvus_client):
+    """Issue #2: Collections with multiple FLOAT_VECTOR fields must work."""
+    schema = MilvusClient.create_schema()
+    schema.add_field("id", DataType.INT64, is_primary=True)
+    schema.add_field("v1", DataType.FLOAT_VECTOR, dim=4)
+    schema.add_field("v2", DataType.FLOAT_VECTOR, dim=4)
+    milvus_client.create_collection("multi_vec", schema=schema)
+    milvus_client.insert("multi_vec", [
+        {"id": 1, "v1": [1, 0, 0, 0], "v2": [0, 0, 0, 1]},
+        {"id": 2, "v1": [0, 1, 0, 0], "v2": [0, 0, 1, 0]},
+    ])
+    idx = milvus_client.prepare_index_params()
+    idx.add_index(field_name="v1", index_type="FLAT",
+                  metric_type="COSINE", params={})
+    idx.add_index(field_name="v2", index_type="FLAT",
+                  metric_type="COSINE", params={})
+    milvus_client.create_index("multi_vec", idx)
+    milvus_client.load_collection("multi_vec")
+
+    # Search on v1
+    r1 = milvus_client.search("multi_vec", data=[[1, 0, 0, 0]],
+                               anns_field="v1", limit=2)
+    assert r1[0][0]["id"] == 1
+
+    # Search on v2
+    r2 = milvus_client.search("multi_vec", data=[[0, 0, 0, 1]],
+                               anns_field="v2", limit=2)
+    assert r2[0][0]["id"] == 1
+
+    milvus_client.drop_collection("multi_vec")
+
+
 
 
 # ---------------------------------------------------------------------------

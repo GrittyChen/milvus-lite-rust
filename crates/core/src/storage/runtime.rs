@@ -1236,26 +1236,9 @@ pub fn flush_one(
                     committed_manifest: None,
                     cleanup_failed: false,
                 })?;
-            let norms = match &data {
-                None => Vec::new(),
-                Some(decoded) => decoded
-                    .columns
-                    .iter()
-                    .find_map(|column| {
-                        if let ColumnData::FloatVector { dim, values } = column {
-                            Some(values.chunks_exact(*dim).map(crate::flat::norm).collect())
-                        } else {
-                            None
-                        }
-                    })
-                    .ok_or_else(|| FlushError {
-                        path: dir.to_path_buf(),
-                        phase: CommitPhase::BeforeReplace,
-                        reason: "published data has no dense vector column".to_owned(),
-                        committed_manifest: None,
-                        cleanup_failed: false,
-                    })?,
-            };
+            let norms = data
+                .as_ref()
+                .map_or_else(Vec::new, |decoded| crate::flat::row_norms(&decoded.columns));
             // 钩子的诊断失败必须落在提交点之前，不能跳过已提交数据的锁内发布。
             #[cfg(feature = "fault-injection")]
             BEFORE_COMMIT_PAUSE.with(|slot| -> Result<(), FlushError> {
@@ -1372,19 +1355,7 @@ fn flush_one_partitioned(
             if let Some(batch) = &batch.data {
                 let decoded = arrow_data::decode_data_batch(schema, batch)
                     .map_err(|error| prepare_error(dir, error))?;
-                let norms = decoded
-                    .columns
-                    .iter()
-                    .find_map(|column| {
-                        if let ColumnData::FloatVector { dim, values } = column {
-                            Some(values.chunks_exact(*dim).map(crate::flat::norm).collect())
-                        } else {
-                            None
-                        }
-                    })
-                    .ok_or_else(|| {
-                        prepare_error(dir, "published data has no dense vector column")
-                    })?;
+                let norms = crate::flat::row_norms(&decoded.columns);
                 data.push(FlushedPartition {
                     id,
                     data: decoded,

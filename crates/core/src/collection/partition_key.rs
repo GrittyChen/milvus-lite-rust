@@ -149,6 +149,7 @@ impl Collection {
                     .map(|v| (*v, row))
             }
         };
+        self.check_other_vectors(n, field_input)?;
         let key_pos = self
             .schema
             .fields
@@ -267,8 +268,7 @@ impl Collection {
                     })
                     .collect::<Vec<_>>()
             });
-            let (dim, vectors) = vector_values(&column_values[self.vector_pos]);
-            let norms = vectors.chunks_exact(dim).map(flat::norm).collect();
+            let norms = flat::row_norms(column_values);
             let partition = self.resolve_write_partition(&name(bucket))?;
             let (wal, decoded) = if let Some(normalized) = normalized {
                 let wal = normalized

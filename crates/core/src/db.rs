@@ -4503,12 +4503,14 @@ fn recovery_error(error: recovery::RecoveryError) -> EngineError {
 
 fn cacheable_recovery_error(error: &recovery::RecoveryError) -> bool {
     use std::error::Error;
-    // 扫描失败及 WAL 真 I/O 故障可随环境恢复；引用文件缺失属于确定的目录损坏。
-    if matches!(
-        error,
-        recovery::RecoveryError::Cleanup { .. } | recovery::RecoveryError::Wal(_)
-    ) {
-        return false;
+    // 扫描失败及 WAL 真 I/O 故障可随环境恢复；引用文件缺失属于确定的目录损坏，WAL 中的 null 同样不会自愈。
+    match error {
+        recovery::RecoveryError::Cleanup { .. } => return false,
+        recovery::RecoveryError::Wal(crate::storage::wal::WalError::NullInRequiredColumn {
+            ..
+        }) => return true,
+        recovery::RecoveryError::Wal(_) => return false,
+        _ => {}
     }
     let mut cause: &(dyn Error + 'static) = error;
     loop {
@@ -5618,6 +5620,12 @@ mod tests {
                 WalError::Io {
                     path: path(),
                     source: io()
+                }
+            )));
+            assert!(cacheable_recovery_error(&RecoveryError::Wal(
+                WalError::NullInRequiredColumn {
+                    path: path(),
+                    source: arrow_schema::ArrowError::InvalidArgumentError("null".to_owned()),
                 }
             )));
         }

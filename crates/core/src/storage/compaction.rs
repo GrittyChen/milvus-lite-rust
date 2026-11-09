@@ -288,17 +288,18 @@ pub(crate) fn prepare(
                 .enable_dynamic_field
                 .then(|| Vec::with_capacity(rows.len())),
         };
-        let mut norms = Vec::with_capacity(rows.len());
+        let vectors = schema.vector_count();
+        let mut norms = Vec::with_capacity(rows.len() * vectors);
         for (target, &(seq, i, block, row, physical)) in rows.iter().enumerate() {
             let chunk = &prepared.inputs[i].chunks[block];
             for (dst, src) in data.columns.iter_mut().zip(&chunk.columns) {
                 dst.push_row(src, row);
             }
             data.seqs.push(seq);
-            norms.push(
-                *chunk
+            norms.extend_from_slice(
+                chunk
                     .norms
-                    .get(row)
+                    .get(row * vectors..(row + 1) * vectors)
                     .ok_or_else(|| storage("compaction vector norm missing"))?,
             );
             if let Some(meta) = &mut data.meta {
