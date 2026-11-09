@@ -1,4 +1,4 @@
-"""用参照实现 v3.2.1（43d1257）重建并核验本目录的小型存储格式样本。
+"""用参照实现 `1320d26`（v3.2.2 之后）重建并核验本目录的小型存储格式样本。
 
 在参照实现的独立 Python 环境中运行：
     <v3>/bin/python crates/core/tests/fixtures/generate.py --verify
@@ -39,12 +39,12 @@ REPO = HERE.parents[3]
 
 
 def check_reference():
-    assert version("milvus-lite") == "3.2.1"
+    assert version("milvus-lite") == "3.2.2"
     assert pa.__version__ == "25.0.1", pa.__version__
     checkout = REPO / "references" / "milvus-lite"
     assert Path(milvus_lite.__file__).resolve().is_relative_to(checkout)
     commit = subprocess.check_output(["git", "-C", str(checkout), "rev-parse", "--short", "HEAD"], text=True).strip()
-    assert commit == "43d1257", commit
+    assert commit == "1320d26", commit
 
 
 def generate(output: Path):
@@ -204,7 +204,7 @@ def main():
             output = Path(directory)
             generate(output)
             verify(output)
-        print("fixtures verified against milvus-lite 3.2.1 (43d1257)")
+        print("fixtures verified against milvus-lite 3.2.2+3 (1320d26)")
     else:
         generate(args.output)
 

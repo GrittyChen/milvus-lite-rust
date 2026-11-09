@@ -1,4 +1,4 @@
-"""以真实 v3.2.1 parser 生成语法诊断真值；--verify 只核对，不覆盖。
+"""以真实参照 parser 生成语法诊断真值；--verify 只核对，不覆盖。
 
 用例种子部分取自参照实现 tests/search/filter/test_parser.py（Apache-2.0，43d1257）。
 运行：<3.x python> tests/differential/generate_filter_parse_fixtures.py [--verify]
@@ -12,9 +12,9 @@ from pathlib import Path
 import milvus_lite
 from milvus_lite.search.filter.parser import parse_expr
 
-assert milvus_lite.__version__ == "3.2.1"
+assert milvus_lite.__version__ == "3.2.2"
 root = Path(__file__).resolve().parents[2]
-assert subprocess.check_output(['git', '-C', str(root / 'references/milvus-lite'), 'rev-parse', '--short=7', 'HEAD'], text=True).strip() == '43d1257'
+assert subprocess.check_output(['git', '-C', str(root / 'references/milvus-lite'), 'rev-parse', '--short=7', 'HEAD'], text=True).strip() == '1320d26'
 assert Path(milvus_lite.__file__).resolve().is_relative_to(root / 'references/milvus-lite')
 reference = root / "references/milvus-lite/tests/search/filter/test_parser.py"
 sources = {
@@ -101,7 +101,7 @@ for source in sorted(sources):
         result = None
     cases.append({"source": source, "error": result})
 target = root / "crates/core/tests/fixtures/filter_parse_v321.json"
-payload = json.dumps({"reference": "v3.2.1 / 43d1257", "cases": cases}, ensure_ascii=False, indent=2) + "\n"
+payload = json.dumps({"reference": "v3.2.2+3 / 1320d26", "cases": cases}, ensure_ascii=False, indent=2) + "\n"
 if "--verify" in sys.argv:
     assert target.read_text() == payload
 else:

@@ -1,4 +1,4 @@
-"""固定参照 43d1257 的 ARRAY 元素转换与完整过滤路线真值；离线显式执行。"""
+"""固定参照 1320d26 的 ARRAY 元素转换与完整过滤路线真值；离线显式执行。"""
 
 import argparse
 import hashlib
@@ -8,7 +8,7 @@ import subprocess
 import sys
 
 ROOT = Path(__file__).resolve().parents[2]
-REF = "43d1257774e629bc9f66873977ab7c320d5bf5a7"
+REF = "1320d26ec3d88b23b525e774df6e3c8e7c208f81"
 TYPES = {"bool": True, "int8": 7, "int16": 7, "int32": 7, "int64": 7,
          "float": 1.5, "double": 1.5, "varchar": "abc"}
 

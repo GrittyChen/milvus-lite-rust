@@ -1,4 +1,4 @@
-"""M2 存储文件矩阵：参照实现 v3.2.1（43d1257）与 Rust 双向读写。"""
+"""M2 存储文件矩阵：参照实现（版本见下方守卫）与 Rust 双向读写。"""
 
 import json
 import os
@@ -215,9 +215,9 @@ def interpreters():
         raise pytest.UsageError(f"storage interop requires: {', '.join(missing)}")
     result = {name: os.environ[name] for name in PYTHONS}
     commit = run(["git", "-C", str(REPO / "references" / "milvus-lite"), "rev-parse", "--short", "HEAD"])
-    assert commit == "43d1257", f"reference checkout is {commit}, expected 43d1257"
+    assert commit == "1320d26", f"reference checkout is {commit}, expected 1320d26"
     for name, python in result.items():
-        expected = "3.2.1" if name == PYTHONS[0] else ("15." if name == PYTHONS[1] else "25.")
+        expected = "3.2.2" if name == PYTHONS[0] else ("15." if name == PYTHONS[1] else "25.")
         expression = (
             'from importlib.metadata import version; print(version("milvus-lite"))'
             if name == PYTHONS[0]
@@ -241,7 +241,7 @@ def interpreters():
                 f"prepare this interpreter as described in tests/storage_interop/README.md.\n{probe.stderr}"
             )
         info = json.loads(probe.stdout)
-        assert info["version"] == "3.2.1", f"{name} has milvus-lite {info['version']}, expected 3.2.1"
+        assert info["version"] == "3.2.2", f"{name} has milvus-lite {info['version']}, expected 3.2.2"
         assert Path(info["path"]).is_relative_to(REPO / "references" / "milvus-lite"), (
             f"{name} imports {info['path']}, not the local reference checkout"
         )

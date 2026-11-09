@@ -1,4 +1,4 @@
-"""从真实 3.x v3.2.1/43d1257 生成顶层动态字段的组件真值。"""
+"""从真实 3.x v3.2.2+3/1320d26 生成顶层动态字段的组件真值。"""
 
 import argparse
 import json
@@ -88,16 +88,16 @@ def generate():
         except Exception as error:
             outcome = {'error':str(error)}
         result.append({**case,**outcome})
-    return {'reference':'3.2.1/43d1257','cases':result}
+    return {'reference':'3.2.2+3/1320d26','cases':result}
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--verify',action='store_true')
     args = parser.parse_args()
-    assert __version__ == '3.2.1'
+    assert __version__ == '3.2.2'
     assert Path(milvus_lite.__file__).resolve() == (REPO/'references/milvus-lite/milvus_lite/__init__.py').resolve()
-    assert subprocess.check_output(['git','-C',str(REPO/'references/milvus-lite'),'rev-parse','--short','HEAD'],text=True).strip() == '43d1257'
+    assert subprocess.check_output(['git','-C',str(REPO/'references/milvus-lite'),'rev-parse','--short','HEAD'],text=True).strip() == '1320d26'
     value = generate()
     if args.verify:
         assert json.loads(OUTPUT.read_text()) == value

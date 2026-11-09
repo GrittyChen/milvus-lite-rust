@@ -10,7 +10,7 @@ import subprocess
 import sys
 from types import SimpleNamespace
 
-REF = "43d1257774e629bc9f66873977ab7c320d5bf5a7"
+REF = "1320d26ec3d88b23b525e774df6e3c8e7c208f81"
 SCALARS = {"BOOL": (True, False), "INT8": (7, 0), "INT16": (7, 0), "INT32": (7, 0),
            "INT64": (7, 0), "FLOAT": (1.5, 0.0), "DOUBLE": (1.5, 0.0),
            "VARCHAR": ("abc", ""), "JSON": ({"k": 1}, {})}

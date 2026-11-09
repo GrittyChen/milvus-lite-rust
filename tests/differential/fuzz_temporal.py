@@ -71,9 +71,9 @@ def main():
     args = parser.parse_args()
     assert args.cases > 0
     assert sys.version_info[:2] == (3, 12), 'ISO 对照固定 CPython 3.12 的 C 解析器'
-    assert milvus_lite.__version__ == '3.2.1'
+    assert milvus_lite.__version__ == '3.2.2'
     assert Path(milvus_lite.__file__).resolve().is_relative_to(ROOT / 'references/milvus-lite')
-    assert subprocess.check_output(['git', '-C', str(ROOT / 'references/milvus-lite'), 'rev-parse', '--short=7', 'HEAD'], text=True).strip() == '43d1257'
+    assert subprocess.check_output(['git', '-C', str(ROOT / 'references/milvus-lite'), 'rev-parse', '--short=7', 'HEAD'], text=True).strip() == '1320d26'
     coverage = Counter()
     with tempfile.TemporaryDirectory(prefix='mlr_temporal_fuzz_') as scratch:
         path = Path(scratch)
@@ -100,7 +100,7 @@ def main():
                     mismatches.append({'source': json.loads(source), 'reference': a, 'rust': b})
         assert checked == args.cases, (checked, args.cases)
         assert all(coverage[k] for k in ['compact', 'separated', 'aware', 'naive', 'fractional_offset', 'mutated'])
-    report = {'reference': '3.2.1 / 43d1257', 'seed': args.seed, 'checked': checked,
+    report = {'reference': '3.2.2+3 / 1320d26', 'seed': args.seed, 'checked': checked,
               'coverage': dict(coverage), 'mismatches': mismatches}
     args.output.write_text(json.dumps(report, ensure_ascii=False, indent=2) + '\n')
     print(json.dumps({k: v for k, v in report.items() if k != 'mismatches'}), flush=True)

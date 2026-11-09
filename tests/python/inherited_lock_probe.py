@@ -43,7 +43,7 @@ def main():
         import milvus_lite
         from milvus_lite.db import MilvusLite
 
-        assert milvus_lite.__version__ == "3.2.1"
+        assert milvus_lite.__version__ == "3.2.2"
 
         def start():
             return MilvusLite(str(args.path))

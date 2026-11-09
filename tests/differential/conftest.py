@@ -19,7 +19,7 @@ from milvus_lite.server_manager import ServerManager
 
 ENV = "MILVUS_LITE_3X_PYTHON"
 # 对照版本（AGENTS.md「参照实现」），升级时同步修改。
-REF_VERSION = "3.2.1"
+REF_VERSION = "3.2.2"
 
 
 def pytest_configure(config):

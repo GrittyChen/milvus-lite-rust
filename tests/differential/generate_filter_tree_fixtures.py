@@ -1,4 +1,4 @@
-"""真实 3.x / 43d1257 的切片 B 组件真值；--verify 不改写语料。"""
+"""真实 3.x / 1320d26 的切片 B 组件真值；--verify 不改写语料。"""
 
 import argparse
 import json
@@ -168,10 +168,10 @@ def main():
     parser.add_argument("--arrow15-python")
     parser.add_argument("--dump-results", action="store_true")
     args = parser.parse_args()
-    assert milvus_lite.__version__ == "3.2.1"
+    assert milvus_lite.__version__ == "3.2.2"
     assert Path(milvus_lite.__file__).resolve().is_relative_to(ROOT / "references/milvus-lite")
-    assert subprocess.check_output(["git", "-C", str(ROOT / "references/milvus-lite"), "rev-parse", "--short=7", "HEAD"], text=True).strip() == "43d1257"
-    payload = {"reference": "3.2.1 / 43d1257", "fields": [list(field) for field in FIELDS], "cases": [run_case(case) for case in cases()]}
+    assert subprocess.check_output(["git", "-C", str(ROOT / "references/milvus-lite"), "rev-parse", "--short=7", "HEAD"], text=True).strip() == "1320d26"
+    payload = {"reference": "3.2.2+3 / 1320d26", "fields": [list(field) for field in FIELDS], "cases": [run_case(case) for case in cases()]}
     if args.dump_results:
         print(json.dumps(payload, ensure_ascii=True, allow_nan=False, separators=(",", ":")))
         return

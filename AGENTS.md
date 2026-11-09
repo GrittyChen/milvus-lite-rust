@@ -20,7 +20,7 @@
 
 | 术语 | 含义 |
 | --- | --- |
-| **参照实现** | [references/milvus-lite/](references/milvus-lite/)，被 `.gitignore` 忽略、不随本仓提交的本地 checkout。当前对照版本为 v3.2.1（`43d1257`），升级时同步改这里与差分测试的版本守卫（[tests/differential/conftest.py](tests/differential/conftest.py) 的 `REF_VERSION`）；记录对照结论时写明所依据的 commit（`git -C references/milvus-lite log -1`） |
+| **参照实现** | [references/milvus-lite/](references/milvus-lite/)，被 `.gitignore` 忽略、不随本仓提交的本地 checkout。当前对照版本为 v3.2.2 之后的 `1320d26`（升级结论见 [0027](docs/decisions/0027-reference-3.2.2-upgrade.md)；此前的决策与验收记录中出现的 `43d1257` 记录当时的基准），升级时同步改这里与差分测试的版本守卫（[tests/differential/conftest.py](tests/differential/conftest.py) 的 `REF_VERSION`）；记录对照结论时写明所依据的 commit（`git -C references/milvus-lite log -1`） |
 | **pymilvus 接入点** | `pymilvus` 遇到以 `.db` 结尾的 URI 时，先检查父目录存在，再执行 `from milvus_lite.server_manager import server_manager_instance` 并调用 `start_and_get_uri(uri)`（3.x 的签名为 `start_and_get_uri(path, args=None)`）；返回 `None` 即报 “Open local milvus failed”，否则按返回的 `http://127.0.0.1:<port>` 走普通 Milvus gRPC（参照实现 [server_manager.py](references/milvus-lite/milvus_lite/server_manager.py)）。以上在 pymilvus 2.6.15 / 2.6.17 / 3.0.2 中逐行一致；pymilvus 升级时重新核对。**模块路径、实例名、方法签名、返回约定都是对外契约**。pymilvus 的 `milvus-lite` extra 依赖 PyPI 上的 `milvus-lite`（`>=2.4.0`，非 Windows），这个名字归官方所有，因此本项目以 `milvus-lite-rust` 发布：用户安装 `pymilvus` 与 `milvus-lite-rust`，不用 `pymilvus[milvus-lite]`。它与官方 `milvus-lite` 争用同一个 `milvus_lite` 模块与 `milvus-lite` 命令，**不得同时安装**：pip 不会阻止，后装者覆盖同名文件，卸载任一方都会弄坏另一方；pymilvus 导入失败时的提示还会把用户引向官方包。因此绑定层导入时须检测已安装的官方发行包 `milvus-lite` 并明确报错，README 的安装说明须先 `pip uninstall milvus-lite`。官方包后装覆盖本包的情形检测不到，只能靠文档说明 |
 | **CLI** | 参照实现提供 `milvus-lite server --data-dir <dir> [--host] [--port] [--max-workers]` 与 `milvus-lite dump`（[cmdline.py](references/milvus-lite/milvus_lite/cmdline.py)）。本实现先提供 `server`，参数与之一致，按对外契约对待（`--max-workers` 控制 RPC 阻塞池，计算池与维护线程独立；见 [0012](docs/decisions/0012-cli-server.md)）；`dump` 后续再做（见[技术栈](#技术栈)） |
 | **gRPC adapter** | Milvus 协议 → 引擎 API 的翻译层。**只翻译、不加能力**：引擎不支持的 RPC 返回 `UNIMPLEMENTED` + 明确信息，绝不静默成功（参照实现架构不变量 15） |
@@ -82,6 +82,7 @@
 | 分组检索（`group_by_field` / `group_size` / `strict_group_size`）：3.x 实测的候选窗口、展平后的 offset 切片、空值组与参数真值，设计评审通过、第 1 步（core 与 gRPC）已实施；HybridSearch 与 rerank 内的分组留给各自切片，主键非 `id`、可空 `distance` / `id` 字段两个 3.x 缺陷不复制并登记 | [0024](docs/decisions/0024-group-by-search.md) |
 | TIMESTAMPTZ 与 `timezone` 属性：3.x 实测的 UTC 微秒值、ISO 解析与输出、请求 / 集合 / 数据库时区的优先级与 `fold=0` 换算、`time_fields`、请求时区的两个校验点与错误先后、毒化整数的处理；设计评审通过，第 1 步（类型与存储）、第 2 步（过滤：ISO / INTERVAL 求值、三条求值路线的差异）与第 3 步（时区：内置 tzdata 的 `fold=0` 换算、请求 / 集合 / 数据库时区、`time_fields`、集合与数据库 `timezone` 属性）已实施；第 4 步（差分、参照用例、文档与验收）已实施待评审，开发验收见验收记录；采用内置 tzdata（jiff）的取舍已确认 | [0025](docs/decisions/0025-timestamptz-and-timezone.md)、[验收](docs/testing/0025-timestamptz-acceptance.md) |
 | HybridSearch 与 rerank（`rank_params` 的 RRF / Weighted，`function_score` 的 boost 与 rrf / weighted / decay）：三个协议表面、两空间分数契约、链式候选行的扁平模型与存在性表、`GroupByOp` 组键、三条路径的 `limit` / `offset` / `group_size`、候选窗口、错误先后；公共 `function_chains`、model、`random_score`、多向量字段不纳入；设计评审通过，第 1 步（Search 的 boost 与 `function_score` 解码）、第 2 步（Search 的 L2：rrf / weighted / decay、`GroupByOp`、rerank 后的 `round_decimal`）与第 3 步（HybridSearch：`rank_params`、顶层与子请求的 `function_score`、分区、分组、时区与 `time_fields`）已实施并评审通过；第 4 步（差分、参照用例、文档与验收）已实施并评审通过；四步均已合入 main（`da8689f`），开发与 CI 验收见验收记录 | [0026](docs/decisions/0026-rerank-and-hybrid-search.md)、[验收](docs/testing/0026-rerank-hybrid-acceptance.md) |
+| 参照从 v3.2.1 升级到 `1320d26`：对外行为差异、Search 主键投影、按目标字段解析度量与错误先后、带分区的 count(*)、仍待第 2 步的 flush 字节预算 | [0027](docs/decisions/0027-reference-3.2.2-upgrade.md) |
 | 验收与调查记录引用的证据分哪几类、谁能复核（仓库内可重跑 / 公开产物 / 本地留存），以及验收与调查记录的写法约定 | [证据的存放与复核范围](docs/testing/README.md) |
 | 性能基线怎么测 / 口径 / 注意事项 | [benchmarks/baseline/README.md](benchmarks/baseline/README.md) |
 | 代码审查 / 修复复审（冻结合同、完整调用链、同类全域清扫、分级与证据门槛、二三阶影响矩阵） | [code-review-rules](.agents/skills/code-review-rules/SKILL.md)（Claude Code 经 `.claude/skills` 软链读取同一份） |
@@ -162,9 +163,9 @@ pymilvus ──server_manager──▶ adapter/grpc ──▶ db（多 collectio
 | Rust 单测 | `cargo test --workspace` |
 | M2 持久化点故障注入单测（feature 默认关闭） | `cargo test -p milvus-lite-core --features fault-injection` |
 | 子进程与关闭重开测试的隔离 / 默认并行 30 轮复验 | [进程内测试隔离记录与命令](docs/testing/process-test-isolation.md) |
-| S1 语法真值核验（参照实现须可编辑安装、HEAD 为 `43d1257`） | `<3.x 的 venv>/bin/python tests/differential/generate_filter_parse_fixtures.py --verify` |
-| 顶层动态过滤组件真值核验（真实 3.x / `43d1257`） | `<3.x 的 venv>/bin/python tests/differential/generate_dynamic_filter_fixtures.py --verify` |
-| 完整布尔树三路线组件真值核验（真实 3.x / `43d1257`；Arrow 15/25 各执行） | `<3.x 的 venv>/bin/python tests/differential/generate_filter_tree_fixtures.py --verify`；重新生成须用 Arrow 25 并指定 `--arrow15-python <Arrow15 的参照解释器>` |
+| S1 语法真值核验（参照实现须可编辑安装、HEAD 为 `1320d26`） | `<3.x 的 venv>/bin/python tests/differential/generate_filter_parse_fixtures.py --verify` |
+| 顶层动态过滤组件真值核验（真实 3.x / `1320d26`） | `<3.x 的 venv>/bin/python tests/differential/generate_dynamic_filter_fixtures.py --verify` |
+| 完整布尔树三路线组件真值核验（真实 3.x / `1320d26`；Arrow 15/25 各执行） | `<3.x 的 venv>/bin/python tests/differential/generate_filter_tree_fixtures.py --verify`；重新生成须用 Arrow 25 并指定 `--arrow15-python <Arrow15 的参照解释器>` |
 | 分区 / Query iterator 参照真值（仓库外生成、--verify 不覆盖） | 环境与命令见 [调查工具 README](tests/compatibility_audit/README.md#分区与-query-iterator-调查) |
 | 0017 分区目录边界补测与 delta 转存数据原型（非产品验收） | [环境、文件系统变体与命令](tests/compatibility_audit/README.md#0017-分区边界补测)；工具自检：`python tests/compatibility_audit/selfcheck.py` |
 | 0017 B key 单/多桶写入、Upsert、读取与峰值专项（仓库外新路径；顺序轮换） | [专项合同与命令](benchmarks/partition-key/README.md) |
@@ -177,13 +178,13 @@ pymilvus ──server_manager──▶ adapter/grpc ──▶ db（多 collectio
 | S1 Unicode 分类表核验（CPython 3.12 / Unicode 15.0） | `<CPython 3.12>/bin/python tests/differential/generate_filter_unicode.py --verify` |
 | 端到端测试（真实 pymilvus；含 [tests/python/adapter/](tests/python/adapter/) 中复制自参照实现的用例，逐条状态见其 INVENTORY.md） | `.venv/bin/python -m pytest tests/python` |
 | 与 3.x 的差分测试（3.x 的 venv 按 [互通 README](tests/storage_interop/README.md) 建 Arrow 25 参照环境；`benchmarks/baseline/setup.sh` 建出的环境不固定 pyarrow，arm64 上会被 S1 用例拒绝；不设环境变量时报错，不跳过；上一行的命令不包含它） | `MILVUS_LITE_3X_PYTHON=<3.x 的 venv>/bin/python .venv/bin/python -m pytest tests/differential` |
-| ARRAY 元素转换、schema/default 与三路线组件真值（真实 3.x / `43d1257`，Arrow 15/25 各执行） | `<参照解释器> tests/differential/generate_array_fixtures.py --verify`；重新生成用 Arrow 25，随后以 Arrow 15 核验 |
+| ARRAY 元素转换、schema/default 与三路线组件真值（真实 3.x / `1320d26`，Arrow 15/25 各执行） | `<参照解释器> tests/differential/generate_array_fixtures.py --verify`；重新生成用 Arrow 25，随后以 Arrow 15 核验 |
 | 固定兼容样本统计、nullable 反事实与 schema 真值（离线、显式执行，不进入默认测试） | [统计工具与命令](tests/compatibility_audit/README.md)；`<参照解释器> tests/compatibility_audit/schema_truth.py --reference references/milvus-lite --kind filters --output <仓库外报告> --verify-nullable-filter-fixture` 核验空值过滤组件 |
 | M2 存储文件双向互通矩阵（环境准备见 [tests/storage_interop/README.md](tests/storage_interop/README.md)；Arrow 15/25 均须安装固定参照引擎，Arrow 15 固定 pyarrow 15.0.0 / NumPy 1.26.4） | `MILVUS_LITE_3X_PYTHON=<v3>/bin/python MILVUS_LITE_ARROW15_PYTHON=<arrow15>/bin/python MILVUS_LITE_ARROW25_PYTHON=<v3>/bin/python .venv/bin/python -m pytest tests/storage_interop` |
 | 独立 CLI server | `.venv/bin/milvus-lite server --data-dir <data_dir> --host 127.0.0.1 --port 19530 --max-workers 10`；也可 `python -m milvus_lite server ...`，合同见 0012 |
 | 构建 wheel / sdist | `.venv/bin/maturin build --release -m crates/py/Cargo.toml` / `.venv/bin/maturin sdist -m crates/py/Cargo.toml` |
 | 核对依赖图中没有 C++ 构建与 protoc | `cargo tree --workspace -e all` |
-| 发行物与安装验收（本地诊断，候选以发行工作流为准；根配置；工作目录在仓库外） | `.venv/bin/python tests/packaging/run_acceptance.py --work-dir <work_dir> --constraints <constraints.txt> --suite --suite-expect 564`；约束文件与完整步骤见 [打包验收](tests/packaging/README.md) |
+| 发行物与安装验收（本地诊断，候选以发行工作流为准；根配置；工作目录在仓库外） | `.venv/bin/python tests/packaging/run_acceptance.py --work-dir <work_dir> --constraints <constraints.txt> --suite --suite-expect 570`；约束文件与完整步骤见 [打包验收](tests/packaging/README.md) |
 | 发行物/平台脚本自检 | `.venv/bin/python -m pytest tests/packaging tests/platform` |
 | CI 纯文档分类与汇总判定自检 | `.venv/bin/python -m pytest tests/ci` |
 | 发行工作流：演练 / 正式运行（0021；从以冻结提交为最新提交的已推送分支触发，正式运行引用同一提交含 PID 1 的成功演练） | `gh workflow run release.yml --repo <owner/repo> --ref <冻结分支> -f commit=<完整 SHA> -f version=<版本> -f dry_run=true`；正式运行改为 `-f dry_run=false -f pid1_dry_run=<演练运行 ID>.<attempt>` |

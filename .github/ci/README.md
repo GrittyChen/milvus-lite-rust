@@ -12,7 +12,7 @@
 | `sdk26` | CPython 3.10 | 安装 wheel 后的 pymilvus 2.6.17 线 |
 | `sdk26-py315` | CPython 3.15 | 发行工作流中 3.15 的 pymilvus 2.6.17 线；`sdk26` 选中的 numpy 2.4.6 没有 cp315 wheel，因此单独解析，不复用 3.10 的集合 |
 | `sdk30` | CPython 3.10–3.15 | 发行工作流中各解释器的 pymilvus 3.0.2 线（3.10 / 3.15 全套与 3.11–3.14 冒烟）；逐解释器、逐平台核对过 wheel |
-| `ref25` / `ref15` | CPython 3.12 | 参照 v3.2.1 的 Arrow 25 / Arrow 15 环境；参照实现的依赖取自其 `pyproject.toml`，checkout 另以 `--no-deps -e` 安装 |
+| `ref25` / `ref15` | CPython 3.12 | 参照实现（`compare.yml` 的 `REFERENCE_COMMIT`）的 Arrow 25 / Arrow 15 环境；参照实现的依赖取自其 `pyproject.toml`，checkout 另以 `--no-deps -e` 安装 |
 | `build` | — | 可编辑安装参照时的构建依赖（hatchling 及其可编辑安装额外请求的 editables），经 `--build-constraint` 使用 |
 
 Linux 上的 CPython 3.15 例外：`orjson==3.13.0` 的 cp315 Linux wheel 只有 `manylinux_2_39`，无法在 glibc 2.28 的测试环境安装，按 [0021](../../docs/decisions/0021-release-build-in-ci.md) 第 11 条只允许它从 sdist（SHA256 `d1de5eb04485110c5da4c657e49168995d55e076b1ce60f1a042e254f4186c4f`）在独立 job 中构建一次，其余依赖仍只用 wheel。

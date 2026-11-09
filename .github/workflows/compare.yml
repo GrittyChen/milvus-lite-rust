@@ -1,4 +1,4 @@
-# 对照层：与参照实现 v3.2.1 的差分、存储互通与固定真值核验。范围与判据见 docs/decisions/0020-continuous-integration.md。
+# 对照层：与参照实现（版本见 REFERENCE_COMMIT）的差分、存储互通与固定真值核验。范围与判据见 docs/decisions/0020-continuous-integration.md。
 name: Compare
 
 on:
@@ -28,7 +28,7 @@ env:
   CARGO_TERM_COLOR: never
   UV_VERSION: "0.12.23"
   UV_CACHE_DIR: ${{ github.workspace }}-uv-cache
-  REFERENCE_COMMIT: 43d1257774e629bc9f66873977ab7c320d5bf5a7
+  REFERENCE_COMMIT: 1320d26ec3d88b23b525e774df6e3c8e7c208f81
 
 jobs:
   changes:
@@ -140,7 +140,7 @@ jobs:
           . .github/ci/crash_capture.sh
           .venv/bin/python tests/sharding/shard.py plan --python .venv/bin/python --suite tests/differential \
             --out "$RUNNER_TEMP/plan" --shards ${{ matrix.shards }} \
-            --group-fixture diff --group-fixture rust_uri --group-fixture ref_uri --expect 472 --expect-group 118
+            --group-fixture diff --group-fixture rust_uri --group-fixture ref_uri --expect 619 --expect-group 262
           .venv/bin/python tests/sharding/shard.py run --plan "$RUNNER_TEMP/plan/plan.json" --out "$RUNNER_TEMP/run"
       - name: 差分（pymilvus 2.6.17，安装 wheel，仓库外运行）
         if: matrix.suite == 'diff-2.6.17'
@@ -151,7 +151,7 @@ jobs:
           mkdir "$RUNNER_TEMP/outside"
           .venv/bin/python tests/sharding/shard.py plan --python "$RUNNER_TEMP/v26/bin/python" --suite "$PWD/tests/differential" \
             --cwd "$RUNNER_TEMP/outside" --out "$RUNNER_TEMP/plan" --shards ${{ matrix.shards }} \
-            --group-fixture diff --group-fixture rust_uri --group-fixture ref_uri --expect 472 --expect-group 118
+            --group-fixture diff --group-fixture rust_uri --group-fixture ref_uri --expect 619 --expect-group 262
           .venv/bin/python tests/sharding/shard.py run --plan "$RUNNER_TEMP/plan/plan.json" --out "$RUNNER_TEMP/run"
       - name: 存储互通
         if: matrix.suite == 'interop'

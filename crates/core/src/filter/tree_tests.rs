@@ -16,7 +16,7 @@ fn nullable_typed_columns_match_reference_all_routes() {
     .unwrap();
     assert_eq!(
         fixture["reference"],
-        "43d1257774e629bc9f66873977ab7c320d5bf5a7"
+        "1320d26ec3d88b23b525e774df6e3c8e7c208f81"
     );
     let mut failures = Vec::new();
     for (index, case) in fixture["cases"].as_array().unwrap().iter().enumerate() {

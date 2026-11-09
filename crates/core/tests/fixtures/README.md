@@ -1,6 +1,6 @@
 # 3.x 参照实现导出的测试数据
 
-本目录的文件均由参照实现 milvus-lite v3.2.1（`43d1257`）生成，原项目按 Apache-2.0 许可发布。存储格式样本的来源代码分别为 `milvus_lite/schema/persistence.py`、`milvus_lite/storage/manifest.py`、`milvus_lite/db.py`、`milvus_lite/storage/wal.py`、`milvus_lite/storage/data_file.py`、`milvus_lite/storage/delta_file.py` 与 `milvus_lite/storage/snapshots.py`。
+本目录的文件均由参照实现 milvus-lite v3.2.1（`43d1257`）生成，并已在 `1320d26` 上重新核验，存储格式样本内容未变；过滤真值的来源字段已更新，同样内容不变（见 [0027](../../../../docs/decisions/0027-reference-3.2.2-upgrade.md)）。原项目按 Apache-2.0 许可发布。存储格式样本的来源代码分别为 `milvus_lite/schema/persistence.py`、`milvus_lite/storage/manifest.py`、`milvus_lite/db.py`、`milvus_lite/storage/wal.py`、`milvus_lite/storage/data_file.py`、`milvus_lite/storage/delta_file.py` 与 `milvus_lite/storage/snapshots.py`。
 
 - `schema_3x.json`：collection `c`，INT64 主键 `id`、二维 FLOAT_VECTOR `vector`。
 - `manifest_3x.json`：新 collection 的首次 manifest，版本 1，无数据文件。

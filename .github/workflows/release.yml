@@ -45,7 +45,7 @@ env:
   UV_VERSION: "0.12.23"
   MODE: ${{ inputs.dry_run && 'dry-run' || 'release' }}
   VERSION: ${{ inputs.version }}
-  REFERENCE_COMMIT: 43d1257774e629bc9f66873977ab7c320d5bf5a7
+  REFERENCE_COMMIT: 1320d26ec3d88b23b525e774df6e3c8e7c208f81
   # 兼容探针的上一版本：附件哈希写死，不在运行时取最新版本（0021 第 11 条）。
   PREVIOUS_VERSION: 0.3.0rc3
   PREVIOUS_WHEEL: milvus_lite_rust-0.3.0rc3-cp310-abi3-manylinux_2_28_x86_64.whl

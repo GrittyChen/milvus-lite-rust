@@ -1,6 +1,6 @@
 {
-  "reference": "43d1257774e629bc9f66873977ab7c320d5bf5a7",
-  "generator_sha256": "49a02912165c9a26f9479bc3d05bf7a494432b68c429dc31b730aadfd9f6910d",
+  "reference": "1320d26ec3d88b23b525e774df6e3c8e7c208f81",
+  "generator_sha256": "0980a33822634181d5536489556915f7bf5245c23bf58e69e90b7ab15f2fb99a",
   "conversions": [
     {
       "type": "bool",
@@ -28126,5 +28126,5 @@
       ]
     }
   ],
-  "business_generator_sha256": "caa2f61e18137d2239a6e20f51a405fdeaef1de32f1f31f61daf2716d669a81d"
+  "business_generator_sha256": "2fc27fa0ef83772400bc4865d679aa7c4b7cc22ded617409c743dd7b47a45f99"
 }
