@@ -1,5 +1,5 @@
 //! SearchRequest 的解析与 SearchResults 的编码，与 3.x `translators/search.py`、`servicer.Search` 与
-//! `translators/result.py` 一致。解析错误按 3.x 的先后报告：placeholder、topk、radius、range_filter、
+//! `translators/result.py` 一致。解析错误按 3.x 的先后报告：placeholder、topk、metric_type 的类型、radius、range_filter、
 //! group_size、offset、round_decimal。
 
 use std::collections::HashMap;
@@ -39,12 +39,25 @@ pub(crate) struct Parsed {
     range: Option<SearchRange>,
     group: Option<GroupBy>,
     pub(crate) unsupported: Option<&'static str>,
+    function_chains_conflict: bool,
     pub(crate) expr: String,
     pub(crate) boost: Option<BoostSpec>,
     l2: Option<L2Function>,
     /// 请求里的 `timezone` / `time_fields`（空串与非字符串视为没有，同 3.x `translators/search.py`）。
     pub(crate) timezone: Option<String>,
     pub(crate) time_fields: Option<String>,
+}
+
+impl Parsed {
+    /// 3.x 在 `prepare_search_function_chain` 中检查，晚于度量解析、早于 load。
+    pub(crate) fn check_function_chains(&self) -> Result<(), EngineError> {
+        if self.function_chains_conflict {
+            return Err(EngineError::SchemaValidation(
+                "function_score and function_chains cannot be used together".to_owned(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// `parsed` 由 [`parse`] 在取 collection 读锁之前得到。
@@ -202,7 +215,7 @@ pub(crate) fn encode(
             scores,
             ids: Some(insert::pb_ids(&pks, varchar)),
             topks,
-            output_fields: result.projection.output_fields(schema, false),
+            output_fields: result.projection.output_fields(schema, true),
             primary_field_name: pk.name.clone(),
             group_by_field_value: match group_field {
                 Some(name) => output::group_by_field_data(
@@ -337,7 +350,22 @@ fn parse_request(req: &svc::SearchRequest, route: bool) -> Result<Parsed, Engine
             }
         },
     };
-    let metric_type = raw.get("metric_type").map(pyint::py_str);
+    // `json.loads` 接受而 serde_json 回退成字符串的 NaN / Infinity 在 3.x 是 float。
+    let nonfinite_metric = req
+        .search_params
+        .iter()
+        .rev()
+        .find(|kv| kv.key == "metric_type")
+        .is_some_and(|kv| pyint::is_python_json_nonfinite(&kv.value));
+    let metric_type = match raw.get("metric_type") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(metric)) if !nonfinite_metric => Some(metric.clone()),
+        Some(_) => {
+            return Err(EngineError::SchemaValidation(
+                "metric_type must be a string".to_owned(),
+            ));
+        }
+    };
     let anns_field = match raw.get("anns_field") {
         Some(Value::String(s)) if !s.is_empty() => Some(s.clone()),
         _ => None,
@@ -406,12 +434,9 @@ fn parse_request(req: &svc::SearchRequest, route: bool) -> Result<Parsed, Engine
         }
     };
 
-    if !route && !req.function_chains.is_empty() {
-        if req.function_score.is_some() {
-            return Err(EngineError::SchemaValidation(
-                "function_score and function_chains cannot be used together".to_owned(),
-            ));
-        }
+    let function_chains_conflict =
+        !route && !req.function_chains.is_empty() && req.function_score.is_some();
+    if !route && !req.function_chains.is_empty() && !function_chains_conflict {
         note("function chains");
     }
     Ok(Parsed {
@@ -422,6 +447,7 @@ fn parse_request(req: &svc::SearchRequest, route: bool) -> Result<Parsed, Engine
         offset,
         round_decimal,
         range: (range.radius.is_some() || range.range_filter.is_some()).then_some(range),
+        function_chains_conflict,
         group,
         unsupported: unsupported_feature,
         expr: req.dsl.clone(),

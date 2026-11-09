@@ -14,16 +14,13 @@ pub enum Metric {
 }
 
 impl Metric {
-    /// 与 3.x `search/distance.py` 相同：区分大小写，只接受这三种。
-    pub fn parse(s: &str) -> Result<Self> {
+    /// 大写的度量名；大小写规范化与报错由调用方按 3.x 的 `resolve_search_metric` 完成。
+    pub(crate) fn parse(s: &str) -> Option<Self> {
         match s {
-            "L2" => Ok(Self::L2),
-            "IP" => Ok(Self::Ip),
-            "COSINE" => Ok(Self::Cosine),
-            _ => Err(EngineError::invalid(format!(
-                "unsupported metric_type {}; expected one of ('COSINE', 'L2', 'IP')",
-                py_repr(s)
-            ))),
+            "L2" => Some(Self::L2),
+            "IP" => Some(Self::Ip),
+            "COSINE" => Some(Self::Cosine),
+            _ => None,
         }
     }
 
@@ -178,8 +175,9 @@ const ACCEPTED_DENSE_INDEX_TYPES: [&str; 7] = [
 /// 调用方已检查「索引已存在」与「字段不存在」。
 pub(crate) fn build_spec(field: &FieldSchema, req: IndexRequest) -> Result<IndexSpec> {
     let index_type = req.index_type.to_uppercase();
+    let requested_metric = req.metric_type.map(|m| m.to_uppercase());
     let metric_type = if field.data_type.is_vector() {
-        req.metric_type.ok_or_else(|| {
+        requested_metric.ok_or_else(|| {
             EngineError::schema("create_index missing required 'metric_type' parameter")
         })?
     } else {
@@ -193,7 +191,7 @@ pub(crate) fn build_spec(field: &FieldSchema, req: IndexRequest) -> Result<Index
         }
         validate_scalar_request(field.data_type, &index_type)?;
         // 3.x：`metric_type or "NONE"`，空串同样视为没有。
-        req.metric_type
+        requested_metric
             .filter(|m| !m.is_empty())
             .unwrap_or_else(|| "NONE".to_owned())
     };
@@ -409,11 +407,23 @@ mod tests {
             err(&vector(), req("FLAT", None)).to_string(),
             "create_index missing required 'metric_type' parameter"
         );
-        let e = err(&vector(), req("FLAT", Some("l2")));
+        let e = err(&vector(), req("FLAT", Some("bad")));
         assert!(matches!(e, EngineError::InvalidArgument(_)));
         assert_eq!(
             e.to_string(),
-            "metric_type must be one of COSINE/L2/IP/BM25/NONE, got 'l2'"
+            "metric_type must be one of COSINE/L2/IP/BM25/NONE, got 'BAD'"
+        );
+    }
+
+    #[test]
+    fn requested_metric_is_uppercased_before_validation_and_storage() {
+        let spec = build_spec(&vector(), req("FLAT", Some("cosine"))).unwrap();
+        assert_eq!(spec.metric_type, "COSINE");
+        // 向量字段上空串不等于缺失，继续由度量校验拒绝。
+        let e = err(&vector(), req("FLAT", Some("")));
+        assert_eq!(
+            e.to_string(),
+            "metric_type must be one of COSINE/L2/IP/BM25/NONE, got ''"
         );
     }
 

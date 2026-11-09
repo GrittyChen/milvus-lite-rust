@@ -834,8 +834,10 @@ impl ReadSnapshot {
         let group_pos = group
             .map(|g| self.resolve_group_field(&g.field))
             .transpose()?;
-        let field_pos = self.resolve_anns_field(req.anns_field.as_deref())?;
+        let field_pos =
+            resolve_anns_field(&self.schema, self.vector_pos, req.anns_field.as_deref())?;
         let field = &self.schema.fields[field_pos];
+        let metric = resolve_field_metric(&self.indexes, field, req.metric_type.as_deref())?;
         let vectors = match &req.vectors {
             QueryVectors::Dense(v) => v,
             // 3.x `_maybe_embed_queries`：字段上没有 TEXT_EMBEDDING function（M1 不支持 function）。
@@ -878,10 +880,6 @@ impl ReadSnapshot {
             self.filtered_chunks_compiled(predicate.as_ref())?
         } else {
             std::borrow::Cow::Borrowed(self.chunks.as_slice())
-        };
-        let metric = match &req.metric_type {
-            Some(m) => Metric::parse(m)?,
-            None => self.default_metric(&field.name)?,
         };
         let dim = field_dim(field);
         // 3.x 不校验，维度不符时报 numpy 的原始错误，空 collection 上反而成功（0004「决策」）。
@@ -1390,41 +1388,6 @@ impl ReadSnapshot {
         Ok(pos)
     }
 
-    fn resolve_anns_field(&self, anns_field: Option<&str>) -> Result<usize> {
-        let Some(name) = anns_field else {
-            return Ok(self.vector_pos);
-        };
-        let pos = self
-            .schema
-            .fields
-            .iter()
-            .position(|f| f.name == name)
-            .ok_or_else(|| {
-                EngineError::schema(format!("anns_field {} not found in schema", py_repr(name)))
-            })?;
-        let field = &self.schema.fields[pos];
-        if !field.data_type.is_vector() {
-            return Err(EngineError::schema(format!(
-                "anns_field {} is not a vector field (dtype={})",
-                py_repr(name),
-                field.data_type.name()
-            )));
-        }
-        Ok(pos)
-    }
-
-    /// 3.x：向量字段有索引且度量不是 NONE 时用索引的度量，否则 COSINE。
-    fn default_metric(&self, field_name: &str) -> Result<Metric> {
-        match self
-            .indexes
-            .iter()
-            .find(|spec| spec.field_name == field_name)
-        {
-            Some(spec) if spec.metric_type != "NONE" => Metric::parse(&spec.metric_type),
-            _ => Ok(Metric::Cosine),
-        }
-    }
-
     fn gather(&self, refs: &[RowRef], projection: &Projection) -> Rows {
         gather_rows(
             &self.schema,
@@ -1453,6 +1416,58 @@ pub(crate) struct ChunkData {
     pub(crate) norms: Vec<f32>,
     pub(crate) seqs: Vec<u64>,
     orders: Vec<u64>,
+}
+
+fn resolve_anns_field(
+    schema: &CollectionSchema,
+    vector_pos: usize,
+    anns_field: Option<&str>,
+) -> Result<usize> {
+    let Some(name) = anns_field else {
+        return Ok(vector_pos);
+    };
+    let pos = schema
+        .fields
+        .iter()
+        .position(|f| f.name == name)
+        .ok_or_else(|| {
+            EngineError::schema(format!("anns_field {} not found in schema", py_repr(name)))
+        })?;
+    let field = &schema.fields[pos];
+    if !field.data_type.is_vector() {
+        return Err(EngineError::schema(format!(
+            "anns_field {} is not a vector field (dtype={})",
+            py_repr(name),
+            field.data_type.name()
+        )));
+    }
+    Ok(pos)
+}
+
+/// 3.x `Collection.resolve_search_metric` 的稠密字段分支：请求的度量先转大写，空串与缺失相同；
+/// 没有请求时用该字段索引的度量，再没有时用 COSINE。索引度量为 BM25 / NONE 时同样报错。
+fn resolve_field_metric(
+    indexes: &[IndexSpec],
+    field: &FieldSchema,
+    requested: Option<&str>,
+) -> Result<Metric> {
+    let metric = requested
+        .map(str::to_uppercase)
+        .filter(|m| !m.is_empty())
+        .or_else(|| {
+            indexes
+                .iter()
+                .find(|spec| spec.field_name == field.name)
+                .map(|spec| spec.metric_type.clone())
+        })
+        .unwrap_or_else(|| "COSINE".to_owned());
+    Metric::parse(&metric).ok_or_else(|| {
+        EngineError::schema(format!(
+            "field {}: unsupported dense metric {}",
+            py_repr(&field.name),
+            py_repr(&metric)
+        ))
+    })
 }
 
 impl std::ops::Deref for Chunk {
@@ -3558,6 +3573,16 @@ impl Collection {
             .chunks
             .sort_by_key(|chunk| (chunk.source_rank, chunk.row_start));
         Ok(snapshot)
+    }
+
+    /// 校验检索目标字段并确定度量。不依赖 load 状态，错误先于 load 与过滤报告。
+    pub fn resolve_search_metric(
+        &self,
+        anns_field: Option<&str>,
+        metric_type: Option<&str>,
+    ) -> Result<Metric> {
+        let pos = resolve_anns_field(&self.schema, self.vector_pos, anns_field)?;
+        resolve_field_metric(&self.indexes, &self.schema.fields[pos], metric_type)
     }
 
     pub fn read_named_snapshot(&self, names: &[String]) -> Result<ReadSnapshot> {

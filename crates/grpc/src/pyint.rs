@@ -218,6 +218,14 @@ pub(crate) fn maybe_python_json_container(text: &str) -> bool {
     matches!(text.trim_start().as_bytes().first(), Some(b'{' | b'['))
 }
 
+/// `json.loads` 接受、严格 JSON 不接受的三个非有限数字字面量（允许 JSON 空白包围）。
+pub(crate) fn is_python_json_nonfinite(text: &str) -> bool {
+    matches!(
+        text.trim_matches([' ', '\t', '\n', '\r']),
+        "NaN" | "Infinity" | "-Infinity"
+    )
+}
+
 /// 把 `json.loads` 的结果转为 Python `str(v)`：字符串原样，其余同 `repr`。
 pub(crate) fn py_str(v: &Value) -> String {
     match v {
@@ -230,6 +238,16 @@ pub(crate) fn py_str(v: &Value) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn python_json_nonfinite_literals_are_exact() {
+        for text in ["NaN", "Infinity", "-Infinity", " NaN\n"] {
+            assert!(is_python_json_nonfinite(text), "{text:?}");
+        }
+        for text in ["nan", "+Infinity", "\"NaN\"", "NaN!", ""] {
+            assert!(!is_python_json_nonfinite(text), "{text:?}");
+        }
+    }
 
     #[test]
     fn schema_proto_integers_never_saturate_wide_defaults() {

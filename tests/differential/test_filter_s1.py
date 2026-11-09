@@ -460,8 +460,10 @@ def test_raw_search_compiles_before_zero_topk_and_preserves_strict_parameter_che
         assert reply.status.code==0 and list(reply.results.topks)==[0]
     for reply in both(request("age == 'bad'")):
         assert (reply.status.code,reply.status.error_code)==(6,6)
-    # 沿用本仓 M1 的参数严检：即使过滤后无候选，也不接受错误维度或未知度量。
-    for metric,vector in [("bad",(1.0,0.0)),("L2",(1.0,))]:
-        rust,reference=both(request("age<0",topk="2",metric=metric,vector=vector))
-        assert (rust.status.code,rust.status.error_code)==(1,0)
-        assert reference.status.code==0 and list(reference.results.topks)==[0]
+    # 未知度量在 3.x 上同样先于过滤报错。
+    rust,reference=both(request("age<0",topk="2",metric="bad"))
+    assert (rust.status.code,rust.status.error_code,rust.status.reason)==(reference.status.code,reference.status.error_code,reference.status.reason)==(6,6,"field 'vector': unsupported dense metric 'BAD'")
+    # 沿用本仓 M1 的参数严检：即使过滤后无候选，也不接受错误维度。
+    rust,reference=both(request("age<0",topk="2",vector=(1.0,)))
+    assert (rust.status.code,rust.status.error_code)==(1,0)
+    assert reference.status.code==0 and list(reference.results.topks)==[0]

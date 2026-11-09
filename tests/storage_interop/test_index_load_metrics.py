@@ -70,16 +70,19 @@ try:
             assert str(state) == 'Loaded', state
     assert manifest.read_bytes() == before
     if expected == 'fail':
-        for call in [
-            lambda: c.query('c', output_fields=['id'], limit=500),
-            lambda: c.get('c', [1]),
-            lambda: c.search('c', [[1., 0.]], anns_field='v', limit=1),
+        released = "Collection 'c' is in state 'released'; call load() before search/get/query"
+        for call, code, message in [
+            (lambda: c.query('c', output_fields=['id'], limit=500), 101, released),
+            (lambda: c.get('c', [1]), 101, released),
+            # 度量在 load 状态之前解析，BM25 / NONE 的索引度量先报错。
+            (lambda: c.search('c', [[1., 0.]], anns_field='v', limit=1), 6,
+             f"field 'v': unsupported dense metric '{metric}'"),
         ]:
             try:
                 call()
             except Exception as e:
-                assert e.code == 101, e
-                assert "Collection 'c' is in state 'released'; call load() before search/get/query" in e.message, e
+                assert e.code == code, e
+                assert message in e.message, e
             else:
                 raise AssertionError('read succeeded after failed load')
         c.drop_index('c', 'v_idx')

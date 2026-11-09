@@ -181,7 +181,7 @@ def test_quick_start_through_pymilvus(env):
     hits = client.search("q", data=[[0.1, 0.9, 0.5, 0.2]], limit=2)[0]
     assert [h["id"] for h in hits] == [1, 0]
     # 不指定 output_fields 时 3.x 返回主键以外的全部字段，包括向量与动态字段。
-    assert set(hits[0]["entity"]) == {"id", "vector", "text"}
+    assert set(hits[0]["entity"]) == {"vector", "text"}
     got = client.get("q", ids=[3, 1, 3, 99])
     assert [r["id"] for r in got] == [3, 1, 3]
     assert client.has_collection("q") and not client.has_collection("nope")
@@ -645,8 +645,14 @@ def test_search_parameter_parsing(env):
     assert status_of(r) == (6, 6, "SearchRequest.search_params['topk'] must be int, got 'abc'")
     r = stub.Search(search_req(params={"offset": "x"}))
     assert status_of(r) == (1, 0, "invalid literal for int() with base 10: 'x'")
-    r = stub.Search(search_req(params={"metric_type": "l2"}))
-    assert status_of(r) == (1, 0, "unsupported metric_type 'l2'; expected one of ('COSINE', 'L2', 'IP')")
+    # 度量不区分大小写；空串与 JSON null 等同没有传，非字符串在解析时报错，未知度量按大写报告。
+    for form in ("l2", "", "null"):
+        r = stub.Search(search_req(params={"metric_type": form}))
+        assert status_of(r)[0] == 0 and list(r.results.ids.int_id.data)
+    r = stub.Search(search_req(params={"metric_type": "nope"}))
+    assert status_of(r) == (6, 6, "field 'v': unsupported dense metric 'NOPE'")
+    r = stub.Search(search_req(params={"metric_type": "123", "radius": "x"}))
+    assert status_of(r) == (6, 6, "metric_type must be a string")
     assert list(stub.Search(search_req(params={"topk": "2.5"})).results.ids.int_id.data) == [1, 2]
     r = stub.Search(search_req(params={"topk": "0"}))
     assert status_of(r)[0] == 0 and list(r.results.topks) == [0] and r.results.top_k == 0
@@ -1024,13 +1030,13 @@ def test_search_result_encoding(env):
     assert res.num_queries == 2 and res.top_k == 2 and list(res.topks) == [2, 2]
     assert list(res.ids.int_id.data) == [1, 2, 5, 4]
     assert res.primary_field_name == "id" and r.collection_name == "c"
-    # 不指定 output_fields：主键列总在，其余字段按 schema 顺序，最后是完整的 `$meta`。
-    assert columns(res.fields_data) == ["id", "v", "t", "$meta"]
+    # 不指定 output_fields：主键只在 ids 中，其余字段按 schema 顺序，最后是完整的 `$meta`。
+    assert columns(res.fields_data) == ["v", "t", "$meta"]
     assert list(res.output_fields) == ["v", "t", "$meta"]
     assert meta_rows(res.fields_data)[0] == b'{"aa": "a1", "zz": 1}'
     # 显式请求的动态 key 按请求顺序输出。
     r = stub.Search(search_req(params={"topk": "1"}, output_fields=["zz", "t", "aa"]))
-    assert columns(r.results.fields_data) == ["id", "t", "$meta"]
+    assert columns(r.results.fields_data) == ["t", "$meta"]
     assert list(r.results.output_fields) == ["t", "zz", "aa"]
     assert meta_rows(r.results.fields_data) == [b'{"zz": 1, "aa": "a1"}']
     # 空结果仍带各列，向量列保留 dim。
@@ -1046,7 +1052,9 @@ def test_search_on_non_dynamic_collection_drops_unknown_fields(env):
     basic(stub, dynamic=False)
     insert(stub, "c", long_fd("id", [1]), vec_fd("v", [[1, 0]]), str_fd("t", ["a"]))
     r = stub.Search(search_req(output_fields=["nope", "t"]))
-    assert columns(r.results.fields_data) == ["id", "t"] and list(r.results.output_fields) == ["t"]
+    assert columns(r.results.fields_data) == ["t"] and list(r.results.output_fields) == ["t"]
+    r = stub.Search(search_req(output_fields=["t", "id"]))
+    assert columns(r.results.fields_data) == ["id", "t"] and list(r.results.output_fields) == ["id", "t"]
 
 
 # ── 查询 ─────────────────────────────────────────────────────
@@ -1101,9 +1109,12 @@ def test_query_load_state(env):
     seed(stub)
     l2_index(stub)
     stub.ReleaseCollection(milvus_pb2.ReleaseCollectionRequest(collection_name="c"))
-    # 空 expr 的 count(*) 不查 load 状态、不看分区。
-    r = stub.Query(query_req(output_fields=["count(*)"], partition_names=["nope"]))
+    # 空 expr 的 count(*) 不查 load 状态；指定分区时按分区计数，分区不存在时报错。
+    r = stub.Query(query_req(output_fields=["count(*)"]))
     assert list(r.fields_data[0].scalars.long_data.data) == [5]
+    r = stub.Query(query_req(output_fields=["count(*)"], partition_names=["_default", "_default"]))
+    assert list(r.fields_data[0].scalars.long_data.data) == [5]
+    assert status_of(stub.Query(query_req(output_fields=["count(*)"], partition_names=["nope"]))) == (200, 200, "nope")
     assert status_of(stub.Query(query_req(expr="id in [1]")))[:2] == (101, 101)
     assert status_of(stub.Query(query_req(expr="id > 1")))[:2] == (101, 101)
     # 带非空 expr 的 count(*) 走通用查询，先检查 load 状态。
@@ -1307,7 +1318,7 @@ def test_search_l2_rerank_functions(env):
     result = client.search("l2", [[1.0, 0.0]], limit=3, output_fields=["age"],
                            ranker=ranker("decay", ["age"], function="linear", origin=1, scale=100, decay=0.5))[0]
     assert [h["id"] for h in result] == [9, 8, 7]
-    assert all(set(h["entity"]) == {"id", "age"} for h in result)
+    assert all(set(h["entity"]) == {"age"} for h in result)
     # 主键不在候选行里：decay 的因子恒为 0，全部同分，按 `$id` 升序（3.x 同）。
     assert hits(ranker=ranker("decay", ["id"], function="gauss", origin=0, scale=1)) == [(0, 0.0), (1, 0.0), (2, 0.0)]
     # 分组在 rerank 链里做：每组取前 group_size 个，组按组内最高分排序。
@@ -1397,7 +1408,7 @@ def test_hybrid_search_rank_params_and_function_score(env):
     decay = Function("d", FunctionType.RERANK, ["age"],
                      params={"reranker": "decay", "function": "linear", "origin": 10, "scale": 100})
     result = hybrid(two, decay, limit=3, output_fields=["cat"])[0]
-    assert result[0]["id"] == 0 and all(set(h["entity"]) == {"id", "cat"} for h in result)
+    assert result[0]["id"] == 0 and all(set(h["entity"]) == {"cat"} for h in result)
     # 分组在 rerank 链里做。
     grouped = hybrid(two, RRFRanker(), limit=1, group_by_field="cat", group_size=2, output_fields=["cat"])[0]
     assert [h["entity"]["cat"] for h in grouped] == ["a", "a"]
@@ -1457,7 +1468,7 @@ def test_faiss_metric_rejection_is_unimplemented_and_does_not_create_index(
     assert status_of(stub.CreateIndex(request)) == (
         1,
         0,
-        "metric_type must be one of COSINE/L2/IP/BM25/NONE, got 'bad'",
+        "metric_type must be one of COSINE/L2/IP/BM25/NONE, got 'BAD'",
     )
     del request.extra_params[1]
     assert status_of(stub.CreateIndex(request)) == (

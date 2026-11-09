@@ -116,6 +116,9 @@ pub(crate) fn fields_data(
 ) -> Result<Vec<pb::FieldData>, EngineError> {
     let mut out = Vec::new();
     for (i, field) in schema.fields.iter().enumerate() {
+        if field.is_primary && !projection.emits_primary(i) {
+            continue;
+        }
         let column = if field.is_primary {
             Column::Pk(rows.iter().flat_map(|r| r.pks.iter()).collect())
         } else if let Some(pos) = projection.schema_fields.iter().position(|&f| f == i) {

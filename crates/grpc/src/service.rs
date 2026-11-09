@@ -688,6 +688,12 @@ impl Service for MilvusService {
             let parsed = search::parse(&req)?;
             let snapshot = {
                 let guard = handle.read();
+                // 3.x 在 load、分组与过滤之前按目标字段确定度量，无效的 anns_field 或度量最先报出。
+                guard.resolve_search_metric(
+                    parsed.anns_field.as_deref(),
+                    parsed.metric_type.as_deref(),
+                )?;
+                parsed.check_function_chains()?;
                 guard.read_named_snapshot(&req.partition_names)?
             };
             #[cfg(test)]

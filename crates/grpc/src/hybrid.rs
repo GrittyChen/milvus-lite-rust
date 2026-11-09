@@ -132,6 +132,10 @@ pub(crate) fn hybrid_search(
     let mut routes: Vec<(ReadSnapshot, RouteRanking)> = Vec::with_capacity(req.requests.len());
     for sub in &req.requests {
         let parsed = search::parse_route(sub)?;
+        // 与 Search 相同，逐路在该路的分区、load 与过滤之前确定度量；前一路已完整执行。
+        handle
+            .read()
+            .resolve_search_metric(parsed.anns_field.as_deref(), parsed.metric_type.as_deref())?;
         // 过滤与 boost 过滤用 `路由的 || rank_params 的`；输出取 rank_params 的，没有则取第一个带它的路由。
         let route_timezone = parsed.timezone.clone().or_else(|| rank.timezone.clone());
         if output_timezone.is_none() {

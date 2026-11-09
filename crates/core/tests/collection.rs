@@ -694,6 +694,39 @@ fn search_default_output_includes_vector_and_meta_but_not_pk_field() {
 }
 
 #[test]
+fn search_metric_is_case_insensitive_and_empty_means_unset() {
+    let mut c = basic(false, false);
+    let search = |c: &mut Collection, metric: Option<&str>| {
+        c.search(
+            SearchRequest {
+                anns_field: None,
+                vectors: QueryVectors::Dense(vec![vec![1.0, 0.0]]),
+                metric_type: metric.map(str::to_owned),
+                limit: 1,
+                offset: 0,
+                output_fields: vec![],
+            },
+            &compute(),
+        )
+    };
+    for metric in [Some("l2"), Some("Ip"), Some(""), None] {
+        assert!(search(&mut c, metric).is_ok(), "{metric:?}");
+    }
+    assert_eq!(
+        c.resolve_search_metric(None, Some("cosine"))
+            .unwrap()
+            .as_str(),
+        "COSINE"
+    );
+    assert_eq!(
+        c.resolve_search_metric(Some("nope"), Some("BAD"))
+            .unwrap_err()
+            .to_string(),
+        "anns_field 'nope' not found in schema"
+    );
+}
+
+#[test]
 fn search_argument_errors() {
     let mut c = basic(false, false);
     let req = |anns: Option<&str>, metric: Option<&str>, q: Vec<f32>| SearchRequest {
@@ -713,8 +746,8 @@ fn search_argument_errors() {
         "query vector has dim 3, but field 'v' expects dim 2"
     );
     assert_eq!(
-        err(req(None, Some("l2"), vec![1.0, 0.0])).to_string(),
-        "unsupported metric_type 'l2'; expected one of ('COSINE', 'L2', 'IP')"
+        err(req(None, Some("nope"), vec![1.0, 0.0])).to_string(),
+        "field 'v': unsupported dense metric 'NOPE'"
     );
     assert_eq!(
         err(req(Some("nope"), None, vec![1.0, 0.0])).to_string(),

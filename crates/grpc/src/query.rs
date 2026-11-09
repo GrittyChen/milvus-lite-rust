@@ -1,5 +1,7 @@
 //! Query 分派保留主键快路径，其余 S1 在不可变快照上求值与编码。
 
+use std::collections::HashSet;
+
 use milvus_lite_core::filter::ParsedFilter;
 use milvus_lite_core::timezone::TimezoneSource;
 use milvus_lite_core::{CollectionHandle, EngineError};
@@ -53,7 +55,8 @@ pub(crate) fn query(
     let parsed = ParsedFilter::parse_with(&req.expr, &timezone);
     let c = handle.read();
     if req.output_fields.iter().any(|f| f == COUNT) {
-        // 3.x：只要请求了 count(*) 就只返回计数；expr 为空时取总行数，不查 load 状态、不看分区。
+        // 3.x：只要请求了 count(*) 就只返回计数；expr 为空时不查 load 状态，指定分区则按去重后的
+        // 分区逐个求和（同一主键跨分区时重复计入，分区不存在时报错）。
         // expr 非空时 3.x 走通用查询，先检查 load 状态。
         if !req.expr.is_empty() {
             c.require_loaded()?;
@@ -64,7 +67,15 @@ pub(crate) fn query(
                 snapshot.count_filtered_parsed(&parsed?)?,
             ));
         }
-        return Ok(count_result(c.name(), c.count()));
+        if req.partition_names.is_empty() {
+            return Ok(count_result(c.name(), c.count()));
+        }
+        let mut seen = HashSet::new();
+        let mut count = 0;
+        for name in req.partition_names.iter().filter(|n| seen.insert(*n)) {
+            count += c.count_partition(name)?;
+        }
+        return Ok(count_result(c.name(), count));
     }
     // query_params 中只要出现 iterator 键，3.x 就改走按主键排序的通用查询。
     let iterator = req.query_params.iter().any(|kv| kv.key == "iterator");

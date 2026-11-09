@@ -394,15 +394,19 @@ def test_quick_create_reopens_unloaded(pair):
     assert diff.step("get", lambda c: c.get("quick", ids=[1]))[1][0]["id"] == 1
 
 
-@pytest.mark.parametrize("index_metric,request_metric,rows,rust_expected,ref_expected", [
-    ("IP", "L2", [[1.0, 0.0], [3.0, 0.0], [0.0, 1.0]],
-     [(1, 0.0), (3, 2.0), (2, 4.0)], [(2, 9.0), (1, 1.0), (3, 0.0)]),
-    ("L2", "IP", [[1.0, 0.0], [3.0, 0.0], [0.0, 0.0]],
-     [(2, 3.0), (1, 1.0), (3, 0.0)], [(1, -0.0), (3, -1.0), (2, -2.0)]),
-    ("IP", "COSINE", [[1.0, 0.0], [0.0, 2.0], [-2.0, 0.0]],
-     [(1, 1.0), (2, 0.0), (3, -1.0)], [(1, 2.0), (2, 1.0), (3, -1.0)]),
+# limit 覆盖 segment 的全部有效行时 3.x 走精确检索，与本实现一致；更小的 limit 上仍是登记的 3.x 缺陷（0004「决策」）。
+@pytest.mark.parametrize("index_metric,request_metric,rows,limit,rust_expected,ref_expected", [
+    ("IP", "L2", [[1.0, 0.0], [3.0, 0.0], [0.0, 1.0]], 3,
+     [(1, 0.0), (3, 2.0), (2, 4.0)], [(1, 0.0), (3, 2.0), (2, 4.0)]),
+    ("L2", "IP", [[1.0, 0.0], [3.0, 0.0], [0.0, 0.0]], 3,
+     [(2, 3.0), (1, 1.0), (3, 0.0)], [(2, 3.0), (1, 1.0), (3, 0.0)]),
+    ("IP", "COSINE", [[1.0, 0.0], [0.0, 2.0], [-2.0, 0.0]], 3,
+     [(1, 1.0), (2, 0.0), (3, -1.0)], [(1, 1.0), (2, 0.0), (3, -1.0)]),
+    ("IP", "L2", [[1.0, 0.0], [3.0, 0.0], [0.0, 1.0]], 1, [(1, 0.0)], [(2, 9.0)]),
+    ("L2", "IP", [[1.0, 0.0], [3.0, 0.0], [0.0, 0.0]], 1, [(2, 3.0)], [(1, -0.0)]),
+    ("IP", "COSINE", [[1.0, 0.0], [0.0, 2.0], [-2.0, 0.0]], 1, [(1, 1.0)], [(1, 2.0)]),
 ])
-def test_request_metric_overrides_flushed_index_metric(pair, index_metric, request_metric, rows,
+def test_request_metric_overrides_flushed_index_metric(pair, index_metric, request_metric, rows, limit,
                                                        rust_expected, ref_expected):
     diff = pair.open()
     diff.step("create", lambda c: c.create_collection("c", schema=schema(), index_params=index(index_metric)))
@@ -415,15 +419,15 @@ def test_request_metric_overrides_flushed_index_metric(pair, index_metric, reque
     diff = pair.open()
     assert str(diff.step("load_state", lambda c: c.get_load_state("c"))[1]["state"]) == "NotLoad"
     diff.step("load", lambda c: c.load_collection("c"))
-    search = lambda c: c.search("c", data=[[1.0, 0.0]], limit=3,
+    search = lambda c: c.search("c", data=[[1.0, 0.0]], limit=limit,
                                 search_params={"metric_type": request_metric})
     rust, ref = run(search, diff.rust), run(search, diff.ref)
     assert rust[0] == ref[0] == "ok"
     rust_hits = [(hit["id"], hit["distance"]) for hit in rust[1][0]]
     ref_hits = [(hit["id"], hit["distance"]) for hit in ref[1][0]]
     assert repr(rust_hits) == repr(rust_expected)
-    # 3.x 的已知缺陷：segment 用索引度量计算内部距离并排序，再按请求度量换算对外分数。
-    assert repr(ref_hits) == repr(ref_expected)
+    assert [hit[0] for hit in ref_hits] == [hit[0] for hit in ref_expected]
+    assert [hit[1] for hit in ref_hits] == pytest.approx([hit[1] for hit in ref_expected], abs=1e-5)
 
 
 def test_failed_reference_startup_preserves_error(pair, monkeypatch):

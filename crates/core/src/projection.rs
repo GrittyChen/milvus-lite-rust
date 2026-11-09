@@ -22,6 +22,7 @@ pub struct Projection {
     pub dynamic_keys: Vec<String>,
     /// 是否输出完整的动态字段对象（`*`、`$meta`，或请求为空时）。
     pub all_dynamic: bool,
+    pub kind: ApiKind,
 }
 
 impl Projection {
@@ -41,6 +42,7 @@ impl Projection {
                 schema_fields,
                 dynamic_keys: Vec::new(),
                 all_dynamic: dynamic,
+                kind,
             };
         }
 
@@ -73,7 +75,13 @@ impl Projection {
             schema_fields,
             dynamic_keys,
             all_dynamic: dynamic && (star || meta),
+            kind,
         }
+    }
+
+    /// 主键是否编码进 fields_data：Query / Get 总是输出；Search 的主键已在 ids 中，只有显式请求或 `*` 时才输出。
+    pub fn emits_primary(&self, primary_index: usize) -> bool {
+        self.kind == ApiKind::Query || self.schema_fields.contains(&primary_index)
     }
 }
 
@@ -118,6 +126,16 @@ mod tests {
             enable_dynamic_field: dynamic,
             properties: Vec::new(),
         }
+    }
+
+    #[test]
+    fn search_emits_primary_only_when_selected_and_query_always_does() {
+        assert!(!p(true, &[], ApiKind::Search).emits_primary(0));
+        assert!(!p(true, &["t"], ApiKind::Search).emits_primary(0));
+        assert!(p(true, &["id", "t"], ApiKind::Search).emits_primary(0));
+        assert!(p(true, &["*"], ApiKind::Search).emits_primary(0));
+        assert!(p(true, &[], ApiKind::Query).emits_primary(0));
+        assert!(p(true, &["t"], ApiKind::Query).emits_primary(0));
     }
 
     fn p(dynamic: bool, fields: &[&str], kind: ApiKind) -> Projection {
