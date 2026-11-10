@@ -260,7 +260,7 @@ fn unsorted_or_renamed_schema_files_are_rewritten_canonically() {
     let canonical = std::fs::read(&path).unwrap();
 
     // 0.3.0rc3 按结构体字段顺序写出、未排序；名字与目录不同的文件也能打开（取舍 3）。
-    let value: serde_json::Value = serde_json::from_slice(&canonical).unwrap();
+    let value: serde_json::Value = milvus_lite_core::json_text::value(&canonical).unwrap();
     let mut reordered = serde_json::Map::new();
     for (key, item) in value.as_object().unwrap().iter().rev() {
         let item = if key == "collection_name" {

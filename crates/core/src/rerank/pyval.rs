@@ -629,7 +629,7 @@ mod tests {
         let value = PyVal::from_json(&json!({"a": [1, 1.5, "x", null, true]}));
         assert_eq!(value.type_name(), "dict");
         assert_eq!(value.py_str(), "{'a': [1, 1.5, 'x', None, True]}");
-        let big: Value = serde_json::from_str("18446744073709551616").unwrap();
+        let big: Value = crate::json_text::value_str("18446744073709551616").unwrap();
         assert_eq!(
             PyVal::from_json(&big),
             PyVal::BigInt("18446744073709551616".into())

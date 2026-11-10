@@ -267,16 +267,17 @@ mod tests {
         );
         assert_eq!(dumps(&json!({})), "{}");
         // arbitrary_precision 接受标准 JSON 的大指数，兼容输出分支仍然可达。
-        let overflow: Value = serde_json::from_str("[1e999,-1e999]").unwrap();
+        let overflow: Value = crate::json_text::value_str("[1e999,-1e999]").unwrap();
         assert_eq!(dumps_unicode(&overflow), "[Infinity, -Infinity]");
         let (a, z) = (json!(1), json!("s"));
         assert_eq!(
             dumps_object([("z", &z), ("a", &a)]),
             r#"{"z": "s", "a": 1}"#
         );
-        let wide: Value =
-            serde_json::from_str(r#"{"z": 184467440737095516160, "a": {"b": 1E2, "a": -0}}"#)
-                .unwrap();
+        let wide: Value = crate::json_text::value_str(
+            r#"{"z": 184467440737095516160, "a": {"b": 1E2, "a": -0}}"#,
+        )
+        .unwrap();
         assert_eq!(
             dumps(&wide),
             r#"{"a": {"a": 0, "b": 100.0}, "z": 184467440737095516160}"#
@@ -296,7 +297,7 @@ mod tests {
         // 期望值取自 Python 3.12：json.dumps(json.loads(raw), indent=2, sort_keys=True,
         // ensure_ascii=False)；与 json.dump 写出的文件字节相同，末尾没有换行。
         let raw = r#"{"z":{"b":[1E2,-0,1e-5,1.10,1e16,184467440737095516160,true,null,[],{}],"a":"中文😀\u0007\"\\\n"},"A":[[1,{"y":[],"x":{}}]],"é":"","_":{}}"#;
-        let value: Value = serde_json::from_str(raw).unwrap();
+        let value: Value = crate::json_text::value_str(raw).unwrap();
         let expected = r#"{
   "A": [
     [
@@ -327,13 +328,14 @@ mod tests {
 }"#;
         assert_eq!(dump_file(&value), expected);
         // 唯一与 Python 字节不同之处：溢出的数保留严格 JSON 文本，读回仍是同一个值。
-        let overflow: Value = serde_json::from_str(r#"{"b": -1E999, "a": [1e999]}"#).unwrap();
+        let overflow: Value =
+            crate::json_text::value_str(r#"{"b": -1E999, "a": [1e999]}"#).unwrap();
         let written = dump_file(&overflow);
         assert_eq!(
             written,
             "{\n  \"a\": [\n    1e+999\n  ],\n  \"b\": -1e+999\n}"
         );
-        assert_eq!(serde_json::from_str::<Value>(&written).unwrap(), overflow);
+        assert_eq!(crate::json_text::value_str(&written).unwrap(), overflow);
         assert_eq!(dump_file(&json!({})), "{}");
         assert_eq!(dump_file(&json!([])), "[]");
         assert_eq!(dump_file(&json!("x")), r#""x""#);

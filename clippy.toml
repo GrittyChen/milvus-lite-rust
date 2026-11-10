@@ -36,4 +36,15 @@ disallowed-methods = [
   { path = "rayon_core::Scope::spawn_broadcast", reason = "use Compute::for_each (0005)" },
   { path = "rayon_core::ScopeFifo::spawn_fifo", reason = "use Compute::for_each (0005)" },
   { path = "rayon_core::ScopeFifo::spawn_broadcast", reason = "use Compute::for_each (0005)" },
+  # 开启 arbitrary_precision 后，serde_json 自带的 Value 反序列化会把首键为 `$serde_json::private::Number`
+  # 的用户对象当作数字；文本解析一律经 json_text。只拦直接调用：类型化结构里的 Value 字段要靠
+  # json_text 的 deserialize_with 函数，`.parse::<Value>()` 也拦不住，见 json_text 模块说明。
+  { path = "serde_json::from_slice", reason = "use json_text (private number key)" },
+  { path = "serde_json::from_str", reason = "use json_text (private number key)" },
+  { path = "serde_json::from_reader", reason = "use json_text (private number key)" },
+  { path = "serde_json::from_value", reason = "use json_text (private number key)" },
+  { path = "serde_json::Deserializer::from_slice", reason = "use json_text (private number key)" },
+  { path = "serde_json::Deserializer::from_str", reason = "use json_text (private number key)" },
+  { path = "serde_json::Deserializer::from_reader", reason = "use json_text (private number key)" },
+  { path = "serde_json::Deserializer::new", reason = "use json_text (private number key)" },
 ]

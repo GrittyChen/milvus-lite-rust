@@ -1161,7 +1161,8 @@ fn manifest_version_exhaustion_rejects_before_any_deletion() {
     db.close();
     drop(db);
     let file = col(&path).join("manifest.json");
-    let mut value: serde_json::Value = serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
+    let mut value: serde_json::Value =
+        milvus_lite_core::json_text::value(&fs::read(&file).unwrap()).unwrap();
     value["version"] = u64::MAX.into();
     fs::write(&file, serde_json::to_vec(&value).unwrap()).unwrap();
     let before = manifest(&path);
@@ -1246,8 +1247,10 @@ fn every_pinning_snapshot_is_checked_before_any_stale_file_deletion() {
     let files = sidecars(&path, "HNSW");
     snapshot(&path, &files);
     let dir = col(&path);
-    let mut metadata: serde_json::Value =
-        serde_json::from_slice(&fs::read(dir.join("snapshots/metadata/s.json")).unwrap()).unwrap();
+    let mut metadata: serde_json::Value = milvus_lite_core::json_text::value(
+        &fs::read(dir.join("snapshots/metadata/s.json")).unwrap(),
+    )
+    .unwrap();
     metadata["name"] = "other".into();
     metadata["id"] = "other".into();
     metadata["manifest_file"] = "snapshots/manifests/other/manifest.json".into();
@@ -1257,7 +1260,8 @@ fn every_pinning_snapshot_is_checked_before_any_stale_file_deletion() {
     }
     let copy = dir.join("snapshots/manifests/other");
     fs::create_dir_all(&copy).unwrap();
-    let mut saved: serde_json::Value = serde_json::from_slice(&manifest(&path)).unwrap();
+    let mut saved: serde_json::Value =
+        milvus_lite_core::json_text::value(&manifest(&path)).unwrap();
     saved["index_specs"]["v"]["metric_type"] = "COSINE".into();
     fs::write(
         copy.join("manifest.json"),
@@ -1289,7 +1293,7 @@ fn windows_snapshot_pins_survive_drop_and_same_definition_recreation() {
     snapshot(&path, &files);
     let metadata = col(&path).join("snapshots/metadata/s.json");
     let mut saved: serde_json::Value =
-        serde_json::from_slice(&fs::read(&metadata).unwrap()).unwrap();
+        milvus_lite_core::json_text::value(&fs::read(&metadata).unwrap()).unwrap();
     for map in ["data_files", "delta_files", "index_files"] {
         for refs in saved[map].as_object_mut().unwrap().values_mut() {
             for file in refs.as_array_mut().unwrap() {

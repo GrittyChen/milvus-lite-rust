@@ -22,7 +22,7 @@ pub struct PersistedFunction {
     pub input_field_names: Vec<String>,
     #[serde(default)]
     pub output_field_names: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::json_text::map_value")]
     pub params: Map<String, Value>,
 }
 
@@ -45,11 +45,15 @@ pub struct PersistedField {
     pub max_capacity: Option<i64>,
     #[serde(default)]
     pub nullable: bool,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::json_text::option_value")]
     pub default_value: Option<Value>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub enable_analyzer: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::json_text::option_value"
+    )]
     pub analyzer_params: Option<Value>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub enable_match: bool,
@@ -68,7 +72,7 @@ pub struct SchemaFile {
     pub version: u64,
     #[serde(default)]
     pub enable_dynamic_field: bool,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::json_text::map_value")]
     pub properties: Map<String, Value>,
     pub fields: Vec<PersistedField>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -131,7 +135,7 @@ impl SchemaFile {
     }
 
     pub fn parse(bytes: &[u8]) -> Result<Self, SchemaFileError> {
-        let schema: Self = serde_json::from_slice(bytes)
+        let schema: Self = crate::json_text::parse(bytes)
             .map_err(|source| SchemaFileError::Invalid(source.to_string()))?;
         if schema.schema_format_version != SCHEMA_FORMAT_VERSION {
             return Err(SchemaFileError::Invalid(format!(
@@ -272,7 +276,7 @@ impl SchemaFile {
         bytes: &[u8],
         collection_name: &str,
     ) -> Result<Vec<u8>, SchemaFileError> {
-        let mut raw: Value = serde_json::from_slice(bytes)
+        let mut raw: Value = crate::json_text::value(bytes)
             .map_err(|source| SchemaFileError::Invalid(source.to_string()))?;
         let object = raw
             .as_object_mut()
@@ -295,7 +299,7 @@ impl SchemaFile {
         collection_name: &str,
         properties: &[(String, String)],
     ) -> Result<Vec<u8>, SchemaFileError> {
-        let mut raw: Value = serde_json::from_slice(bytes)
+        let mut raw: Value = crate::json_text::value(bytes)
             .map_err(|source| SchemaFileError::Invalid(source.to_string()))?;
         let object = raw
             .as_object_mut()
@@ -394,7 +398,7 @@ mod tests {
             properties: Vec::new(),
         };
         let schema = SchemaFile::from_core("c", &source);
-        let value: Value = serde_json::from_slice(&schema.to_bytes().unwrap()).unwrap();
+        let value: Value = crate::json_text::value(&schema.to_bytes().unwrap()).unwrap();
         assert_eq!(value["schema_format_version"], 2);
         assert_eq!(value["version"], 1);
         assert_eq!(value["fields"][0]["dtype"], "int64");
@@ -466,5 +470,45 @@ mod tests {
         let core = schema.to_core().unwrap();
         assert_eq!(core.fields[0].data_type, DataType::Int64);
         assert_eq!(core.fields[1].data_type, DataType::FloatVector);
+    }
+
+    /// serde_json 的数字私有键（T）在属性、默认值、`analyzer_params` 与 function 参数里都是普通键：
+    /// 解析、写出、改名与改属性后重开都保持对象。
+    #[test]
+    fn private_number_key_survives_parse_and_rewrites() {
+        const T: &str = "$serde_json::private::Number";
+        let bytes = format!(
+            r#"{{"collection_name":"c","version":1,"properties":{{"{T}":"1"}},"fields":[{{"name":"id","dtype":"int64","is_primary":true}},{{"name":"v","dtype":"float_vector","dim":2}},{{"name":"j","dtype":"json","default_value":{{"{T}":"1"}}}},{{"name":"s","dtype":"varchar","max_length":8,"enable_analyzer":true,"analyzer_params":{{"b":1,"{T}":"abc"}}}}],"functions":[{{"name":"f","function_type":1,"params":{{"{T}":{{"{T}":"2"}}}}}}]}}"#
+        );
+        let expected = |text: &str| crate::json_text::value_str(text).unwrap();
+        let check = |bytes: &[u8]| {
+            let schema = SchemaFile::parse(bytes).unwrap();
+            assert_eq!(schema.properties[T], "1");
+            assert_eq!(
+                schema.fields[2].default_value,
+                Some(expected(&format!(r#"{{"{T}":"1"}}"#)))
+            );
+            assert_eq!(
+                schema.fields[3].analyzer_params,
+                Some(expected(&format!(r#"{{"b":1,"{T}":"abc"}}"#)))
+            );
+            assert_eq!(
+                schema.functions[0].params[T],
+                expected(&format!(r#"{{"{T}":"2"}}"#))
+            );
+            schema
+        };
+        let schema = check(bytes.as_bytes());
+        check(&schema.to_bytes().unwrap());
+        let renamed = SchemaFile::with_name(bytes.as_bytes(), "d").unwrap();
+        assert_eq!(check(&renamed).collection_name, "d");
+        let altered =
+            SchemaFile::with_properties(&renamed, "e", &[(T.to_owned(), "2".to_owned())]).unwrap();
+        let altered = SchemaFile::parse(&altered).unwrap();
+        assert_eq!(altered.properties[T], "2");
+        assert_eq!(
+            altered.fields[2].default_value,
+            Some(expected(&format!(r#"{{"{T}":"1"}}"#)))
+        );
     }
 }

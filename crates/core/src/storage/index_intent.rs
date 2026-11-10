@@ -45,7 +45,7 @@ struct Marker {
 
 impl Marker {
     fn parse(bytes: &[u8]) -> Result<Self, String> {
-        let value: serde_json::Value = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
+        let value: serde_json::Value = crate::json_text::value(bytes).map_err(|e| e.to_string())?;
         for key in [
             "format_version",
             "operation",
@@ -59,7 +59,7 @@ impl Marker {
                 return Err(format!("missing field {key}"));
             }
         }
-        let marker: Self = serde_json::from_value(value).map_err(|e| e.to_string())?;
+        let marker: Self = crate::json_text::from_value(value).map_err(|e| e.to_string())?;
         if marker.format_version != 1
             || !matches!(marker.operation.as_str(), "create_index" | "drop_index")
             || marker.field_names.is_empty()

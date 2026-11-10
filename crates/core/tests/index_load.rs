@@ -84,14 +84,15 @@ fn manifest_path(path: &Path, name: &str) -> std::path::PathBuf {
 fn rewrite_index_type(path: &Path, name: &str, index_type: &str) {
     let file = manifest_path(path, name);
     let mut manifest: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+        milvus_lite_core::json_text::value(&std::fs::read(&file).unwrap()).unwrap();
     manifest["index_specs"]["v"]["index_type"] = index_type.into();
     std::fs::write(&file, serde_json::to_vec(&manifest).unwrap()).unwrap();
 }
 
 fn data_files(path: &Path, name: &str) -> usize {
     let manifest: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(manifest_path(path, name)).unwrap()).unwrap();
+        milvus_lite_core::json_text::value(&std::fs::read(manifest_path(path, name)).unwrap())
+            .unwrap();
     manifest["partitions"]["_default"]["data_files"]
         .as_array()
         .map_or(0, Vec::len)
@@ -262,7 +263,7 @@ fn failed_load_leaves_other_collections_usable() {
 fn rewrite_metric(path: &Path, kind: &str, metric: &str) {
     let file = manifest_path(path, "c");
     let mut value: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+        milvus_lite_core::json_text::value(&std::fs::read(&file).unwrap()).unwrap();
     value["index_specs"]["v"]["index_type"] = kind.into();
     value["index_specs"]["v"]["metric_type"] = metric.into();
     std::fs::write(file, serde_json::to_vec(&value).unwrap()).unwrap();
@@ -272,7 +273,8 @@ fn sidecars(path: &Path, kind: &str) -> Vec<std::path::PathBuf> {
     let dir = path.join("collections/c/partitions/_default/indexes");
     std::fs::create_dir_all(&dir).unwrap();
     let value: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(manifest_path(path, "c")).unwrap()).unwrap();
+        milvus_lite_core::json_text::value(&std::fs::read(manifest_path(path, "c")).unwrap())
+            .unwrap();
     value["partitions"]["_default"]["data_files"]
         .as_array()
         .unwrap()
@@ -495,7 +497,7 @@ fn compaction_new_source_requires_a_sidecar_on_the_next_metric_load() {
     db.close();
     let file = manifest_path(&path, "c");
     let mut value: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+        milvus_lite_core::json_text::value(&std::fs::read(&file).unwrap()).unwrap();
     let parent = path.join("collections/c/partitions/_default");
     for i in 2..=4 {
         let other = format!("data/data_{i:06}_{i:06}.parquet");

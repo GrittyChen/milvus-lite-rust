@@ -50,18 +50,19 @@
 | 情形 | 3.x | 本实现 | 理由 |
 | --- | --- | --- | --- |
 | Unicode 版本 | 随运行的 Python 版本变化 | 固定 CPython 3.12 / Unicode 15.0，与过滤表达式的词法分类一致（[0006](0006-m2-scope.md)） | 分词要在各构建上逐位相同 |
-| `analyzer_params` 含 `NaN`、`Infinity`、`1e999` 这类溢出数，或深度 125 到约 1000 层，或键名是 `$serde_json::private::Number` | 建表成功 | 建表返回 `UNIMPLEMENTED` | 这些值无法写成本实现重开时能读回的严格 JSON，私有键会被 serde_json 静默改成数字 |
+| `analyzer_params` 含 `NaN`、`Infinity`、`1e999` 这类溢出数，或深度 125 到约 1000 层 | 建表成功 | 建表返回 `UNIMPLEMENTED` | 这些值无法写成本实现重开时能读回的严格 JSON |
 | `analyzer_params` 含孤立代理，或深度超过约 1000 层（取决于调用栈） | 报 code 1；前者还会留下集合目录 | 建表返回 `UNIMPLEMENTED` | 两边都拒绝，错误码不同 |
 | 重复键把不可表示的值覆盖掉，如 `{"a":"\udc00","a":{}}` | 建表成功 | 建表返回 `UNIMPLEMENTED` | serde_json 在解析中途失败；方向是拒绝，不会静默出错 |
-| 3.x 写出的 `schema.json` 含 `NaN`、`Infinity`（含 `1e999` 落成的）、超过 124 层的 `analyzer_params`，或上述私有键与其他键并存、私有键的值不是数字文本 | 能打开 | 打开该集合报 code 1 `storage error`，drop 可用，同库其他集合不受影响 | 同上 |
-| 3.x 写出的 `schema.json` 里，某个对象只含上述私有键，值是数字文本（如 `"1"`、`"1e5"`） | 原样回显 | 重开后该对象被当作数字回显（如 `1`、`100000.0`） | 读文件时无法区分；这个键极少见，`text_match` 也不读 `analyzer_params` |
+| 3.x 写出的 `schema.json` 含 `NaN`、`Infinity`（含 `1e999` 落成的）、超过 124 层的 `analyzer_params` | 能打开 | 打开该集合报 code 1 `storage error`，drop 可用，同库其他集合不受影响 | 同上 |
 | JSON 字段的顶层字符串（如 `{"j": '"a\\nb"'}`） | 存解码后的无引号文本 | 存带引号的 JSON 文本，见 [0004](0004-m1-scope.md) | 差异产生在写入时。`==`、`!=`、`in`、`like`、比较和 `text_match` 这些按存储文本的整字段操作都受影响；3.x 读本实现写的目录，结果与本实现相同，所以不在分词前解码 |
 | 读到越界 TIMESTAMPTZ 的毒化目录时走 `text_match` | 回退路线 `to_pylist()` 全表，报 code 1 | 按列求值，不读无关的时间列，不报错 | 见 [0025](0025-timestamptz-and-timezone.md) |
+
+`analyzer_params` 含 serde_json 数字私有键 `$serde_json::private::Number` 的登记（建表拒绝、读 3.x 的 `schema.json` 出错或改值）已随 JSON 文本解析的修复注销，现与 3.x 一致，见 [修复记录](../testing/json-private-number-key-fix.md)。
 
 ## 验收
 
 - [analyzer_standard.rs](../../crates/core/tests/analyzer_standard.rs) 对照真实 StandardAnalyzer 导出的语料（`tests/differential/generate_analyzer_fixtures.py`），覆盖全部有小写映射的码位；[fuzz_analyzer.py](../../tests/differential/fuzz_analyzer.py) 手动运行，种子 29、31 各 20 万条零差异。
-- [test_text_match.py](../../tests/differential/test_text_match.py) 67 条差分：行为矩阵（内存与落盘）、错误先后、各读取路径、多 segment 与分区、`$id` 改绑、属性取值矩阵与全部字段类型、登记差异。
+- [test_text_match.py](../../tests/differential/test_text_match.py) 65 条差分：行为矩阵（内存与落盘）、错误先后、各读取路径、多 segment 与分区、`$id` 改绑、属性取值矩阵与全部字段类型、登记差异。
 - [互通 test_text_match.py](../../tests/storage_interop/test_text_match.py) 14 条：Rust 与 Arrow 15/25 的 3.x 互相打开 WAL 和 segment，新进程重开后的键序，不可表示的 `analyzer_params` 打开失败时可 drop。
 - 迁入参照 `TestSearchTextMatch` 4 条。依赖 BM25 schema 的其余 `text_match` 用例留到全文检索切片。
 

@@ -327,8 +327,8 @@ fn parse_request(req: &svc::SearchRequest, route: bool) -> Result<Parsed, Engine
         .search_params
         .iter()
         .map(|kv| {
-            let v =
-                serde_json::from_str(&kv.value).unwrap_or_else(|_| Value::String(kv.value.clone()));
+            let v = milvus_lite_core::json_text::value_str(&kv.value)
+                .unwrap_or_else(|_| Value::String(kv.value.clone()));
             (kv.key.as_str(), v)
         })
         .collect();

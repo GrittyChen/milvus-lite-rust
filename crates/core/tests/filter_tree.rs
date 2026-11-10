@@ -172,7 +172,7 @@ fn late_source_failure_never_publishes_masks_or_writes_a_delete() {
     );
     insert(&db, 3, &[json!({"x":2})]);
     db.flush_collection("", "c").unwrap();
-    let manifest: Value = serde_json::from_slice(
+    let manifest: Value = milvus_lite_core::json_text::value(
         &std::fs::read(root.path().join("collections/c/manifest.json")).unwrap(),
     )
     .unwrap();

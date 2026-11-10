@@ -477,7 +477,7 @@ struct Step {
 }
 
 fn verify(path: &str) -> Result<()> {
-    let fixture: serde_json::Value = serde_json::from_slice(&std::fs::read(path)?)?;
+    let fixture: serde_json::Value = milvus_lite_core::json_text::value(&std::fs::read(path)?)?;
     let cases = fixture["cases"].as_object().ok_or("缺少 cases")?;
     let mut checks = 0;
     let mut old_checks = 0;
@@ -486,7 +486,7 @@ fn verify(path: &str) -> Result<()> {
         if name.starts_with("raw/") {
             continue;
         }
-        let steps: Vec<Step> = serde_json::from_value(case.clone())?;
+        let steps: Vec<Step> = milvus_lite_core::json_text::from_value(case.clone())?;
         let mut model = Model::default();
         let mut old = Vec::<(Snapshot, Vec<Output>)>::new();
         for step in steps {
@@ -536,13 +536,13 @@ fn verify_core(path: &str) -> Result<()> {
         Key::Int(value) => Pk::Int64(*value),
         Key::Text(value) => Pk::VarChar(value.clone()),
     };
-    let fixture: serde_json::Value = serde_json::from_slice(&std::fs::read(path)?)?;
+    let fixture: serde_json::Value = milvus_lite_core::json_text::value(&std::fs::read(path)?)?;
     let mut checks = 0;
     for (name, case) in fixture["cases"].as_object().ok_or("cases missing")? {
         if name.starts_with("raw/") {
             continue;
         }
-        let steps: Vec<Step> = serde_json::from_value(case.clone())?;
+        let steps: Vec<Step> = milvus_lite_core::json_text::from_value(case.clone())?;
         for step in steps {
             let mut parts = BTreeMap::<String, u32>::new();
             let mut intern = |part: &str| {

@@ -633,8 +633,10 @@ fn collection_directory_rename_crashes_preserve_commit_boundary() {
         // 同名重建必须先清悬空别名，不能将旧别名接到新表。
         if stage == "drop-after" {
             db.create_collection("", "c", schema()).unwrap();
-            let aliases: serde_json::Value =
-                serde_json::from_slice(&std::fs::read(path.join("aliases.json")).unwrap()).unwrap();
+            let aliases: serde_json::Value = milvus_lite_core::json_text::value(
+                &std::fs::read(path.join("aliases.json")).unwrap(),
+            )
+            .unwrap();
             assert!(aliases.get("old").is_none());
         }
         db.close();

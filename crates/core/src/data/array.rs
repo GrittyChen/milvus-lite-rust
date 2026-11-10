@@ -90,7 +90,7 @@ pub(crate) fn row_len(values: &InputValues, row: usize) -> Option<usize> {
     match values.values() {
         InputValues::Array(rows) => rows[row].as_ref().map(InputValues::len),
         InputValues::JsonValues(rows) => rows[row].as_array().map(Vec::len),
-        InputValues::Json(rows) => serde_json::from_slice::<Value>(&rows[row])
+        InputValues::Json(rows) => crate::json_text::value(&rows[row])
             .ok()?
             .as_array()
             .map(Vec::len),
@@ -112,7 +112,7 @@ pub(crate) fn row_input(values: &InputValues, row: usize) -> Result<Option<Cow<'
             InputValues::JsonValues(items.clone())
         }
         InputValues::Json(rows) => {
-            let value: Value = serde_json::from_slice(&rows[row])
+            let value: Value = crate::json_text::value(&rows[row])
                 .map_err(|e| EngineError::schema(e.to_string()))?;
             let Value::Array(items) = value else {
                 return Err(EngineError::schema("validated ARRAY lost list value"));
@@ -295,7 +295,8 @@ mod tests {
     #[test]
     fn element_conversion_matches_arrow_15_and_25() {
         let fixture: Value =
-            serde_json::from_str(include_str!("../../tests/fixtures/array_v321.json")).unwrap();
+            crate::json_text::value_str(include_str!("../../tests/fixtures/array_v321.json"))
+                .unwrap();
         let mut failures = Vec::new();
         for case in fixture["conversions"].as_array().unwrap() {
             let dtype = match case["type"].as_str().unwrap() {

@@ -1163,7 +1163,8 @@ fn wide_integers_in_dynamic_fields_round_trip() {
         let actual = milvus_lite_core::pyjson::dumps(&serde_json::Value::Object(
             got.rows.meta.unwrap()[0].clone(),
         ));
-        let expected = milvus_lite_core::pyjson::dumps(&serde_json::from_str(text).unwrap());
+        let expected =
+            milvus_lite_core::pyjson::dumps(&milvus_lite_core::json_text::value_str(text).unwrap());
         assert_eq!(actual, expected, "{text}");
     }
     // 64 位以内的整数、浮点数、字符串中的长数字都照常保存。

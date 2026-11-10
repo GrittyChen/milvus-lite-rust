@@ -108,7 +108,7 @@ fn nulls_defaults_snapshots_and_real_compaction_survive_reopen() {
         db.flush_collection("", "c").unwrap();
     }
     db.close();
-    let manifest: serde_json::Value = serde_json::from_slice(
+    let manifest: serde_json::Value = milvus_lite_core::json_text::value(
         &std::fs::read(root.path().join("collections/c/manifest.json")).unwrap(),
     )
     .unwrap();

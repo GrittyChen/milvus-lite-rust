@@ -4369,7 +4369,7 @@ fn parse_dynamic_json(field: &str, text: &[u8]) -> Result<Value> {
 }
 
 fn parse_json(field: &str, text: &[u8]) -> Result<Value> {
-    serde_json::from_slice(text).map_err(|e| {
+    crate::json_text::value(text).map_err(|e| {
         EngineError::schema(format!(
             "field {} value is not valid JSON: {e}",
             py_repr(field)
@@ -4828,7 +4828,7 @@ pub(crate) fn py_type_name(values: &InputValues, row: usize) -> &'static str {
         InputValues::Float(_) => "float",
         InputValues::Str(_) => "str",
         InputValues::FloatVector { .. } => "list",
-        InputValues::Json(v) => match serde_json::from_slice::<Value>(&v[row]) {
+        InputValues::Json(v) => match crate::json_text::value(&v[row]) {
             Ok(Value::Object(_)) => "dict",
             Ok(Value::Array(_)) => "list",
             Ok(Value::String(_)) => "str",
@@ -4875,7 +4875,7 @@ pub(crate) fn py_value_repr(values: &InputValues, row: usize) -> String {
                 .collect();
             format!("[{}]", items.join(", "))
         }
-        InputValues::Json(v) => match serde_json::from_slice::<Value>(&v[row]) {
+        InputValues::Json(v) => match crate::json_text::value(&v[row]) {
             Ok(value) => py_json_repr(&value),
             Err(_) => py_repr(&String::from_utf8_lossy(&v[row])),
         },
@@ -5439,7 +5439,7 @@ mod tests {
                         },
                         FieldSchema {
                             default_value: Some(
-                                serde_json::from_str(r#"{"z":1E2,"a":"中文"}"#).unwrap(),
+                                crate::json_text::value_str(r#"{"z":1E2,"a":"中文"}"#).unwrap(),
                             ),
                             ..FieldSchema::new("j", DataType::Json)
                         },
@@ -5731,7 +5731,7 @@ mod tests {
     #[test]
     fn json_null_probe_matches_parser_and_rejects_non_json_whitespace() {
         let check = |text: &[u8]| {
-            let expected = serde_json::from_slice::<Value>(text).is_ok_and(|value| value.is_null());
+            let expected = crate::json_text::value(text).is_ok_and(|value| value.is_null());
             assert_eq!(json_text_is_null(text), expected, "{text:?}");
         };
         // 覆盖全部字节边界，防止 trim_ascii 扩大 JSON 空白集合或 UTF-8 解码改变语义。

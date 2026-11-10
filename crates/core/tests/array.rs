@@ -118,7 +118,7 @@ fn arrays_roundtrip_slices_gathers_defaults_and_old_snapshots() {
         db.flush_collection("", "c").unwrap();
     }
     db.close();
-    let m: serde_json::Value = serde_json::from_slice(
+    let m: serde_json::Value = milvus_lite_core::json_text::value(
         &std::fs::read(root.path().join("collections/c/manifest.json")).unwrap(),
     )
     .unwrap();
@@ -196,7 +196,7 @@ fn array_nan_membership_keeps_python_identity_without_changing_comparison() {
 fn array_schema_defaults_and_business_errors_match_336_reference_cases() {
     use milvus_lite_core::Collection;
     let fixture: serde_json::Value =
-        serde_json::from_str(include_str!("fixtures/array_v321.json")).unwrap();
+        milvus_lite_core::json_text::value_str(include_str!("fixtures/array_v321.json")).unwrap();
     for case in fixture["business"].as_array().unwrap() {
         let dt = match case["element_type"].as_str().unwrap() {
             "BOOL" => DataType::Bool,

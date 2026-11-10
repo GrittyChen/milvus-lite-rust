@@ -403,8 +403,6 @@ pub enum AnalyzerParams {
 
 /// `schema.json` 的字段比 `analyzer_params` 多包三层，serde_json 的递归上限在文件里只留下 124 层。
 const MAX_ANALYZER_PARAMS_DEPTH: usize = 124;
-/// 开启 arbitrary_precision 后，serde_json 把只含这个键的对象解析成数字，会静默改值。
-const SERDE_NUMBER_TOKEN: &str = "$serde_json::private::Number";
 
 fn exceeds_strict_json(value: &serde_json::Value, depth: usize) -> bool {
     use serde_json::Value;
@@ -428,21 +426,13 @@ fn exceeds_strict_json(value: &serde_json::Value, depth: usize) -> bool {
 /// 判定用 Python 语义的解码器，取值用 serde_json，两者的分歧都落在 [`AnalyzerParams::Unrepresentable`]。
 pub fn classify_analyzer_params(text: &str) -> AnalyzerParams {
     let input: Vec<u32> = text.chars().map(u32::from).collect();
-    let document = match decode(&input) {
-        Ok(Some(document)) => document,
+    match decode(&input) {
+        Ok(Some(_)) => {}
         Ok(None) => return AnalyzerParams::Unset,
         // 只有递归深度错误，3.x 没有捕获它。
         Err(_) => return AnalyzerParams::Unrepresentable,
-    };
-    let token: Vec<u32> = SERDE_NUMBER_TOKEN.chars().map(u32::from).collect();
-    if document
-        .nodes
-        .iter()
-        .any(|node| matches!(node, JsonNode::Object(object) if object.get(&token).is_some()))
-    {
-        return AnalyzerParams::Unrepresentable;
     }
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
+    let Ok(value) = crate::json_text::value_str(text) else {
         return AnalyzerParams::Unrepresentable;
     };
     if !crate::pyjson::python_truthy(&value) {
@@ -536,9 +526,6 @@ mod analyzer_params_tests {
             "{\"x\":-1e999}",
             "\"\\ud800\"",
             "{\"x\":\"\\ud800\"}",
-            "{\"$serde_json::private::Number\":\"1\"}",
-            "{\"x\":{\"$serde_json::private::Number\":\"1e5\"}}",
-            "{\"$serde_json::private::Number\":2,\"y\":1}",
         ] {
             assert_eq!(
                 classify_analyzer_params(text),
@@ -582,6 +569,38 @@ mod analyzer_params_tests {
                     AnalyzerParams::Unrepresentable
                 );
             }
+        }
+    }
+
+    /// serde_json 的数字私有键在用户数据里只是普通键：原样保留，写进 schema.json 后重开读回相同的值。
+    #[test]
+    fn private_number_key_round_trips_through_schema_file() {
+        for text in [
+            "{\"$serde_json::private::Number\":\"1\"}",
+            "{\"x\":{\"$serde_json::private::Number\":\"1e5\"}}",
+            "{\"$serde_json::private::Number\":2,\"y\":1}",
+            "{\"y\":1,\"$serde_json::private::Number\":\"abc\"}",
+        ] {
+            let AnalyzerParams::Keep(value) = classify_analyzer_params(text) else {
+                panic!("{text} rejected");
+            };
+            assert_eq!(crate::pyjson::dumps_unsorted(&value).replace(' ', ""), text);
+            let mut field = crate::schema::FieldSchema::new("t", crate::schema::DataType::VarChar);
+            field.max_length = Some(8);
+            field.enable_analyzer = true;
+            field.analyzer_params = Some(value.clone());
+            let mut pk = crate::schema::FieldSchema::new("id", crate::schema::DataType::Int64);
+            pk.is_primary = true;
+            let mut vector =
+                crate::schema::FieldSchema::new("v", crate::schema::DataType::FloatVector);
+            vector.dim = Some(2);
+            let schema = crate::schema::CollectionSchema {
+                fields: vec![pk, field, vector],
+                ..Default::default()
+            };
+            let bytes = SchemaFile::from_core("c", &schema).to_bytes().unwrap();
+            let reopened = SchemaFile::parse(&bytes).unwrap().to_core().unwrap();
+            assert_eq!(reopened.fields[1].analyzer_params, Some(value), "{text}");
         }
     }
 

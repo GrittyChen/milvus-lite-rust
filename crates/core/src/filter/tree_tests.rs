@@ -10,7 +10,7 @@ use serde_json::Value;
 
 #[test]
 fn nullable_typed_columns_match_reference_all_routes() {
-    let fixture: Value = serde_json::from_str(include_str!(
+    let fixture: Value = crate::json_text::value_str(include_str!(
         "../../tests/fixtures/nullable_filter_v321.json"
     ))
     .unwrap();
@@ -113,7 +113,13 @@ fn nullable_typed_columns_match_reference_all_routes() {
         let meta: Vec<serde_json::Map<String, Value>> =
             [r#"{"d":1}"#, r#"{"d":null}"#, "{}", r#"{"d":{"k":1}}"#]
                 .iter()
-                .map(|v| serde_json::from_str(v).unwrap())
+                .map(|v| {
+                    crate::json_text::value_str(v)
+                        .unwrap()
+                        .as_object()
+                        .unwrap()
+                        .clone()
+                })
                 .collect();
         let rows: Vec<_> = (0..4)
             .map(|row| DynamicRow {
@@ -180,7 +186,7 @@ fn nullable_typed_columns_match_reference_all_routes() {
 #[test]
 fn all_routes_match_reference_tree_corpus() {
     let fixture: Value =
-        serde_json::from_str(include_str!("../../tests/fixtures/filter_tree.json")).unwrap();
+        crate::json_text::value_str(include_str!("../../tests/fixtures/filter_tree.json")).unwrap();
     let types = |name: &str| match name {
         "INT64" => DataType::Int64,
         "INT8" => DataType::Int8,
@@ -348,7 +354,7 @@ fn all_routes_match_reference_tree_corpus() {
 #[test]
 fn array_columns_match_reference_routes_and_masks() {
     let fixture: Value =
-        serde_json::from_str(include_str!("../../tests/fixtures/array_v321.json")).unwrap();
+        crate::json_text::value_str(include_str!("../../tests/fixtures/array_v321.json")).unwrap();
     let mut failures = Vec::new();
     for (i, case) in fixture["filters"].as_array().unwrap().iter().enumerate() {
         let dtype = match case["element_type"].as_str().unwrap() {
@@ -412,7 +418,13 @@ fn array_columns_match_reference_routes_and_masks() {
         let meta: Vec<serde_json::Map<String, Value>> =
             [r#"{"d":1}"#, r#"{"d":null}"#, "{}", r#"{"d":false}"#]
                 .iter()
-                .map(|s| serde_json::from_str(s).unwrap())
+                .map(|s| {
+                    crate::json_text::value_str(s)
+                        .unwrap()
+                        .as_object()
+                        .unwrap()
+                        .clone()
+                })
                 .collect();
         let rows: Vec<_> = (0..4)
             .map(|row| DynamicRow {

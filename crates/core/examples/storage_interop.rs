@@ -164,7 +164,7 @@ fn write_wal_matrix(root: &Path) -> Result<(), Box<dyn Error>> {
 
 fn read_wal_matrix(root: &Path) -> Result<(), Box<dyn Error>> {
     let cases: Vec<(String, String)> =
-        serde_json::from_slice(&std::fs::read(root.join("cases.json"))?)?;
+        milvus_lite_core::json_text::parse(&std::fs::read(root.join("cases.json"))?)?;
     let mut result = Vec::new();
     let schema = schema();
     for (file, kind) in cases {

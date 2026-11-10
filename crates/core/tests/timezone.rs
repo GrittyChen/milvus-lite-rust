@@ -472,7 +472,8 @@ fn conversions_match_the_cpython_zoneinfo_fixture() {
     use milvus_lite_core::timestamptz::{format_iso_z, parse};
     use milvus_lite_core::timezone::resolve;
     let fixture: serde_json::Value =
-        serde_json::from_str(include_str!("fixtures/timezone_v321.json")).unwrap();
+        milvus_lite_core::json_text::value_str(include_str!("fixtures/timezone_v321.json"))
+            .unwrap();
     let none = || Ok(None);
     let mut mismatches = Vec::new();
     for case in fixture["local"].as_array().unwrap() {

@@ -209,7 +209,7 @@ fn data_stems<'a>(
 }
 
 fn parse(bytes: &[u8]) -> Result<TruncateIntent, String> {
-    let value: serde_json::Value = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
+    let value: serde_json::Value = crate::json_text::value(bytes).map_err(|e| e.to_string())?;
     // `Option` 字段缺失时 serde 会静默取 None；缺字段按损坏处理。
     for key in [
         "format_version",
@@ -223,7 +223,7 @@ fn parse(bytes: &[u8]) -> Result<TruncateIntent, String> {
             return Err(format!("missing field {key}"));
         }
     }
-    let marker: Marker = serde_json::from_value(value).map_err(|e| e.to_string())?;
+    let marker: Marker = crate::json_text::from_value(value).map_err(|e| e.to_string())?;
     if marker.format_version != 1 {
         return Err(format!(
             "unsupported format_version {}",
@@ -314,7 +314,7 @@ fn metadata_id(path: &Path) -> Result<Option<String>, String> {
     }
     let bytes = fs::read(path).map_err(|e| format!("{path:?}: {e}"))?;
     let value: serde_json::Value =
-        serde_json::from_slice(&bytes).map_err(|e| format!("{path:?}: {e}"))?;
+        crate::json_text::value(&bytes).map_err(|e| format!("{path:?}: {e}"))?;
     value
         .get("id")
         .and_then(serde_json::Value::as_str)
@@ -696,6 +696,19 @@ pub(crate) fn settle(
 mod tests {
     use super::*;
 
+    /// 3.x 的 snapshot 元数据按 sort_keys 写出，以分区名为键的对象里 T（serde_json 的数字私有键）排在首位。
+    #[test]
+    fn metadata_id_reads_files_with_private_number_key_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.json");
+        fs::write(
+            &path,
+            r#"{"data_files": {"$serde_json::private::Number": ["partitions/p/data_1.parquet"], "_default": []}, "id": "abc"}"#,
+        )
+        .unwrap();
+        assert_eq!(metadata_id(&path).unwrap().as_deref(), Some("abc"));
+    }
+
     const ID: &str = "0123456789abcdef0123456789abcdef";
 
     fn old_manifest() -> String {
@@ -801,15 +814,15 @@ mod tests {
             r#""active_wal_number":4"#,
         ] {
             let mut next: serde_json::Value =
-                serde_json::from_str(base["candidate_manifest"].as_str().unwrap()).unwrap();
+                crate::json_text::value_str(base["candidate_manifest"].as_str().unwrap()).unwrap();
             let (k, v) = change.split_once(':').unwrap();
-            next[k.trim_matches('"')] = serde_json::from_str(v).unwrap();
+            next[k.trim_matches('"')] = crate::json_text::value_str(v).unwrap();
             let mut case = base.clone();
             case["candidate_manifest"] = next.to_string().into();
             cases.push(case);
         }
         let mut next: serde_json::Value =
-            serde_json::from_str(base["candidate_manifest"].as_str().unwrap()).unwrap();
+            crate::json_text::value_str(base["candidate_manifest"].as_str().unwrap()).unwrap();
         next["partitions"]["q"] = serde_json::json!({});
         let mut case = base.clone();
         case["candidate_manifest"] = next.to_string().into();

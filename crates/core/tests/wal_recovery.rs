@@ -46,12 +46,14 @@ fn batch(schema: &CollectionSchema, kind: WalKind, n: i64) -> RecordBatch {
         ColumnData::VarChar(vec!["中文".into(), "longer text".into()]),
         ColumnData::Json(vec![br#"{"x":1}"#.to_vec(), br#"{"x":[2,3]}"#.to_vec()]),
     ];
-    let meta =
-        vec![
-            serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(r#"{"extra":1}"#)
-                .unwrap();
-            2
-        ];
+    let meta = vec![
+        milvus_lite_core::json_text::value_str(r#"{"extra":1}"#)
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .clone();
+        2
+    ];
     arrow_data::wal_data_batch(
         schema,
         &[2 * n as u64 + 1, 2 * n as u64 + 2],

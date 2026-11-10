@@ -335,10 +335,9 @@ def test_sdk_attributes_round_trip(diff):
 @pytest.mark.parametrize("text,ref_ok", [
     ('{"x": NaN}', True), ("NaN", True), ("[Infinity]", True), ("-Infinity", True), ("1e999", True), ('{"x":1e999}', True),
     ("[" * 125 + "]" * 125, True),
-    ('{"$serde_json::private::Number":"1"}', True), ('{"x":{"$serde_json::private::Number":"1e5"}}', True),
     ('"\\ud800"', False), ('{"x":"\\ud800"}', False),
     ("[" * 3000 + "]" * 3000, False),
-], ids=["nan-object", "nan", "inf-array", "neg-inf", "overflow", "overflow-object", "depth-125", "private-key", "private-key-nested",
+], ids=["nan-object", "nan", "inf-array", "neg-inf", "overflow", "overflow-object", "depth-125",
         "surrogate", "surrogate-object", "depth-3000"])
 def test_unrepresentable_params_are_a_registered_difference(diff, stubs, text, ref_ok, request):
     # 3.x 写 schema 失败时留下集合目录，之后同名建表都报 File exists，所以每条用独立的名字。

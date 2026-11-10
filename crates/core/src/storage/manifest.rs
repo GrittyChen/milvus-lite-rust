@@ -23,9 +23,9 @@ pub struct IndexSpec {
     pub field_name: String,
     pub index_type: String,
     pub metric_type: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::json_text::map_value")]
     pub build_params: Map<String, Value>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::json_text::map_value")]
     pub search_params: Map<String, Value>,
 }
 
@@ -92,9 +92,9 @@ pub enum ManifestError {
 
 impl Manifest {
     pub fn parse(bytes: &[u8]) -> Result<Self, ManifestError> {
-        let mut manifest: Self = serde_json::from_slice(bytes)
+        let mut manifest: Self = crate::json_text::parse(bytes)
             .map_err(|source| ManifestError::Invalid(source.to_string()))?;
-        let raw: Value = serde_json::from_slice(bytes).map_err(ManifestError::Encode)?;
+        let raw: Value = crate::json_text::value(bytes).map_err(ManifestError::Encode)?;
         manifest.partition_order = raw
             .get("partitions")
             .and_then(Value::as_object)
@@ -179,7 +179,7 @@ mod tests {
         let manifest = Manifest::parse(raw).unwrap();
         assert_eq!(manifest.partition_order, ["z", "_default", "a"]);
         let bytes = manifest.to_bytes().unwrap();
-        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        let value: Value = crate::json_text::value(&bytes).unwrap();
         assert!(value.get("partition_order").is_none());
         assert_eq!(
             Manifest::parse(&bytes).unwrap().partition_order,
@@ -190,7 +190,7 @@ mod tests {
     #[test]
     fn default_matches_3x_shape() {
         let manifest = Manifest::default();
-        let value: Value = serde_json::from_slice(&manifest.to_bytes().unwrap()).unwrap();
+        let value: Value = crate::json_text::value(&manifest.to_bytes().unwrap()).unwrap();
         assert_eq!(value["manifest_format_version"], 2);
         assert_eq!(value["version"], 0);
         assert_eq!(value["current_seq"], 0);
@@ -234,7 +234,7 @@ mod tests {
     #[test]
     fn unknown_keys_and_formats_fail_closed() {
         let mut value: Value =
-            serde_json::from_slice(&Manifest::default().to_bytes().unwrap()).unwrap();
+            crate::json_text::value(&Manifest::default().to_bytes().unwrap()).unwrap();
         value["new_field"] = serde_json::json!(true);
         assert!(Manifest::parse(&serde_json::to_vec(&value).unwrap()).is_err());
         value.as_object_mut().unwrap().remove("new_field");
@@ -246,5 +246,30 @@ mod tests {
     fn unsafe_file_paths_fail_closed() {
         let bytes = br#"{"partitions":{"_default":{"data_files":["../outside.parquet"]}}}"#;
         assert!(Manifest::parse(bytes).is_err());
+    }
+
+    /// 分区名、建了索引的字段名都可以是 T（serde_json 的数字私有键，3.x 视为普通名字），
+    /// 索引参数里也可以出现；3.x 按 `sort_keys` 写出，T 会排到对象首位。
+    #[test]
+    fn private_number_key_names_and_params_parse() {
+        const T: &str = "$serde_json::private::Number";
+        let bytes = format!(
+            r#"{{"partitions":{{"{T}":{{"data_files":["partitions/p1/data_1.parquet"],"delta_files":[]}},"_default":{{}}}},"index_specs":{{"{T}":{{"field_name":"{T}","index_type":"FLAT","metric_type":"L2","build_params":{{"{T}":"1","x":{{"{T}":"2"}}}},"search_params":{{"x":{{"{T}":"abc","b":1}}}}}}}}}}"#
+        );
+        let manifest = Manifest::parse(bytes.as_bytes()).unwrap();
+        assert_eq!(manifest.partition_order, [T, "_default"]);
+        let spec = &manifest.index_specs[T];
+        assert_eq!(spec.build_params[T], "1");
+        assert_eq!(
+            spec.build_params["x"],
+            crate::json_text::value_str(&format!(r#"{{"{T}":"2"}}"#)).unwrap()
+        );
+        assert_eq!(
+            spec.search_params["x"],
+            crate::json_text::value_str(&format!(r#"{{"{T}":"abc","b":1}}"#)).unwrap()
+        );
+        let reopened = Manifest::parse(&manifest.to_bytes().unwrap()).unwrap();
+        assert_eq!(reopened.index_specs, manifest.index_specs);
+        assert_eq!(reopened.partitions, manifest.partitions);
     }
 }

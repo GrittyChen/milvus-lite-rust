@@ -376,7 +376,7 @@ mod tests {
 
     #[test]
     fn default_metadata_rejects_unreadable_python_integers_without_rejecting_strings() {
-        let large: serde_json::Value = serde_json::from_str(&"9".repeat(4301)).unwrap();
+        let large: serde_json::Value = crate::json_text::value_str(&"9".repeat(4301)).unwrap();
         let mut field = FieldSchema::new("x", DataType::Int64);
         field.default_value = Some(large);
         let mut schema = CollectionSchema {

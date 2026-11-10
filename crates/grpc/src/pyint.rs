@@ -281,7 +281,8 @@ mod tests {
             proto_integer(&json!(text)).unwrap_err().message(),
             "Exceeds the limit (4300 digits) for integer string conversion: value has 4301 digits; use sys.set_int_max_str_digits() to increase the limit"
         );
-        let big: Value = serde_json::from_str(&format!("1{}", "0".repeat(400))).unwrap();
+        let big: Value =
+            milvus_lite_core::json_text::value_str(&format!("1{}", "0".repeat(400))).unwrap();
         assert_eq!(
             proto_float(&big).unwrap_err().message(),
             "int too large to convert to float"

@@ -25,7 +25,9 @@ thread_local! {
 /// 非空字符串才生效。
 pub(crate) fn string_param(params: &[KeyValuePair], key: &str) -> Option<String> {
     let kv = params.iter().find(|kv| kv.key == key)?;
-    match serde_json::from_str(&kv.value).unwrap_or_else(|_| Value::String(kv.value.clone())) {
+    match milvus_lite_core::json_text::value_str(&kv.value)
+        .unwrap_or_else(|_| Value::String(kv.value.clone()))
+    {
         Value::String(s) if !s.is_empty() => Some(s),
         _ => None,
     }

@@ -56,7 +56,7 @@ fn count(db: &Db, name: &str) -> usize {
 fn schema_name(root: &Path, name: &str) -> String {
     let text =
         std::fs::read_to_string(root.join("collections").join(name).join("schema.json")).unwrap();
-    let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let value: serde_json::Value = milvus_lite_core::json_text::value_str(&text).unwrap();
     value["collection_name"].as_str().unwrap().to_owned()
 }
 

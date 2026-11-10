@@ -603,7 +603,7 @@ fn future_schema_key_fails_as_unsupported_without_modifying_files() {
     db.close();
     let schema_path = path.join("collections/c/schema.json");
     let mut value: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&schema_path).unwrap()).unwrap();
+        milvus_lite_core::json_text::value(&std::fs::read(&schema_path).unwrap()).unwrap();
     value["future_key"] = serde_json::json!(1);
     let bytes = serde_json::to_vec(&value).unwrap();
     std::fs::write(&schema_path, &bytes).unwrap();
@@ -638,9 +638,10 @@ fn index_spec_is_committed_and_recovered_with_load_state() {
         },
     )
     .unwrap();
-    let manifest: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(path.join("collections/c/manifest.json")).unwrap())
-            .unwrap();
+    let manifest: serde_json::Value = milvus_lite_core::json_text::value(
+        &std::fs::read(path.join("collections/c/manifest.json")).unwrap(),
+    )
+    .unwrap();
     assert_eq!(manifest["index_specs"]["v"]["metric_type"], "L2");
     db.close();
 
@@ -722,7 +723,8 @@ fn create_cleans_dangling_aliases_before_the_new_name_can_reuse_them() {
     let db = Db::new(DataDir::open(&path).unwrap(), compute()).unwrap();
     db.create_collection("", "new", schema()).unwrap();
     let aliases: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(path.join("aliases.json")).unwrap()).unwrap();
+        milvus_lite_core::json_text::value(&std::fs::read(path.join("aliases.json")).unwrap())
+            .unwrap();
     assert_eq!(aliases, serde_json::json!({"live": "existing"}));
     db.close();
 }
@@ -1200,9 +1202,10 @@ fn committed_drop_alias_error_is_explicit_and_retry_does_not_rebind_old_alias() 
             "other-drop" => db.drop_collection("", "other").unwrap(),
             _ => db.drop_collection("", "c").unwrap(),
         }
-        let aliases: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(root.path().join("aliases.json")).unwrap())
-                .unwrap();
+        let aliases: serde_json::Value = milvus_lite_core::json_text::value(
+            &std::fs::read(root.path().join("aliases.json")).unwrap(),
+        )
+        .unwrap();
         assert!(aliases.get("old").is_none());
         if retry == "other-drop" {
             assert!(aliases.get("keep").is_none());
@@ -1459,7 +1462,7 @@ fn create_alias_cleanup_fault_fires_before_directory_commit_and_can_retry() {
     assert_eq!(std::fs::read(&aliases_path).unwrap(), aliases);
     db.create_collection("", "gone", schema()).unwrap();
     let aliases: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(aliases_path).unwrap()).unwrap();
+        milvus_lite_core::json_text::value(&std::fs::read(aliases_path).unwrap()).unwrap();
     assert_eq!(aliases, serde_json::json!({"live": "existing"}));
     db.close();
 }
@@ -1773,7 +1776,7 @@ fn schema_collection_name_differing_from_directory_opens_under_directory_name() 
         db.close();
     }
     let mut raw: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&schema_path).unwrap()).unwrap();
+        milvus_lite_core::json_text::value(&std::fs::read(&schema_path).unwrap()).unwrap();
     raw["collection_name"] = serde_json::json!("old");
     std::fs::write(&schema_path, serde_json::to_vec(&raw).unwrap()).unwrap();
     {
@@ -1819,7 +1822,13 @@ fn non_finite_index_params_are_rejected_without_manifest_write() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("index-params.db");
     let manifest_path = path.join("collections/c/manifest.json");
-    let params = |text: &str| serde_json::from_str::<serde_json::Map<_, _>>(text).unwrap();
+    let params = |text: &str| {
+        milvus_lite_core::json_text::value_str(text)
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .clone()
+    };
     let request = |params, search_params| IndexRequest {
         index_type: "HNSW".to_owned(),
         metric_type: Some("L2".to_owned()),
@@ -1889,7 +1898,11 @@ fn existing_overflowing_index_params_stay_readable_after_manifest_rewrite() {
             IndexRequest {
                 index_type: "HNSW".to_owned(),
                 metric_type: Some("L2".to_owned()),
-                params: serde_json::from_str(r#"{"M": 16}"#).unwrap(),
+                params: milvus_lite_core::json_text::value_str(r#"{"M": 16}"#)
+                    .unwrap()
+                    .as_object()
+                    .unwrap()
+                    .clone(),
                 ..Default::default()
             },
         )

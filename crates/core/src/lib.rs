@@ -13,6 +13,7 @@ pub mod filter;
 mod flat;
 pub mod flush_budget;
 pub mod index;
+pub mod json_text;
 pub mod lock_order;
 mod maintenance;
 #[cfg(feature = "fault-injection")]

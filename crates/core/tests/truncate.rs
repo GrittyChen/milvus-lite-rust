@@ -571,7 +571,7 @@ fn unsorted_schema_keeps_the_in_process_order_and_is_rewritten_canonically() {
     let path = dir(root.path(), "c").join("schema.json");
     let canonical = std::fs::read(&path).unwrap();
     // 0.3.0rc3 写出的未排序文件：键序按插入顺序，属性 z 在 a 之前。
-    let mut value: serde_json::Value = serde_json::from_slice(&canonical).unwrap();
+    let mut value: serde_json::Value = milvus_lite_core::json_text::value(&canonical).unwrap();
     let object = value.as_object_mut().unwrap();
     let mut unsorted = serde_json::Map::new();
     for key in [
@@ -614,7 +614,7 @@ fn unsorted_schema_keeps_the_in_process_order_and_is_rewritten_canonically() {
 /// 手写一份意图：`old` 为旧 manifest 原文，候选按第 4 步推导、以紧凑 JSON 写出。
 fn write_intent(root: &Path, name: &str, old: Option<&str>) -> String {
     let mut next: serde_json::Value = match old {
-        Some(text) => serde_json::from_str(text).unwrap(),
+        Some(text) => milvus_lite_core::json_text::value_str(text).unwrap(),
         None => serde_json::to_value(Manifest::default()).unwrap(),
     };
     next["version"] = (next["version"].as_u64().unwrap() + 1).into();
@@ -656,7 +656,8 @@ fn reopen_settles_truncate_intents_by_the_current_manifest() {
     for current in [None, Some("other")] {
         write_intent(root.path(), "c", Some(&old));
         if current.is_some() {
-            let mut changed: serde_json::Value = serde_json::from_str(&old).unwrap();
+            let mut changed: serde_json::Value =
+                milvus_lite_core::json_text::value_str(&old).unwrap();
             changed["version"] = 99.into();
             std::fs::write(base.join("manifest.json"), changed.to_string()).unwrap();
         }
@@ -819,14 +820,14 @@ mod faults {
     fn unsort_schema(root: &Path) {
         let path = dir(root, "c").join("schema.json");
         let value: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            milvus_lite_core::json_text::value(&std::fs::read(&path).unwrap()).unwrap();
         std::fs::write(&path, value.to_string()).unwrap();
     }
 
     /// 意图里旧 manifest 列出的全部 data / delta 文件（含清空第 2 步 flush 新写出的），相对集合目录。
     fn intent_old_files(base: &Path) -> Vec<String> {
         let intent: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(base.join(INTENT)).unwrap()).unwrap();
+            milvus_lite_core::json_text::value(&std::fs::read(base.join(INTENT)).unwrap()).unwrap();
         let old = Manifest::parse(intent["old_manifest"].as_str().unwrap().as_bytes()).unwrap();
         let files: Vec<String> = old
             .partitions

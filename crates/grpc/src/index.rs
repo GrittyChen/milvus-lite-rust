@@ -37,7 +37,7 @@ fn json_object(text: Option<&str>) -> Result<Map<String, Value>, EngineError> {
     let Some(text) = text.filter(|t| !t.is_empty()) else {
         return Ok(Map::new());
     };
-    match serde_json::from_str::<Value>(text) {
+    match milvus_lite_core::json_text::value_str(text) {
         Ok(Value::Object(m)) => Ok(m),
         Err(_) if pyint::maybe_python_json_container(text) => {
             Err(unsupported("index params that are not strict JSON"))

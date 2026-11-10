@@ -30,8 +30,8 @@ fn decode_kv_pairs(pairs: &[KeyValuePair]) -> HashMap<&str, Value> {
     pairs
         .iter()
         .map(|kv| {
-            let value =
-                serde_json::from_str(&kv.value).unwrap_or_else(|_| Value::String(kv.value.clone()));
+            let value = milvus_lite_core::json_text::value_str(&kv.value)
+                .unwrap_or_else(|_| Value::String(kv.value.clone()));
             (kv.key.as_str(), value)
         })
         .collect()
@@ -98,7 +98,7 @@ fn boost_function(
     let random_score = match params.get("random_score") {
         None | Some(Value::Null) => false,
         Some(Value::Object(_)) => true,
-        Some(Value::String(text)) => match serde_json::from_str(text) {
+        Some(Value::String(text)) => match milvus_lite_core::json_text::value_str(text) {
             Ok(Value::Object(_)) => true,
             _ => return Err(not_object()),
         },
@@ -136,7 +136,8 @@ fn l2_function(
                 let parsed;
                 let value = match value {
                     Value::String(text) => {
-                        parsed = serde_json::from_str::<Value>(text).map_err(|_| not_array())?;
+                        parsed = milvus_lite_core::json_text::value_str(text)
+                            .map_err(|_| not_array())?;
                         &parsed
                     }
                     other => other,
@@ -191,7 +192,7 @@ fn check_model_queries(params: &HashMap<&str, Value>) -> Result<(), EngineError>
     let parsed;
     let queries = match queries {
         Value::String(text) => {
-            parsed = serde_json::from_str::<Value>(text).map_err(|_| {
+            parsed = milvus_lite_core::json_text::value_str(text).map_err(|_| {
                 schema_error("Model reranker params.queries must be a JSON array".to_owned())
             })?;
             &parsed

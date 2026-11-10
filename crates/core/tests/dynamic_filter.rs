@@ -193,7 +193,8 @@ fn unknown_ordering_cannot_commit_a_partial_delete_or_consume_sequence() {
     engine.insert("", "c", batch(3, &[json!(2)])).unwrap();
     engine.flush_collection("", "c").unwrap();
     let manifest: Value =
-        serde_json::from_slice(&std::fs::read(dir.join("manifest.json")).unwrap()).unwrap();
+        milvus_lite_core::json_text::value(&std::fs::read(dir.join("manifest.json")).unwrap())
+            .unwrap();
     assert_eq!(manifest["current_seq"], json!(3));
     engine.close();
     let reopened = db(root.path());
@@ -321,8 +322,10 @@ fn out_of_range_float_membership_never_matches_int64_max_or_deletes_it() {
             let (id, seq) = if stage == "committed" { (5, 5) } else { (6, 6) };
             engine.insert("", "c", batch(id, &[json!(1)])).unwrap();
             engine.flush_collection("", "c").unwrap();
-            let manifest: Value =
-                serde_json::from_slice(&std::fs::read(dir.join("manifest.json")).unwrap()).unwrap();
+            let manifest: Value = milvus_lite_core::json_text::value(
+                &std::fs::read(dir.join("manifest.json")).unwrap(),
+            )
+            .unwrap();
             assert_eq!(manifest["current_seq"], json!(seq), "{stage}");
         }
     }

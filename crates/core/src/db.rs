@@ -5096,7 +5096,7 @@ mod tests {
             worker.join().unwrap();
         }
         let aliases: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            crate::json_text::value(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(aliases, serde_json::json!({"keep":"live"}));
         db.close();
     }
@@ -5494,7 +5494,7 @@ mod tests {
             seed_lazy_collections(root.path());
             let dir = root.path().join("collections/c");
             let manifest: serde_json::Value =
-                serde_json::from_slice(&fs::read(dir.join("manifest.json")).unwrap()).unwrap();
+                crate::json_text::value(&fs::read(dir.join("manifest.json")).unwrap()).unwrap();
             let data = dir.join("partitions/_default").join(
                 manifest["partitions"]["_default"]["data_files"][0]
                     .as_str()
@@ -5515,7 +5515,7 @@ mod tests {
             if kind == "missing-data" {
                 fs::remove_file(&damaged).unwrap();
             } else if kind == "schema" {
-                let mut json: serde_json::Value = serde_json::from_slice(&original).unwrap();
+                let mut json: serde_json::Value = crate::json_text::value(&original).unwrap();
                 json["future_key"] = true.into();
                 fs::write(&damaged, serde_json::to_vec(&json).unwrap()).unwrap();
             } else {

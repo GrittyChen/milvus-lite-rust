@@ -857,10 +857,10 @@ mod tests {
             .rows;
         assert_eq!(rows.pks, vec![milvus_lite_core::Pk::Int64(1)]);
         assert_eq!(
-            std::fs::read_to_string(path.join("collections/c/manifest.json"))
-                .unwrap()
-                .parse::<serde_json::Value>()
-                .unwrap()["current_seq"],
+            milvus_lite_core::json_text::value(
+                &std::fs::read(path.join("collections/c/manifest.json")).unwrap()
+            )
+            .unwrap()["current_seq"],
             1
         );
         reopened.close();

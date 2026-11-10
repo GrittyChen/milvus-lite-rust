@@ -329,7 +329,7 @@ fn key_default_outside_i64_is_a_business_error_without_wal_or_sequence_consumpti
         let root = tempfile::tempdir().unwrap();
         let db = open(root.path());
         let mut s = schema(true);
-        s.fields[1].default_value = Some(serde_json::from_str(text).unwrap());
+        s.fields[1].default_value = Some(milvus_lite_core::json_text::value_str(text).unwrap());
         db.create_collection("", "c", s).unwrap();
         let mut input = batch(&[0], None);
         input.columns.retain(|(name, _)| name != "k");

@@ -28,7 +28,7 @@ fn read(root: &Path) -> Result<Aliases> {
         Err(error) => return Err(EngineError::Storage(error.to_string())),
     };
     let value: serde_json::Value =
-        serde_json::from_slice(&bytes).map_err(|error| EngineError::Storage(error.to_string()))?;
+        crate::json_text::value(&bytes).map_err(|error| EngineError::Storage(error.to_string()))?;
     let mut aliases = Aliases::new();
     if let serde_json::Value::Object(map) = value {
         for (alias, target) in map {
@@ -115,5 +115,27 @@ mod tests {
         assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
         write(root.path(), &Aliases::new(), |_| Ok(())).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"{}");
+    }
+
+    /// 别名或目标是 T（serde_json 的数字私有键）时仍是普通对象：数字文本目标不被清空，非数字目标不报错。
+    #[test]
+    fn private_number_key_alias_loads() {
+        const T: &str = "$serde_json::private::Number";
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("aliases.json");
+        for (text, expected) in [
+            (format!(r#"{{"{T}":"1"}}"#), vec![(T, "1")]),
+            (
+                format!(r#"{{"{T}":"c","a":"d"}}"#),
+                vec![(T, "c"), ("a", "d")],
+            ),
+        ] {
+            std::fs::write(&path, text).unwrap();
+            let expected: Aliases = expected
+                .into_iter()
+                .map(|(k, v)| (k.to_owned(), v.to_owned()))
+                .collect();
+            assert_eq!(load(&mut None, root.path()).unwrap(), &expected);
+        }
     }
 }

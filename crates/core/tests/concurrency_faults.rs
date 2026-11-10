@@ -421,8 +421,10 @@ fn parallel_drops_preserve_live_aliases_and_remove_both_deleted_targets() {
     for worker in workers {
         worker.join().unwrap().unwrap();
     }
-    let aliases: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(root.path().join("aliases.json")).unwrap()).unwrap();
+    let aliases: serde_json::Value = milvus_lite_core::json_text::value(
+        &std::fs::read(root.path().join("aliases.json")).unwrap(),
+    )
+    .unwrap();
     assert_eq!(aliases, serde_json::json!({"keep":"live"}));
     db.close();
 }
@@ -968,9 +970,10 @@ fn concurrent_writes_reads_and_flush_crash_keep_all_acknowledged_rows() {
             "{}",
             std::fs::read_to_string(root.path().join("child.log")).unwrap()
         );
-        let expected: Vec<(i64, i64)> =
-            serde_json::from_slice(&std::fs::read(root.path().join("expected.json")).unwrap())
-                .unwrap();
+        let expected: Vec<(i64, i64)> = milvus_lite_core::json_text::parse(
+            &std::fs::read(root.path().join("expected.json")).unwrap(),
+        )
+        .unwrap();
         let db = open(root.path());
         assert_eq!(
             rows(&db.collection("", "c").unwrap().read().read_snapshot()),
@@ -1141,16 +1144,18 @@ fn controlled_concurrent_failure_rejection_and_inflight_recovery_match_model() {
         "{}",
         std::fs::read_to_string(root.path().join("child.log")).unwrap()
     );
-    let oracle: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(root.path().join("oracle.json")).unwrap()).unwrap();
+    let oracle: serde_json::Value = milvus_lite_core::json_text::value(
+        &std::fs::read(root.path().join("oracle.json")).unwrap(),
+    )
+    .unwrap();
     assert_eq!(oracle["rejected"], 3);
     let confirmed: BTreeMap<i64, i64> =
-        serde_json::from_value::<Vec<(i64, i64)>>(oracle["confirmed"].clone())
+        milvus_lite_core::json_text::from_value::<Vec<(i64, i64)>>(oracle["confirmed"].clone())
             .unwrap()
             .into_iter()
             .collect();
     let inflight: BTreeMap<i64, i64> =
-        serde_json::from_value::<Vec<(i64, i64)>>(oracle["inflight"].clone())
+        milvus_lite_core::json_text::from_value::<Vec<(i64, i64)>>(oracle["inflight"].clone())
             .unwrap()
             .into_iter()
             .collect();
@@ -1257,11 +1262,11 @@ fn alias_rename_then_panic_preserves_the_real_file_change_and_can_retry() {
     assert!(error.contains("collection was removed") && error.contains("panicked"));
     assert!(!root.path().join("collections/c").exists());
     let aliases: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        milvus_lite_core::json_text::value(&std::fs::read(&path).unwrap()).unwrap();
     assert_eq!(aliases, serde_json::json!({"keep":"live"}));
     db.drop_collection("", "c").unwrap();
     assert_eq!(
-        serde_json::from_slice::<serde_json::Value>(&std::fs::read(path).unwrap()).unwrap(),
+        milvus_lite_core::json_text::value(&std::fs::read(path).unwrap()).unwrap(),
         aliases
     );
     db.close();

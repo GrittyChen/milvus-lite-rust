@@ -34,7 +34,7 @@ struct RankParams {
 }
 
 fn decode_value(text: &str) -> Value {
-    serde_json::from_str(text).unwrap_or_else(|_| Value::String(text.to_owned()))
+    milvus_lite_core::json_text::value_str(text).unwrap_or_else(|_| Value::String(text.to_owned()))
 }
 
 /// `int()` 依次作用在 `limit`、`offset`、`group_size` 上（3.x 字典字面量的求值顺序），失败都是 code 1。

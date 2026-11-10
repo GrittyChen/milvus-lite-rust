@@ -57,7 +57,7 @@ pub(crate) fn read(root: &Path) -> Result<Option<RenameIntent>, ReadError> {
 }
 
 fn parse(bytes: &[u8]) -> Result<RenameIntent, String> {
-    let marker: Marker = serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
+    let marker: Marker = crate::json_text::parse(bytes).map_err(|error| error.to_string())?;
     if marker.format_version != 1 {
         return Err(format!(
             "unsupported format_version {}",

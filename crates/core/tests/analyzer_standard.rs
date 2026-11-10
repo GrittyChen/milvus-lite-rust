@@ -11,7 +11,8 @@ struct Case {
 #[test]
 fn matches_the_reference_tokenizer_on_the_exported_corpus() {
     let cases: Vec<Case> =
-        serde_json::from_str(include_str!("fixtures/analyzer_standard.json")).unwrap();
+        milvus_lite_core::json_text::parse_str(include_str!("fixtures/analyzer_standard.json"))
+            .unwrap();
     assert!(cases.len() > 500, "corpus shrank to {}", cases.len());
     for case in cases {
         assert_eq!(tokenize(&case.text), case.tokens, "{:?}", case.text);

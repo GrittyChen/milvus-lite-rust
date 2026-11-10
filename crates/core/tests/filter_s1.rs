@@ -231,8 +231,10 @@ fn out_of_range_float_membership_delete_leaves_rows_sequence_and_wal_unchanged()
             let (pk, seq) = if stage == "committed" { (6, 4) } else { (7, 5) };
             engine.insert("", "c", batch(&[(pk, 4)])).unwrap();
             engine.flush_collection("", "c").unwrap();
-            let manifest: serde_json::Value =
-                serde_json::from_slice(&std::fs::read(dir.join("manifest.json")).unwrap()).unwrap();
+            let manifest: serde_json::Value = milvus_lite_core::json_text::value(
+                &std::fs::read(dir.join("manifest.json")).unwrap(),
+            )
+            .unwrap();
             assert_eq!(manifest["current_seq"], serde_json::json!(seq), "{stage}");
         }
     }

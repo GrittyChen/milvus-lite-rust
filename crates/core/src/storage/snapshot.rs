@@ -120,7 +120,7 @@ fn read_snapshots(collection_dir: &Path) -> Result<Vec<SnapshotMetadata>, Snapsh
             source,
         })?;
         let mut snap: SnapshotMetadata =
-            serde_json::from_slice(&bytes).map_err(|error| SnapshotError::Invalid {
+            crate::json_text::parse(&bytes).map_err(|error| SnapshotError::Invalid {
                 path: path.clone(),
                 reason: error.to_string(),
             })?;

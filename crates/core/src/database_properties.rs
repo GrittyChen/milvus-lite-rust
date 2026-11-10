@@ -34,7 +34,7 @@ fn read(root: &Path) -> Result<Properties> {
         Err(error) => return Err(EngineError::Storage(error.to_string())),
     };
     let value: serde_json::Value =
-        serde_json::from_slice(&bytes).map_err(|error| EngineError::Storage(error.to_string()))?;
+        crate::json_text::value(&bytes).map_err(|error| EngineError::Storage(error.to_string()))?;
     let serde_json::Value::Object(map) = value else {
         return Ok(Properties::new());
     };
@@ -233,5 +233,23 @@ mod tests {
         assert_eq!(fs::read_dir(root.path()).unwrap().count(), 1);
         write(root.path(), &Properties::new(), |_| Ok(())).unwrap();
         assert_eq!(fs::read(&path).unwrap(), b"{}");
+    }
+
+    /// 属性键是 T（serde_json 的数字私有键）时仍是普通对象：唯一属性不被静默清空，与其他键并存不报错。
+    #[test]
+    fn private_number_key_property_loads() {
+        const T: &str = "$serde_json::private::Number";
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join(FILE);
+        for (text, expected) in [
+            (format!(r#"{{"{T}":"1"}}"#), props(&[(T, "1")])),
+            (
+                format!(r#"{{"{T}":"abc","a":"x"}}"#),
+                props(&[(T, "abc"), ("a", "x")]),
+            ),
+        ] {
+            fs::write(&path, text).unwrap();
+            assert_eq!(*load(&mut None, root.path()).unwrap(), expected);
+        }
     }
 }

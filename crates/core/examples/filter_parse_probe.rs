@@ -6,7 +6,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let input = io::stdin().lock();
     let mut output = io::BufWriter::new(io::stdout().lock());
     for line in input.lines() {
-        let source: String = serde_json::from_str(&line?)?;
+        let source: String = milvus_lite_core::json_text::parse_str(&line?)?;
         let error = ParsedFilter::parse(&source)
             .err()
             .map(|error| error.to_string());

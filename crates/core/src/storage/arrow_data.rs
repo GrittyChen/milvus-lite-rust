@@ -118,12 +118,11 @@ fn json_strings(name: &str, values: &[Vec<u8>]) -> Result<Vec<String>, ArrowData
     values
         .iter()
         .map(|raw| {
-            let value = serde_json::from_slice::<Value>(raw).map_err(|source| {
-                ArrowDataError::JsonText {
+            let value =
+                crate::json_text::value(raw).map_err(|source| ArrowDataError::JsonText {
                     name: name.to_owned(),
                     source,
-                }
-            })?;
+                })?;
             check_finite_json_numbers(name, &value)?;
             Ok(pyjson::dumps_unicode(&value))
         })
@@ -1034,7 +1033,7 @@ fn decode_batch(
                 meta.push(Map::new());
                 continue;
             }
-            let value: Value = serde_json::from_str(strings.value(row))
+            let value: Value = crate::json_text::value_str(strings.value(row))
                 .map_err(|source| ArrowDataError::InvalidMeta(source.to_string()))?;
             let Value::Object(map) = value else {
                 return Err(ArrowDataError::InvalidMeta(format!(
@@ -1244,7 +1243,7 @@ mod tests {
             properties: Vec::new(),
         };
         let Value::Object(meta) =
-            serde_json::from_str(r#"{"z":{"b":1,"a":2},"a":"中文"}"#).unwrap()
+            crate::json_text::value_str(r#"{"z":{"b":1,"a":2},"a":"中文"}"#).unwrap()
         else {
             panic!("object fixture");
         };
@@ -1284,6 +1283,75 @@ mod tests {
             meta.value(0),
             r#"{"a": "\u4e2d\u6587", "z": {"a": 2, "b": 1}}"#
         );
+    }
+
+    /// serde_json 的数字私有键在用户数据里是普通键：JSON 列原样规范化，`$meta` 排序后私有键排到首位，
+    /// 写出与读回都保持对象（排序后首位曾让 flush 与恢复失败）。
+    #[test]
+    fn private_number_key_stays_an_object_through_write_and_decode() {
+        const T: &str = "$serde_json::private::Number";
+        let mut pk = FieldSchema::new("id", DataType::Int64);
+        pk.is_primary = true;
+        let mut vector = FieldSchema::new("vector", DataType::FloatVector);
+        vector.dim = Some(2);
+        let schema = CollectionSchema {
+            fields: vec![pk, vector, FieldSchema::new("j", DataType::Json)],
+            enable_dynamic_field: true,
+            properties: Vec::new(),
+        };
+        let json = [
+            format!(r#"{{"{T}":"1"}}"#),
+            format!(r#"{{"b":2,"{T}":"abc"}}"#),
+            format!(r#"[{{"{T}":"1.5e3"}}]"#),
+        ];
+        let metas: Vec<Map<String, Value>> = [
+            format!(r#"{{"x":{{"b":2,"{T}":"1"}}}}"#),
+            format!(r#"{{"{T}":"1","y":3}}"#),
+            format!(r#"{{"{T}":{{"{T}":"2"}}}}"#),
+        ]
+        .iter()
+        .map(|text| {
+            crate::json_text::value_str(text)
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .clone()
+        })
+        .collect();
+        let batch = data_batch(
+            &schema,
+            &[1, 2, 3],
+            &[
+                ColumnData::Int64(vec![1, 2, 3]),
+                ColumnData::FloatVector {
+                    dim: 2,
+                    values: vec![0.0; 6],
+                },
+                ColumnData::Json(json.iter().map(|t| t.as_bytes().to_vec()).collect()),
+            ],
+            Some(&metas),
+        )
+        .unwrap();
+        let written = batch
+            .column(4)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(
+            written.value(0),
+            format!(r#"{{"x": {{"{T}": "1", "b": 2}}}}"#)
+        );
+        let decoded = decode_data_batch(&schema, &batch).unwrap();
+        assert_eq!(decoded.meta.unwrap(), metas);
+        let ColumnData::Json(rows) = &decoded.columns[2] else {
+            panic!("json column");
+        };
+        for (row, text) in rows.iter().zip(&json) {
+            assert_eq!(
+                crate::json_text::value(row).unwrap(),
+                crate::json_text::value_str(text).unwrap()
+            );
+        }
     }
 
     fn two_int_schema() -> CollectionSchema {

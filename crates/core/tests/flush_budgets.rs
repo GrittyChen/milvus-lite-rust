@@ -288,7 +288,7 @@ fn committed_wal_over_budget_is_reclaimed_with_an_empty_generation() {
         let crashed = crash_copy(root.path());
         db.flush_collection("", "c").unwrap();
         let manifest = |root: &Path| -> serde_json::Value {
-            serde_json::from_slice(
+            milvus_lite_core::json_text::value(
                 &std::fs::read(root.join("collections/c/manifest.json")).unwrap(),
             )
             .unwrap()
