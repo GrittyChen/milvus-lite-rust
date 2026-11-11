@@ -47,9 +47,9 @@ env:
   VERSION: ${{ inputs.version }}
   REFERENCE_COMMIT: 1320d26ec3d88b23b525e774df6e3c8e7c208f81
   # 兼容探针的上一版本：附件哈希写死，不在运行时取最新版本（0021 第 11 条）。
-  PREVIOUS_VERSION: 0.3.0rc3
-  PREVIOUS_WHEEL: milvus_lite_rust-0.3.0rc3-cp310-abi3-manylinux_2_28_x86_64.whl
-  PREVIOUS_WHEEL_SHA256: 50d93202d33c1809400553a04b4f500f3f429fa6aed5b7eb501fe5a0139d2239
+  PREVIOUS_VERSION: 0.4.0rc1
+  PREVIOUS_WHEEL: milvus_lite_rust-0.4.0rc1-cp310-abi3-manylinux_2_28_x86_64.whl
+  PREVIOUS_WHEEL_SHA256: 0130b0393a0d304e75af075ba286a1b9ee219a85bbe474ee433225d9ab23c03c
   ORJSON_SDIST_URL: https://files.pythonhosted.org/packages/source/o/orjson/orjson-3.13.0.tar.gz
 
 jobs:
