@@ -16,6 +16,7 @@ fn schema() -> CollectionSchema {
     let mut vector = FieldSchema::new("v", DataType::FloatVector);
     vector.dim = Some(2);
     CollectionSchema {
+        functions: Vec::new(),
         fields: vec![id, vector, FieldSchema::new("json", DataType::Json)],
         enable_dynamic_field: true,
         properties: Vec::new(),

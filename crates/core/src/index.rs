@@ -11,10 +11,14 @@ pub enum Metric {
     L2,
     Ip,
     Cosine,
+    /// BM25 function 输出字段的度量（0031）。3.x 的内部距离就是 `-score`，对外也原样返回，
+    /// 所以下面三个换算都是恒等。只在稀疏分支按字段直接取得，[`Self::parse`] 不接纳。
+    Bm25,
 }
 
 impl Metric {
-    /// 大写的度量名；大小写规范化与报错由调用方按 3.x 的 `resolve_search_metric` 完成。
+    /// 大写的稠密度量名；大小写规范化与报错由调用方按 3.x 的 `resolve_search_metric` 完成。
+    /// 3.x 对稠密字段的 BM25 报 `unsupported dense metric`，所以这里不接纳 BM25。
     pub(crate) fn parse(s: &str) -> Option<Self> {
         match s {
             "L2" => Some(Self::L2),
@@ -29,6 +33,7 @@ impl Metric {
             Self::L2 => "L2",
             Self::Ip => "IP",
             Self::Cosine => "COSINE",
+            Self::Bm25 => "BM25",
         }
     }
 
@@ -42,7 +47,7 @@ impl Metric {
                 d * d
             }
             Self::Cosine => 1.0 - f64::from(1.0 - score),
-            Self::Ip => f64::from(score),
+            Self::Ip | Self::Bm25 => f64::from(score),
         }
     }
 
@@ -54,6 +59,7 @@ impl Metric {
             Self::L2 => score.sqrt(),
             Self::Cosine => 1.0 - score,
             Self::Ip => -score,
+            Self::Bm25 => score,
         }
     }
 
@@ -64,12 +70,14 @@ impl Metric {
             Self::L2 => distance * distance,
             Self::Cosine => 1.0 - distance,
             Self::Ip => -distance,
+            Self::Bm25 => distance,
         }
     }
 
-    /// 对外分数是否越大越相似（COSINE / IP 返回相似度，L2 返回平方距离）。
+    /// 对外分数是否越大越相似（COSINE / IP 返回相似度，L2 返回平方距离，BM25 返回 `-score`）。
+    /// 只服务排序与 range；rerank 链的「正相关」是另一个概念，BM25 在那里是正相关（`rerank::chain`）。
     pub fn higher_is_better(self) -> bool {
-        !matches!(self, Self::L2)
+        matches!(self, Self::Ip | Self::Cosine)
     }
 }
 
@@ -174,41 +182,74 @@ const ACCEPTED_DENSE_INDEX_TYPES: [&str; 8] = [
 ];
 pub(crate) const SPARSE_INDEX: &str = "SPARSE_INVERTED_INDEX";
 
-/// 3.x `_validate_sparse_index_config`：普通稀疏字段只接受 SPARSE_INVERTED_INDEX + IP，再校验
+/// 3.x `_validate_sparse_index_config` 与 `resolve_search_metric` 的 `expected`：BM25 function 的输出字段要求
+/// BM25，其余稀疏字段要求 IP。本实现只接受 BM25 这一种函数，稀疏的函数输出字段一定由它产出（0031）。
+pub(crate) fn sparse_metric(field: &FieldSchema) -> &'static str {
+    if field.is_function_output {
+        "BM25"
+    } else {
+        "IP"
+    }
+}
+
+/// 3.x `_validate_sparse_index_config`：稀疏字段只接受 SPARSE_INVERTED_INDEX + 期望的度量，再校验
 /// build 与 search 两组参数里的调参项。create_index、load 与每次检索都用它校验同一份定义。
 pub(crate) fn check_sparse_config(
-    field: &str,
+    field: &FieldSchema,
     index_type: &str,
     metric_type: &str,
     params: &Map<String, Value>,
     search_params: &Map<String, Value>,
 ) -> Result<()> {
-    if index_type != SPARSE_INDEX || metric_type != "IP" {
+    let expected = sparse_metric(field);
+    if index_type != SPARSE_INDEX || metric_type != expected {
         return Err(EngineError::schema(format!(
-            "sparse field {} requires SPARSE_INVERTED_INDEX with metric IP; got {}/{}. \
+            "sparse field {} requires SPARSE_INVERTED_INDEX with metric {expected}; got {}/{}. \
              For an existing index, release, drop, and recreate it with the allowed metric.",
-            py_repr(field),
+            py_repr(&field.name),
             py_repr(index_type),
             py_repr(metric_type)
         )));
     }
-    check_sparse_tuning(field, params)?;
-    check_sparse_tuning(field, search_params)
+    check_sparse_tuning(&field.name, metric_type, params)?;
+    check_sparse_tuning(&field.name, metric_type, search_params)
 }
 
 /// 3.x `_validate_sparse_tuning`：数值按 Python `float()` 转换（`"0"`、`False` 可以，`True`、`None` 不行）。
-/// 普通稀疏字段的度量只能是 IP，所以 BM25 参数一律拒绝；BM25 字段的取值校验随第 6 步加入。
-pub(crate) fn check_sparse_tuning(field: &str, params: &Map<String, Value>) -> Result<()> {
+/// `metric` 是期望的度量（`IP` / `BM25`）。溢出的数（`1e999`、超长整数）与 3.x 一样在这里被拒绝，
+/// 不会进入持久化；`NaN` / `Infinity` 字面量不是严格 JSON，已在 gRPC 解码时返回 UNIMPLEMENTED。
+pub(crate) fn check_sparse_tuning(
+    field: &str,
+    metric: &str,
+    params: &Map<String, Value>,
+) -> Result<()> {
     use crate::rerank::pyval::PyVal;
     let float = |value: &Value| PyVal::from_json(value).to_float().ok();
-    if let Some(name) = ["bm25_k1", "bm25_b"]
-        .into_iter()
-        .find(|name| params.contains_key(*name))
-    {
-        return Err(EngineError::schema(format!(
-            "IP field {} does not accept {name}",
-            py_repr(field)
-        )));
+    for name in ["bm25_k1", "bm25_b"] {
+        let Some(value) = params.get(name) else {
+            continue;
+        };
+        if metric != "BM25" {
+            return Err(EngineError::schema(format!(
+                "IP field {} does not accept {name}",
+                py_repr(field)
+            )));
+        }
+        let valid = !value.is_boolean()
+            && float(value).is_some_and(|v| {
+                v.is_finite()
+                    && if name == "bm25_k1" {
+                        v > 0.0
+                    } else {
+                        (0.0..=1.0).contains(&v)
+                    }
+            });
+        if !valid {
+            return Err(EngineError::schema(format!(
+                "field {}: invalid {name}",
+                py_repr(field)
+            )));
+        }
     }
     for name in ["drop_ratio_build", "drop_ratio_search"] {
         if let Some(value) = params.get(name)
@@ -241,13 +282,7 @@ pub(crate) fn build_spec(field: &FieldSchema, req: IndexRequest) -> Result<Index
             EngineError::schema("create_index missing required 'metric_type' parameter")
         })?;
         if field.data_type.is_sparse_vector() {
-            check_sparse_config(
-                &field.name,
-                &index_type,
-                &metric,
-                &req.params,
-                &req.search_params,
-            )?;
+            check_sparse_config(field, &index_type, &metric, &req.params, &req.search_params)?;
         }
         metric
     } else {
@@ -493,7 +528,7 @@ mod tests {
     /// 3.x `_validate_sparse_tuning` 的 Python `float()` 规则；build 与 search 两组参数都校验。
     #[test]
     fn sparse_tuning_follows_python_float_rules() {
-        let check = |json| check_sparse_tuning("sp", &params(json));
+        let check = |json| check_sparse_tuning("sp", "IP", &params(json));
         for ok in [
             serde_json::json!({}),
             serde_json::json!({"drop_ratio_build": 0}),
@@ -560,6 +595,134 @@ mod tests {
             .to_string(),
             "field 'sp': only drop_ratio_search=0 is supported"
         );
+    }
+
+    /// 3.x `_validate_sparse_tuning` 的 BM25 分支（期望值逐条取自 `1320d26` 的该函数）：`float()` 之后有限、
+    /// 不是 bool，k1 > 0、b 在 [0, 1]；依次校验 k1、b、drop ratio、算法名。溢出的数同样报 invalid。
+    #[test]
+    fn bm25_tuning_follows_3x() {
+        let check = |json: &str| {
+            check_sparse_tuning(
+                "sp",
+                "BM25",
+                &crate::json_text::value_str(json)
+                    .unwrap()
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            )
+            .map_err(|e| e.to_string())
+        };
+        let huge = format!("1{}", "0".repeat(400));
+        for ok in [
+            r#"{"bm25_k1": 1.2}"#,
+            r#"{"bm25_k1": "2"}"#,
+            r#"{"bm25_k1": 1e308}"#,
+            r#"{"bm25_k1": " 3 "}"#,
+            r#"{"bm25_k1": "1_0"}"#,
+            r#"{"bm25_k1": 1}"#,
+            r#"{"bm25_b": 0}"#,
+            r#"{"bm25_b": 1}"#,
+            r#"{"bm25_b": "0.5"}"#,
+            r#"{"bm25_b": -0.0}"#,
+            r#"{"bm25_b": 0.5, "drop_ratio_search": "0.0", "inverted_index_algo": "Taat_Naive"}"#,
+        ] {
+            assert_eq!(check(ok), Ok(()), "{ok}");
+        }
+        let k1 = "field 'sp': invalid bm25_k1";
+        let b = "field 'sp': invalid bm25_b";
+        let mut bad: Vec<(String, &str)> = [
+            "0",
+            "-1",
+            "true",
+            "false",
+            "null",
+            "[1]",
+            "\"x\"",
+            "\"inf\"",
+            "\"nan\"",
+            "{}",
+            "\"Infinity\"",
+            "\"1e999\"",
+            "1e999",
+            "-1e999",
+        ]
+        .into_iter()
+        .map(|v| (format!(r#"{{"bm25_k1": {v}}}"#), k1))
+        .collect();
+        bad.push((format!(r#"{{"bm25_k1": {huge}}}"#), k1));
+        bad.extend(
+            [
+                "false",
+                "true",
+                "null",
+                "1.0000001",
+                "\"nan\"",
+                "-1e-300",
+                "1e999",
+            ]
+            .into_iter()
+            .map(|v| (format!(r#"{{"bm25_b": {v}}}"#), b)),
+        );
+        bad.push((r#"{"bm25_k1": 1.2, "bm25_b": 2}"#.into(), b));
+        bad.push((r#"{"bm25_k1": 0, "drop_ratio_build": 1}"#.into(), k1));
+        bad.push((
+            r#"{"drop_ratio_build": 1e999}"#.into(),
+            "field 'sp': only drop_ratio_build=0 is supported",
+        ));
+        bad.push((
+            r#"{"inverted_index_algo": 1e999}"#.into(),
+            "field 'sp': unsupported sparse algorithm inf; use TAAT_NAIVE",
+        ));
+        for (json, message) in bad {
+            assert_eq!(check(&json), Err(message.to_owned()), "{json}");
+        }
+    }
+
+    /// BM25 输出字段只接受 SPARSE_INVERTED_INDEX + BM25，两组参数都校验（3.x `_validate_sparse_index_config`）。
+    #[test]
+    fn bm25_output_fields_require_bm25_metric() {
+        let field = FieldSchema {
+            is_function_output: true,
+            ..FieldSchema::new("sp", DataType::SparseFloatVector)
+        };
+        for (index_type, metric) in [
+            ("SPARSE_INVERTED_INDEX", "IP"),
+            ("AUTOINDEX", "BM25"),
+            ("INVERTED", "BM25"),
+        ] {
+            assert_eq!(
+                build_spec(&field, req(index_type, Some(metric)))
+                    .unwrap_err()
+                    .to_string(),
+                format!(
+                    "sparse field 'sp' requires SPARSE_INVERTED_INDEX with metric BM25; got '{index_type}'/'{metric}'. \
+                     For an existing index, release, drop, and recreate it with the allowed metric."
+                )
+            );
+        }
+        let mut request = req("sparse_inverted_index", Some("bm25"));
+        request.params = params(serde_json::json!({"bm25_k1": "2", "bm25_b": 0}));
+        let spec = build_spec(&field, request).unwrap();
+        assert_eq!(
+            (spec.index_type.as_str(), spec.metric_type.as_str()),
+            ("SPARSE_INVERTED_INDEX", "BM25")
+        );
+        let mut request = req("SPARSE_INVERTED_INDEX", Some("BM25"));
+        request.search_params = params(serde_json::json!({"bm25_b": 2}));
+        assert_eq!(
+            build_spec(&field, request).unwrap_err().to_string(),
+            "field 'sp': invalid bm25_b"
+        );
+        // 普通稀疏字段仍是 IP，BM25 度量与 BM25 调参项都拒绝。
+        let plain = FieldSchema::new("sp", DataType::SparseFloatVector);
+        assert!(
+            build_spec(&plain, req("SPARSE_INVERTED_INDEX", Some("BM25")))
+                .unwrap_err()
+                .to_string()
+                .contains("requires SPARSE_INVERTED_INDEX with metric IP")
+        );
+        assert_eq!(Metric::parse("BM25"), None);
     }
 
     /// 稠密字段上的 SPARSE_INVERTED_INDEX：五种度量都能建，调参项不校验，load 时不建任何东西（3.x 实测）。

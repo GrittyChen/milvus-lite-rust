@@ -1004,6 +1004,7 @@ mod tests {
             ];
             for (dtype, column, literals) in cases {
                 let schema = CollectionSchema {
+                    functions: Vec::new(),
                     fields: vec![FieldSchema::new("x", dtype)],
                     enable_dynamic_field: false,
                     properties: vec![],
@@ -1036,6 +1037,7 @@ mod tests {
     #[test]
     fn typed_cast_rejects_live_wide_integers_even_after_a_false_term() {
         let schema = CollectionSchema {
+            functions: Vec::new(),
             fields: vec![FieldSchema::new("x", DataType::Int64)],
             enable_dynamic_field: false,
             properties: vec![],

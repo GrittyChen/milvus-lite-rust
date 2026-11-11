@@ -20,6 +20,7 @@ fn schema(pk: &str) -> CollectionSchema {
     let mut n = FieldSchema::new("n", DataType::Int64);
     n.nullable = true;
     CollectionSchema {
+        functions: Vec::new(),
         fields: vec![
             id,
             v,

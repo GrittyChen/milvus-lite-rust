@@ -21,6 +21,9 @@ use crate::index::Metric;
 const LANES: usize = 16;
 type Lanes = [f32; LANES];
 
+/// 稠密字段的度量只来自 `Metric::parse`，它不接纳 BM25；BM25 只在稀疏分支按字段取得（0031）。
+const DENSE_ONLY: &str = "BM25 is never a dense metric";
+
 /// 同时打分的查询条数：候选向量读入一次，供这几条查询共用。
 pub(crate) const BATCH: usize = 4;
 
@@ -56,6 +59,7 @@ impl<'a> Query<'a> {
                 candidate,
                 product,
             ),
+            Metric::Bm25 => unreachable!("{DENSE_ONLY}"),
         };
         self.to_score(raw, candidate_norm)
     }
@@ -109,6 +113,7 @@ pub(crate) fn score_batch(
     let (lanes, op): (_, fn(f32, f32) -> f32) = match queries[0].metric {
         Metric::L2 => (diff_sq_lanes_batch(&vectors, candidate), diff_sq),
         Metric::Ip | Metric::Cosine => (product_lanes_batch(&vectors, candidate), product),
+        Metric::Bm25 => unreachable!("{DENSE_ONLY}"),
     };
     std::array::from_fn(|i| {
         let raw = finish(lanes[i], vectors[i], candidate, op);

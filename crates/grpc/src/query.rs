@@ -210,6 +210,7 @@ mod tests {
             "",
             "c",
             CollectionSchema {
+                functions: Vec::new(),
                 fields: vec![id, vector],
                 enable_dynamic_field: false,
                 properties: vec![],
@@ -297,6 +298,7 @@ mod tests {
             "",
             "c",
             CollectionSchema {
+                functions: Vec::new(),
                 fields: vec![id, v, ts],
                 enable_dynamic_field: false,
                 properties: vec![],
@@ -388,6 +390,7 @@ mod tests {
                 "",
                 "c",
                 CollectionSchema {
+                    functions: Vec::new(),
                     fields: vec![id, v],
                     enable_dynamic_field: false,
                     properties: vec![],

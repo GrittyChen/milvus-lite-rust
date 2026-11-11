@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use crate::schema::{CollectionSchema, DataType, FieldSchema};
+use crate::schema::{CollectionSchema, DataType, FUNCTION_BM25, FieldSchema, Function};
 
 const SCHEMA_FORMAT_VERSION: u32 = 2;
 
@@ -114,7 +114,7 @@ impl SchemaFile {
                 enable_analyzer: field.enable_analyzer,
                 analyzer_params: field.analyzer_params.clone(),
                 enable_match: field.enable_match,
-                is_function_output: false,
+                is_function_output: field.is_function_output,
                 is_partition_key: field.is_partition_key,
             })
             .collect();
@@ -130,7 +130,17 @@ impl SchemaFile {
             enable_dynamic_field: schema.enable_dynamic_field,
             properties,
             fields,
-            functions: Vec::new(),
+            functions: schema
+                .functions
+                .iter()
+                .map(|function| PersistedFunction {
+                    name: function.name.clone(),
+                    function_type: function.function_type,
+                    input_field_names: function.input_field_names.clone(),
+                    output_field_names: function.output_field_names.clone(),
+                    params: function.params.clone(),
+                })
+                .collect(),
         }
     }
 
@@ -169,9 +179,19 @@ impl SchemaFile {
 
     /// 完整解析与支持范围判定分开：范围外的 schema 仍可供 DescribeCollection 编码与 drop。
     pub fn to_core(&self) -> Result<CollectionSchema, SchemaFileError> {
-        if !self.functions.is_empty() {
+        // BM25 之外的函数（TEXT_EMBEDDING 需要外部服务）仍在范围外。
+        if self
+            .functions
+            .iter()
+            .any(|f| f.function_type != FUNCTION_BM25)
+        {
             return Err(SchemaFileError::Unsupported("schema functions".to_owned()));
         }
+        let bm25_inputs: std::collections::HashSet<&str> = self
+            .functions
+            .iter()
+            .flat_map(|f| f.input_field_names.iter().map(String::as_str))
+            .collect();
         let properties = self
             .properties
             .iter()
@@ -199,7 +219,6 @@ impl SchemaFile {
                     && (field.nullable || field.default_value.is_some()))
                     || (field.dtype != "array"
                         && (field.element_type.is_some() || field.max_capacity.is_some()))
-                    || field.is_function_output
                 {
                     return Err(SchemaFileError::Unsupported(format!(
                         "field {:?} has unsupported attributes",
@@ -245,6 +264,13 @@ impl SchemaFile {
                         .analyzer_params
                         .clone()
                         .filter(crate::pyjson::python_truthy),
+                    // 3.x 打开时把原值交给 BM25 输入字段的 `create_analyzer`；只有手改的文件会有假值。
+                    unsaved_analyzer_params: field.analyzer_params.clone().filter(|value| {
+                        bm25_inputs.contains(field.name.as_str())
+                            && !crate::pyjson::python_truthy(value)
+                            && !matches!(value, Value::Null | Value::Object(_))
+                    }),
+                    is_function_output: field.is_function_output,
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -252,6 +278,17 @@ impl SchemaFile {
             fields,
             enable_dynamic_field: self.enable_dynamic_field,
             properties,
+            functions: self
+                .functions
+                .iter()
+                .map(|function| Function {
+                    name: function.name.clone(),
+                    function_type: function.function_type,
+                    input_field_names: function.input_field_names.clone(),
+                    output_field_names: function.output_field_names.clone(),
+                    params: function.params.clone(),
+                })
+                .collect(),
         };
         // 3.x 在创建时把 TIMESTAMPTZ 的字符串默认值换成微秒再落盘；字符串只可能来自手改的文件，
         // 它需要数据库时区才能规范化，打开路径不带这个上下文，所以按范围外 schema 处理（0025）。
@@ -437,6 +474,7 @@ mod tests {
         let mut vector = FieldSchema::new("vector", DataType::FloatVector);
         vector.dim = Some(2);
         let source = CollectionSchema {
+            functions: Vec::new(),
             fields: vec![pk, vector],
             enable_dynamic_field: false,
             properties: Vec::new(),

@@ -112,6 +112,7 @@ mod tests {
 
     fn schema(dynamic: bool) -> CollectionSchema {
         CollectionSchema {
+            functions: Vec::new(),
             fields: vec![
                 FieldSchema {
                     is_primary: true,

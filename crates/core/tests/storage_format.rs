@@ -176,6 +176,7 @@ fn same_type_schema() -> CollectionSchema {
     let mut vector = FieldSchema::new("vector", DataType::FloatVector);
     vector.dim = Some(2);
     CollectionSchema {
+        functions: Vec::new(),
         fields: vec![pk, FieldSchema::new("score", DataType::Int64), vector],
         enable_dynamic_field: false,
         properties: Vec::new(),

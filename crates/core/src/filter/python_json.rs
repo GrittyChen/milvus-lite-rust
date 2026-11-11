@@ -394,8 +394,11 @@ mod tests {
 /// `analyzer_params` 文本的处理结果，判定规则见 [`classify_analyzer_params`]。
 #[derive(Debug, PartialEq)]
 pub enum AnalyzerParams {
-    /// 3.x 当作没有设置：解析失败或者是假值。
+    /// 3.x 当作没有设置：解析失败、null 或空对象。
     Unset,
+    /// 其余假值（`0`、`""`、`[]`、`false` 等）：不保存、不回显，但 BM25 输入字段的 `create_analyzer`
+    /// 拿到的是这个原值并报错（0031）。
+    Falsy(serde_json::Value),
     Keep(serde_json::Value),
     /// 3.x 能接受，但无法写成本实现重开时读得回的严格 JSON。
     Unrepresentable,
@@ -403,20 +406,26 @@ pub enum AnalyzerParams {
 
 /// `schema.json` 的字段比 `analyzer_params` 多包三层，serde_json 的递归上限在文件里只留下 124 层。
 const MAX_ANALYZER_PARAMS_DEPTH: usize = 124;
+/// 函数参数比 `analyzer_params` 再多包一层（`functions[i].params`）。
+const MAX_FUNCTION_PARAM_DEPTH: usize = 123;
 
-fn exceeds_strict_json(value: &serde_json::Value, depth: usize) -> bool {
+fn exceeds_strict_json(value: &serde_json::Value, depth: usize, limit: usize) -> bool {
     use serde_json::Value;
     match value {
         Value::Number(n) => {
             crate::pyjson::json_float_text(&n.to_string()).is_some_and(f64::is_infinite)
         }
         Value::Array(items) => {
-            depth == MAX_ANALYZER_PARAMS_DEPTH
-                || items.iter().any(|v| exceeds_strict_json(v, depth + 1))
+            depth == limit
+                || items
+                    .iter()
+                    .any(|v| exceeds_strict_json(v, depth + 1, limit))
         }
         Value::Object(entries) => {
-            depth == MAX_ANALYZER_PARAMS_DEPTH
-                || entries.values().any(|v| exceeds_strict_json(v, depth + 1))
+            depth == limit
+                || entries
+                    .values()
+                    .any(|v| exceeds_strict_json(v, depth + 1, limit))
         }
         _ => false,
     }
@@ -436,11 +445,39 @@ pub fn classify_analyzer_params(text: &str) -> AnalyzerParams {
         return AnalyzerParams::Unrepresentable;
     };
     if !crate::pyjson::python_truthy(&value) {
-        AnalyzerParams::Unset
-    } else if exceeds_strict_json(&value, 0) {
+        match value {
+            serde_json::Value::Null | serde_json::Value::Object(_) => AnalyzerParams::Unset,
+            falsy => AnalyzerParams::Falsy(falsy),
+        }
+    } else if exceeds_strict_json(&value, 0, MAX_ANALYZER_PARAMS_DEPTH) {
         AnalyzerParams::Unrepresentable
     } else {
         AnalyzerParams::Keep(value)
+    }
+}
+
+/// 一个函数参数的 `json.loads` 结果（3.x `_decode_function`）。
+#[derive(Debug, PartialEq)]
+pub enum FunctionParam {
+    /// 解析失败，保留原字符串。
+    Raw,
+    Value(serde_json::Value),
+    /// 3.x 能接受，但无法写成本实现重开时读得回的严格 JSON（0029 的登记同样适用）。
+    Unrepresentable,
+}
+
+pub fn classify_function_param(text: &str) -> FunctionParam {
+    let input: Vec<u32> = text.chars().map(u32::from).collect();
+    match decode(&input) {
+        Ok(Some(_)) => {}
+        Ok(None) => return FunctionParam::Raw,
+        Err(_) => return FunctionParam::Unrepresentable,
+    }
+    match crate::json_text::value_str(text) {
+        Ok(value) if !exceeds_strict_json(&value, 0, MAX_FUNCTION_PARAM_DEPTH) => {
+            FunctionParam::Value(value)
+        }
+        _ => FunctionParam::Unrepresentable,
     }
 }
 
@@ -465,30 +502,81 @@ mod analyzer_params_tests {
     #[test]
     fn unset_when_python_rejects_or_value_is_falsy() {
         let wide = format!("{{\"a\":{}}}", "1".repeat(4301));
-        for text in [
-            "not json",
-            "{\"a\":1} x",
-            "{",
-            &wide,
-            "{}",
-            "[]",
-            "0",
-            "-0",
-            "0.0",
-            "-0.0",
-            "0e5",
-            "1e-999",
-            "-1e-999",
-            "\"\"",
-            "null",
-            "false",
-        ] {
+        for text in ["not json", "{\"a\":1} x", "{", &wide, "{}", "null"] {
             assert_eq!(
                 classify_analyzer_params(text),
                 AnalyzerParams::Unset,
                 "{text}"
             );
         }
+        for text in [
+            "[]", "0", "-0", "0.0", "-0.0", "0e5", "1e-999", "-1e-999", "\"\"", "false",
+        ] {
+            assert!(
+                matches!(classify_analyzer_params(text), AnalyzerParams::Falsy(_)),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn function_params_keep_text_python_rejects() {
+        for text in ["x", "", "[1,", "{bad", " ", "1 2"] {
+            assert_eq!(classify_function_param(text), FunctionParam::Raw, "{text}");
+        }
+        assert_eq!(
+            classify_function_param(" 2 "),
+            FunctionParam::Value(json!(2))
+        );
+        assert_eq!(
+            classify_function_param("null"),
+            FunctionParam::Value(json!(null))
+        );
+        assert_eq!(
+            classify_function_param("{\"k\": [1, 2]}"),
+            FunctionParam::Value(json!({"k": [1, 2]}))
+        );
+        for text in ["NaN", "[Infinity]", "1e999", "\"\\ud800\""] {
+            assert_eq!(
+                classify_function_param(text),
+                FunctionParam::Unrepresentable,
+                "{text}"
+            );
+        }
+    }
+
+    /// 函数参数能保存的最深嵌套正好是 `schema.json` 重开时读得回的深度。
+    #[test]
+    fn function_param_depth_matches_schema_file() {
+        use crate::schema::{CollectionSchema, DataType, FieldSchema, Function};
+        let nested = |depth: usize| format!("{}{}", "[".repeat(depth), "]".repeat(depth));
+        let roundtrip = |value: serde_json::Value| {
+            let schema = CollectionSchema {
+                fields: vec![FieldSchema::new("v", DataType::FloatVector)],
+                functions: vec![Function {
+                    name: "f".into(),
+                    function_type: 1,
+                    input_field_names: vec![],
+                    output_field_names: vec![],
+                    params: serde_json::Map::from_iter([("p".to_owned(), value)]),
+                }],
+                ..Default::default()
+            };
+            let bytes = SchemaFile::from_core("c", &schema).to_bytes().unwrap();
+            SchemaFile::parse(&bytes).is_ok()
+        };
+        let FunctionParam::Value(deepest) =
+            classify_function_param(&nested(MAX_FUNCTION_PARAM_DEPTH))
+        else {
+            panic!("depth {MAX_FUNCTION_PARAM_DEPTH} should be kept");
+        };
+        assert!(roundtrip(deepest));
+        assert_eq!(
+            classify_function_param(&nested(MAX_FUNCTION_PARAM_DEPTH + 1)),
+            FunctionParam::Unrepresentable
+        );
+        let too_deep = crate::json_text::value_str(&nested(MAX_FUNCTION_PARAM_DEPTH + 1)).unwrap();
+        assert!(!roundtrip(too_deep));
     }
 
     #[test]

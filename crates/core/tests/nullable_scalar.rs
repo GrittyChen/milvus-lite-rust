@@ -30,6 +30,7 @@ fn schema() -> CollectionSchema {
     let mut j = FieldSchema::new("j", DataType::Json);
     j.nullable = true;
     CollectionSchema {
+        functions: Vec::new(),
         fields: vec![id, vector, x, flag, title, j],
         enable_dynamic_field: false,
         properties: vec![],

@@ -28,6 +28,7 @@ fn schema() -> CollectionSchema {
     let mut vector = FieldSchema::new("v", DataType::FloatVector);
     vector.dim = Some(2);
     CollectionSchema {
+        functions: Vec::new(),
         fields: vec![pk, vector],
         enable_dynamic_field: false,
         properties: Vec::new(),

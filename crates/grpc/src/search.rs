@@ -132,6 +132,7 @@ pub(crate) fn search(
                 } else {
                     usize::try_from(parsed.top_k.max(0)).unwrap_or(usize::MAX)
                 },
+                chained: false,
             },
         )?,
         (None, None) => c.search_grouped_in(
@@ -548,7 +549,14 @@ fn placeholders(req: &svc::SearchRequest) -> Result<QueryVectors, EngineError> {
                 .map(|blob| milvus_lite_core::data::sparse::decode(blob))
                 .collect::<Result<_, _>>()?,
         )),
-        PLACEHOLDER_VARCHAR => Ok(QueryVectors::Text),
+        // 3.x：`blob.decode("utf-8") if blob else ""`，失败时是 Python 的 UnicodeDecodeError（code 1）。
+        PLACEHOLDER_VARCHAR => Ok(QueryVectors::Text(
+            first
+                .values
+                .iter()
+                .map(|blob| python_utf8(blob))
+                .collect::<Result<_, _>>()?,
+        )),
         t => Err(schema_err(format!(
             "PlaceholderValue type {t} not supported \
              (supported: FloatVector=101, SparseFloatVector=104, VarChar=21)"
@@ -556,9 +564,76 @@ fn placeholders(req: &svc::SearchRequest) -> Result<QueryVectors, EngineError> {
     }
 }
 
+/// Python `bytes.decode("utf-8")` 的结果与错误文案。Rust 的 `Utf8Error` 与 Python 都按「最大非法子序列」
+/// 划分出错的区间：`error_len` 为 None 时是末尾不完整（`unexpected end of data`，区间到末尾）；否则首字节
+/// 不可能开始一个字符（0x80–0xC1、0xF5–0xFF）时是 `invalid start byte`，其余是 `invalid continuation byte`。
+fn python_utf8(blob: &[u8]) -> Result<String, EngineError> {
+    let error = match std::str::from_utf8(blob) {
+        Ok(text) => return Ok(text.to_owned()),
+        Err(error) => error,
+    };
+    let start = error.valid_up_to();
+    let (len, reason) = match error.error_len() {
+        None => (blob.len() - start, "unexpected end of data"),
+        Some(len) if matches!(blob[start], 0x80..=0xC1 | 0xF5..=0xFF) => {
+            (len, "invalid start byte")
+        }
+        Some(len) => (len, "invalid continuation byte"),
+    };
+    let what = if len == 1 {
+        format!("byte 0x{:02x} in position {start}", blob[start])
+    } else {
+        format!("bytes in position {start}-{}", start + len - 1)
+    };
+    Err(EngineError::InvalidArgument(format!(
+        "'utf-8' codec can't decode {what}: {reason}"
+    )))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 期望文案取自 CPython 3.12 的 `bytes.decode("utf-8")`；随机拼接的 30 万条字节串也与它逐条一致（仓库外核对）。
+    #[test]
+    fn utf8_errors_match_python() {
+        for (hex, want) in [
+            ("ff", "byte 0xff in position 0: invalid start byte"),
+            ("e282", "bytes in position 0-1: unexpected end of data"),
+            ("e28228", "bytes in position 0-1: invalid continuation byte"),
+            (
+                "eda080",
+                "byte 0xed in position 0: invalid continuation byte",
+            ),
+            ("e080", "byte 0xe0 in position 0: invalid continuation byte"),
+            ("f490", "byte 0xf4 in position 0: invalid continuation byte"),
+            ("c3", "byte 0xc3 in position 0: unexpected end of data"),
+            ("61ff62", "byte 0xff in position 1: invalid start byte"),
+            ("f09f98", "bytes in position 0-2: unexpected end of data"),
+            ("80", "byte 0x80 in position 0: invalid start byte"),
+            ("c0af", "byte 0xc0 in position 0: invalid start byte"),
+            ("f5", "byte 0xf5 in position 0: invalid start byte"),
+            (
+                "e4b8ade2",
+                "byte 0xe2 in position 3: unexpected end of data",
+            ),
+            ("2828e282", "bytes in position 2-3: unexpected end of data"),
+        ] {
+            let bytes: Vec<u8> = (0..hex.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+                .collect();
+            let error = python_utf8(&bytes).unwrap_err();
+            assert!(matches!(error, EngineError::InvalidArgument(_)), "{hex}");
+            assert_eq!(
+                error.to_string(),
+                format!("'utf-8' codec can't decode {want}"),
+                "{hex}"
+            );
+        }
+        assert_eq!(python_utf8("中文 fox".as_bytes()).unwrap(), "中文 fox");
+        assert_eq!(python_utf8(b"").unwrap(), "");
+    }
 
     #[test]
     fn py_round_matches_python() {

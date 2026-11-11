@@ -9,6 +9,7 @@ use serde_json::{Value, json};
 
 fn schema() -> CollectionSchema {
     CollectionSchema {
+        functions: Vec::new(),
         fields: vec![
             FieldSchema {
                 is_primary: true,

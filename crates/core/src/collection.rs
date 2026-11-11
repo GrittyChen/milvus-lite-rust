@@ -31,14 +31,14 @@ pub enum LoadState {
     Released,
 }
 
-/// 查询向量。文本查询（BM25 function 之外）在 3.x 中报错，这里保留它的种类，以便在与 3.x 相同的位置报出
-/// 相同的错误。
+/// 查询向量。各种类都保留到引擎，以便在与 3.x 相同的位置报出相同的错误。
 #[derive(Debug, Clone, PartialEq)]
 pub enum QueryVectors {
     Dense(Vec<Vec<f32>>),
     /// 每条查询按 3.x `bytes_to_sparse` 解码后的 `(维度, 权重)`，尚未校验。
     Sparse(Vec<Vec<(u32, f32)>>),
-    Text,
+    /// 文本查询：BM25 输出字段用它检索（0031），其余字段报 3.x 的错误。
+    Text(Vec<String>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -135,6 +135,7 @@ pub struct ReadSnapshot {
     unusable: bool,
     /// 集合的稀疏倒排代号与取快照时的值（见 [`SparseCache::publish`]）。
     sparse_epoch: (Arc<std::sync::atomic::AtomicU64>, u64),
+    bm25: Arc<[crate::schema::Bm25Function]>,
 }
 
 /// 主键在锁内定位，投影与结果复制在放锁后完成。
@@ -282,6 +283,12 @@ fn run_chain(
                     .public
                     .as_ref()
                     .map_or_else(|| metric.public_f64(query.scores[i]), |p| p[i]);
+                // 3.x `hit_score_for_chain`：只有 BM25 在链的入口取负（对外距离是 `-score`，链要正分）。
+                let public = if metric == Metric::Bm25 {
+                    -public
+                } else {
+                    public
+                };
                 rows.push(chain.row(sources.len(), id, public, |name| {
                     snapshot.entity_value(at, name, &ranking.projection, ranking.boosted)
                 })?);
@@ -656,6 +663,7 @@ impl ReadSnapshot {
         let plan = boost.map(|spec| BoostPlan {
             spec: spec.clone(),
             keep: top_k,
+            chained: true,
         });
         let rows_per_block = self.rows_per_block(req.anns_field.as_deref());
         let ranking = self.rank_in_blocks(
@@ -714,6 +722,7 @@ impl ReadSnapshot {
         let plan = filter.boost.map(|spec| BoostPlan {
             spec: spec.clone(),
             keep: req.limit,
+            chained: true,
         });
         let rows_per_block = self.rows_per_block(req.anns_field.as_deref());
         let ranking = self.rank_in_blocks(
@@ -826,6 +835,8 @@ impl ReadSnapshot {
     /// 稀疏字段的候选（0030，3.x `_search_sparse`）。错误的先后与 3.x 相同：调参项 → 查询 → 过滤编译 →
     /// 逐个 segment（建倒排 → 过滤）→ MemTable（解码 → 过滤 → 规范化）。建倒排与打分在计算池上并行，
     /// 全部算完后按这个先后取第一个错误；结果与按 `RankedRow` 全序串行排序一致。
+    /// BM25 输出字段（0031）：查询文本用输入字段的分词器切词；倒排不规范化、不校验；统计按数据源汇总，
+    /// segment 计入全部物理行，MemTable 只计入存活且通过过滤的行；对外距离是 `-score`。
     fn rank_sparse(
         &self,
         req: &SearchRequest,
@@ -838,22 +849,55 @@ impl ReadSnapshot {
         use crate::data::sparse;
         use crate::sparse_index::{self, Postings};
         let field = &self.schema.fields[field_pos];
-        crate::index::check_sparse_tuning(&field.name, &req.params)?;
+        crate::index::check_sparse_tuning(
+            &field.name,
+            crate::index::sparse_metric(field),
+            &req.params,
+        )?;
         let query_error = |message: String| {
             EngineError::schema(format!(
                 "sparse query field {}: {message}",
                 py_repr(&field.name)
             ))
         };
-        let queries: Vec<Vec<(u32, f32)>> = match &req.vectors {
-            QueryVectors::Sparse(rows) => rows
+        let bm25 = if field.is_function_output {
+            let function = self
+                .bm25
+                .iter()
+                .find(|function| function.output == field_pos)
+                .ok_or_else(|| {
+                    EngineError::Storage("BM25 output field has no producing function".into())
+                })?;
+            Some((function, self.bm25_tuning(&field.name)?))
+        } else {
+            None
+        };
+        let metric = if bm25.is_some() {
+            Metric::Bm25
+        } else {
+            Metric::Ip
+        };
+        let queries: Vec<Vec<(u32, f32)>> = match (&req.vectors, bm25) {
+            // 3.x `_prepare_sparse_queries`：BM25 输出字段只接受文本查询（稠密向量同样报这句）；查询词按首次
+            // 出现的顺序、词频为权重，不经过 `normalize`（它会把顺序变成维度序）。
+            (QueryVectors::Text(texts), Some((function, _))) => texts
+                .iter()
+                .map(|text| function.analyzer.term_frequencies(text))
+                .collect(),
+            (_, Some(_)) => {
+                return Err(EngineError::schema(format!(
+                    "BM25 field {} requires a text query, not a sparse vector",
+                    py_repr(&field.name)
+                )));
+            }
+            (QueryVectors::Sparse(rows), None) => rows
                 .iter()
                 .map(|pairs| sparse::normalize(pairs, true).map_err(query_error))
                 .collect::<Result<_>>()?,
-            QueryVectors::Dense(_) => {
+            (QueryVectors::Dense(_), None) => {
                 return Err(query_error("sparse vector must be a dict, got list".into()));
             }
-            QueryVectors::Text => {
+            (QueryVectors::Text(_), None) => {
                 return Err(query_error("sparse vector must be a dict, got str".into()));
             }
         };
@@ -903,9 +947,12 @@ impl ReadSnapshot {
                 )));
                 return;
             };
-            build.result = Some(sparse_index::build_segment(rows, |row| {
-                !column.is_null(row)
-            }));
+            let valid = |row| !column.is_null(row);
+            build.result = Some(if bm25.is_some() {
+                sparse_index::build_bm25_segment(rows, valid)
+            } else {
+                sparse_index::build_segment(rows, valid)
+            });
         });
         let mut build_errors: HashMap<usize, EngineError> = HashMap::new();
         let (epoch, seen) = &self.sparse_epoch;
@@ -966,33 +1013,51 @@ impl ReadSnapshot {
                 Some(filter) => Some(filter.evaluate(&dynamic_rows(&chunks, &locations))?),
                 None => None,
             };
-            let normalized = decoded
-                .iter()
-                .map(|pairs| sparse::normalize(pairs, true).map_err(EngineError::InvalidArgument))
-                .collect::<Result<Vec<_>>>()?;
+            // BM25 的倒排不规范化、不校验（3.x `SparseInvertedIndex.build`）。
+            let normalized = if bm25.is_some() {
+                decoded
+            } else {
+                decoded
+                    .iter()
+                    .map(|pairs| {
+                        sparse::normalize(pairs, true).map_err(EngineError::InvalidArgument)
+                    })
+                    .collect::<Result<Vec<_>>>()?
+            };
             // 3.x 的 MemTable 只要有行就打分（不看过滤结果）。
             if req.negative_top_k && !locations.is_empty() {
                 return Err(negative_top_k());
             }
-            let built = Postings::build(
-                normalized
-                    .iter()
-                    .enumerate()
-                    .filter(|(index, _)| keep.as_ref().is_none_or(|bits| bits.get(*index)))
-                    .map(|(index, pairs)| (index as u32, pairs.as_slice())),
-            );
+            let kept = normalized
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| keep.as_ref().is_none_or(|bits| bits.get(*index)))
+                .map(|(index, pairs)| (index as u32, pairs.as_slice()));
+            let built = if bm25.is_some() {
+                sparse_index::build_bm25(kept, normalized.len())
+            } else {
+                Postings::build(kept)
+            };
             Some((rank, locations, built))
         } else {
             None
         };
 
-        let mut tops: Vec<TopK> = queries
-            .iter()
-            .map(|_| TopK::new(Metric::Ip, take))
-            .collect();
+        let mut tops: Vec<TopK> = queries.iter().map(|_| TopK::new(metric, take)).collect();
         if take == 0 {
             return Ok(tops);
         }
+        // BM25 的数据源统计与每条查询各词的 IDF；`source` 是下标。
+        let mut stats: Vec<(sparse_index::Bm25Source, Vec<Vec<Option<f32>>>)> = Vec::new();
+        let mut source_stats = |blocks: &[&Postings]| -> Option<Option<usize>> {
+            let Some((_, (k1, b))) = bm25 else {
+                return Some(None);
+            };
+            let source = sparse_index::Bm25Source::new(blocks, k1, b)?;
+            let idf = queries.iter().map(|q| source.idf(blocks, q)).collect();
+            stats.push((source, idf));
+            Some(Some(stats.len() - 1))
+        };
         #[derive(Clone, Copy)]
         enum Unit<'a> {
             Segment(usize, &'a Postings),
@@ -1002,94 +1067,112 @@ impl ReadSnapshot {
         // 每条查询仍在同一数据源上按同样的次序打分，结果与不分段时逐位相同。
         struct ScoreLeaf<'a> {
             unit: Unit<'a>,
+            /// BM25 时为数据源统计的下标。
+            source: Option<usize>,
             queries: std::ops::Range<usize>,
             tops: Vec<TopK>,
         }
-        let mut units: Vec<Unit> = Vec::new();
+        let mut units: Vec<(Unit, Option<usize>)> = Vec::new();
         for range in &segments {
+            // 3.x 跳过没有有效行的 segment；有的话，统计包含这个 segment 的全部块。
+            if !range.clone().any(|i| chunks[i].live.any_live()) {
+                continue;
+            }
+            let blocks: Vec<&Postings> = range
+                .clone()
+                .filter_map(|i| postings[i].as_deref())
+                .collect();
+            let Some(source) = source_stats(&blocks) else {
+                continue;
+            };
             for i in range.clone() {
                 if let Some(built) = &postings[i]
                     && chunks[i].live.any_live()
                 {
-                    units.push(Unit::Segment(i, built));
+                    units.push((Unit::Segment(i, built), source));
                 }
             }
         }
         if let Some((rank, locations, built)) = &memory
             && !locations.is_empty()
+            && let Some(source) = source_stats(&[built])
         {
-            units.push(Unit::Memory(*rank, locations, built));
+            units.push((Unit::Memory(*rank, locations, built), source));
         }
         let per_leaf = queries.len().div_ceil(compute.threads().max(1));
         let mut leaves: Vec<ScoreLeaf> = Vec::new();
-        for unit in units {
+        for (unit, source) in units {
             for start in (0..queries.len()).step_by(per_leaf.max(1)) {
                 leaves.push(ScoreLeaf {
                     unit,
+                    source,
                     queries: start..(start + per_leaf).min(queries.len()),
                     tops: Vec::new(),
                 });
             }
         }
         let chunks_ref = &chunks;
+        let stats_ref = &stats;
         compute.for_each(&mut leaves, |leaf| {
-            let leaf_queries = &queries[leaf.queries.clone()];
-            leaf.tops = leaf_queries
-                .iter()
-                .map(|_| TopK::new(Metric::Ip, take))
+            leaf.tops = leaf
+                .queries
+                .clone()
+                .map(|_| TopK::new(metric, take))
                 .collect();
-            let (built, rows) = match &leaf.unit {
-                Unit::Segment(i, built) => (*built, chunks_ref[*i].live.len),
-                Unit::Memory(_, locations, built) => (*built, locations.len()),
+            let rows = match &leaf.unit {
+                Unit::Segment(i, _) => chunks_ref[*i].live.len,
+                Unit::Memory(_, locations, _) => locations.len(),
             };
             let mut scratch = sparse_index::Scratch::with_rows(rows);
-            for (query, top) in leaf_queries.iter().zip(leaf.tops.iter_mut()) {
+            for (q, top) in leaf.queries.clone().zip(leaf.tops.iter_mut()) {
+                let source = leaf.source.map(|source| {
+                    let (source, idf) = &stats_ref[source];
+                    (source, idf[q].as_slice())
+                });
                 match &leaf.unit {
-                    Unit::Segment(i, _) => {
+                    Unit::Segment(i, built) => {
                         let chunk = &chunks_ref[*i];
-                        sparse_index::score(
+                        score_sparse_unit(
                             built,
-                            query,
+                            &queries[q],
+                            source,
                             |row| chunk.live.get(row as usize),
-                            &mut scratch,
-                            |row, score| {
+                            |row| {
                                 let row = row as usize;
-                                top.push(score.exact as f32, || {
-                                    RankedRow::sparse(
-                                        chunk.source_rank,
-                                        score,
-                                        RowRef {
-                                            order: row_order(chunk, row),
-                                            chunk: *i,
-                                            row,
-                                        },
-                                    )
-                                });
+                                let order = row_order(chunk, row);
+                                (
+                                    chunk.source_rank,
+                                    RowRef {
+                                        order,
+                                        chunk: *i,
+                                        row,
+                                    },
+                                )
                             },
-                        );
-                    }
-                    Unit::Memory(rank, locations, _) => {
-                        sparse_index::score(
-                            built,
-                            query,
-                            |_| true,
                             &mut scratch,
-                            |index, score| {
-                                let (i, row) = locations[index as usize];
-                                top.push(score.exact as f32, || {
-                                    RankedRow::sparse(
-                                        *rank,
-                                        score,
-                                        RowRef {
-                                            order: row_order(&chunks_ref[i], row),
-                                            chunk: i,
-                                            row,
-                                        },
-                                    )
-                                });
-                            },
+                            top,
                         );
                     }
+                    Unit::Memory(rank, locations, built) => score_sparse_unit(
+                        built,
+                        &queries[q],
+                        source,
+                        |_| true,
+                        |index| {
+                            let (i, row) = locations[index as usize];
+                            let order = row_order(&chunks_ref[i], row);
+                            (
+                                *rank,
+                                RowRef {
+                                    order,
+                                    chunk: i,
+                                    row,
+                                },
+                            )
+                        },
+                        &mut scratch,
+                        top,
+                    ),
                 }
             }
             leaf.tops.iter_mut().for_each(TopK::shrink);
@@ -1100,6 +1183,22 @@ impl ReadSnapshot {
             }
         }
         Ok(tops)
+    }
+
+    /// 3.x `create_sparse_index`：k1 / b 只取索引定义的 `params`（build params），缺省 1.5 / 0.75；检索请求里的
+    /// 同名参数只校验、不参与打分。定义已由 `check_sparse_config` 校验过。
+    fn bm25_tuning(&self, field: &str) -> Result<(f64, f64)> {
+        let params = self
+            .indexes
+            .iter()
+            .find(|spec| spec.field_name == field)
+            .map(|spec| &spec.params);
+        let get = |name: &str, default: f64| {
+            params
+                .and_then(|p| p.get(name))
+                .map_or(Ok(default), |value| PyVal::from_json(value).to_float())
+        };
+        Ok((get("bm25_k1", 1.5)?, get("bm25_b", 0.75)?))
     }
 
     fn strip(&self, rows: &mut Rows, names: &[&str]) {
@@ -1124,6 +1223,7 @@ impl ReadSnapshot {
         // 3.x：没有查询向量时在一切检查之前返回空结果。
         if matches!(&req.vectors, QueryVectors::Dense(v) if v.is_empty())
             || matches!(&req.vectors, QueryVectors::Sparse(v) if v.is_empty())
+            || matches!(&req.vectors, QueryVectors::Text(v) if v.is_empty())
         {
             return Ok(Ranking {
                 projection,
@@ -1159,7 +1259,7 @@ impl ReadSnapshot {
             let vectors = match &req.vectors {
                 QueryVectors::Dense(v) => v,
                 // 3.x `_maybe_embed_queries`：字段上没有 TEXT_EMBEDDING function（M1 不支持 function）。
-                QueryVectors::Text => {
+                QueryVectors::Text(_) => {
                     return Err(EngineError::schema(format!(
                         "Text query on field {} requires a TEXT_EMBEDDING function targeting that field",
                         py_repr(&field.name)
@@ -1273,6 +1373,7 @@ impl ReadSnapshot {
                 offset: req.offset,
                 limit: req.limit,
                 keep: plan.keep,
+                chained: plan.chained,
             })?;
             return Ok(Ranking {
                 projection,
@@ -1356,6 +1457,7 @@ impl ReadSnapshot {
             offset,
             limit,
             keep,
+            chained,
         } = input;
         let schema_field = |name: &str| {
             self.schema
@@ -1451,7 +1553,7 @@ impl ReadSnapshot {
         for (rows, _) in &kept {
             let mut scores = Vec::with_capacity(rows.len());
             for row in rows {
-                scores.push(boost::public_score(&row.distance, metric)?);
+                scores.push(boost::public_score(&row.distance, metric, chained)?);
             }
             public.push(scores);
         }
@@ -1782,28 +1884,33 @@ fn resolve_field_metric(
     field: &FieldSchema,
     requested: Option<&str>,
 ) -> Result<Metric> {
-    // 3.x：稀疏字段先校验已有的定义，请求的度量只能是 IP。
+    // 3.x：稀疏字段先校验已有的定义，请求的度量只能是期望的度量（BM25 输出字段为 BM25，其余为 IP）。
     if field.data_type.is_sparse_vector() {
+        let expected = crate::index::sparse_metric(field);
         if let Some(spec) = indexes.iter().find(|spec| spec.field_name == field.name) {
             crate::index::check_sparse_config(
-                &field.name,
+                field,
                 &spec.index_type,
                 &spec.metric_type,
                 &spec.params,
                 &spec.search_params,
             )?;
         }
-        // 与稠密分支不同，3.x 这里只放行 None：空串照样不是 IP。
+        // 与稠密分支不同，3.x 这里只放行 None：空串照样不是期望的度量。
         if let Some(metric) = requested.map(str::to_uppercase)
-            && metric != "IP"
+            && metric != expected
         {
             return Err(EngineError::schema(format!(
-                "sparse field {} requires metric IP, got {}",
+                "sparse field {} requires metric {expected}, got {}",
                 py_repr(&field.name),
                 py_repr(&metric)
             )));
         }
-        return Ok(Metric::Ip);
+        return Ok(if field.is_function_output {
+            Metric::Bm25
+        } else {
+            Metric::Ip
+        });
     }
     let metric = requested
         .map(str::to_uppercase)
@@ -1936,6 +2043,8 @@ pub struct Collection {
     persistent: Option<PersistentCollection>,
     memory_key: Option<Box<partition_key::MemoryKey>>,
     deleted: bool,
+    /// schema 中的 BM25 function，写入时据此生成输出字段，检索时用同一分词器处理查询文本（0031）。
+    bm25: Arc<[crate::schema::Bm25Function]>,
 }
 
 impl Collection {
@@ -1973,6 +2082,7 @@ impl Collection {
             .partition_key()
             .map(|_| partition_key::MemoryKey::new(&schema).map(Box::new))
             .transpose()?;
+        let bm25 = schema.bm25_functions()?.into();
         Ok(Self {
             name: name.into(),
             schema,
@@ -1990,6 +2100,7 @@ impl Collection {
             persistent: None,
             memory_key,
             deleted: false,
+            bm25,
         })
     }
 
@@ -3078,7 +3189,7 @@ impl Collection {
             // 3.x 在逐 segment 建索引之前、不论有没有数据都校验稀疏字段的定义。
             if field.data_type.is_sparse_vector() {
                 crate::index::check_sparse_config(
-                    &field.name,
+                    field,
                     &spec.index_type,
                     &spec.metric_type,
                     &spec.params,
@@ -3370,7 +3481,7 @@ impl Collection {
 
     pub(crate) fn upsert_partition_from_db(
         &mut self,
-        batch: InsertBatch,
+        mut batch: InsertBatch,
         partition: &str,
     ) -> Result<Vec<Pk>> {
         if self.schema.partition_key().is_some() {
@@ -3386,6 +3497,8 @@ impl Collection {
         for (name, values) in &batch.columns {
             check_column_len(name, values, n)?;
         }
+        self.check_function_outputs(&batch)?;
+        self.generate_function_outputs(&mut batch, true);
         let dynamic = self.decode_dynamic(&batch);
         let mut supplied: HashMap<&str, &InputValues> = HashMap::new();
         let mut json_checks: HashMap<&str, Vec<&InputValues>> = HashMap::new();
@@ -3533,12 +3646,13 @@ impl Collection {
                 ),
             ));
         }
-        self.insert_partition_inner(
+        self.insert_columns(
             InsertBatch {
                 num_rows: n,
                 columns,
             },
             partition,
+            false,
         )
     }
 
@@ -3662,6 +3776,16 @@ impl Collection {
     }
 
     fn insert_partition_inner(&mut self, batch: InsertBatch, partition: &str) -> Result<Vec<Pk>> {
+        self.insert_columns(batch, partition, true)
+    }
+
+    /// `request` 为假时批次是 upsert 合并后的整行：函数输出已按请求生成，不再检查或重新生成。
+    fn insert_columns(
+        &mut self,
+        mut batch: InsertBatch,
+        partition: &str,
+        request: bool,
+    ) -> Result<Vec<Pk>> {
         if self.schema.partition_key().is_some() {
             return self.insert_key_batch(batch, false);
         }
@@ -3675,6 +3799,9 @@ impl Collection {
         }
         for (name, values) in &batch.columns {
             check_column_len(name, values, n)?;
+        }
+        if request {
+            self.check_function_outputs(&batch)?;
         }
 
         // 与 validate_row 对第 0 行最先做的两项检查相同。提前做，避免在缺列时仍按 num_rows
@@ -3694,6 +3821,9 @@ impl Collection {
                 "vector field {} missing or None",
                 py_repr(&vector.name)
             )));
+        }
+        if request {
+            self.generate_function_outputs(&mut batch, false);
         }
 
         let dynamic = self.decode_dynamic(&batch);
@@ -3988,6 +4118,7 @@ impl Collection {
             load_state: self.load_state,
             deleted: self.deleted,
             unusable: self.persistent.as_ref().is_some_and(|p| p.poisoned()),
+            bm25: Arc::clone(&self.bm25),
         }
     }
 
@@ -4309,6 +4440,83 @@ impl Collection {
     }
 
     /// 与 3.x `validate_record` 的检查顺序一致：主键、向量、其余字段（schema 顺序）、多余字段。
+    /// 3.x `_validate_bm25_input_ownership`：输出字段出现在记录里（列或动态字段的键）就整批拒绝。
+    /// 在列长度这类翻译层检查之后、主键与向量缺失这类逐行校验之前。
+    fn check_function_outputs(&self, batch: &InsertBatch) -> Result<()> {
+        for function in self.bm25.iter() {
+            let name = &self.schema.fields[function.output].name;
+            let in_meta = || {
+                batch
+                    .columns
+                    .iter()
+                    .filter(|(column, _)| column == META_FIELD)
+                    .any(|(_, values)| match values.values() {
+                        InputValues::Json(rows) => rows.iter().any(|raw| {
+                            matches!(crate::json_text::value(raw),
+                                Ok(Value::Object(map)) if map.contains_key(name.as_str()))
+                        }),
+                        InputValues::JsonValues(rows) => rows
+                            .iter()
+                            .any(|row| row.as_object().is_some_and(|m| m.contains_key(name))),
+                        _ => false,
+                    })
+            };
+            if batch.columns.iter().any(|(column, _)| column == name) || in_meta() {
+                return Err(EngineError::schema(format!(
+                    "BM25 output field {} is generated; provide its source text instead",
+                    py_repr(name)
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// 按输入文本生成 BM25 输出列，放进批次。3.x 在补默认值之前生成：文本缺失或为 null 时生成空向量，
+    /// 即使之后文本补成默认值。Upsert 没有提供文本列时取请求前该主键的文本（3.x 先合并旧记录再生成）。
+    fn generate_function_outputs(&self, batch: &mut InsertBatch, upsert: bool) {
+        if self.bm25.is_empty() {
+            return;
+        }
+        let n = batch.num_rows;
+        let last = |name: &str| {
+            batch
+                .columns
+                .iter()
+                .rev()
+                .find(|(c, _)| c == name)
+                .map(|(_, v)| v)
+        };
+        let pk_values = last(&self.schema.fields[self.pk_pos].name);
+        let mut generated = Vec::with_capacity(self.bm25.len());
+        for function in self.bm25.iter() {
+            let input = &self.schema.fields[function.input];
+            let supplied = last(&input.name);
+            let rows = (0..n)
+                .map(|row| {
+                    let text = match supplied {
+                        Some(values) => input_text(values, row),
+                        None if upsert => pk_values
+                            .and_then(|values| input_pk(values, row))
+                            .and_then(|pk| self.pk_index.get(&pk))
+                            .and_then(|at| {
+                                column_text(&self.chunks[&at.chunk].columns[function.input], at.row)
+                            }),
+                        None => None,
+                    };
+                    let mut pairs =
+                        text.map_or_else(Vec::new, |text| function.analyzer.term_frequencies(text));
+                    pairs.sort_unstable_by_key(|&(id, _)| id);
+                    pairs
+                })
+                .collect();
+            generated.push((
+                self.schema.fields[function.output].name.clone(),
+                InputValues::SparseFloatVector(rows),
+            ));
+        }
+        batch.columns.extend(generated);
+    }
+
     fn validate_row(
         &self,
         by_name: &HashMap<&str, &InputValues>,
@@ -4373,6 +4581,10 @@ impl Collection {
                 }
             }
             if field.data_type.is_dense_vector() {
+                continue;
+            }
+            // 函数输出由写入生成，3.x 跳过稀疏值校验（FNV 哈希可以是 2^32-1）。
+            if field.is_function_output {
                 continue;
             }
             // 3.x 对稀疏字段单独检查：None 与缺失同样报「missing」，没有类型无关的 None 检查。
@@ -4595,6 +4807,37 @@ fn scan(
     }
 }
 
+/// 一个稀疏打分单元（一个块或 MemTable）上的一条查询：`source` 为 BM25 的数据源统计与这条查询各词的 IDF，
+/// 对外距离是 `-score`；为 None 时是 IP，对外分数是内积。`at` 给出行的数据源名次与位置。
+#[allow(clippy::too_many_arguments)]
+fn score_sparse_unit(
+    built: &crate::sparse_index::Postings,
+    query: &[(u32, f32)],
+    source: Option<(&crate::sparse_index::Bm25Source, &[Option<f32>])>,
+    live: impl Fn(u32) -> bool,
+    at: impl Fn(u32) -> (usize, RowRef),
+    scratch: &mut crate::sparse_index::Scratch,
+    top: &mut TopK,
+) {
+    use crate::sparse_index;
+    let mut emit = |row: u32, score: sparse_index::Score, distance: f32| {
+        top.push(distance, || {
+            let (rank, at) = at(row);
+            RankedRow::sparse(rank, score, at)
+        });
+    };
+    match source {
+        Some((source, idf)) => {
+            sparse_index::score_bm25(built, source, idf, query, live, scratch, |row, score| {
+                emit(row, score, -(score.exact as f32))
+            })
+        }
+        None => sparse_index::score(built, query, live, scratch, |row, score| {
+            emit(row, score, score.exact as f32)
+        }),
+    }
+}
+
 /// 数据源序号只存在于本次检索候选中，不扩大存活主键索引的行引用。
 ///
 /// 稀疏检索（0030）在数据源名次与行位置之间还有两层：3.x 每个源内按 double 分数取前 k、并列时保持
@@ -4603,7 +4846,7 @@ fn scan(
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct RankedRow {
     source_rank: usize,
-    /// double 分数降序的键：非负分数的位模式随数值单调，取反后小者在前。
+    /// 分数降序的键（[`descending_key`]）：IP 是 double 分数，BM25 是 float32 分数。
     exact: u64,
     first_hit: u32,
     at: RowRef,
@@ -4622,11 +4865,23 @@ impl RankedRow {
     fn sparse(source_rank: usize, score: crate::sparse_index::Score, at: RowRef) -> Self {
         Self {
             source_rank,
-            exact: !score.exact.to_bits(),
+            exact: descending_key(score.exact),
             first_hit: score.first_hit,
             at,
         }
     }
+}
+
+/// 浮点数降序的整数键，小者在前。对有限值与无穷随数值单调：BM25 的分数可以为负（手工改写的负 tf）。
+/// 分数不会是 -0.0（累加从 `0.0 +` 开始），NaN 的次序已登记为差异（0031）。
+fn descending_key(value: f64) -> u64 {
+    let bits = value.to_bits();
+    let ascending = if bits >> 63 == 1 {
+        !bits
+    } else {
+        bits | (1 << 63)
+    };
+    !ascending
 }
 
 /// 一条查询的前 `take` 个结果，按 (分数的名次, 行的位置) 这一全序排列。
@@ -4743,6 +4998,7 @@ struct BoostInput<'a> {
     offset: usize,
     limit: usize,
     keep: usize,
+    chained: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -4843,6 +5099,29 @@ fn input_pk(values: &InputValues, row: usize) -> Option<Pk> {
             .as_i64()
             .map(Pk::Int64)
             .or_else(|| v[row].as_str().map(|v| Pk::VarChar(v.to_owned()))),
+        _ => None,
+    }
+}
+
+/// BM25 输入值：只有字符串参与分词（3.x `BM25Expr` 把非字符串当作没有文本）。
+fn input_text(values: &InputValues, row: usize) -> Option<&str> {
+    if values.is_null(row) {
+        return None;
+    }
+    match values.values() {
+        InputValues::Str(v) => Some(v[row].as_str()),
+        InputValues::JsonValues(v) => v[row].as_str(),
+        _ => None,
+    }
+}
+
+fn column_text(column: &ColumnData, row: usize) -> Option<&str> {
+    match column {
+        ColumnData::Nullable { values, validity } => validity
+            .get(row)
+            .then(|| column_text(values, row))
+            .flatten(),
+        ColumnData::VarChar(v) => Some(v[row].as_str()),
         _ => None,
     }
 }
@@ -5359,12 +5638,18 @@ fn convert_nonnull(field: &FieldSchema, values: &InputValues) -> Result<ColumnDa
                 values: values.clone(),
             }
         }
-        // 已经过 `check_sparse`；存规范化后按维度排序的字节，与 3.x `sparse_to_bytes` 相同。
+        // 已经过 `check_sparse`；存规范化后按维度排序的字节，与 3.x `sparse_to_bytes` 相同。函数输出
+        // 由写入生成、已按维度排序，3.x 不校验它，原样编码。
         (DataType::SparseFloatVector, InputValues::SparseFloatVector(rows)) => {
             ColumnData::SparseFloatVector(crate::data::SparseData::from_rows(
                 rows.iter()
                     .map(|pairs| {
-                        sparse_value(&field.name, pairs).map(|v| crate::data::sparse::encode(&v))
+                        if field.is_function_output {
+                            Ok(crate::data::sparse::encode(pairs))
+                        } else {
+                            sparse_value(&field.name, pairs)
+                                .map(|v| crate::data::sparse::encode(&v))
+                        }
                     })
                     .collect::<Result<Vec<_>>>()?,
             ))
@@ -5544,6 +5829,26 @@ fn check_loaded(name: &str, state: LoadState, deleted: bool, unusable: bool) -> 
 mod tests {
     use super::*;
 
+    /// 0031：函数输出由写入生成，不经过稀疏值校验，FNV 哈希可以是 2^32-1；普通稀疏字段照常拒绝。
+    #[test]
+    fn function_outputs_skip_sparse_normalization() {
+        let values = InputValues::SparseFloatVector(vec![vec![(5, 1.0), (u32::MAX, 2.0)]]);
+        let mut field = FieldSchema::new("sp", DataType::SparseFloatVector);
+        assert!(convert_nonnull(&field, &values).is_err());
+        field.is_function_output = true;
+        let ColumnData::SparseFloatVector(rows) = convert_nonnull(&field, &values).unwrap() else {
+            panic!("sparse column lost its type");
+        };
+        assert_eq!(
+            rows.row(0),
+            crate::data::sparse::encode(&[(5, 1.0), (u32::MAX, 2.0)])
+        );
+        assert_eq!(
+            crate::data::sparse::output_dim(rows.row(0)).unwrap(),
+            1 << 32
+        );
+    }
+
     /// 0026：Search + boost 的引擎路径。1 维向量 `[i]`，查询 `[0]`：L2 的内部距离就是 `i`，对外分数是 `i²`。
     mod boosted {
         use super::*;
@@ -5564,6 +5869,7 @@ mod tests {
             ];
             fields.extend(extra);
             CollectionSchema {
+                functions: Vec::new(),
                 fields,
                 enable_dynamic_field: dynamic,
                 properties: Vec::new(),
@@ -5619,6 +5925,7 @@ mod tests {
                     function_mode: Mode::Multiply,
                 },
                 keep,
+                chained: false,
             }
         }
 
@@ -6032,6 +6339,7 @@ mod tests {
         ts.nullable = true;
         ts.default_value = Some(serde_json::json!("2025-07-01T12:00:00"));
         let schema = CollectionSchema {
+            functions: Vec::new(),
             fields: vec![id, vector, ts],
             enable_dynamic_field: false,
             properties: Vec::new(),
@@ -6263,6 +6571,7 @@ mod tests {
         let mut collection = Collection::new(
             "c",
             CollectionSchema {
+                functions: Vec::new(),
                 fields: vec![id, vector],
                 enable_dynamic_field: false,
                 properties: vec![],
@@ -6344,8 +6653,34 @@ mod tests {
     }
 
     #[test]
+    fn descending_key_orders_negative_scores() {
+        let values = [f64::INFINITY, 3.5, 1.0, 0.0, -0.5, -2.0, f64::NEG_INFINITY];
+        let keys: Vec<u64> = values.iter().map(|v| descending_key(*v)).collect();
+        assert!(keys.windows(2).all(|w| w[0] < w[1]), "{keys:?}");
+    }
+
+    /// BM25 的对外距离是负数，range 按 L2 一侧比较（3.x `_apply_range_filter` 的 else 分支，不平方）：
+    /// `radius=-0.3, range_filter=-3` 命中 -1，反过来写一条都不命中。
+    #[test]
+    fn bm25_range_compares_negative_distances_like_l2() {
+        let range = |radius, range_filter| SearchRange {
+            radius: Some(radius),
+            range_filter: Some(range_filter),
+        };
+        assert!(range(-0.3, -3.0).contains(Metric::Bm25, -1.0));
+        assert!(range(-0.3, -3.0).contains(Metric::Bm25, -3.0));
+        // 边界值取 float32 能精确表示的数：`d < radius` 是开区间。
+        assert!(!range(-0.5, -3.0).contains(Metric::Bm25, -0.5));
+        assert!(!range(-3.0, -0.3).contains(Metric::Bm25, -1.0));
+        assert!(!Metric::Bm25.higher_is_better());
+        assert_eq!(Metric::Bm25.public_f64(-1.5), -1.5);
+        assert_eq!(Metric::Bm25.internal(-1.5), -1.5);
+        assert_eq!(Metric::Bm25.public_from_internal(-1.5), -1.5);
+    }
+
+    #[test]
     fn active_range_rejects_nan_scores_and_nan_bounds() {
-        for metric in [Metric::L2, Metric::Ip, Metric::Cosine] {
+        for metric in [Metric::L2, Metric::Ip, Metric::Cosine, Metric::Bm25] {
             for range in [
                 SearchRange {
                     radius: Some(10.),
@@ -6433,6 +6768,7 @@ mod tests {
             "",
             "c",
             CollectionSchema {
+                functions: Vec::new(),
                 fields: vec![id, v],
                 enable_dynamic_field: false,
                 properties: vec![],
@@ -6477,6 +6813,7 @@ mod tests {
         let mut tag = FieldSchema::new("tag", DataType::VarChar);
         tag.max_length = Some(100);
         let schema = CollectionSchema {
+            functions: Vec::new(),
             fields: vec![id, vector, tag, FieldSchema::new("json", DataType::Json)],
             enable_dynamic_field: true,
             properties: vec![],
@@ -7142,6 +7479,7 @@ mod tests {
 
     fn collection(rng: &mut Rng, dim: usize) -> Collection {
         let schema = CollectionSchema {
+            functions: Vec::new(),
             fields: vec![
                 FieldSchema {
                     is_primary: true,
@@ -7494,6 +7832,120 @@ mod tests {
 
     /// 0030：已提交块的倒排在首次检索时缓存；release、create_index、drop_index 后清空并重建。
     /// 作废前取的快照晚到的构建结果不写回槽位（代号已变）。
+    /// rerank 链的入口只对 BM25 取负（3.x `hit_score_for_chain`）：BM25 的对外距离是 `-score`，链要正分；
+    /// IP 的对外分数原样进入链。同一组行、同一组正分，两种度量进入链后的分数与次序相同。
+    #[test]
+    fn chain_input_negates_only_bm25_distances() {
+        use crate::rerank::chain::{L2Function, Tail};
+        let mut c = Collection::new(
+            "c",
+            CollectionSchema {
+                fields: vec![
+                    FieldSchema {
+                        is_primary: true,
+                        ..FieldSchema::new("id", DataType::Int64)
+                    },
+                    FieldSchema {
+                        dim: Some(1),
+                        ..FieldSchema::new("v", DataType::FloatVector)
+                    },
+                ],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        c.insert(InsertBatch {
+            num_rows: 2,
+            columns: vec![
+                ("id".into(), InputValues::Int(vec![1, 2])),
+                (
+                    "v".into(),
+                    InputValues::FloatVector {
+                        dim: 1,
+                        values: vec![1.0, 2.0],
+                    },
+                ),
+            ],
+        })
+        .unwrap();
+        let compute = Compute::new(std::num::NonZeroUsize::MIN).unwrap();
+        let snapshot = c.read_snapshot();
+        let ip = snapshot
+            .rank_route(
+                SearchRequest {
+                    anns_field: None,
+                    vectors: QueryVectors::Dense(vec![vec![1.0]]),
+                    metric_type: Some("IP".into()),
+                    limit: 10,
+                    offset: 0,
+                    output_fields: Vec::new(),
+                    params: Map::new(),
+                    negative_top_k: false,
+                },
+                &compute,
+                RouteFilter {
+                    expr: "",
+                    timezone: &crate::timezone::TimezoneSource::none(),
+                    boost: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(ip.0.queries[0].scores, vec![2.0, 1.0]);
+        let mut bm25 = RouteRanking(Ranking {
+            projection: ip.0.projection.clone(),
+            metric: Some(Metric::Bm25),
+            queries: ip
+                .0
+                .queries
+                .iter()
+                .map(|q| Ranked {
+                    refs: q.refs.clone(),
+                    scores: q.scores.iter().map(|s| -s).collect(),
+                    group_values: None,
+                    public: None,
+                    ids: None,
+                })
+                .collect(),
+            boosted: false,
+        });
+        let merged = |route: &RouteRanking, normalize: bool| {
+            let result = hybrid_merge(
+                &snapshot.schema,
+                &[(&snapshot, route)],
+                HybridMerge::Function(&L2Function::Weighted {
+                    weights: vec![1.0],
+                    normalize,
+                }),
+                Tail {
+                    limit: 10,
+                    offset: 0,
+                    group: None,
+                },
+                &[],
+            )
+            .unwrap();
+            let hits = &result.hits[0];
+            (hits.rows.pks.clone(), hits.public_scores.clone().unwrap())
+        };
+        let (pks, scores) = merged(&bm25, false);
+        assert_eq!(pks, vec![Pk::Int64(2), Pk::Int64(1)]);
+        assert_eq!(scores, vec![2.0, 1.0]);
+        assert_eq!(merged(&ip, false), (pks.clone(), scores));
+        // 归一化：BM25 是 `2·atan(x)/π`，IP 是 `0.5 + atan(x)/π`。
+        let pi = std::f64::consts::PI;
+        assert_eq!(
+            merged(&bm25, true).1,
+            vec![2.0 * 2f64.atan() / pi, 2.0 * 1f64.atan() / pi]
+        );
+        assert_eq!(
+            merged(&ip, true).1,
+            vec![0.5 + 2f64.atan() / pi, 0.5 + 1f64.atan() / pi]
+        );
+        // 有 boost 时链读 `public`（已是对外距离），同样取负。
+        bm25.0.queries[0].public = Some(vec![-4.0, -3.0]);
+        assert_eq!(merged(&bm25, false).1, vec![4.0, 3.0]);
+    }
+
     #[test]
     fn sparse_postings_cache_follows_release_and_index_changes() {
         use crate::{Compute, DataDir, Db};

@@ -95,6 +95,19 @@ pub(crate) fn json_float_text(raw: &str) -> Option<f64> {
 
 /// Python 的 `bool(value)`。数字按文本判断：`as_f64` 把宽整数和溢出的浮点数变成 inf 或丢失，
 /// `1e-999` 下溢为 0 是假值，`1e999` 是 inf，是真值。
+/// `json.loads` 解出的值在 Python 中的类型名（`type(x).__name__`）。
+pub(crate) fn python_type_name(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "NoneType",
+        Value::Bool(_) => "bool",
+        Value::Number(n) if n.as_str().contains(['.', 'e', 'E']) => "float",
+        Value::Number(_) => "int",
+        Value::String(_) => "str",
+        Value::Array(_) => "list",
+        Value::Object(_) => "dict",
+    }
+}
+
 pub fn python_truthy(value: &Value) -> bool {
     match value {
         Value::Null => false,

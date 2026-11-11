@@ -915,6 +915,7 @@ mod tests {
             "",
             "c",
             CollectionSchema {
+                functions: Vec::new(),
                 fields: vec![id, v],
                 enable_dynamic_field: false,
                 properties: vec![],

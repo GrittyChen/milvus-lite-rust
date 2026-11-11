@@ -82,8 +82,13 @@ pub struct FieldSchema {
     pub max_capacity: Option<i64>,
     pub enable_analyzer: bool,
     pub enable_match: bool,
-    /// 3.x 保存任意 JSON 真值，不要求是对象；只回显，`text_match` 不读它。
+    /// 3.x 保存任意 JSON 真值，不要求是对象；回显、持久化，BM25 输入字段用它构造分词器，`text_match` 不读它。
     pub analyzer_params: Option<serde_json::Value>,
+    /// 解析成功、但为假值所以不保存也不回显的 `analyzer_params`（不含 null 与空对象，它们与没有设置等价）。
+    /// 3.x 把原值交给 `create_analyzer`，BM25 输入字段上这些值报错；建表或打开成功时它必然为空。
+    pub unsaved_analyzer_params: Option<serde_json::Value>,
+    /// 3.x `FieldSchema.is_function_output`：函数的输出字段，或 proto 上带了这个标记的字段。
+    pub is_function_output: bool,
 }
 
 impl FieldSchema {
@@ -103,6 +108,8 @@ impl FieldSchema {
             enable_analyzer: false,
             enable_match: false,
             analyzer_params: None,
+            unsaved_analyzer_params: None,
+            is_function_output: false,
         }
     }
 }
@@ -114,6 +121,29 @@ pub struct CollectionSchema {
     /// collection properties，按 Python dict 的语义：key 唯一、保持首次出现的位置。
     /// 3.x 原样保存与回显，只有 `timezone` 有语义（见 [`CollectionSchema::validate`]）。
     pub properties: Vec<(String, String)>,
+    /// 3.x `CollectionSchema.functions`，按声明顺序。
+    pub functions: Vec<Function>,
+}
+
+/// 3.x 的 BM25 function 类型号（proto `FunctionType.BM25`）。
+pub const FUNCTION_BM25: i64 = 1;
+
+/// 3.x `Function`。参数逐个按 `json.loads` 解析，失败时保留原字符串（`_decode_function`）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct Function {
+    pub name: String,
+    pub function_type: i64,
+    pub input_field_names: Vec<String>,
+    pub output_field_names: Vec<String>,
+    pub params: serde_json::Map<String, serde_json::Value>,
+}
+
+/// 一个 BM25 function 的输入、输出位置与分词器。
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Bm25Function {
+    pub(crate) input: usize,
+    pub(crate) output: usize,
+    pub(crate) analyzer: crate::analyzer::Bm25Analyzer,
 }
 
 /// 3.x 用 `_validate_sparse_vector` 校验默认值。gRPC 的默认值只能是标量，得到 3.x 的类型错误；dict 只能来自
@@ -130,12 +160,7 @@ fn check_sparse_default(name: &str, value: &serde_json::Value) -> Result<()> {
                 ),
             ));
         }
-        Value::Bool(_) => "bool",
-        Value::Number(n) if n.as_str().contains(['.', 'e', 'E']) => "float",
-        Value::Number(_) => "int",
-        Value::String(_) => "str",
-        Value::Array(_) => "list",
-        Value::Null => "NoneType",
+        other => crate::pyjson::python_type_name(other),
     };
     Err(EngineError::schema(format!(
         "sparse vector field {}: sparse vector must be a dict, got {kind}",
@@ -323,6 +348,8 @@ impl CollectionSchema {
                 )));
             }
         }
+        self.validate_functions()?;
+        self.bm25_functions()?;
         if self
             .fields
             .iter()
@@ -334,6 +361,142 @@ impl CollectionSchema {
             ));
         }
         Ok(())
+    }
+
+    /// 3.x `validate_schema` 末尾的函数校验，顺序与文案一致。
+    fn validate_functions(&self) -> Result<()> {
+        let mut names = HashSet::new();
+        let mut outputs = HashSet::new();
+        for function in &self.functions {
+            if !names.insert(function.name.as_str()) {
+                return Err(EngineError::schema(format!(
+                    "duplicate function name {}",
+                    py_repr(&function.name)
+                )));
+            }
+            for output in &function.output_field_names {
+                if !outputs.insert(output.as_str()) {
+                    return Err(EngineError::schema(format!(
+                        "function output field {} is used by multiple functions",
+                        py_repr(output)
+                    )));
+                }
+            }
+            self.validate_function(function)?;
+        }
+        for f in &self.fields {
+            if f.data_type == DataType::SparseFloatVector
+                && f.is_function_output
+                && !outputs.contains(f.name.as_str())
+            {
+                return Err(EngineError::schema(format!(
+                    "sparse function output field {} has no producing Function",
+                    py_repr(&f.name)
+                )));
+            }
+        }
+        // 3.x 接受标了输出却没有函数产出的非稀疏字段，写入时把它当作可以缺失；本实现不支持这种 schema。
+        if self
+            .fields
+            .iter()
+            .any(|f| f.is_function_output && !outputs.contains(f.name.as_str()))
+        {
+            return Err(EngineError::unsupported(
+                "functions",
+                "functions are not supported in this build of milvus-lite-rust yet",
+            ));
+        }
+        Ok(())
+    }
+
+    /// 3.x `_validate_function` 的 BM25 分支；其他类型只能来自引擎接口，gRPC 与 `schema.json` 已先行拒绝。
+    fn validate_function(&self, function: &Function) -> Result<()> {
+        if function.function_type != FUNCTION_BM25 {
+            return Err(EngineError::unsupported(
+                "functions",
+                "functions are not supported in this build of milvus-lite-rust yet",
+            ));
+        }
+        let name = py_repr(&function.name);
+        let [input] = function.input_field_names.as_slice() else {
+            return Err(EngineError::schema(format!(
+                "BM25 function {name} requires exactly one input field"
+            )));
+        };
+        let Some(field) = self.field(input) else {
+            return Err(EngineError::schema(format!(
+                "BM25 function {name} input field {} not found in schema",
+                py_repr(input)
+            )));
+        };
+        if field.data_type != DataType::VarChar {
+            return Err(EngineError::schema(format!(
+                "BM25 function {name} input field {} must be VARCHAR, got {}",
+                py_repr(input),
+                field.data_type.name()
+            )));
+        }
+        if !field.enable_analyzer {
+            return Err(EngineError::schema(format!(
+                "BM25 function {name} input field {} must have enable_analyzer=True",
+                py_repr(input)
+            )));
+        }
+        let [output] = function.output_field_names.as_slice() else {
+            return Err(EngineError::schema(format!(
+                "BM25 function {name} requires exactly one output field"
+            )));
+        };
+        let Some(field) = self.field(output) else {
+            return Err(EngineError::schema(format!(
+                "BM25 function {name} output field {} not found in schema",
+                py_repr(output)
+            )));
+        };
+        if field.data_type != DataType::SparseFloatVector {
+            return Err(EngineError::schema(format!(
+                "BM25 function {name} output field {} must be SPARSE_FLOAT_VECTOR, got {}",
+                py_repr(output),
+                field.data_type.name()
+            )));
+        }
+        Ok(())
+    }
+
+    /// 已校验 schema 的 BM25 function 与分词器（3.x 构造 Collection 时按函数顺序 `create_analyzer`）。
+    pub(crate) fn bm25_functions(&self) -> Result<Vec<Bm25Function>> {
+        let position = |name: &str| {
+            self.fields
+                .iter()
+                .position(|f| f.name == name)
+                .ok_or_else(|| EngineError::schema(format!("field {} not found", py_repr(name))))
+        };
+        self.functions
+            .iter()
+            .filter(|f| f.function_type == FUNCTION_BM25)
+            .map(|function| {
+                fn first<'a>(function: &Function, names: &'a [String]) -> Result<&'a str> {
+                    names.first().map(String::as_str).ok_or_else(|| {
+                        EngineError::schema(format!(
+                            "BM25 function {} is not validated",
+                            py_repr(&function.name)
+                        ))
+                    })
+                }
+                let input = position(first(function, &function.input_field_names)?)?;
+                let output = position(first(function, &function.output_field_names)?)?;
+                let field = &self.fields[input];
+                let params = field
+                    .analyzer_params
+                    .as_ref()
+                    .or(field.unsaved_analyzer_params.as_ref());
+                Ok(Bm25Function {
+                    input,
+                    output,
+                    analyzer: crate::analyzer::Bm25Analyzer::from_params(params)?,
+                })
+            })
+            .collect()
     }
 
     /// 校验通过后的规范化：TIMESTAMPTZ 的字符串默认值换成 UTC 微秒（3.x 在 `validate_schema` 里就地替换）。
@@ -356,6 +519,16 @@ impl CollectionSchema {
         }
         for (index, value) in converted {
             self.fields[index].default_value = Some(value);
+        }
+        // 3.x 在翻译时给函数的输出字段打上标记；引擎接口建的 schema 在这里补上，两条入口保存的相同。
+        for field in &mut self.fields {
+            if self
+                .functions
+                .iter()
+                .any(|f| f.output_field_names.contains(&field.name))
+            {
+                field.is_function_output = true;
+            }
         }
         Ok(self)
     }
@@ -431,6 +604,7 @@ mod tests {
         let mut nullable = sparse("sp");
         nullable.nullable = true;
         let only_sparse = CollectionSchema {
+            functions: Vec::new(),
             fields: vec![pk("id"), nullable],
             enable_dynamic_field: false,
             properties: Vec::new(),
@@ -443,6 +617,7 @@ mod tests {
             let mut field = sparse("sp");
             field.default_value = Some(value);
             CollectionSchema {
+                functions: Vec::new(),
                 fields: vec![pk("id"), vec("v", 2), field],
                 enable_dynamic_field: false,
                 properties: Vec::new(),
@@ -471,6 +646,7 @@ mod tests {
         dense.nullable = true;
         assert!(matches!(
             CollectionSchema {
+                functions: Vec::new(),
                 fields: vec![pk("id"), dense],
                 enable_dynamic_field: false,
                 properties: Vec::new(),
@@ -486,6 +662,7 @@ mod tests {
         let mut field = FieldSchema::new("x", DataType::Int64);
         field.default_value = Some(large);
         let mut schema = CollectionSchema {
+            functions: Vec::new(),
             fields: vec![pk("id"), vec("v", 2), field],
             enable_dynamic_field: false,
             properties: Vec::new(),
@@ -517,6 +694,7 @@ mod tests {
 
     fn schema(fields: Vec<FieldSchema>) -> CollectionSchema {
         CollectionSchema {
+            functions: Vec::new(),
             fields,
             enable_dynamic_field: false,
             properties: Vec::new(),

@@ -18,6 +18,7 @@ fn open(path: &std::path::Path) -> Arc<Db> {
 }
 fn schema() -> CollectionSchema {
     CollectionSchema {
+        functions: Vec::new(),
         fields: vec![
             FieldSchema {
                 is_primary: true,

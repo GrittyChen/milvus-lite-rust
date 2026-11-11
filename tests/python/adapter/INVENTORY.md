@@ -6,16 +6,16 @@
 
 | 状态 | 含义 | 条数 |
 | --- | --- | --- |
-| 已复制 | 原样复制到本目录 | 274 |
+| 已复制 | 原样复制到本目录 | 313 |
 | 改后复制 | 仅按 0004「验收」第 2 项与 0006 第 25 项授权的条件替换，逐条说明改动 | 0 |
-| 范围外 | 用到当前切片不支持的功能，或断言 3.x 自身也不满足的上游契约，不复制；未实现能力的代表性入口见「范围外功能的 `UNIMPLEMENTED` 断言」 | 53 |
+| 范围外 | 用到当前切片不支持的功能，或断言 3.x 自身也不满足的上游契约，不复制；未实现能力的代表性入口见「范围外功能的 `UNIMPLEMENTED` 断言」 | 47 |
 | 待复用 | 原功能阻断已解除，尚未复制到本地默认套件；0015 的条目已通过固定外部套件验收 | 53 |
-| 依赖内部模块 | 导入或使用 3.x 的内部模块、内部对象，换成本实现后无法运行 | 50 |
+| 依赖内部模块 | 导入或使用 3.x 的内部模块、内部对象，换成本实现后无法运行 | 52 |
 | 不运行 | 上游被同名定义覆盖，上游自己也不运行 | 1 |
 
-以上是逐条列出的 30 个文件中的 431 条（含 0027 从 `1320d26` 盘点的 3 条与 0030 盘点的 18 条），其余 19 个文件的 234 条整个文件记一行原因，见「整个文件不复用的文件」。
+以上是逐条列出的 34 个文件中的 466 条（含 0027 从 `1320d26` 盘点的 3 条、0030 盘点的 18 条与 0031 按 `1320d26` 逐条列出的 4 个文件 35 条），其余 15 个文件的 199 条整个文件记一行原因，见「整个文件不复用的文件」。
 
-「已复制」与「改后复制」共 274 个用例函数，参数化展开后 333 条（0030 新增 15 个函数、27 条：稀疏向量的上游 Milvus 场景；0029 新增 4 个函数、4 条：`text_match`；0028 新增 1 个函数、1 条：多向量字段；0027 新增 2 个函数、6 条，取自 `1320d26`：Search 的主键投影与带分区的 count(*)；上游同批新增的 `test_hybrid_search_honors_primary_key_projection` 依赖 BM25，属范围外；0026 第 3 步新增 4 个函数、4 条：HybridSearch 的顶层 decay、TIMESTAMPTZ 时区与 `time_fields`、顶层 boost，以及动态字段 `["*"]` 随 Hybrid 分组返回；0026 第 2 步新增 1 个函数、1 条：Search 的 decay；0026 第 1 步新增 8 个函数、10 条：Search 的 boost 7 个函数 9 条，动态字段 `["*"]` 随 boost 返回 1 条；0025 新增 22 个函数、22 条：TIMESTAMPTZ 的 16 个与数据库 `timezone` 属性的 6 个；0024 新增 6 个函数、6 条：分组检索 5 个与动态字段 `["*"]` 随分组返回 1 个；0023 B 新增 19 个函数、31 条：数据库用例 17 个函数 29 条，加两个按数据库隔离的用例）。S1 恢复 [test_grpc_crud.py](test_grpc_crud.py) 中的原过滤表达式，并纳入除 LIKE 外的全部 19 条；它们在本实现与真实 3.x 上的两条客户端线均作为 S1 验收。随后迁移全部 40 条待复用用例，恢复此前为绕过过滤限制而替换的原表达式；顶层动态字段切片另加入原样的 TestDynamicField 用例。0014 已恢复原 HNSW 定义，并新增创建 HNSW、DropIndex 和 describe 参数的原用例；检索仍按 FLAT 执行。
+「已复制」与「改后复制」共 313 个用例函数，参数化展开后 379 条（0031 新增 39 个函数、46 条：BM25 / 全文检索的 4 个文件 30 个函数、HybridSearch 中依赖 BM25 的 9 个函数，均取自 `1320d26`；0030 新增 15 个函数、27 条：稀疏向量的上游 Milvus 场景；0029 新增 4 个函数、4 条：`text_match`；0028 新增 1 个函数、1 条：多向量字段；0027 新增 2 个函数、6 条，取自 `1320d26`：Search 的主键投影与带分区的 count(*)；上游同批新增的 `test_hybrid_search_honors_primary_key_projection` 依赖 BM25，随 0031 复制；0026 第 3 步新增 4 个函数、4 条：HybridSearch 的顶层 decay、TIMESTAMPTZ 时区与 `time_fields`、顶层 boost，以及动态字段 `["*"]` 随 Hybrid 分组返回；0026 第 2 步新增 1 个函数、1 条：Search 的 decay；0026 第 1 步新增 8 个函数、10 条：Search 的 boost 7 个函数 9 条，动态字段 `["*"]` 随 boost 返回 1 条；0025 新增 22 个函数、22 条：TIMESTAMPTZ 的 16 个与数据库 `timezone` 属性的 6 个；0024 新增 6 个函数、6 条：分组检索 5 个与动态字段 `["*"]` 随分组返回 1 个；0023 B 新增 19 个函数、31 条：数据库用例 17 个函数 29 条，加两个按数据库隔离的用例）。S1 恢复 [test_grpc_crud.py](test_grpc_crud.py) 中的原过滤表达式，并纳入除 LIKE 外的全部 19 条；它们在本实现与真实 3.x 上的两条客户端线均作为 S1 验收。随后迁移全部 40 条待复用用例，恢复此前为绕过过滤限制而替换的原表达式；顶层动态字段切片另加入原样的 TestDynamicField 用例。0014 已恢复原 HNSW 定义，并新增创建 HNSW、DropIndex 和 describe 参数的原用例；检索仍按 FLAT 执行。
 
 历史的 HNSW→FLAT 授权替换按 0014 恢复原定义；`== N` 换成 `in [N]` 的条件见 0004「验收」第 2 项及 0006 第 25 项。已接通 S1 的 CRUD 副本不再替换表达式或读回方式。其余副本只删去随范围外用例一起不再使用的 import、helper 与空的分节标题；上游用于跳过的 `importorskip` 改为直接导入（本仓不允许因缺依赖静默跳过），上游因 HNSW 需要 faiss 而加的 `skipif` 随 HNSW 一起去掉。起服务的 fixture 与清理见 [conftest.py](conftest.py)。
 
@@ -567,7 +567,7 @@
 
 ### [test_hybrid_search.py](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_hybrid_search.py)（0026）
 
-20 条：已复制 3，范围外 6，依赖内部模块 11。
+20 条：已复制 12，依赖内部模块 8。0031 起本地副本改为从 `1320d26` 复制：该版本中依赖 BM25 的用例直接以文本检索，不再导入 3.x 的 `milvus_lite.analyzer`。
 
 | 用例 | 状态 | 说明 |
 | --- | --- | --- |
@@ -577,20 +577,83 @@
 | [`test_rrf_single_route`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_hybrid_search.py#L139) | 依赖内部模块 | 同上 |
 | [`test_offset`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_hybrid_search.py#L149) | 依赖内部模块 | 同上 |
 | [`test_chain_score_conversion_keeps_ip_direction`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_hybrid_search.py#L159) | 依赖内部模块 | 导入 3.x 的 `servicer._hit_score_for_chain` |
-| [`test_hybrid_weighted_dense_bm25`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_hybrid_search.py#L172) | 依赖内部模块 | 导入 3.x 的 `milvus_lite.analyzer`；还用 BM25 |
-| [`test_hybrid_top_level_function_score_weighted`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_hybrid_search.py#L212) | 依赖内部模块 | 导入 3.x 的 `milvus_lite.analyzer`；还用 BM25 |
+| [`test_hybrid_weighted_dense_bm25`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_hybrid_search.py#L172) | 已复制 | 0031；`1320d26` 中已不导入内部模块 |
+| [`test_hybrid_top_level_function_score_weighted`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_hybrid_search.py#L212) | 已复制 | 0031；`1320d26` 中已不导入内部模块 |
 | [`test_hybrid_top_level_decay_uses_hidden_input_field`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_hybrid_search.py#L252) | 已复制 | 第 3 步 |
 | [`test_hybrid_top_level_model_uses_hidden_input_field`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_hybrid_search.py#L298) | 依赖内部模块 | 替换 3.x 的 `milvus_lite.rerank.factory.create_rerank_provider` |
 | [`test_search_top_level_decay_uses_hidden_input_field`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_hybrid_search.py#L359) | 已复制 | 第 2 步 |
 | [`test_search_top_level_model_uses_hidden_input_field`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_hybrid_search.py#L401) | 依赖内部模块 | 替换 3.x 的 `milvus_lite.rerank.factory.create_rerank_provider` |
-| [`test_hybrid_rrf_dense_bm25`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_hybrid_search.py#L458) | 依赖内部模块 | 导入 3.x 的 `milvus_lite.analyzer`；还用 BM25 |
-| [`test_hybrid_search_honors_primary_key_projection`](https://github.com/milvus-io/milvus-lite/blob/1320d26ec3d88b23b525e774df6e3c8e7c208f81/tests/adapter/test_hybrid_search.py#L96) | 范围外 | 取自 `1320d26`；BM25 / text analyzer（全文检索切片） |
-| [`test_hybrid_output_fields`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_hybrid_search.py#L495) | 范围外 | BM25 / text analyzer（全文检索切片） |
-| [`test_hybrid_group_by_hidden_field_not_output`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_hybrid_search.py#L521) | 范围外 | BM25 / text analyzer（全文检索切片） |
-| [`test_hybrid_with_filter`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_hybrid_search.py#L550) | 范围外 | BM25 / text analyzer（全文检索切片） |
+| [`test_hybrid_rrf_dense_bm25`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_hybrid_search.py#L458) | 已复制 | 0031；`1320d26` 中已不导入内部模块 |
+| [`test_hybrid_search_honors_primary_key_projection`](https://github.com/milvus-io/milvus-lite/blob/1320d26ec3d88b23b525e774df6e3c8e7c208f81/tests/adapter/test_hybrid_search.py#L96) | 已复制 | 取自 `1320d26`；0031（参数化 2 条） |
+| [`test_hybrid_output_fields`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_hybrid_search.py#L495) | 已复制 | 0031 |
+| [`test_hybrid_group_by_hidden_field_not_output`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_hybrid_search.py#L521) | 已复制 | 0031 |
+| [`test_hybrid_with_filter`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_hybrid_search.py#L550) | 已复制 | 0031 |
 | [`test_hybrid_timestamptz_timezone_and_time_fields`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_hybrid_search.py#L576) | 已复制 | 第 3 步 |
-| [`test_hybrid_single_route_same_as_search`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_hybrid_search.py#L623) | 范围外 | BM25 / text analyzer（全文检索切片） |
-| [`test_hybrid_bm25_no_explicit_metric`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_hybrid_search.py#L685) | 范围外 | BM25 / text analyzer（全文检索切片） |
+| [`test_hybrid_single_route_same_as_search`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_hybrid_search.py#L623) | 已复制 | 0031 |
+| [`test_hybrid_bm25_no_explicit_metric`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_hybrid_search.py#L685) | 已复制 | 0031 |
+
+### [test_grpc_fts.py](https://github.com/milvus-io/milvus-lite/blob/1320d26/tests/adapter/test_grpc_fts.py)（0031）
+
+7 条：已复制 7。
+
+| 用例 | 状态 | 说明 |
+| --- | --- | --- |
+| [`test_create_collection_with_bm25`](https://github.com/milvus-io/milvus-lite/blob/1320d26/tests/adapter/test_grpc_fts.py#L20) | 已复制 | 0031 |
+| [`test_describe_collection_shows_functions`](https://github.com/milvus-io/milvus-lite/blob/1320d26/tests/adapter/test_grpc_fts.py#L45) | 已复制 | 0031 |
+| [`test_insert_with_bm25_function`](https://github.com/milvus-io/milvus-lite/blob/1320d26/tests/adapter/test_grpc_fts.py#L108) | 已复制 | 0031 |
+| [`test_bm25_search_via_grpc`](https://github.com/milvus-io/milvus-lite/blob/1320d26/tests/adapter/test_grpc_fts.py#L119) | 已复制 | 0031 |
+| [`test_text_match_filter_via_grpc`](https://github.com/milvus-io/milvus-lite/blob/1320d26/tests/adapter/test_grpc_fts.py#L147) | 已复制 | 0031 |
+| [`test_text_match_multi_token_via_grpc`](https://github.com/milvus-io/milvus-lite/blob/1320d26/tests/adapter/test_grpc_fts.py#L163) | 已复制 | 0031 |
+| [`test_text_match_with_dense_search`](https://github.com/milvus-io/milvus-lite/blob/1320d26/tests/adapter/test_grpc_fts.py#L179) | 已复制 | 0031 |
+
+### [test_milvus_fts_compat.py](https://github.com/milvus-io/milvus-lite/blob/1320d26/tests/adapter/test_milvus_fts_compat.py)（0031）
+
+14 条：已复制 14。
+
+| 用例 | 状态 | 说明 |
+| --- | --- | --- |
+| [`test_bm25_auto_generation`](https://github.com/milvus-io/milvus-lite/blob/1320d26/tests/adapter/test_milvus_fts_compat.py#L94) | 已复制 | 0031 |
+| [`test_bm25_search_text_query`](https://github.com/milvus-io/milvus-lite/blob/1320d26/tests/adapter/test_milvus_fts_compat.py#L106) | 已复制 | 0031 |
+| [`test_bm25_search_relevance_ordering`](https://github.com/milvus-io/milvus-lite/blob/1320d26/tests/adapter/test_milvus_fts_compat.py#L129) | 已复制 | 0031 |
+| [`test_text_match_single_token`](https://github.com/milvus-io/milvus-lite/blob/1320d26/tests/adapter/test_milvus_fts_compat.py#L151) | 已复制 | 0031 |
+| [`test_text_match_multi_token_or`](https://github.com/milvus-io/milvus-lite/blob/1320d26/tests/adapter/test_milvus_fts_compat.py#L164) | 已复制 | 0031 |
+| [`test_text_match_no_results`](https://github.com/milvus-io/milvus-lite/blob/1320d26/tests/adapter/test_milvus_fts_compat.py#L178) | 已复制 | 0031 |
+| [`test_text_match_with_dense_search`](https://github.com/milvus-io/milvus-lite/blob/1320d26/tests/adapter/test_milvus_fts_compat.py#L193) | 已复制 | 0031 |
+| [`test_text_match_and_scalar_filter`](https://github.com/milvus-io/milvus-lite/blob/1320d26/tests/adapter/test_milvus_fts_compat.py#L208) | 已复制 | 0031 |
+| [`test_bm25_search_with_filter`](https://github.com/milvus-io/milvus-lite/blob/1320d26/tests/adapter/test_milvus_fts_compat.py#L229) | 已复制 | 0031 |
+| [`test_bm25_search_after_flush`](https://github.com/milvus-io/milvus-lite/blob/1320d26/tests/adapter/test_milvus_fts_compat.py#L251) | 已复制 | 0031 |
+| [`test_upsert_updates_bm25`](https://github.com/milvus-io/milvus-lite/blob/1320d26/tests/adapter/test_milvus_fts_compat.py#L274) | 已复制 | 0031 |
+| [`test_delete_excludes_from_bm25`](https://github.com/milvus-io/milvus-lite/blob/1320d26/tests/adapter/test_milvus_fts_compat.py#L311) | 已复制 | 0031 |
+| [`test_bm25_multiple_queries`](https://github.com/milvus-io/milvus-lite/blob/1320d26/tests/adapter/test_milvus_fts_compat.py#L335) | 已复制 | 0031 |
+| [`test_bm25_output_fields`](https://github.com/milvus-io/milvus-lite/blob/1320d26/tests/adapter/test_milvus_fts_compat.py#L359) | 已复制 | 0031 |
+
+### [test_multi_index.py](https://github.com/milvus-io/milvus-lite/blob/1320d26/tests/adapter/test_multi_index.py)（0031）
+
+7 条：已复制 3，依赖内部模块 4。
+
+| 用例 | 状态 | 说明 |
+| --- | --- | --- |
+| [`test_create_two_indexes`](https://github.com/milvus-io/milvus-lite/blob/1320d26/tests/adapter/test_multi_index.py#L55) | 依赖内部模块 | `TestMultiIndexEngine`：直接构造 3.x 的 `milvus_lite.engine.collection.Collection` |
+| [`test_load_builds_both`](https://github.com/milvus-io/milvus-lite/blob/1320d26/tests/adapter/test_multi_index.py#L71) | 依赖内部模块 | `TestMultiIndexEngine`：直接构造 3.x 的 `milvus_lite.engine.collection.Collection` |
+| [`test_drop_one_keeps_other`](https://github.com/milvus-io/milvus-lite/blob/1320d26/tests/adapter/test_multi_index.py#L95) | 依赖内部模块 | `TestMultiIndexEngine`：直接构造 3.x 的 `milvus_lite.engine.collection.Collection` |
+| [`test_get_index_info_per_field`](https://github.com/milvus-io/milvus-lite/blob/1320d26/tests/adapter/test_multi_index.py#L112) | 依赖内部模块 | `TestMultiIndexEngine`：直接构造 3.x 的 `milvus_lite.engine.collection.Collection` |
+| [`test_grpc_multi_index_create`](https://github.com/milvus-io/milvus-lite/blob/1320d26/tests/adapter/test_multi_index.py#L148) | 已复制 | 0031 |
+| [`test_grpc_multi_index_search_both`](https://github.com/milvus-io/milvus-lite/blob/1320d26/tests/adapter/test_multi_index.py#L165) | 已复制 | 0031 |
+| [`test_grpc_drop_one_index`](https://github.com/milvus-io/milvus-lite/blob/1320d26/tests/adapter/test_multi_index.py#L186) | 已复制 | 0031 |
+
+### [test_sparse_field_contract.py](https://github.com/milvus-io/milvus-lite/blob/1320d26/tests/adapter/test_sparse_field_contract.py)（`1320d26` 新增）（0031）
+
+7 条：已复制 6，依赖内部模块 1。
+
+| 用例 | 状态 | 说明 |
+| --- | --- | --- |
+| [`test_pymilvus_sparse_ip_scores_and_field_default`](https://github.com/milvus-io/milvus-lite/blob/1320d26/tests/adapter/test_sparse_field_contract.py#L49) | 已复制 | 0031（参数化 4 条） |
+| [`test_pymilvus_bm25_omitted_metric_uses_its_own_index`](https://github.com/milvus-io/milvus-lite/blob/1320d26/tests/adapter/test_sparse_field_contract.py#L61) | 已复制 | 0031 |
+| [`test_pymilvus_rejects_invalid_field_input_metric_combinations`](https://github.com/milvus-io/milvus-lite/blob/1320d26/tests/adapter/test_sparse_field_contract.py#L74) | 已复制 | 0031（参数化 4 条） |
+| [`test_hybrid_sparse_ip_route_preserves_inner_product_ranking`](https://github.com/milvus-io/milvus-lite/blob/1320d26/tests/adapter/test_sparse_field_contract.py#L81) | 已复制 | 0031 |
+| [`test_hybrid_resolves_sparse_and_bm25_defaults_independently`](https://github.com/milvus-io/milvus-lite/blob/1320d26/tests/adapter/test_sparse_field_contract.py#L89) | 已复制 | 0031 |
+| [`test_invalid_hybrid_route_fails_entire_request`](https://github.com/milvus-io/milvus-lite/blob/1320d26/tests/adapter/test_sparse_field_contract.py#L100) | 已复制 | 0031 |
+| [`test_search_decoder_preserves_metric_omission`](https://github.com/milvus-io/milvus-lite/blob/1320d26/tests/adapter/test_sparse_field_contract.py#L111) | 依赖内部模块 | 调用 3.x 翻译层的 `parse_search_request` |
 
 ### [test_group_by.py](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_group_by.py)（0024）
 
@@ -695,7 +758,6 @@
 | [test_against_milvus.py](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_against_milvus.py) | 17 | 连接真实的 Milvus 服务（`MILVUS_URI`），不针对 milvus-lite |
 | [test_array_field.py](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_array_field.py) | 9 | 0015 B 后 gRPC 用例待复用；其中 7 条依赖内部模块，仍不直接复制 |
 | [test_array_milvus.py](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_array_milvus.py) | 22 | 0015 B 已通过固定外部套件，待复用 |
-| [test_grpc_fts.py](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_fts.py) | 7 | BM25、text_match；其中 1 条依赖内部模块（稀疏向量已由 0030 支持，这些用例的稀疏字段都是 BM25 输出） |
 | [test_grpc_geometry.py](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_geometry.py) | 8 | GEOMETRY |
 | [test_grpc_partition_key.py](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_partition_key.py) | 6 | partition key |
 | [test_grpc_snapshot.py](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_snapshot.py) | 10 | snapshot；全部依赖内部模块：经 fixture 返回的 3.x `db` 对象创建 snapshot，[L11](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_grpc_snapshot.py#L11) 顶层导入 |
@@ -706,10 +768,7 @@
 | [test_json_field.py](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_json_field.py) | 21 | 共享 fixture 的 JSON 字段为 nullable，并写入了 null 值（[L18](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_json_field.py#L18)、L37）；多数用例还用 JSON 过滤表达式 |
 | [test_milvus_compat_partition_key.py](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat_partition_key.py) | 9 | partition key；其中 3 条只断言抛出异常，`UNIMPLEMENTED` 也会通过 |
 | [test_milvus_compat_v2.py](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_compat_v2.py) | 24 | 全部用到过滤表达式，多数还有 nullable 与 HNSW |
-| [test_milvus_fts_compat.py](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_milvus_fts_compat.py) | 14 | BM25、text_match、nullable；其中 8 条依赖内部模块 |
-| [test_multi_index.py](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_multi_index.py) | 7 | BM25、标量索引；其中 5 条依赖内部模块（稀疏向量已由 0030 支持，这些用例的稀疏字段都是 BM25 输出） |
 | [test_range_search.py](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_range_search.py) | 11 | 0016 B 在固定外部原始套件实跑，5 条待复用；6 条依赖内部模块 |
-| [test_sparse_field_contract.py](https://github.com/milvus-io/milvus-lite/blob/1320d26/tests/adapter/test_sparse_field_contract.py)（`1320d26` 新增） | 7 | 共用的 `_setup()` 默认建 BM25 function，除 `test_pymilvus_sparse_ip_scores_and_field_default` 的 `mixed=False` 两组外都依赖 BM25；拆参数化属于改后复制，未复制；`test_search_decoder_preserves_metric_omission` 依赖内部模块（3.x 翻译层）。普通稀疏 IP 的度量缺省与分数方向由差分测试覆盖 |
 | [test_server_restart.py](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_server_restart.py) | 8 | 重启后读回数据，M1 只在内存中；其中 7 条依赖内部模块（[L24](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_server_restart.py#L24) 顶层导入） |
 
 ## tests/compatibility

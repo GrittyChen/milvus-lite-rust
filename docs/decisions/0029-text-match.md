@@ -8,7 +8,7 @@
 - 建表属性 `enable_analyzer`、`enable_match`、`analyzer_params`：接受、持久化、回显，与 3.x 数据目录互通。
 - standard 分词（不带停用词）。
 
-不包含：停用词与 FNV term hash（只有 BM25 用得到，属于全文检索切片）；BM25 function（继续拒绝，带 function 的 3.x 集合仍然打不开）；Jieba；与算术混用的 `text_match`（算术过滤切片之前继续返回 `UNIMPLEMENTED`）。
+不包含：停用词与 FNV term hash（只有 BM25 用得到，属于全文检索切片）；BM25 function（本切片当时继续拒绝）；Jieba；与算术混用的 `text_match`（算术过滤切片之前继续返回 `UNIMPLEMENTED`）。其中停用词、FNV term hash 与 BM25 function 现已由 [0031](0031-bm25.md) 实现，BM25 输入字段的 `analyzer_params` 按原值构造分词器。
 
 ## 3.x 的行为
 
@@ -57,6 +57,8 @@
 | JSON 字段的顶层字符串（如 `{"j": '"a\\nb"'}`） | 存解码后的无引号文本 | 存带引号的 JSON 文本，见 [0004](0004-m1-scope.md) | 差异产生在写入时。`==`、`!=`、`in`、`like`、比较和 `text_match` 这些按存储文本的整字段操作都受影响；3.x 读本实现写的目录，结果与本实现相同，所以不在分词前解码 |
 | 读到越界 TIMESTAMPTZ 的毒化目录时走 `text_match` | 回退路线 `to_pylist()` 全表，报 code 1 | 按列求值，不读无关的时间列，不报错 | 见 [0025](0025-timestamptz-and-timezone.md) |
 
+上表中关于 `analyzer_params` 非严格 JSON 的建表与打开规则（上表列出的各类情形），对 BM25 function 的参数同样适用（见 [0031](0031-bm25.md)）。
+
 `analyzer_params` 含 serde_json 数字私有键 `$serde_json::private::Number` 的登记（建表拒绝、读 3.x 的 `schema.json` 出错或改值）已随 JSON 文本解析的修复注销，现与 3.x 一致，见 [修复记录](../testing/json-private-number-key-fix.md)。
 
 ## 验收
@@ -64,7 +66,7 @@
 - [analyzer_standard.rs](../../crates/core/tests/analyzer_standard.rs) 对照真实 StandardAnalyzer 导出的语料（`tests/differential/generate_analyzer_fixtures.py`），覆盖全部有小写映射的码位；[fuzz_analyzer.py](../../tests/differential/fuzz_analyzer.py) 手动运行，种子 29、31 各 20 万条零差异。
 - [test_text_match.py](../../tests/differential/test_text_match.py) 65 条差分：行为矩阵（内存与落盘）、错误先后、各读取路径、多 segment 与分区、`$id` 改绑、属性取值矩阵与全部字段类型、登记差异。
 - [互通 test_text_match.py](../../tests/storage_interop/test_text_match.py) 14 条：Rust 与 Arrow 15/25 的 3.x 互相打开 WAL 和 segment，新进程重开后的键序，不可表示的 `analyzer_params` 打开失败时可 drop。
-- 迁入参照 `TestSearchTextMatch` 4 条。依赖 BM25 schema 的其余 `text_match` 用例留到全文检索切片。
+- 迁入参照 `TestSearchTextMatch` 4 条。依赖 BM25 schema 的其余 `text_match` 用例已随 [0031](0031-bm25.md) 迁入（`test_grpc_fts.py`、`test_milvus_fts_compat.py`）。
 
 没有性能声明。`text_match` 与 3.x 一样逐行全扫，不建倒排索引。
 

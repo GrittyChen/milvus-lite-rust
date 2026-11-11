@@ -1119,6 +1119,7 @@ mod tests {
             let mut field = FieldSchema::new("j", DataType::Json);
             field.nullable = mask.is_some();
             let schema = CollectionSchema {
+                functions: Vec::new(),
                 fields: vec![field],
                 enable_dynamic_field: true,
                 properties: vec![],
@@ -1229,6 +1230,7 @@ mod tests {
         let mut sparse = FieldSchema::new("sp", DataType::SparseFloatVector);
         sparse.nullable = true;
         let schema = CollectionSchema {
+            functions: Vec::new(),
             fields: vec![pk, sparse],
             enable_dynamic_field: false,
             properties: Vec::new(),
@@ -1265,6 +1267,7 @@ mod tests {
         let mut vector = FieldSchema::new("vector", DataType::FloatVector);
         vector.dim = Some(2);
         let schema = CollectionSchema {
+            functions: Vec::new(),
             fields: vec![pk, vector],
             enable_dynamic_field: false,
             properties: Vec::new(),
@@ -1298,6 +1301,7 @@ mod tests {
         let mut vector = FieldSchema::new("vector", DataType::FloatVector);
         vector.dim = Some(2);
         let schema = CollectionSchema {
+            functions: Vec::new(),
             fields: vec![pk, vector, FieldSchema::new("j", DataType::Json)],
             enable_dynamic_field: true,
             properties: Vec::new(),
@@ -1355,6 +1359,7 @@ mod tests {
         let mut vector = FieldSchema::new("vector", DataType::FloatVector);
         vector.dim = Some(2);
         let schema = CollectionSchema {
+            functions: Vec::new(),
             fields: vec![pk, vector, FieldSchema::new("j", DataType::Json)],
             enable_dynamic_field: true,
             properties: Vec::new(),
@@ -1420,6 +1425,7 @@ mod tests {
         let mut vector = FieldSchema::new("vector", DataType::FloatVector);
         vector.dim = Some(2);
         CollectionSchema {
+            functions: Vec::new(),
             fields: vec![pk, FieldSchema::new("score", DataType::Int64), vector],
             enable_dynamic_field: false,
             properties: Vec::new(),
@@ -1484,6 +1490,7 @@ mod tests {
         let mut vector = FieldSchema::new("vector", DataType::FloatVector);
         vector.dim = Some(2);
         let varchar_schema = CollectionSchema {
+            functions: Vec::new(),
             fields: vec![varchar_pk, vector],
             enable_dynamic_field: false,
             properties: Vec::new(),

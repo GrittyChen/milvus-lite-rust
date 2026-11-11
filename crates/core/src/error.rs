@@ -183,8 +183,9 @@ pub fn py_json_repr(value: &Value) -> String {
             (None, Some(u), _) => u.to_string(),
             // 超出 u64 的整数在 Python 中仍是精确的 int；JSON 整数文本没有前导零或正号，原文即 repr。
             _ if !n.as_str().contains(['.', 'e', 'E']) => n.as_str().to_owned(),
-            (None, None, Some(f)) => py_float_repr(f),
-            (None, None, None) => n.to_string(),
+            // `as_f64` 对溢出的浮点文本（`1e999`）返回 None；Python 把它读成 inf。
+            _ => crate::pyjson::json_float_text(n.as_str())
+                .map_or_else(|| n.to_string(), py_float_repr),
         },
         Value::String(s) => py_repr(s),
         Value::Array(items) => {
@@ -212,6 +213,24 @@ pub(crate) fn panic_description(payload: &(dyn std::any::Any + Send)) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 期望值为 CPython 3.12 的 `repr(json.loads(text))`。
+    #[test]
+    fn py_json_repr_matches_python_for_wide_numbers() {
+        for (text, want) in [
+            ("1e999", "inf"),
+            ("-1e999", "-inf"),
+            ("[1e999, 1.5, 1e16]", "[inf, 1.5, 1e+16]"),
+            (
+                "123456789012345678901234567890",
+                "123456789012345678901234567890",
+            ),
+            ("1e-999", "0.0"),
+        ] {
+            let value = crate::json_text::value_str(text).unwrap();
+            assert_eq!(py_json_repr(&value), want, "{text}");
+        }
+    }
 
     #[test]
     fn panic_diagnostics_accept_both_string_payloads_and_opaque_values() {

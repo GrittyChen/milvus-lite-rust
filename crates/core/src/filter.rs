@@ -14,7 +14,9 @@ pub(crate) mod unicode;
 pub(crate) use dynamic::DynamicRow;
 pub(crate) use eval::Predicate;
 pub(crate) use python::{int_cmp, int_float_cmp};
-pub use python_json::{AnalyzerParams, classify_analyzer_params};
+pub use python_json::{
+    AnalyzerParams, FunctionParam, classify_analyzer_params, classify_function_param,
+};
 
 /// 错误字符串与词法必须使用同一版 Unicode 属性，避免未分配码位的 repr 漂移。
 pub(crate) fn printable_char(c: char) -> bool {
@@ -420,6 +422,7 @@ mod tests {
             let mut opt = FieldSchema::new("opt", DataType::Int32);
             opt.nullable = true;
             CollectionSchema {
+                functions: Vec::new(),
                 fields: vec![
                     id,
                     v,

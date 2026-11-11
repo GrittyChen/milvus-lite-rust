@@ -537,6 +537,7 @@ mod tests {
     #[test]
     fn dynamic_binding_uses_original_live_rows_and_does_not_change_old_masks() {
         let schema = CollectionSchema {
+            functions: Vec::new(),
             fields: vec![FieldSchema {
                 is_primary: true,
                 ..FieldSchema::new("id", DataType::Int64)
@@ -589,6 +590,7 @@ mod tests {
         for (index, case) in fixture["cases"].as_array().unwrap().iter().enumerate() {
             let collision = case["collision"].as_bool().unwrap();
             let mut schema = CollectionSchema {
+                functions: Vec::new(),
                 fields: vec![
                     FieldSchema {
                         is_primary: true,

@@ -50,7 +50,11 @@ struct PreparedBucket {
 }
 
 impl Collection {
-    pub(super) fn insert_key_batch(&mut self, batch: InsertBatch, upsert: bool) -> Result<Vec<Pk>> {
+    pub(super) fn insert_key_batch(
+        &mut self,
+        mut batch: InsertBatch,
+        upsert: bool,
+    ) -> Result<Vec<Pk>> {
         if self.deleted {
             return Err(EngineError::CollectionNotFound(self.name.clone()));
         }
@@ -61,6 +65,7 @@ impl Collection {
         for (field, values) in &batch.columns {
             check_column_len(field, values, n)?;
         }
+        self.check_function_outputs(&batch)?;
         let pk_field = &self.schema.fields[self.pk_pos];
         if !upsert {
             let has = |name: &str| batch.columns.iter().any(|(field, _)| field == name);
@@ -79,6 +84,7 @@ impl Collection {
                 )));
             }
         }
+        self.generate_function_outputs(&mut batch, upsert);
         let dynamic = self.decode_dynamic(&batch);
         let mut supplied = HashMap::new();
         let mut checks = HashMap::<&str, Vec<&InputValues>>::new();
@@ -391,6 +397,7 @@ mod tests {
 
     fn schema(auto: bool) -> CollectionSchema {
         CollectionSchema {
+            functions: Vec::new(),
             fields: vec![
                 FieldSchema {
                     is_primary: true,

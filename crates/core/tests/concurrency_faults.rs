@@ -34,6 +34,7 @@ fn schema() -> CollectionSchema {
     let mut v = FieldSchema::new("v", DataType::FloatVector);
     v.dim = Some(2);
     CollectionSchema {
+        functions: Vec::new(),
         fields: vec![id, v, FieldSchema::new("age", DataType::Int64)],
         enable_dynamic_field: false,
         properties: vec![],

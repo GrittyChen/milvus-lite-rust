@@ -34,6 +34,7 @@ fn schema() -> CollectionSchema {
     default.default_value = Some(json!([]));
     fields.push(default);
     CollectionSchema {
+        functions: Vec::new(),
         fields,
         enable_dynamic_field: false,
         properties: vec![],

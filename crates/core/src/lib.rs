@@ -45,7 +45,7 @@ pub use db::{CollectionHandle, DEFAULT_DATABASE, Db, InFlight};
 pub use error::{EngineError, Result};
 pub use index::{IndexRequest, IndexSpec, Metric};
 pub use projection::{ApiKind, Projection};
-pub use schema::{CollectionSchema, DataType, FieldSchema};
+pub use schema::{CollectionSchema, DataType, FieldSchema, Function};
 #[cfg(feature = "fault-injection")]
 pub use storage::partition_drop::{
     CopyFault as PartitionCopyFault, inject_copy_fault_once as inject_partition_copy_fault_once,

@@ -17,6 +17,7 @@ fn compute() -> Compute {
 
 fn schema() -> CollectionSchema {
     CollectionSchema {
+        functions: Vec::new(),
         fields: vec![
             FieldSchema {
                 is_primary: true,
@@ -201,6 +202,7 @@ fn schema_errors_take_precedence_over_duplicate_names() {
     let (_root, db) = db();
     db.create_collection("", "c", schema()).unwrap();
     let bad = CollectionSchema {
+        functions: Vec::new(),
         fields: vec![],
         enable_dynamic_field: false,
         properties: Vec::new(),
@@ -354,6 +356,7 @@ fn search_with_a_queued_writer_does_not_deadlock() {
     let (_root, db) = db();
     let dim = 64;
     let schema = CollectionSchema {
+        functions: Vec::new(),
         fields: vec![
             FieldSchema {
                 is_primary: true,

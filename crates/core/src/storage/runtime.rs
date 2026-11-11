@@ -1461,6 +1461,7 @@ mod retained_wal_tests {
         let mut pk = FieldSchema::new("id", DataType::Int64);
         pk.is_primary = true;
         let schema = CollectionSchema {
+            functions: Vec::new(),
             fields: vec![pk],
             enable_dynamic_field: false,
             properties: vec![],
@@ -1530,6 +1531,7 @@ mod retained_wal_tests {
         let mut pk = FieldSchema::new("id", DataType::Int64);
         pk.is_primary = true;
         let schema = CollectionSchema {
+            functions: Vec::new(),
             fields: vec![pk],
             enable_dynamic_field: false,
             properties: Vec::new(),
@@ -1577,6 +1579,7 @@ mod retained_wal_tests {
         let mut pk = FieldSchema::new("id", DataType::Int64);
         pk.is_primary = true;
         let schema = CollectionSchema {
+            functions: Vec::new(),
             fields: vec![pk],
             enable_dynamic_field: false,
             properties: Vec::new(),
@@ -1649,6 +1652,7 @@ mod retained_wal_tests {
         let mut pk = FieldSchema::new("id", DataType::Int64);
         pk.is_primary = true;
         let schema = CollectionSchema {
+            functions: Vec::new(),
             fields: vec![pk],
             enable_dynamic_field: false,
             properties: Vec::new(),

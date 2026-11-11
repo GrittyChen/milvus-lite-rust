@@ -34,6 +34,7 @@ fn schema(dense: bool, nullable: bool, dynamic: bool) -> CollectionSchema {
         ..FieldSchema::new("sp", DataType::SparseFloatVector)
     });
     CollectionSchema {
+        functions: Vec::new(),
         fields,
         enable_dynamic_field: dynamic,
         properties: Vec::new(),
@@ -582,6 +583,7 @@ fn sparse_search_metric_accepts_only_ip() {
 /// 有标量字段与动态字段的稀疏集合，供检索用例过滤。
 fn scalar_schema() -> CollectionSchema {
     CollectionSchema {
+        functions: Vec::new(),
         fields: vec![
             FieldSchema {
                 is_primary: true,

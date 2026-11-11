@@ -38,6 +38,7 @@ fn schema(properties: &[(&str, &str)], default: Option<serde_json::Value>) -> Co
     ts.nullable = true;
     ts.default_value = default;
     CollectionSchema {
+        functions: Vec::new(),
         fields: vec![id, vector, ts],
         enable_dynamic_field: false,
         properties: pairs(properties),

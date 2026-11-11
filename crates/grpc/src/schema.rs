@@ -1,9 +1,12 @@
 //! CollectionSchema 在 Milvus proto 与引擎之间的转换，与 3.x `translators/schema.py` 一致。
 
 use milvus_lite_core::error::py_repr;
-use milvus_lite_core::filter::{AnalyzerParams, classify_analyzer_params};
+use milvus_lite_core::filter::{
+    AnalyzerParams, FunctionParam, classify_analyzer_params, classify_function_param,
+};
 use milvus_lite_core::pyjson;
-use milvus_lite_core::{CollectionSchema, DataType, EngineError, FieldSchema};
+use milvus_lite_core::schema::FUNCTION_BM25;
+use milvus_lite_core::{CollectionSchema, DataType, EngineError, FieldSchema, Function};
 use prost::Message;
 use serde_json::Value;
 
@@ -195,15 +198,16 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<CollectionSchema, EngineError> {
         };
         // 3.x 对任意字段类型都接受这三个属性（`_decode_field`）。
         let flag = |key: &str| param(key).is_some_and(|v| v.to_lowercase() == "true");
-        let analyzer_params = match param("analyzer_params")
+        let (analyzer_params, unsaved_analyzer_params) = match param("analyzer_params")
             .filter(|s| !s.is_empty())
             .map(classify_analyzer_params)
         {
-            None | Some(AnalyzerParams::Unset) => None,
-            Some(AnalyzerParams::Keep(value)) => Some(value),
+            None | Some(AnalyzerParams::Unset) => (None, None),
+            Some(AnalyzerParams::Falsy(value)) => (None, Some(value)),
+            Some(AnalyzerParams::Keep(value)) => (Some(value), None),
             Some(AnalyzerParams::Unrepresentable) => {
                 note("analyzer_params that strict JSON cannot represent");
-                None
+                (None, None)
             }
         };
         if f.nullable && data_type == Some(DataType::FloatVector) {
@@ -243,9 +247,6 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<CollectionSchema, EngineError> {
         if default_value.is_some() && data_type == Some(DataType::FloatVector) {
             note("vector default values");
         }
-        if f.is_function_output {
-            note("functions");
-        }
         if let Some(data_type) = data_type {
             fields.push(FieldSchema {
                 is_primary: f.is_primary_key,
@@ -260,10 +261,13 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<CollectionSchema, EngineError> {
                 enable_analyzer: flag("enable_analyzer"),
                 enable_match: flag("enable_match"),
                 analyzer_params,
+                unsaved_analyzer_params,
+                is_function_output: f.is_function_output,
                 ..FieldSchema::new(f.name.clone(), data_type)
             });
         }
     }
+    let mut functions = Vec::with_capacity(proto.functions.len());
     for function in &proto.functions {
         // 3.x 只认识 BM25(1) 与 TEXT_EMBEDDING(2)。
         if !matches!(function.r#type, 1 | 2) {
@@ -273,7 +277,46 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<CollectionSchema, EngineError> {
                 function.r#type
             )));
         }
-        note("functions");
+        // TEXT_EMBEDDING 需要外部 embedding 服务，不在范围内（0031）。
+        if i64::from(function.r#type) != FUNCTION_BM25 {
+            note("functions");
+            continue;
+        }
+        // 3.x `_decode_function`：逐个 `json.loads`，失败时保留原字符串；同名 key 以后出现者为准。
+        let mut params = serde_json::Map::new();
+        for kv in &function.params {
+            let value = match classify_function_param(&kv.value) {
+                FunctionParam::Raw => Value::String(kv.value.clone()),
+                FunctionParam::Value(value) => value,
+                FunctionParam::Unrepresentable => {
+                    note("function params that strict JSON cannot represent");
+                    continue;
+                }
+            };
+            params.insert(kv.key.clone(), value);
+        }
+        functions.push(Function {
+            name: function.name.clone(),
+            function_type: FUNCTION_BM25,
+            input_field_names: function.input_field_names.clone(),
+            output_field_names: function.output_field_names.clone(),
+            params,
+        });
+    }
+    for field in &mut fields {
+        if functions
+            .iter()
+            .any(|f| f.output_field_names.contains(&field.name))
+        {
+            field.is_function_output = true;
+        }
+        // 假值原值只在 BM25 输入字段上构造分词器时有用（3.x 只为它们调用 `create_analyzer`）。
+        if !functions
+            .iter()
+            .any(|f| f.input_field_names.contains(&field.name))
+        {
+            field.unsaved_analyzer_params = None;
+        }
     }
     if let Some(feature) = first_unsupported {
         return Err(unsupported(feature));
@@ -285,6 +328,7 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<CollectionSchema, EngineError> {
         }
     }
     Ok(CollectionSchema {
+        functions,
         fields,
         enable_dynamic_field: proto.enable_dynamic_field,
         properties: Vec::new(),
@@ -352,6 +396,7 @@ pub(crate) fn encode(
                 auto_id: f.auto_id,
                 type_params,
                 nullable: f.nullable,
+                is_function_output: f.is_function_output,
                 default_value: f
                     .default_value
                     .as_ref()
@@ -362,12 +407,40 @@ pub(crate) fn encode(
             })
         })
         .collect::<Result<Vec<_>, EngineError>>()?;
+    let functions = schema
+        .functions
+        .iter()
+        .map(|function| {
+            Ok(pb::FunctionSchema {
+                name: function.name.clone(),
+                r#type: i32::try_from(function.function_type).map_err(|_| {
+                    EngineError::Storage(format!(
+                        "function type {} does not fit the protocol",
+                        function.function_type
+                    ))
+                })?,
+                input_field_names: function.input_field_names.clone(),
+                output_field_names: function.output_field_names.clone(),
+                // 3.x：字符串原样，其余 `json.dumps`。
+                params: function
+                    .params
+                    .iter()
+                    .map(|(key, value)| match value {
+                        Value::String(text) => kv(key, text.clone()),
+                        other => kv(key, pyjson::dumps_unsorted(other)),
+                    })
+                    .collect(),
+                ..Default::default()
+            })
+        })
+        .collect::<Result<Vec<_>, EngineError>>()?;
     #[allow(deprecated)]
     Ok(pb::CollectionSchema {
         name: name.to_owned(),
         auto_id: schema.fields.iter().any(|f| f.is_primary && f.auto_id),
         fields,
         enable_dynamic_field: schema.enable_dynamic_field,
+        functions,
         ..Default::default()
     })
 }

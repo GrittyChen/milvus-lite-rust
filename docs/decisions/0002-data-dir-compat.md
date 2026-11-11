@@ -90,6 +90,7 @@
    - term hash 是 UTF-8 字节上的 32 位 FNV-1a（[hash.py](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/milvus_lite/analyzer/hash.py)）。
    - 逐位一致的范围还包括 `analyzer_params` 的 filter：`{type: "stop", stop_words}` 在 lower 之后过滤 token，其他 filter 类型被静默忽略（[factory.py:92](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/milvus_lite/analyzer/factory.py#L92)）。jieba 分词器对每个 token 做 `strip().lower()`，jieba 本身的等价性另议。
    - BM25 的 IDF 是检索时按 segment 现算的，不落盘（[collection.py:884](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/milvus_lite/engine/collection.py#L884) 的 TODO）。打分一致属于行为层（规则 2），不属于格式层。
+   - [0031](0031-bm25.md) 已实现：分词、停用词与 FNV-1a 生成的稀疏值与 3.x 逐字节相同（含普通稀疏值不允许的维度 `2^32-1`），带 BM25 function 的 `schema.json` 双向读写；打分按 segment 统计，与 NumPy 2 环境中的 3.x 逐位一致，倒排与统计只在内存中，不写索引文件。
 9. **Parquet 写入参数。**
    - 必须写入 `ARROW:schema` 元数据（pyarrow 的 `store_schema` 默认开启）。缺少时，3.x 把定长向量列读成变长 list，打开 collection 直接失败。
    - 压缩与 3.x 默认一致，用 snappy。3.x 调 `pq.write_table` 时没有指定压缩，用的是 pyarrow 的默认值。

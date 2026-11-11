@@ -448,6 +448,25 @@ fn float_literal(s: &str) -> Option<f64> {
     float_str(&normalized)
 }
 
+/// CPython 3.12 的 `sum()`：浮点累加带 Neumaier 补偿，结果可能与逐项相加差一个 ulp，会影响并列。
+pub(crate) fn python_sum(values: impl IntoIterator<Item = f64>) -> f64 {
+    let (mut total, mut compensation) = (0.0_f64, 0.0_f64);
+    for value in values {
+        let next = total + value;
+        if total.abs() >= value.abs() {
+            compensation += (total - next) + value;
+        } else {
+            compensation += (value - next) + total;
+        }
+        total = next;
+    }
+    if compensation != 0.0 && compensation.is_finite() {
+        total + compensation
+    } else {
+        total
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

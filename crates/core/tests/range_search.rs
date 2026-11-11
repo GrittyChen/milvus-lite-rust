@@ -19,6 +19,7 @@ fn range_window_float64_thresholds_parallel_queries_and_old_snapshot() {
         "",
         "c",
         CollectionSchema {
+            functions: Vec::new(),
             fields: vec![id, v],
             enable_dynamic_field: false,
             properties: vec![],

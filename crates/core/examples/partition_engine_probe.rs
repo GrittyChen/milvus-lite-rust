@@ -51,6 +51,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             DEFAULT_DATABASE,
             "c",
             CollectionSchema {
+                functions: Vec::new(),
                 fields: vec![pk, vector],
                 enable_dynamic_field: false,
                 properties: Vec::new(),
@@ -161,6 +162,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut vector = FieldSchema::new("vector", DataType::FloatVector);
     vector.dim = Some(i64::try_from(dim)?);
     let schema = CollectionSchema {
+        functions: Vec::new(),
         fields: vec![pk, vector],
         enable_dynamic_field: false,
         properties: Vec::new(),

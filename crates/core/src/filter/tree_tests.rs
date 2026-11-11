@@ -39,6 +39,7 @@ fn nullable_typed_columns_match_reference_all_routes() {
         let mut x = FieldSchema::new("x", dtype);
         x.nullable = true;
         let schema = CollectionSchema {
+            functions: Vec::new(),
             fields: vec![id, vector, x, FieldSchema::new("j", DataType::Json)],
             enable_dynamic_field: true,
             properties: vec![],
@@ -222,6 +223,7 @@ fn all_routes_match_reference_tree_corpus() {
     let mut failures = Vec::new();
     for (index, case) in fixture["cases"].as_array().unwrap().iter().enumerate() {
         let mut schema = CollectionSchema {
+            functions: Vec::new(),
             fields: fields.clone(),
             enable_dynamic_field: case["dynamic"].as_bool().unwrap(),
             properties: vec![],
@@ -390,6 +392,7 @@ fn array_columns_match_reference_routes_and_masks() {
         );
         let column = crate::data::array::convert(&f, &input).unwrap();
         let schema = CollectionSchema {
+            functions: Vec::new(),
             fields: vec![
                 FieldSchema {
                     is_primary: true,

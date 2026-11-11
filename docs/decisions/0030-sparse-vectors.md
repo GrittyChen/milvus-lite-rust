@@ -8,7 +8,7 @@
 - `SPARSE_INVERTED_INDEX` + IP 的定义、load 与检索，以及稀疏字段在 Search、HybridSearch、range、boost、分组、offset、`round_decimal`、search iterator 中的使用。
 - 稠密字段上的 `SPARSE_INVERTED_INDEX` 定义，按 3.x 的实际行为接受。
 
-不包含：BM25 function 与 BM25 度量（第 6 步；带 function 的 schema 继续 `UNIMPLEMENTED`，3.x 的这类集合仍然打不开）；稀疏字段默认值（登记为差异，见下文）。
+不包含：BM25 function 与 BM25 度量（第 6 步，已由 [0031](0031-bm25.md) 实现，倒排与缓存沿用本文的槽位）；稀疏字段默认值（登记为差异，见下文）。
 
 ## 3.x 的行为
 
@@ -74,7 +74,7 @@
 | 指定分区、尚未 flush 的删除，目标主键在其他分区的已提交 segment 里 | MemTable 对每个主键只记最近一次删除的序号与分区，稀疏检索只在这条删除不限分区或与 segment 的分区相同时屏蔽该行，所以 flush 之前仍返回它；flush 之后 delta 全局生效，稠密检索也始终全局屏蔽 | 稀疏检索与稠密检索一样始终按主键全局屏蔽 | 3.x 的稀疏检索在这一点上与自己 flush 之后的结果、与稠密检索都不一致；本实现沿用 [0017](0017-partitions.md) 已实现的「删除按主键全局生效」。照搬需要在分区可见性组件中记录每条待提交删除的分区，冻结代还要另定规则，风险与收益不相称 |
 | 动态字段里的稀疏值带 NaN / Inf 权重 | 写出非法 JSON，之后读取时 pymilvus 报 `JSONDecodeError` | 写入时报 `field 'extra' value nan is not representable in JSON`，不落盘 | 与本实现对动态字段里其他非有限浮点的处理相同，不写出坏数据 |
 
-稀疏字段的 `bytes_data` 默认值（只有原始 gRPC 能发出）沿用已有的「binary default values」UNIMPLEMENTED，先于 3.x 的 `must be a dict, got bytes` 报出。建索引的 `params` / `search_params` 不是严格 JSON（含 `NaN`、`Infinity`、溢出的数字或像 JSON 容器的坏文本）时沿用 0014 的 UNIMPLEMENTED；3.x 把坏文本当作 `{}`，把 `NaN` 等读成浮点后由调参项校验拒绝。稀疏字段让这些参数第一次有了语义，差异由此可见，但仍只有原始 gRPC 能发出。
+稀疏字段的 `bytes_data` 默认值（只有原始 gRPC 能发出）沿用已有的「binary default values」UNIMPLEMENTED，先于 3.x 的 `must be a dict, got bytes` 报出。建索引的 `params` / `search_params` 与检索请求的 `params` 不是严格 JSON（含 `NaN`、`Infinity`、`-Infinity` 字面量或像 JSON 容器的坏文本）时沿用 0014 的 UNIMPLEMENTED；3.x 把坏文本当作 `{}`，把 `NaN` 等读成浮点后由调参项校验拒绝。溢出的数字（如 `1e999`）是严格 JSON：调参项照常按 3.x 校验并报相同的错误；其余键里的溢出数在建索引时无法写进定义，沿用 0014 的 UNIMPLEMENTED。稀疏字段让这些参数第一次有了语义，差异由此可见，但仍只有原始 gRPC 能发出。
 
 稠密字段上的 `SPARSE_INVERTED_INDEX` 定义，以及 MemTable 走 Python 路线，都与 3.x 一致，不算差异，但会在 [0006](0006-m2-scope.md) 的差异表中注明，避免被误当作缺陷修掉。
 
@@ -93,6 +93,8 @@
    - 对照 3.x 与 2.5.1 的检索性能（热查询、首次检索的建倒排耗时、RSS、倒排的实测内存）。
 
 ## 验收
+
+下表是 0030 合入时（`59716a4`）的当次结果，之后的用例计数见各切片自己的验收记录。
 
 | 项目 | 结果 |
 | --- | --- |

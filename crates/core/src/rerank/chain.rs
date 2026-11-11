@@ -70,6 +70,8 @@ enum Norm {
     Cosine,
     /// IP 与其他正相关度量。
     Positive,
+    /// BM25：`2·atan(x)/π`。链的输入已是正分（`-距离`），值域落在 [0, 1)。
+    Bm25,
     /// L2 类：`1 − 2·atan(d)/π`。
     Distance,
 }
@@ -80,13 +82,14 @@ impl Norm {
         Ok(match self {
             Self::Cosine => (1.0 + x) * 0.5,
             Self::Positive => 0.5 + x.atan() / std::f64::consts::PI,
+            Self::Bm25 => 2.0 * x.atan() / std::f64::consts::PI,
             Self::Distance => 1.0 - 2.0 * x.atan() / std::f64::consts::PI,
         })
     }
 }
 
 fn positively_related(metric: Metric) -> bool {
-    matches!(metric, Metric::Cosine | Metric::Ip)
+    matches!(metric, Metric::Cosine | Metric::Ip | Metric::Bm25)
 }
 
 /// 3.x `_resolve_merge_behavior`：返回排序方向（降序为真）与每一路的归一化。
@@ -106,6 +109,7 @@ fn resolve(
                     Metric::Cosine => Norm::Cosine,
                     Metric::Ip => Norm::Positive,
                     Metric::L2 => Norm::Distance,
+                    Metric::Bm25 => Norm::Bm25,
                 })
             })
             .collect();
@@ -1535,6 +1539,18 @@ mod tests {
             resolve(true, false, &[Ip]),
             (true, vec![Some(Norm::Positive)])
         );
+        // 3.x `_positively_related` 含 BM25：与 IP 同向、不混合；归一化用 `2·atan(x)/π`。
+        assert_eq!(resolve(false, false, &[Bm25, Ip]), (true, vec![None, None]));
+        assert_eq!(
+            resolve(false, false, &[Bm25, L2]),
+            (true, vec![None, Some(Norm::Distance)])
+        );
+        assert_eq!(
+            resolve(true, false, &[Bm25]),
+            (true, vec![Some(Norm::Bm25)])
+        );
+        assert_eq!(Norm::Bm25.apply(&PyVal::Float(1.0)).unwrap(), 0.5);
+        assert_eq!(Norm::Bm25.apply(&PyVal::Float(0.0)).unwrap(), 0.0);
     }
 
     #[test]

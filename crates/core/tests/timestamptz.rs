@@ -30,6 +30,7 @@ fn schema() -> CollectionSchema {
     let mut ts2 = FieldSchema::new("ts2", DataType::Timestamptz);
     ts2.default_value = Some(json!(1_735_689_600_000_000_i64));
     CollectionSchema {
+        functions: Vec::new(),
         fields: vec![id, vector, ts, ts2],
         enable_dynamic_field: false,
         properties: vec![],

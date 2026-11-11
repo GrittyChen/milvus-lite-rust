@@ -30,6 +30,7 @@ fn ordered_pages_use_typed_primary_keys_and_an_immutable_snapshot() {
             "",
             "c",
             CollectionSchema {
+                functions: Vec::new(),
                 fields: vec![pk, vector],
                 enable_dynamic_field: false,
                 properties: vec![],

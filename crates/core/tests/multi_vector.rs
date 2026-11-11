@@ -40,6 +40,7 @@ fn schema(key: bool) -> CollectionSchema {
         });
     }
     CollectionSchema {
+        functions: Vec::new(),
         fields,
         enable_dynamic_field: false,
         properties: Vec::new(),

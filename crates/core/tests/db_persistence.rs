@@ -20,6 +20,7 @@ fn schema() -> CollectionSchema {
     let mut vector = FieldSchema::new("v", DataType::FloatVector);
     vector.dim = Some(2);
     CollectionSchema {
+        functions: Vec::new(),
         fields: vec![pk, vector],
         enable_dynamic_field: false,
         properties: Vec::new(),
@@ -675,6 +676,7 @@ fn insert_response_pk_type_comes_from_the_handle_that_received_the_write() {
         "",
         "c",
         CollectionSchema {
+            functions: Vec::new(),
             fields: vec![pk, vector],
             enable_dynamic_field: false,
             properties: Vec::new(),
@@ -1740,6 +1742,7 @@ fn shared_json_files_are_written_in_3x_sorted_layout() {
     let mut vector = FieldSchema::new("vector", DataType::FloatVector);
     vector.dim = Some(2);
     let fixture_schema = CollectionSchema {
+        functions: Vec::new(),
         fields: vec![pk, vector],
         enable_dynamic_field: false,
         properties: Vec::new(),

@@ -39,6 +39,9 @@ pub struct BoostSpec {
 pub struct BoostPlan {
     pub spec: BoostSpec,
     pub keep: usize,
+    /// boost 之后是否接 L2 rerank 链（Search + L2、HybridSearch 的各路）。只影响 BM25 对外分数的还原：
+    /// 3.x 的对外换算对 BM25 是恒等，接链时链的入口再取负（[`public_score`]）。
+    pub chained: bool,
 }
 
 fn random_score_unsupported() -> EngineError {
@@ -110,26 +113,7 @@ impl<'a> CompiledBoost<'a> {
 fn combine(values: &[f64], mode: Mode) -> f64 {
     match mode {
         Mode::Multiply => values.iter().product::<f64>(),
-        Mode::Sum => python_sum(values),
-    }
-}
-
-/// CPython 3.12 的 `sum()`：浮点累加带 Neumaier 补偿，结果可能与逐项相加差一个 ulp，会影响并列。
-fn python_sum(values: &[f64]) -> f64 {
-    let (mut total, mut compensation) = (0.0_f64, 0.0_f64);
-    for &value in values {
-        let next = total + value;
-        if total.abs() >= value.abs() {
-            compensation += (total - next) + value;
-        } else {
-            compensation += (value - next) + total;
-        }
-        total = next;
-    }
-    if compensation != 0.0 && compensation.is_finite() {
-        total + compensation
-    } else {
-        total
+        Mode::Sum => super::pyval::python_sum(values.iter().copied()),
     }
 }
 
@@ -138,7 +122,7 @@ fn transform(distance: f64, value: f64, mode: Mode, metric: Metric) -> f64 {
     match (mode, metric) {
         (Mode::Multiply, Metric::Cosine) => 1.0 - (1.0 - distance) * value,
         (Mode::Multiply, _) => distance * value,
-        (Mode::Sum, Metric::Cosine | Metric::Ip) => distance - value,
+        (Mode::Sum, Metric::Cosine | Metric::Ip | Metric::Bm25) => distance - value,
         (Mode::Sum, Metric::L2) => distance + value,
     }
 }
@@ -173,7 +157,9 @@ fn tie(a: &Row, b: &Row) -> Result<Ordering> {
 }
 
 /// 3.x `_internal_distance_to_milvus_distance` 再加响应编码的 `float()`。输入可能是同名字段盖掉的值。
-pub(crate) fn public_score(distance: &PyVal, metric: Metric) -> Result<f64> {
+/// BM25 的换算是恒等：不接链时只有响应编码的 `float()`（`"1.5"` 得 1.5）；接链时链的入口
+/// `hit_score_for_chain` 先做一元负号，非数值报 Python 的类型错误（链再对返回值取负）。
+pub(crate) fn public_score(distance: &PyVal, metric: Metric, chained: bool) -> Result<f64> {
     let wrong = |message: String| Err(EngineError::invalid(message));
     let kind = distance.type_name();
     match metric {
@@ -190,6 +176,13 @@ pub(crate) fn public_score(distance: &PyVal, metric: Metric) -> Result<f64> {
                 Ok(metric.public_from_internal(distance.to_float()?))
             }
             _ => wrong(format!("bad operand type for unary -: '{kind}'")),
+        },
+        Metric::Bm25 => match distance {
+            PyVal::Float(_) | PyVal::Int(_) | PyVal::BigInt(_) | PyVal::Bool(_) => {
+                distance.to_float()
+            }
+            _ if chained => wrong(format!("bad operand type for unary -: '{kind}'")),
+            _ => distance.to_float(),
         },
         Metric::L2 => match distance {
             PyVal::Float(value) => Ok(metric.public_from_internal(*value)),
@@ -244,7 +237,7 @@ mod tests {
 
     #[test]
     fn transform_table_operates_on_internal_distance() {
-        use Metric::{Cosine, Ip, L2};
+        use Metric::{Bm25, Cosine, Ip, L2};
         use Mode::{Multiply, Sum};
         // COSINE：内部距离 0.25 即相似度 0.75；乘 2 得相似度 1.5，内部距离 -0.5。
         assert_eq!(transform(0.25, 2.0, Multiply, Cosine), -0.5);
@@ -255,6 +248,9 @@ mod tests {
         // L2：内部距离是开方后的距离。
         assert_eq!(transform(3.0, 2.0, Multiply, L2), 6.0);
         assert_eq!(transform(3.0, 2.0, Sum, L2), 5.0);
+        // BM25：内部距离就是 `-score`，与 IP 同向（3.x `metric_type in ("IP", "BM25")`）。
+        assert_eq!(transform(-3.0, 2.0, Multiply, Bm25), -6.0);
+        assert_eq!(transform(-3.0, 2.0, Sum, Bm25), -5.0);
     }
 
     #[test]
@@ -318,10 +314,19 @@ mod tests {
     #[test]
     fn sum_uses_compensated_summation_like_python() {
         // Python 3.12：sum([1e100, 1.0, -1e100, 1e-20]) == 1.0
-        assert_eq!(python_sum(&[1e100, 1.0, -1e100, 1e-20]), 1.0);
-        assert_eq!(python_sum(&[0.1, 0.2]), 0.30000000000000004);
-        assert_eq!(python_sum(&[f64::INFINITY, 1.0]), f64::INFINITY);
-        assert!(python_sum(&[f64::INFINITY, f64::NEG_INFINITY]).is_nan());
+        assert_eq!(
+            crate::rerank::pyval::python_sum([1e100, 1.0, -1e100, 1e-20]),
+            1.0
+        );
+        assert_eq!(
+            crate::rerank::pyval::python_sum([0.1, 0.2]),
+            0.30000000000000004
+        );
+        assert_eq!(
+            crate::rerank::pyval::python_sum([f64::INFINITY, 1.0]),
+            f64::INFINITY
+        );
+        assert!(crate::rerank::pyval::python_sum([f64::INFINITY, f64::NEG_INFINITY]).is_nan());
     }
 
     #[test]
@@ -411,38 +416,74 @@ mod tests {
     fn public_score_reproduces_python_arithmetic_errors() {
         let str_value = PyVal::Str("1".into());
         assert_eq!(
-            message(public_score(&str_value, Metric::Cosine)),
+            message(public_score(&str_value, Metric::Cosine, false)),
             "unsupported operand type(s) for -: 'float' and 'str'"
         );
         assert_eq!(
-            message(public_score(&str_value, Metric::Ip)),
+            message(public_score(&str_value, Metric::Ip, false)),
             "bad operand type for unary -: 'str'"
         );
         assert_eq!(
-            message(public_score(&str_value, Metric::L2)),
+            message(public_score(&str_value, Metric::L2, false)),
             "can't multiply sequence by non-int of type 'str'"
         );
         assert_eq!(
-            message(public_score(&PyVal::None, Metric::L2)),
+            message(public_score(&PyVal::None, Metric::L2, false)),
             "unsupported operand type(s) for *: 'NoneType' and 'NoneType'"
         );
         assert_eq!(
-            public_score(&PyVal::Bool(true), Metric::Cosine).unwrap(),
+            public_score(&PyVal::Bool(true), Metric::Cosine, false).unwrap(),
             0.0
         );
-        assert_eq!(public_score(&PyVal::Int(100), Metric::Ip).unwrap(), -100.0);
-        assert_eq!(public_score(&PyVal::Int(100), Metric::L2).unwrap(), 10000.0);
+        assert_eq!(
+            public_score(&PyVal::Int(100), Metric::Ip, false).unwrap(),
+            -100.0
+        );
+        assert_eq!(
+            public_score(&PyVal::Int(100), Metric::L2, false).unwrap(),
+            10000.0
+        );
         // 10^200 本身能转浮点，平方不能。
         let big = PyVal::BigInt(format!("1{}", "0".repeat(200)));
         assert_eq!(
-            message(public_score(&big, Metric::L2)),
+            message(public_score(&big, Metric::L2, false)),
             "int too large to convert to float"
         );
-        assert_eq!(public_score(&big, Metric::Ip).unwrap(), -1e200);
+        assert_eq!(public_score(&big, Metric::Ip, false).unwrap(), -1e200);
         let wide = (1_i64 << 53) + 1;
         assert_eq!(
-            public_score(&PyVal::Int(wide), Metric::L2).unwrap(),
+            public_score(&PyVal::Int(wide), Metric::L2, false).unwrap(),
             (i128::from(wide) * i128::from(wide)) as f64
         );
+    }
+
+    /// 3.x 实测（boost 的过滤不命中，`$distance` 是 VARCHAR 字段）：不接链时 `float("1.5")` 得 1.5，
+    /// 接 rrf 时报 `bad operand type for unary -: 'str'`；数值原样（链再取负）。
+    #[test]
+    fn bm25_public_score_is_identity_with_python_float() {
+        let text = PyVal::Str("1.5".into());
+        assert_eq!(public_score(&text, Metric::Bm25, false).unwrap(), 1.5);
+        assert_eq!(
+            message(public_score(&text, Metric::Bm25, true)),
+            "bad operand type for unary -: 'str'"
+        );
+        assert_eq!(
+            message(public_score(&PyVal::Str("x".into()), Metric::Bm25, false)),
+            "could not convert string to float: 'x'"
+        );
+        assert_eq!(
+            message(public_score(&PyVal::None, Metric::Bm25, false)),
+            "float() argument must be a string or a real number, not 'NoneType'"
+        );
+        for chained in [false, true] {
+            assert_eq!(
+                public_score(&PyVal::Float(-2.5), Metric::Bm25, chained).unwrap(),
+                -2.5
+            );
+            assert_eq!(
+                public_score(&PyVal::Bool(true), Metric::Bm25, chained).unwrap(),
+                1.0
+            );
+        }
     }
 }

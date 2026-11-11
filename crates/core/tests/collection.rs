@@ -34,6 +34,7 @@ fn vec_field(name: &str, dim: i64) -> FieldSchema {
 /// id INT64 主键、v 二维向量、t VARCHAR(max 5)。
 fn basic(dynamic: bool, auto_id: bool) -> Collection {
     let schema = CollectionSchema {
+        functions: Vec::new(),
         fields: vec![
             pk_field("id", auto_id),
             vec_field("v", 2),
@@ -274,6 +275,7 @@ fn insert_errors_match_3x() {
 #[test]
 fn scalar_type_checks_match_3x() {
     let schema = CollectionSchema {
+        functions: Vec::new(),
         fields: vec![
             pk_field("id", false),
             vec_field("v", 2),
@@ -342,6 +344,7 @@ fn scalar_type_checks_match_3x() {
 fn row_major_check_order_matches_3x() {
     // 3.x 逐行校验，每行内依次查主键、向量、schema 顺序的字段、多余字段。
     let schema = CollectionSchema {
+        functions: Vec::new(),
         fields: vec![
             pk_field("id", false),
             vec_field("v", 2),
@@ -431,6 +434,7 @@ fn integers_into_float_fields_must_be_exact() {
     // 3.x 由 pyarrow 转换：不能精确表示时报 ArrowInvalid（code 1）。经 gRPC 发送 type=Int64 的 FieldData
     // 写入 FLOAT 字段实测，reason 与此相同；pymilvus 会在客户端先转成 float，走不到这里。
     let schema = CollectionSchema {
+        functions: Vec::new(),
         fields: vec![
             pk_field("id", false),
             vec_field("v", 2),
@@ -467,6 +471,7 @@ fn integers_into_float_fields_must_be_exact() {
 fn non_json_values_for_json_fields_are_rejected() {
     // 0004「决策」：3.x 接受并存下读取时会出错的值，本实现报类型不符。
     let schema = CollectionSchema {
+        functions: Vec::new(),
         fields: vec![
             pk_field("id", false),
             vec_field("v", 2),
@@ -558,6 +563,7 @@ fn malformed_json_and_meta_are_rejected() {
     assert_eq!(c.count(), 0);
 
     let schema = CollectionSchema {
+        functions: Vec::new(),
         fields: vec![
             pk_field("id", false),
             vec_field("v", 2),
@@ -836,6 +842,7 @@ fn create_index_errors_match_3x() {
 #[test]
 fn varchar_primary_key() {
     let schema = CollectionSchema {
+        functions: Vec::new(),
         fields: vec![
             FieldSchema {
                 is_primary: true,
@@ -910,6 +917,7 @@ fn dynamic_floats_round_trip_exactly() {
 fn json_nesting_depth_is_limited() {
     // 0004「决策」：3.x 接受约 1000 层以内的嵌套；本实现上限为 127 层，更深明确报错。
     let schema = CollectionSchema {
+        functions: Vec::new(),
         fields: vec![
             pk_field("id", false),
             vec_field("v", 2),
@@ -937,6 +945,7 @@ fn json_nesting_depth_is_limited() {
 #[test]
 fn more_scalar_type_checks_match_3x() {
     let schema = CollectionSchema {
+        functions: Vec::new(),
         fields: vec![
             pk_field("id", false),
             vec_field("v", 2),
@@ -1040,7 +1049,7 @@ fn search_with(c: &Collection, anns: Option<&str>, vectors: QueryVectors) -> Eng
 #[test]
 fn sparse_and_text_queries_fail_where_3x_fails() {
     let mut c = basic(false, false);
-    let text = search_with(&c, None, QueryVectors::Text);
+    let text = search_with(&c, None, QueryVectors::Text(vec!["x".into()]));
     assert!(matches!(text, EngineError::SchemaValidation(_)));
     assert_eq!(
         text.to_string(),
@@ -1054,7 +1063,7 @@ fn sparse_and_text_queries_fail_where_3x_fails() {
     );
     // 3.x 先解析 anns_field，再看查询向量的种类；更早的是 load 状态。
     assert_eq!(
-        search_with(&c, Some("nope"), QueryVectors::Text).to_string(),
+        search_with(&c, Some("nope"), QueryVectors::Text(vec!["x".into()])).to_string(),
         "anns_field 'nope' not found in schema"
     );
     flat_index(&mut c, "L2");

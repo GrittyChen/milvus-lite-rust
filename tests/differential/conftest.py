@@ -25,6 +25,12 @@ REF_VERSION = "3.2.2"
 def pytest_configure(config):
     if not os.environ.get(ENV):
         raise pytest.UsageError(f"{ENV} must point to the python of a venv with milvus-lite 3.x installed")
+    # 3.x 的 BM25 分数随 NumPy 主版本变化（NEP 50），本实现按 NumPy 2 逐位对齐（0031「与 3.x 的差异」）。
+    numpy = subprocess.run([os.environ[ENV], "-c", "import numpy; print(numpy.__version__)"],
+                           capture_output=True, text=True, check=False)
+    major = numpy.stdout.strip().split(".")[0]
+    if numpy.returncode != 0 or not major.isdigit() or int(major) < 2:
+        raise pytest.UsageError(f"{ENV} must have NumPy 2 for BM25 scores (0031), got {numpy.stdout.strip() or numpy.stderr.strip()}")
 
 
 @pytest.fixture(scope="session")
