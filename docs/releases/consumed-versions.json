@@ -30,6 +30,12 @@
       "run_id": 42390752289,
       "run_attempt": 1,
       "outcome": "released"
+    },
+    {
+      "version": "0.5.0rc1",
+      "run_id": 43050734920,
+      "run_attempt": 1,
+      "outcome": "candidate"
     }
   ]
 }
