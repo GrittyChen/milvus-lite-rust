@@ -7,7 +7,9 @@ use crate::schema::{DataType, FieldSchema};
 use crate::storage::visibility::SourceBits;
 
 pub(crate) mod array;
+pub mod sparse;
 pub use array::ArrayData;
+pub use sparse::SparseData;
 
 /// 列空值独立于行的删除有效位；全部有效的列不持有此对象。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -66,6 +68,8 @@ pub enum InputValues {
         dim: usize,
         values: Vec<f32>,
     },
+    /// 每行解码后的 `(维度, 权重)`，按 3.x `bytes_to_sparse` 的 dict 语义，尚未校验。
+    SparseFloatVector(Vec<Vec<(u32, f32)>>),
 }
 
 impl InputValues {
@@ -97,6 +101,7 @@ impl InputValues {
             Self::Str(v) => v.len(),
             Self::Json(v) => v.len(),
             Self::FloatVector { dim, values } => values.len().checked_div(*dim).unwrap_or(0),
+            Self::SparseFloatVector(rows) => rows.len(),
         }
     }
 
@@ -205,6 +210,8 @@ pub enum ColumnData {
         dim: usize,
         values: Vec<f32>,
     },
+    /// 每行原样的打包字节（见 [`sparse`]）。
+    SparseFloatVector(SparseData),
 }
 
 impl ColumnData {
@@ -249,6 +256,7 @@ impl ColumnData {
                     values: vec![0.0; dim.saturating_mul(n)],
                 }
             }
+            DataType::SparseFloatVector => Self::SparseFloatVector(SparseData::empty_rows(n)),
         };
         values.with_validity(&vec![false; n])
     }
@@ -301,6 +309,7 @@ impl ColumnData {
                 dim: field_dim(field),
                 values: Vec::new(),
             },
+            DataType::SparseFloatVector => Self::SparseFloatVector(SparseData::default()),
         }
     }
 
@@ -318,6 +327,7 @@ impl ColumnData {
             Self::VarChar(v) => v.len(),
             Self::Json(v) => v.len(),
             Self::FloatVector { dim, values } => values.len().checked_div(*dim).unwrap_or(0),
+            Self::SparseFloatVector(rows) => rows.len(),
         }
     }
 
@@ -346,7 +356,8 @@ impl ColumnData {
                 Self::Double(_) => Self::Double(Vec::new()),
                 Self::VarChar(_) => Self::VarChar(Vec::new()),
                 Self::Json(_) => Self::Json(Vec::new()),
-                _ => unreachable!("nullable storage contains a scalar column"),
+                Self::SparseFloatVector(_) => Self::SparseFloatVector(SparseData::default()),
+                _ => unreachable!("nullable storage contains a scalar or sparse column"),
             };
             let previous = std::mem::replace(self, empty);
             let mut values = match previous {
@@ -372,6 +383,7 @@ impl ColumnData {
             (Self::FloatVector { dim, values: d }, Self::FloatVector { values: s, .. }) => {
                 d.extend_from_slice(&s[row * *dim..(row + 1) * *dim])
             }
+            (Self::SparseFloatVector(d), Self::SparseFloatVector(s)) => d.push(s.row(row)),
             // 同一字段的存储列与输出列都由 ColumnData::empty(field) 创建，变体一致。
             _ => unreachable!("column type mismatch within one schema field"),
         }
@@ -396,6 +408,7 @@ impl ColumnData {
                         assert_eq!(dim, other, "columns of one field have the same dimension");
                         dst.extend_from_slice(source);
                     }
+                    (Self::SparseFloatVector(dst), Self::SparseFloatVector(source)) => dst.extend(source),
                     _ => unreachable!("columns of one field have the same type"),
                 }
             };

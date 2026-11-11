@@ -23,6 +23,8 @@ pub enum PyVal {
     Dict(Vec<(String, PyVal)>),
     /// `datetime`（TIMESTAMPTZ 字段）：UTC 微秒。
     DateTime(i64),
+    /// `bytes`：3.x 候选行里稀疏字段的值是存储的打包字节（segment 与 MemTable 都是）。
+    Bytes(Vec<u8>),
 }
 
 const TOO_LARGE: &str = "int too large to convert to float";
@@ -63,6 +65,7 @@ impl PyVal {
                     .map(|v| Self::Float(f64::from(*v)))
                     .collect(),
             ),
+            ColumnData::SparseFloatVector(rows) => Self::Bytes(rows.row(row).to_vec()),
             ColumnData::Array(array) => {
                 let mut items = Vec::with_capacity(array.range(row).len());
                 for index in array.range(row) {
@@ -136,6 +139,7 @@ impl PyVal {
             }
             // TIMESTAMPTZ 不能作 ARRAY 元素，动态字段里也没有 datetime，所以它只出现在顶层（走 py_str）。
             Self::DateTime(micros) => crate::timestamptz::python_str(*micros),
+            Self::Bytes(bytes) => bytes_repr(bytes),
         }
     }
 
@@ -150,6 +154,7 @@ impl PyVal {
             Self::List(_) => "list",
             Self::Dict(_) => "dict",
             Self::DateTime(_) => "datetime.datetime",
+            Self::Bytes(_) => "bytes",
         }
     }
 
@@ -185,6 +190,7 @@ impl PyVal {
             (Self::None, Self::None) => true,
             (Self::Str(a), Self::Str(b)) => a == b,
             (Self::DateTime(a), Self::DateTime(b)) => a == b,
+            (Self::Bytes(a), Self::Bytes(b)) => a == b,
             (Self::List(a), Self::List(b)) => {
                 a.len() == b.len() && a.iter().zip(b).all(|(a, b)| a.py_eq(b))
             }
@@ -209,6 +215,7 @@ impl PyVal {
         match (self, other) {
             (Self::Str(a), Self::Str(b)) => Ok(a.cmp(b)),
             (Self::DateTime(a), Self::DateTime(b)) => Ok(a.cmp(b)),
+            (Self::Bytes(a), Self::Bytes(b)) => Ok(a.cmp(b)),
             (Self::List(a), Self::List(b)) => {
                 for (x, y) in a.iter().zip(b) {
                     if !x.py_eq(y) {
@@ -333,6 +340,7 @@ pub(crate) fn python_cell(field: &FieldSchema, value: &PyVal) -> Result<ColumnDa
             PyVal::List(items) => !items.is_empty(),
             PyVal::Dict(items) => !items.is_empty(),
             PyVal::BigInt(_) | PyVal::DateTime(_) => true,
+            PyVal::Bytes(bytes) => !bytes.is_empty(),
             PyVal::None => false,
         }]),
         DataType::Int8 | DataType::Int16 | DataType::Int32 => {
@@ -364,8 +372,38 @@ pub(crate) fn python_cell(field: &FieldSchema, value: &PyVal) -> Result<ColumnDa
             PyVal::DateTime(micros) => ColumnData::Int64(vec![*micros]),
             _ => return Err(unsupported_cell(field)),
         },
-        DataType::Array | DataType::FloatVector => return Err(unsupported_cell(field)),
+        DataType::Array | DataType::FloatVector | DataType::SparseFloatVector => {
+            return Err(unsupported_cell(field));
+        }
     })
+}
+
+/// Python `repr(bytes)`：可打印 ASCII 原样（反斜杠与引号转义），`\t` `\n` `\r` 用转义名，其余 `\xNN`；
+/// 含单引号且不含双引号时用双引号包围。
+fn bytes_repr(bytes: &[u8]) -> String {
+    let quote = if bytes.contains(&b'\'') && !bytes.contains(&b'"') {
+        '"'
+    } else {
+        '\''
+    };
+    let mut out = String::from("b");
+    out.push(quote);
+    for &b in bytes {
+        match b {
+            b'\\' => out.push_str("\\\\"),
+            b'\t' => out.push_str("\\t"),
+            b'\n' => out.push_str("\\n"),
+            b'\r' => out.push_str("\\r"),
+            _ if b == quote as u8 => {
+                out.push('\\');
+                out.push(quote);
+            }
+            0x20..=0x7e => out.push(b as char),
+            _ => out.push_str(&format!("\\x{b:02x}")),
+        }
+    }
+    out.push(quote);
+    out
 }
 
 /// 去掉数字之间的单个下划线；下划线出现在开头、结尾、连续出现或不在两个数字之间时不合法。
@@ -413,6 +451,22 @@ fn float_literal(s: &str) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Python `repr(bytes)` 的实测值。
+    #[test]
+    fn bytes_repr_matches_python() {
+        let cases: [(&[u8], &str); 5] = [
+            (b"", "b''"),
+            (b"\x01\x00\x80?", "b'\\x01\\x00\\x80?'"),
+            (b"a'b", "b\"a'b\""),
+            (b"'\"", "b'\\'\"'"),
+            (b"\\\t\n\r~\x7f", "b'\\\\\\t\\n\\r~\\x7f'"),
+        ];
+        for (bytes, expected) in cases {
+            assert_eq!(PyVal::Bytes(bytes.to_vec()).repr(), expected);
+        }
+        assert_eq!(PyVal::Bytes(vec![1]).type_name(), "bytes");
+    }
     use serde_json::json;
 
     fn message<T: std::fmt::Debug>(result: Result<T>) -> String {

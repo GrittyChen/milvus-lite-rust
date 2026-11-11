@@ -82,7 +82,11 @@ impl ArrayData {
         for i in self.range(row) {
             values.push_row(&self.values, i);
         }
-        super::super::collection::input_from_column_all(&values)
+        // 元素是标量列，只有稀疏列的解码会失败。
+        match super::super::collection::input_from_column_all(&values) {
+            Ok(input) => input,
+            Err(_) => unreachable!("ARRAY elements are scalar columns"),
+        }
     }
 }
 

@@ -74,7 +74,9 @@ fn drop_displaced_open_collection_retires_wal_and_old_handle_before_recreate() {
                         metric_type: Some("L2".into()),
                         limit: 10,
                         offset: 0,
-                        output_fields: vec![]
+                        output_fields: vec![],
+                        params: Default::default(),
+                        negative_top_k: false,
                     },
                     db.compute()
                 )

@@ -31,12 +31,13 @@ pub enum LoadState {
     Released,
 }
 
-/// 查询向量。M1 的 collection 只有稠密向量字段，稀疏与文本查询在 3.x 中同样报错，
-/// 这里保留它们的种类，以便在与 3.x 相同的位置报出相同的错误。
+/// 查询向量。文本查询（BM25 function 之外）在 3.x 中报错，这里保留它的种类，以便在与 3.x 相同的位置报出
+/// 相同的错误。
 #[derive(Debug, Clone, PartialEq)]
 pub enum QueryVectors {
     Dense(Vec<Vec<f32>>),
-    Sparse,
+    /// 每条查询按 3.x `bytes_to_sparse` 解码后的 `(维度, 权重)`，尚未校验。
+    Sparse(Vec<Vec<(u32, f32)>>),
     Text,
 }
 
@@ -50,6 +51,11 @@ pub struct SearchRequest {
     pub limit: usize,
     pub offset: usize,
     pub output_fields: Vec<String>,
+    /// 请求 `search_params` 中的 `params` 对象（3.x 的引擎检索参数）；稀疏检索按它校验调参项。
+    pub params: Map<String, Value>,
+    /// 3.x 的有效 top_k（`top_k + offset` 及分组、范围、boost 的放大）为负。`limit` 已按 0 截断；
+    /// 稀疏检索在遇到有可检索行的数据源时报 `top_k must be a non-negative integer`（0030）。
+    pub negative_top_k: bool,
 }
 
 /// 分组检索参数（0024）；`size` 为 3.x 解析后的 `group_size`（0 已换成 1，负数使每组留不下命中）。
@@ -121,12 +127,14 @@ pub struct ReadSnapshot {
     name: String,
     schema: CollectionSchema,
     pk_pos: usize,
-    vector_pos: usize,
+    vector_pos: Option<usize>,
     chunks: Vec<Chunk>,
     indexes: Vec<IndexSpec>,
     load_state: LoadState,
     deleted: bool,
     unusable: bool,
+    /// 集合的稀疏倒排代号与取快照时的值（见 [`SparseCache::publish`]）。
+    sparse_epoch: (Arc<std::sync::atomic::AtomicU64>, u64),
 }
 
 /// 主键在锁内定位，投影与结果复制在放锁后完成。
@@ -503,9 +511,13 @@ impl ReadSnapshot {
 
     /// 只决定并行切分：`anns_field` 无效时检索流程会按 3.x 的先后报错，这里用默认字段即可。
     fn rows_per_block(&self, anns_field: Option<&str>) -> usize {
-        let pos = resolve_anns_field(&self.schema, self.vector_pos, anns_field)
-            .unwrap_or(self.vector_pos);
-        (BLOCK_ELEMS / field_dim(&self.schema.fields[pos])).max(1)
+        let dim = resolve_anns_field(&self.schema, self.vector_pos, anns_field)
+            .ok()
+            .or(self.vector_pos)
+            .map(|pos| &self.schema.fields[pos])
+            .filter(|field| field.data_type.is_dense_vector())
+            .map_or(1, field_dim);
+        (BLOCK_ELEMS / dim.max(1)).max(1)
     }
 
     /// 在 `compute` 上并行计算（[0005](../../../docs/decisions/0005-search-thread-model.md)），
@@ -651,6 +663,7 @@ impl ReadSnapshot {
                 limit: top_k,
                 offset: 0,
                 output_fields: search_fields,
+                negative_top_k: window < 0,
                 ..req
             },
             compute,
@@ -810,6 +823,285 @@ impl ReadSnapshot {
         }
     }
 
+    /// 稀疏字段的候选（0030，3.x `_search_sparse`）。错误的先后与 3.x 相同：调参项 → 查询 → 过滤编译 →
+    /// 逐个 segment（建倒排 → 过滤）→ MemTable（解码 → 过滤 → 规范化）。建倒排与打分在计算池上并行，
+    /// 全部算完后按这个先后取第一个错误；结果与按 `RankedRow` 全序串行排序一致。
+    fn rank_sparse(
+        &self,
+        req: &SearchRequest,
+        compute: &Compute,
+        field_pos: usize,
+        expr: &str,
+        timezone: &crate::timezone::TimezoneSource<'_>,
+        take: usize,
+    ) -> Result<Vec<TopK>> {
+        use crate::data::sparse;
+        use crate::sparse_index::{self, Postings};
+        let field = &self.schema.fields[field_pos];
+        crate::index::check_sparse_tuning(&field.name, &req.params)?;
+        let query_error = |message: String| {
+            EngineError::schema(format!(
+                "sparse query field {}: {message}",
+                py_repr(&field.name)
+            ))
+        };
+        let queries: Vec<Vec<(u32, f32)>> = match &req.vectors {
+            QueryVectors::Sparse(rows) => rows
+                .iter()
+                .map(|pairs| sparse::normalize(pairs, true).map_err(query_error))
+                .collect::<Result<_>>()?,
+            QueryVectors::Dense(_) => {
+                return Err(query_error("sparse vector must be a dict, got list".into()));
+            }
+            QueryVectors::Text => {
+                return Err(query_error("sparse vector must be a dict, got str".into()));
+            }
+        };
+        let (predicate, record_filter) = if expr.is_empty() {
+            (None, None)
+        } else {
+            let parsed = crate::filter::ParsedFilter::parse_with(expr, timezone)?;
+            let predicate = crate::filter::Predicate::from_parsed(&parsed, &self.schema)?;
+            let record = crate::filter::RecordFilter::compile(&parsed, &self.schema)?;
+            (Some(predicate), record)
+        };
+
+        let mut chunks = self.chunks.clone();
+        let ranges = source_ranges(&chunks);
+        let (segments, memtable): (Vec<_>, Vec<_>) = ranges
+            .into_iter()
+            .partition(|range| chunks[range.start].generation == 0);
+
+        // 已提交块：缓存命中的直接用，其余在计算池上构建（建倒排不看有效位，规范化全部物理行）。
+        let mut postings: Vec<Option<Arc<Postings>>> = vec![None; chunks.len()];
+        struct Build<'a> {
+            chunk: usize,
+            data: &'a ChunkData,
+            result: Option<Result<Postings>>,
+        }
+        let mut builds = Vec::new();
+        for range in &segments {
+            for i in range.clone() {
+                if chunks[i].live.len == 0 {
+                    continue;
+                }
+                match chunks[i].data.sparse.get(field_pos) {
+                    Some(cached) => postings[i] = Some(cached),
+                    None => builds.push(Build {
+                        chunk: i,
+                        data: &self.chunks[i].data,
+                        result: None,
+                    }),
+                }
+            }
+        }
+        compute.for_each(&mut builds, |build| {
+            let column = &build.data.columns[field_pos];
+            let ColumnData::SparseFloatVector(rows) = column.values() else {
+                build.result = Some(Err(EngineError::Storage(
+                    "sparse field column lost its type".into(),
+                )));
+                return;
+            };
+            build.result = Some(sparse_index::build_segment(rows, |row| {
+                !column.is_null(row)
+            }));
+        });
+        let mut build_errors: HashMap<usize, EngineError> = HashMap::new();
+        let (epoch, seen) = &self.sparse_epoch;
+        for build in builds {
+            match build.result {
+                Some(Ok(built)) => {
+                    let built = Arc::new(built);
+                    build.data.sparse.publish(field_pos, &built, epoch, *seen);
+                    postings[build.chunk] = Some(built);
+                }
+                Some(Err(error)) => {
+                    build_errors.insert(build.chunk, error);
+                }
+                None => {
+                    return Err(EngineError::Storage("sparse build task did not run".into()));
+                }
+            }
+        }
+        for range in &segments {
+            if let Some(i) = range.clone().find(|i| build_errors.contains_key(i)) {
+                return Err(build_errors.remove(&i).unwrap_or_else(|| {
+                    EngineError::Storage("sparse build error vanished".into())
+                }));
+            }
+            if let Some(predicate) = &predicate {
+                filter_source(&mut chunks[range.clone()], predicate)?;
+            }
+            // 3.x 只对还有有效行的 segment 调用打分，负的 top_k 在那里才报错。
+            if req.negative_top_k && chunks[range.clone()].iter().any(|c| c.live.any_live()) {
+                return Err(negative_top_k());
+            }
+        }
+
+        // MemTable（活跃代与冻结代）：每次检索临时构建，只含存活行，3.x 中是一个数据源。
+        type MemorySource = (usize, Vec<(usize, usize)>, Postings);
+        let memory: Option<MemorySource> = if let Some(first) = memtable.first() {
+            let rank = chunks[first.start].source_rank;
+            let mut locations: Vec<(usize, usize)> = memtable
+                .iter()
+                .flat_map(|range| range.clone())
+                .flat_map(|i| chunks[i].live.live_rows().map(move |row| (i, row)))
+                .collect();
+            locations.sort_unstable_by_key(|&(i, row)| row_order(&chunks[i], row));
+            let decoded = locations
+                .iter()
+                .map(|&(i, row)| {
+                    let column = &chunks[i].columns[field_pos];
+                    match column.values() {
+                        _ if column.is_null(row) => Ok(Vec::new()),
+                        ColumnData::SparseFloatVector(rows) => sparse::decode(rows.row(row)),
+                        _ => Err(EngineError::Storage(
+                            "sparse field column lost its type".into(),
+                        )),
+                    }
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let keep = match &record_filter {
+                Some(filter) => Some(filter.evaluate(&dynamic_rows(&chunks, &locations))?),
+                None => None,
+            };
+            let normalized = decoded
+                .iter()
+                .map(|pairs| sparse::normalize(pairs, true).map_err(EngineError::InvalidArgument))
+                .collect::<Result<Vec<_>>>()?;
+            // 3.x 的 MemTable 只要有行就打分（不看过滤结果）。
+            if req.negative_top_k && !locations.is_empty() {
+                return Err(negative_top_k());
+            }
+            let built = Postings::build(
+                normalized
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, _)| keep.as_ref().is_none_or(|bits| bits.get(*index)))
+                    .map(|(index, pairs)| (index as u32, pairs.as_slice())),
+            );
+            Some((rank, locations, built))
+        } else {
+            None
+        };
+
+        let mut tops: Vec<TopK> = queries
+            .iter()
+            .map(|_| TopK::new(Metric::Ip, take))
+            .collect();
+        if take == 0 {
+            return Ok(tops);
+        }
+        #[derive(Clone, Copy)]
+        enum Unit<'a> {
+            Segment(usize, &'a Postings),
+            Memory(usize, &'a [(usize, usize)], &'a Postings),
+        }
+        // 一个计算任务是一个数据源上的一段查询：只有一个 segment 时，多条查询也能分到各个线程。
+        // 每条查询仍在同一数据源上按同样的次序打分，结果与不分段时逐位相同。
+        struct ScoreLeaf<'a> {
+            unit: Unit<'a>,
+            queries: std::ops::Range<usize>,
+            tops: Vec<TopK>,
+        }
+        let mut units: Vec<Unit> = Vec::new();
+        for range in &segments {
+            for i in range.clone() {
+                if let Some(built) = &postings[i]
+                    && chunks[i].live.any_live()
+                {
+                    units.push(Unit::Segment(i, built));
+                }
+            }
+        }
+        if let Some((rank, locations, built)) = &memory
+            && !locations.is_empty()
+        {
+            units.push(Unit::Memory(*rank, locations, built));
+        }
+        let per_leaf = queries.len().div_ceil(compute.threads().max(1));
+        let mut leaves: Vec<ScoreLeaf> = Vec::new();
+        for unit in units {
+            for start in (0..queries.len()).step_by(per_leaf.max(1)) {
+                leaves.push(ScoreLeaf {
+                    unit,
+                    queries: start..(start + per_leaf).min(queries.len()),
+                    tops: Vec::new(),
+                });
+            }
+        }
+        let chunks_ref = &chunks;
+        compute.for_each(&mut leaves, |leaf| {
+            let leaf_queries = &queries[leaf.queries.clone()];
+            leaf.tops = leaf_queries
+                .iter()
+                .map(|_| TopK::new(Metric::Ip, take))
+                .collect();
+            let (built, rows) = match &leaf.unit {
+                Unit::Segment(i, built) => (*built, chunks_ref[*i].live.len),
+                Unit::Memory(_, locations, built) => (*built, locations.len()),
+            };
+            let mut scratch = sparse_index::Scratch::with_rows(rows);
+            for (query, top) in leaf_queries.iter().zip(leaf.tops.iter_mut()) {
+                match &leaf.unit {
+                    Unit::Segment(i, _) => {
+                        let chunk = &chunks_ref[*i];
+                        sparse_index::score(
+                            built,
+                            query,
+                            |row| chunk.live.get(row as usize),
+                            &mut scratch,
+                            |row, score| {
+                                let row = row as usize;
+                                top.push(score.exact as f32, || {
+                                    RankedRow::sparse(
+                                        chunk.source_rank,
+                                        score,
+                                        RowRef {
+                                            order: row_order(chunk, row),
+                                            chunk: *i,
+                                            row,
+                                        },
+                                    )
+                                });
+                            },
+                        );
+                    }
+                    Unit::Memory(rank, locations, _) => {
+                        sparse_index::score(
+                            built,
+                            query,
+                            |_| true,
+                            &mut scratch,
+                            |index, score| {
+                                let (i, row) = locations[index as usize];
+                                top.push(score.exact as f32, || {
+                                    RankedRow::sparse(
+                                        *rank,
+                                        score,
+                                        RowRef {
+                                            order: row_order(&chunks_ref[i], row),
+                                            chunk: i,
+                                            row,
+                                        },
+                                    )
+                                });
+                            },
+                        );
+                    }
+                }
+            }
+            leaf.tops.iter_mut().for_each(TopK::shrink);
+        });
+        for leaf in leaves {
+            for (top, part) in tops[leaf.queries].iter_mut().zip(leaf.tops) {
+                top.absorb(part);
+            }
+        }
+        Ok(tops)
+    }
+
     fn strip(&self, rows: &mut Rows, names: &[&str]) {
         strip_rows(&self.schema, rows, names, None);
     }
@@ -830,7 +1122,9 @@ impl ReadSnapshot {
         } = filter;
         let projection = Projection::new(&self.schema, &req.output_fields, ApiKind::Search);
         // 3.x：没有查询向量时在一切检查之前返回空结果。
-        if matches!(&req.vectors, QueryVectors::Dense(v) if v.is_empty()) {
+        if matches!(&req.vectors, QueryVectors::Dense(v) if v.is_empty())
+            || matches!(&req.vectors, QueryVectors::Sparse(v) if v.is_empty())
+        {
             return Ok(Ranking {
                 projection,
                 metric: None,
@@ -846,30 +1140,6 @@ impl ReadSnapshot {
             resolve_anns_field(&self.schema, self.vector_pos, req.anns_field.as_deref())?;
         let field = &self.schema.fields[field_pos];
         let metric = resolve_field_metric(&self.indexes, field, req.metric_type.as_deref())?;
-        let vectors = match &req.vectors {
-            QueryVectors::Dense(v) => v,
-            // 3.x `_maybe_embed_queries`：字段上没有 TEXT_EMBEDDING function（M1 不支持 function）。
-            QueryVectors::Text => {
-                return Err(EngineError::schema(format!(
-                    "Text query on field {} requires a TEXT_EMBEDDING function targeting that field",
-                    py_repr(&field.name)
-                )));
-            }
-            // 3.x 把稀疏向量（dict）交给 numpy 转成稠密数组时的 TypeError。
-            QueryVectors::Sparse => {
-                return Err(EngineError::invalid(
-                    "float() argument must be a string or a real number, not 'dict'",
-                ));
-            }
-        };
-        let predicate = if expr.is_empty() {
-            None
-        } else {
-            Some(crate::filter::Predicate::from_parsed(
-                &crate::filter::ParsedFilter::parse_with(expr, timezone)?,
-                &self.schema,
-            )?)
-        };
         let range = range.filter(|r| r.radius.is_some() || r.range_filter.is_some());
         let end = req.limit.saturating_add(req.offset);
         // 3.x 只在有限近邻窗口内做范围过滤，不能在扫描时提前筛掉范围外候选。
@@ -883,66 +1153,95 @@ impl ReadSnapshot {
             (None, None) if range.is_some() => end.saturating_mul(5),
             (None, None) => end,
         };
-        // 3.x 编译过滤后才处理 topk<=0，但此时不会进入数据求值或数值转换。
-        let chunks = if take > 0 {
-            self.filtered_chunks_compiled(predicate.as_ref())?
+        let tops = if field.data_type.is_sparse_vector() {
+            self.rank_sparse(&req, compute, field_pos, expr, timezone, take)?
         } else {
-            std::borrow::Cow::Borrowed(self.chunks.as_slice())
-        };
-        let dim = field_dim(field);
-        // 3.x 不校验，维度不符时报 numpy 的原始错误，空 collection 上反而成功（0004「决策」）。
-        for v in vectors {
-            if v.len() != dim {
-                return Err(EngineError::invalid(format!(
-                    "query vector has dim {}, but field {} expects dim {dim}",
-                    v.len(),
-                    py_repr(&field.name)
-                )));
+            let vectors = match &req.vectors {
+                QueryVectors::Dense(v) => v,
+                // 3.x `_maybe_embed_queries`：字段上没有 TEXT_EMBEDDING function（M1 不支持 function）。
+                QueryVectors::Text => {
+                    return Err(EngineError::schema(format!(
+                        "Text query on field {} requires a TEXT_EMBEDDING function targeting that field",
+                        py_repr(&field.name)
+                    )));
+                }
+                // 3.x 把稀疏向量（dict）交给 numpy 转成稠密数组时的 TypeError。
+                QueryVectors::Sparse(_) => {
+                    return Err(EngineError::invalid(
+                        "float() argument must be a string or a real number, not 'dict'",
+                    ));
+                }
+            };
+            let predicate = if expr.is_empty() {
+                None
+            } else {
+                Some(crate::filter::Predicate::from_parsed(
+                    &crate::filter::ParsedFilter::parse_with(expr, timezone)?,
+                    &self.schema,
+                )?)
+            };
+            // 3.x 编译过滤后才处理 topk<=0，但此时不会进入数据求值或数值转换。
+            let chunks = if take > 0 {
+                self.filtered_chunks_compiled(predicate.as_ref())?
+            } else {
+                std::borrow::Cow::Borrowed(self.chunks.as_slice())
+            };
+            let dim = field_dim(field);
+            // 3.x 不校验，维度不符时报 numpy 的原始错误，空 collection 上反而成功（0004「决策」）。
+            for v in vectors {
+                if v.len() != dim {
+                    return Err(EngineError::invalid(format!(
+                        "query vector has dim {}, but field {} expects dim {dim}",
+                        v.len(),
+                        py_repr(&field.name)
+                    )));
+                }
             }
-        }
-        let norm_slot = NormSlot {
-            ordinal: self.schema.vector_ordinal(field_pos),
-            stride: self.schema.vector_count(),
-        };
-        let queries: Vec<flat::Query> = vectors
-            .iter()
-            .map(|v| flat::Query::new(metric, v))
-            .collect();
-        let mut tops: Vec<TopK> = queries.iter().map(|_| TopK::new(metric, take)).collect();
-        let blocks = row_blocks(&chunks, rows_per_block);
-        if take > 0 && !blocks.is_empty() {
-            let groups: Vec<&[flat::Query]> = queries.chunks(flat::BATCH).collect();
-            let per_wave = groups_per_wave(compute.threads(), blocks.len());
-            for wave in (0..groups.len()).step_by(per_wave) {
-                let mut leaves: Vec<Leaf> = (wave..groups.len().min(wave + per_wave))
-                    .flat_map(|group| {
-                        blocks.iter().map(move |block| Leaf {
-                            group,
-                            block,
-                            tops: Vec::new(),
+            let norm_slot = NormSlot {
+                ordinal: self.schema.vector_ordinal(field_pos),
+                stride: self.schema.vector_count(),
+            };
+            let queries: Vec<flat::Query> = vectors
+                .iter()
+                .map(|v| flat::Query::new(metric, v))
+                .collect();
+            let mut tops: Vec<TopK> = queries.iter().map(|_| TopK::new(metric, take)).collect();
+            let blocks = row_blocks(&chunks, rows_per_block);
+            if take > 0 && !blocks.is_empty() {
+                let groups: Vec<&[flat::Query]> = queries.chunks(flat::BATCH).collect();
+                let per_wave = groups_per_wave(compute.threads(), blocks.len());
+                for wave in (0..groups.len()).step_by(per_wave) {
+                    let mut leaves: Vec<Leaf> = (wave..groups.len().min(wave + per_wave))
+                        .flat_map(|group| {
+                            blocks.iter().map(move |block| Leaf {
+                                group,
+                                block,
+                                tops: Vec::new(),
+                            })
                         })
-                    })
-                    .collect();
-                compute.for_each(&mut leaves, |leaf| {
-                    let queries = groups[leaf.group];
-                    leaf.tops = queries.iter().map(|_| TopK::new(metric, take)).collect();
-                    scan(
-                        &chunks,
-                        leaf.block,
-                        field_pos,
-                        norm_slot,
-                        queries,
-                        &mut leaf.tops,
-                    );
-                    leaf.tops.iter_mut().for_each(TopK::shrink);
-                });
-                for leaf in leaves {
-                    for (i, top) in leaf.tops.into_iter().enumerate() {
-                        tops[leaf.group * flat::BATCH + i].absorb(top);
+                        .collect();
+                    compute.for_each(&mut leaves, |leaf| {
+                        let queries = groups[leaf.group];
+                        leaf.tops = queries.iter().map(|_| TopK::new(metric, take)).collect();
+                        scan(
+                            &chunks,
+                            leaf.block,
+                            field_pos,
+                            norm_slot,
+                            queries,
+                            &mut leaf.tops,
+                        );
+                        leaf.tops.iter_mut().for_each(TopK::shrink);
+                    });
+                    for leaf in leaves {
+                        for (i, top) in leaf.tops.into_iter().enumerate() {
+                            tops[leaf.group * flat::BATCH + i].absorb(top);
+                        }
                     }
                 }
             }
-        }
+            tops
+        };
         if let Some(plan) = boost {
             // 3.x 在范围过滤之后才构造 BoostOp：过滤表达式的错误晚于前面所有校验，没有候选也要报。
             let id_key_visible = dynamic_key_visible(&self.schema, &projection, ID_FIELD);
@@ -1200,52 +1499,8 @@ impl ReadSnapshot {
             return Ok(std::borrow::Cow::Borrowed(&self.chunks));
         };
         let mut chunks = self.chunks.clone();
-        if predicate.requires_source_rows() {
-            let mut start = 0;
-            while start < chunks.len() {
-                let source = chunks[start].source;
-                let end = start
-                    + chunks[start..]
-                        .iter()
-                        .take_while(|c| c.source == source)
-                        .count();
-                let (locations, matching) = {
-                    let mut locations: Vec<_> = (start..end)
-                        .flat_map(|chunk| {
-                            chunks[chunk].live.live_rows().map(move |row| (chunk, row))
-                        })
-                        .collect();
-                    // 参照按整个 segment/memtable 推断类型；活跃代的报错顺序沿用主键位次。
-                    locations.sort_unstable_by_key(|&(i, row)| {
-                        if chunks[i].generation == 0 {
-                            (chunks[i].row_start + row) as u64
-                        } else {
-                            chunks[i].orders[row]
-                        }
-                    });
-                    let rows: Vec<_> = locations
-                        .iter()
-                        .map(|&(i, row)| crate::filter::DynamicRow {
-                            columns: &chunks[i].columns,
-                            meta: chunks[i].meta.as_ref().map(|m| &m[row]),
-                            row,
-                            sequence: Some(chunks[i].seqs[row]),
-                        })
-                        .collect();
-                    let matching = predicate.evaluate_source_rows(&rows)?;
-                    (locations, matching)
-                };
-                for (index, (chunk, row)) in locations.into_iter().enumerate() {
-                    if !matching.get(index) {
-                        chunks[chunk].live.set(row, false);
-                    }
-                }
-                start = end;
-            }
-        } else {
-            for chunk in &mut chunks {
-                chunk.live = predicate.evaluate(&chunk.columns, &chunk.live)?;
-            }
+        for range in source_ranges(&chunks) {
+            filter_source(&mut chunks[range], predicate)?;
         }
         Ok(std::borrow::Cow::Owned(chunks))
     }
@@ -1433,15 +1688,74 @@ pub(crate) struct ChunkData {
     pub(crate) norms: Vec<f32>,
     pub(crate) seqs: Vec<u64>,
     orders: Vec<u64>,
+    sparse: SparseCache,
 }
 
+/// 已提交块上每个稀疏字段的倒排（0030，3.x 的 `Segment.sparse_indexes`）。随块共享、随块释放；
+/// 克隆块数据时不复制。只在计算池之外读写，计算任务只构建、不碰槽位（0005）。
+struct SparseCache(crate::lock_order::Mutex<Vec<(usize, Arc<crate::sparse_index::Postings>)>, 6>);
+
+impl Default for SparseCache {
+    fn default() -> Self {
+        Self(crate::lock_order::Mutex::new(Vec::new()))
+    }
+}
+
+impl Clone for SparseCache {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+impl std::fmt::Debug for SparseCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SparseCache")
+    }
+}
+
+impl SparseCache {
+    fn get(&self, field: usize) -> Option<Arc<crate::sparse_index::Postings>> {
+        self.0
+            .lock()
+            .iter()
+            .find(|(f, _)| *f == field)
+            .map(|(_, postings)| Arc::clone(postings))
+    }
+
+    /// 只在代号仍是取快照时的值时写入：release / 索引变更先递增代号再清空槽位，
+    /// 在槽位锁内比对代号就不会把作废的结果写回。并发的首次检索各自构建，先写入者为准。
+    fn publish(
+        &self,
+        field: usize,
+        postings: &Arc<crate::sparse_index::Postings>,
+        epoch: &std::sync::atomic::AtomicU64,
+        seen: u64,
+    ) {
+        let mut slots = self.0.lock();
+        if epoch.load(std::sync::atomic::Ordering::SeqCst) == seen
+            && !slots.iter().any(|(f, _)| *f == field)
+        {
+            slots.push((field, Arc::clone(postings)));
+        }
+    }
+
+    fn clear(&self) {
+        self.0.lock().clear();
+    }
+}
+
+/// 3.x `_resolve_anns_field`：默认取第一个 FLOAT_VECTOR；只有稀疏字段时必须显式指定。
 fn resolve_anns_field(
     schema: &CollectionSchema,
-    vector_pos: usize,
+    vector_pos: Option<usize>,
     anns_field: Option<&str>,
 ) -> Result<usize> {
     let Some(name) = anns_field else {
-        return Ok(vector_pos);
+        return vector_pos.ok_or_else(|| {
+            EngineError::schema(
+                "collection has no FLOAT_VECTOR field; specify anns_field explicitly for sparse search",
+            )
+        });
     };
     let pos = schema
         .fields
@@ -1451,7 +1765,7 @@ fn resolve_anns_field(
             EngineError::schema(format!("anns_field {} not found in schema", py_repr(name)))
         })?;
     let field = &schema.fields[pos];
-    if !field.data_type.is_vector() {
+    if !field.data_type.is_any_vector() {
         return Err(EngineError::schema(format!(
             "anns_field {} is not a vector field (dtype={})",
             py_repr(name),
@@ -1468,6 +1782,29 @@ fn resolve_field_metric(
     field: &FieldSchema,
     requested: Option<&str>,
 ) -> Result<Metric> {
+    // 3.x：稀疏字段先校验已有的定义，请求的度量只能是 IP。
+    if field.data_type.is_sparse_vector() {
+        if let Some(spec) = indexes.iter().find(|spec| spec.field_name == field.name) {
+            crate::index::check_sparse_config(
+                &field.name,
+                &spec.index_type,
+                &spec.metric_type,
+                &spec.params,
+                &spec.search_params,
+            )?;
+        }
+        // 与稠密分支不同，3.x 这里只放行 None：空串照样不是 IP。
+        if let Some(metric) = requested.map(str::to_uppercase)
+            && metric != "IP"
+        {
+            return Err(EngineError::schema(format!(
+                "sparse field {} requires metric IP, got {}",
+                py_repr(&field.name),
+                py_repr(&metric)
+            )));
+        }
+        return Ok(Metric::Ip);
+    }
     let metric = requested
         .map(str::to_uppercase)
         .filter(|m| !m.is_empty())
@@ -1485,6 +1822,82 @@ fn resolve_field_metric(
             py_repr(&metric)
         ))
     })
+}
+
+/// 3.x `empty_results` 对负 top_k 的 `ValueError`（code 1）。
+fn negative_top_k() -> EngineError {
+    EngineError::invalid("top_k must be a non-negative integer")
+}
+
+/// 快照中按数据源连续排列的块的下标范围，按源序。
+fn source_ranges(chunks: &[Chunk]) -> Vec<std::ops::Range<usize>> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    while start < chunks.len() {
+        let source = chunks[start].source;
+        let end = start
+            + chunks[start..]
+                .iter()
+                .take_while(|c| c.source == source)
+                .count();
+        out.push(start..end);
+        start = end;
+    }
+    out
+}
+
+/// 对一个数据源的块求值过滤，清掉不匹配行的有效位。需要源内全部行的表达式按 3.x 对整个
+/// segment / memtable 推断类型，其余逐块列式求值。
+fn filter_source(chunks: &mut [Chunk], predicate: &crate::filter::Predicate) -> Result<()> {
+    if !predicate.requires_source_rows() {
+        for chunk in chunks.iter_mut() {
+            chunk.live = predicate.evaluate(&chunk.columns, &chunk.live)?;
+        }
+        return Ok(());
+    }
+    let locations = ordered_live_rows(chunks);
+    let matching = {
+        let rows = dynamic_rows(chunks, &locations);
+        predicate.evaluate_source_rows(&rows)?
+    };
+    for (index, (chunk, row)) in locations.into_iter().enumerate() {
+        if !matching.get(index) {
+            chunks[chunk].live.set(row, false);
+        }
+    }
+    Ok(())
+}
+
+/// 源内的存活行，按 3.x 的遍历先后：segment 按物理行，活跃代按主键位次。
+fn ordered_live_rows(chunks: &[Chunk]) -> Vec<(usize, usize)> {
+    let mut locations: Vec<_> = (0..chunks.len())
+        .flat_map(|chunk| chunks[chunk].live.live_rows().map(move |row| (chunk, row)))
+        .collect();
+    locations.sort_unstable_by_key(|&(i, row)| row_order(&chunks[i], row));
+    locations
+}
+
+fn row_order(chunk: &Chunk, row: usize) -> u64 {
+    if chunk.generation == 0 {
+        (chunk.row_start + row) as u64
+    } else {
+        chunk.orders[row]
+    }
+}
+
+fn dynamic_rows<'a>(
+    chunks: &'a [Chunk],
+    locations: &[(usize, usize)],
+) -> Vec<crate::filter::DynamicRow<'a>> {
+    locations
+        .iter()
+        .map(|&(i, row)| crate::filter::DynamicRow {
+            columns: &chunks[i].columns,
+            meta: chunks[i].meta.as_ref().map(|m| &m[row]),
+            row,
+            sequence: Some(chunks[i].seqs[row]),
+        })
+        .collect()
 }
 
 impl std::ops::Deref for Chunk {
@@ -1507,7 +1920,8 @@ pub struct Collection {
     name: String,
     schema: CollectionSchema,
     pk_pos: usize,
-    vector_pos: usize,
+    /// 第一个 FLOAT_VECTOR 字段；只有稀疏向量字段的集合没有。
+    vector_pos: Option<usize>,
     chunks: BTreeMap<usize, Chunk>,
     next_chunk: usize,
     pk_index: PkMap<RowRef>,
@@ -1515,6 +1929,8 @@ pub struct Collection {
     next_seq: u64,
     /// 按创建顺序。
     indexes: Vec<IndexSpec>,
+    /// release 与索引变更时递增，使在途检索构建的稀疏倒排不再写回缓存（0030）。
+    sparse_epoch: Arc<std::sync::atomic::AtomicU64>,
     load_state: LoadState,
     next_order: u64,
     persistent: Option<PersistentCollection>,
@@ -1552,12 +1968,7 @@ impl Collection {
         let vector_pos = schema
             .fields
             .iter()
-            .position(|f| f.data_type.is_vector())
-            .ok_or_else(|| {
-                EngineError::schema(
-                    "schema has no vector field (FLOAT_VECTOR or SPARSE_FLOAT_VECTOR)",
-                )
-            })?;
+            .position(|f| f.data_type.is_dense_vector());
         let memory_key = schema
             .partition_key()
             .map(|_| partition_key::MemoryKey::new(&schema).map(Box::new))
@@ -1572,6 +1983,7 @@ impl Collection {
             pk_index: PkMap::default(),
             next_seq: 1,
             indexes: Vec::new(),
+            sparse_epoch: Arc::default(),
             // 3.x：新建的 collection 没有索引定义，初始即为 loaded。
             load_state: LoadState::Loaded,
             next_order: 0,
@@ -1847,6 +2259,7 @@ impl Collection {
                 norms,
                 seqs: decoded.seqs,
                 orders,
+                sparse: SparseCache::default(),
             }),
             live: SourceBits::from_live(&live),
             generation,
@@ -2077,6 +2490,7 @@ impl Collection {
                     seqs: decoded.seqs,
                     norms,
                     orders,
+                    sparse: SparseCache::default(),
                 }),
                 live: SourceBits::from_live(&live),
                 source,
@@ -2259,6 +2673,7 @@ impl Collection {
                             seqs: data.data.seqs,
                             norms: data.norms,
                             orders,
+                            sparse: SparseCache::default(),
                         }),
                         live,
                         source,
@@ -2602,6 +3017,7 @@ impl Collection {
                         seqs: output.data.seqs,
                         norms: output.norms,
                         orders,
+                        sparse: SparseCache::default(),
                     }),
                     live: SourceBits::from_live(&live[i]),
                     generation: 0,
@@ -2659,6 +3075,17 @@ impl Collection {
             else {
                 continue;
             };
+            // 3.x 在逐 segment 建索引之前、不论有没有数据都校验稀疏字段的定义。
+            if field.data_type.is_sparse_vector() {
+                crate::index::check_sparse_config(
+                    &field.name,
+                    &spec.index_type,
+                    &spec.metric_type,
+                    &spec.params,
+                    &spec.search_params,
+                )?;
+                continue;
+            }
             if let Some(error) = crate::index::unbuildable(spec, field)
                 && self.has_committed_rows()?
             {
@@ -2731,6 +3158,8 @@ impl Collection {
 
     /// 3.x：没有任何索引定义时 release 不生效，collection 仍可检索。
     pub fn release(&mut self) {
+        // 3.x `release()` 不论有没有索引定义都清空各 segment 的稀疏缓存。
+        self.invalidate_sparse();
         if !self.indexes.is_empty() {
             self.load_state = LoadState::Released;
         }
@@ -2785,7 +3214,18 @@ impl Collection {
     fn create_index_inner(&mut self, field_name: &str, req: IndexRequest) -> Result<()> {
         let spec = self.prepare_create_index(field_name, req)?;
         self.indexes.push(spec);
+        self.invalidate_sparse();
         Ok(())
+    }
+
+    /// 3.x 在 release、create_index 与 drop_index 时丢弃已建的稀疏倒排：先递增代号再清空，见
+    /// [`SparseCache::publish`]。
+    fn invalidate_sparse(&self) {
+        self.sparse_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        for chunk in self.chunks.values() {
+            chunk.data.sparse.clear();
+        }
     }
 
     pub(crate) fn prepare_create_index(
@@ -2887,6 +3327,7 @@ impl Collection {
     }
 
     pub(crate) fn publish_index_change(&mut self, change: crate::index::IndexChange) {
+        self.invalidate_sparse();
         match change {
             crate::index::IndexChange::Create(spec) => self.indexes.push(spec),
             crate::index::IndexChange::Drop(specs) => {
@@ -2958,6 +3399,7 @@ impl Collection {
         }
         retain_masked_json(&supplied, &mut json_checks);
         let pk_field = &self.schema.fields[self.pk_pos];
+        self.decode_inherited_sparse(&supplied, n)?;
         let mut fields: Vec<ColumnData> =
             self.schema.fields.iter().map(ColumnData::empty).collect();
         let mut array_inputs: HashMap<usize, Vec<Option<InputValues>>> = HashMap::new();
@@ -2969,11 +3411,19 @@ impl Collection {
                 .and_then(|values| input_pk(values, row));
             let current = candidate.as_ref().and_then(|pk| self.pk_index.get(pk));
             let mut values = if let Some(old) = current {
+                // 提供了的字段随后被覆盖，不解码旧值：3.x 只解码继承下来的稀疏值。
                 self.chunks[&old.chunk]
                     .columns
                     .iter()
-                    .map(|column| input_from_column(column, old.row))
-                    .collect()
+                    .zip(&self.schema.fields)
+                    .map(|(column, field)| {
+                        if supplied.contains_key(field.name.as_str()) {
+                            Ok(InputValues::Null(1))
+                        } else {
+                            input_from_column(column, old.row)
+                        }
+                    })
+                    .collect::<Result<Vec<_>>>()?
             } else {
                 Vec::new()
             };
@@ -3037,7 +3487,7 @@ impl Collection {
                     continue;
                 }
                 // 和 ARRAY 一样要等全部行校验完：这里转换会抢先报错，维度不符时还无法拼进列。
-                if i != self.vector_pos && field.data_type == DataType::FloatVector {
+                if Some(i) != self.vector_pos && field.data_type == DataType::FloatVector {
                     other_vectors
                         .entry(i)
                         .or_default()
@@ -3069,8 +3519,8 @@ impl Collection {
             .fields
             .iter()
             .zip(fields.iter())
-            .map(|(field, column)| (field.name.clone(), input_from_column_all(column)))
-            .collect();
+            .map(|(field, column)| Ok((field.name.clone(), input_from_column_all(column)?)))
+            .collect::<Result<_>>()?;
         if self.schema.enable_dynamic_field {
             columns.push((
                 META_FIELD.to_owned(),
@@ -3237,8 +3687,9 @@ impl Collection {
                 py_repr(&pk.name)
             )));
         }
-        let vector = &self.schema.fields[self.vector_pos];
-        if !has_column(&vector.name) {
+        if let Some(vector) = self.vector_pos.map(|pos| &self.schema.fields[pos])
+            && !has_column(&vector.name)
+        {
             return Err(EngineError::schema(format!(
                 "vector field {} missing or None",
                 py_repr(&vector.name)
@@ -3374,6 +3825,7 @@ impl Collection {
                 norms,
                 seqs: seqs.clone(),
                 orders: Vec::with_capacity(n),
+                sparse: SparseCache::default(),
             }),
             live: SourceBits::from_live(&vec![true; n]),
             generation,
@@ -3529,6 +3981,10 @@ impl Collection {
             vector_pos: self.vector_pos,
             chunks: Vec::new(),
             indexes: self.indexes.clone(),
+            sparse_epoch: (
+                Arc::clone(&self.sparse_epoch),
+                self.sparse_epoch.load(std::sync::atomic::Ordering::SeqCst),
+            ),
             load_state: self.load_state,
             deleted: self.deleted,
             unusable: self.persistent.as_ref().is_some_and(|p| p.poisoned()),
@@ -3630,6 +4086,30 @@ impl Collection {
             }
             Some(ids) if ids.contains(&0) => Ok(self.read_snapshot()),
             Some(_) => Ok(self.read_metadata()),
+        }
+    }
+
+    /// 检索的读快照。目标是稀疏字段且指定了分区时按 3.x `_search_sparse` 的分区语义：先全局判版本再剪枝
+    /// （0030）；其余与 [`Self::read_named_snapshot`] 相同。目标字段无效时也走后者，错误由度量解析报出。
+    pub fn read_search_snapshot(
+        &self,
+        names: &[String],
+        anns_field: Option<&str>,
+    ) -> Result<ReadSnapshot> {
+        let sparse = resolve_anns_field(&self.schema, self.vector_pos, anns_field)
+            .is_ok_and(|pos| self.schema.fields[pos].data_type.is_sparse_vector());
+        if !sparse {
+            return self.read_named_snapshot(names);
+        }
+        match self.resolve_partitions(names)? {
+            None => Ok(self.read_snapshot()),
+            Some(ids) => match self.partition_visibility() {
+                Some(visibility) => {
+                    self.read_snapshot_with_visibility(&visibility.sparse_selected_snapshot(&ids))
+                }
+                None if ids.contains(&0) => Ok(self.read_snapshot()),
+                None => Ok(self.read_metadata()),
+            },
         }
     }
 
@@ -3796,7 +4276,7 @@ impl Collection {
     ) -> Result<()> {
         let mut missing = None;
         for (pos, field) in self.schema.fields.iter().enumerate() {
-            if pos == self.vector_pos || field.data_type != DataType::FloatVector {
+            if Some(pos) == self.vector_pos || field.data_type != DataType::FloatVector {
                 continue;
             }
             let expected = field_dim(field);
@@ -3849,15 +4329,17 @@ impl Collection {
                 py_repr(&pk.name)
             )));
         }
-        let vector = &self.schema.fields[self.vector_pos];
-        match by_name.get(vector.name.as_str()) {
-            None => {
+        // 3.x `_find_float_vector`：只有稀疏向量字段时没有这一项检查。
+        let vector = self.vector_pos.map(|pos| &self.schema.fields[pos]);
+        match vector.map(|vector| (vector, by_name.get(vector.name.as_str()))) {
+            None => {}
+            Some((vector, None)) => {
                 return Err(EngineError::schema(format!(
                     "vector field {} missing or None",
                     py_repr(&vector.name)
                 )));
             }
-            Some(InputValues::FloatVector { dim, .. }) => {
+            Some((vector, Some(InputValues::FloatVector { dim, .. }))) => {
                 if *dim != field_dim(vector) {
                     return Err(EngineError::schema(format!(
                         "vector field {} expected dim {}, got {dim}",
@@ -3866,13 +4348,13 @@ impl Collection {
                     )));
                 }
             }
-            Some(other) if input_is_null(other, row) => {
+            Some((vector, Some(other))) if input_is_null(other, row) => {
                 return Err(EngineError::schema(format!(
                     "vector field {} missing or None",
                     py_repr(&vector.name)
                 )));
             }
-            Some(other) => {
+            Some((vector, Some(other))) => {
                 return Err(EngineError::schema(format!(
                     "vector field {} must be list/tuple, got {}",
                     py_repr(&vector.name),
@@ -3890,7 +4372,23 @@ impl Collection {
                     }
                 }
             }
-            if field.data_type.is_vector() {
+            if field.data_type.is_dense_vector() {
+                continue;
+            }
+            // 3.x 对稀疏字段单独检查：None 与缺失同样报「missing」，没有类型无关的 None 检查。
+            if field.data_type == DataType::SparseFloatVector {
+                match by_name.get(field.name.as_str()) {
+                    Some(values) if !input_is_null(values, row) => {
+                        check_sparse(field, values.values(), row)?;
+                    }
+                    _ if field.nullable => {}
+                    _ => {
+                        return Err(EngineError::schema(format!(
+                            "sparse vector field {} missing and not nullable / no default",
+                            py_repr(&field.name)
+                        )));
+                    }
+                }
                 continue;
             }
             if i == self.pk_pos
@@ -3933,6 +4431,50 @@ impl Collection {
                 "record has fields {} not in schema (enable_dynamic_field is False)",
                 py_repr_list(dynamic.maps[row].keys().map(String::as_str))
             )));
+        }
+        Ok(())
+    }
+}
+
+impl Collection {
+    /// 3.x 的 upsert 先把每条已有记录与补丁合并，未提供的稀疏字段经 `bytes_to_sparse` 解码，全部合并完才校验；
+    /// 历史行的字节长度错误因此先于任何一行的校验报出。
+    pub(crate) fn decode_inherited_sparse(
+        &self,
+        supplied: &HashMap<&str, &InputValues>,
+        n: usize,
+    ) -> Result<()> {
+        let inherited: Vec<usize> = self
+            .schema
+            .fields
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| {
+                f.data_type == DataType::SparseFloatVector
+                    && !supplied.contains_key(f.name.as_str())
+            })
+            .map(|(i, _)| i)
+            .collect();
+        if inherited.is_empty() {
+            return Ok(());
+        }
+        let pk_field = &self.schema.fields[self.pk_pos];
+        for row in 0..n {
+            let Some(old) = supplied
+                .get(pk_field.name.as_str())
+                .and_then(|values| input_pk(values, row))
+                .and_then(|pk| self.pk_index.get(&pk))
+            else {
+                continue;
+            };
+            for &i in &inherited {
+                let column = &self.chunks[&old.chunk].columns[i];
+                if !column.is_null(old.row)
+                    && let ColumnData::SparseFloatVector(rows) = column.values()
+                {
+                    crate::data::sparse::decode(rows.row(old.row))?;
+                }
+            }
         }
         Ok(())
     }
@@ -4026,17 +4568,15 @@ fn scan(
                     )
                 })
         };
-        let at = |row| RankedRow {
-            source_rank: chunk.source_rank,
-            at: RowRef {
-                order: if chunk.generation == 0 {
-                    (chunk.row_start + row) as u64
-                } else {
-                    chunk.orders[row]
+        let at = |row| {
+            RankedRow::dense(
+                chunk.source_rank,
+                RowRef {
+                    order: row_order(chunk, row),
+                    chunk: seg.chunk,
+                    row,
                 },
-                chunk: seg.chunk,
-                row,
-            },
+            )
         };
         if let Ok(batch) = <&[flat::Query; flat::BATCH]>::try_from(queries) {
             for (row, candidate, norm) in live_rows() {
@@ -4056,10 +4596,37 @@ fn scan(
 }
 
 /// 数据源序号只存在于本次检索候选中，不扩大存活主键索引的行引用。
+///
+/// 稀疏检索（0030）在数据源名次与行位置之间还有两层：3.x 每个源内按 double 分数取前 k、并列时保持
+/// 插入 dict 的先后（首个命中的查询维度序号），之后各源按 float32 距离稳定合并。稠密检索两层都为 0，
+/// 次序不变。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct RankedRow {
     source_rank: usize,
+    /// double 分数降序的键：非负分数的位模式随数值单调，取反后小者在前。
+    exact: u64,
+    first_hit: u32,
     at: RowRef,
+}
+
+impl RankedRow {
+    fn dense(source_rank: usize, at: RowRef) -> Self {
+        Self {
+            source_rank,
+            exact: 0,
+            first_hit: 0,
+            at,
+        }
+    }
+
+    fn sparse(source_rank: usize, score: crate::sparse_index::Score, at: RowRef) -> Self {
+        Self {
+            source_rank,
+            exact: !score.exact.to_bits(),
+            first_hit: score.first_hit,
+            at,
+        }
+    }
 }
 
 /// 一条查询的前 `take` 个结果，按 (分数的名次, 行的位置) 这一全序排列。
@@ -4301,15 +4868,19 @@ fn input_row(values: &InputValues, row: usize) -> InputValues {
             dim: *dim,
             values: values[row * dim..(row + 1) * dim].to_vec(),
         },
+        InputValues::SparseFloatVector(rows) => {
+            InputValues::SparseFloatVector(vec![rows[row].clone()])
+        }
     }
 }
 
-pub(crate) fn input_from_column(column: &ColumnData, row: usize) -> InputValues {
-    match column {
+/// 存储列的一行作为写入值。稀疏行按 3.x partial upsert 的 `bytes_to_sparse` 解码，长度不对时报错。
+pub(crate) fn input_from_column(column: &ColumnData, row: usize) -> Result<InputValues> {
+    Ok(match column {
         ColumnData::Array(array) => InputValues::Array(vec![Some(array.input(row))]),
         ColumnData::Nullable { values, validity } => {
             if validity.get(row) {
-                input_from_column(values, row)
+                input_from_column(values, row)?
             } else {
                 InputValues::Null(1)
             }
@@ -4327,16 +4898,19 @@ pub(crate) fn input_from_column(column: &ColumnData, row: usize) -> InputValues 
             dim: *dim,
             values: values[row * dim..(row + 1) * dim].to_vec(),
         },
-    }
+        ColumnData::SparseFloatVector(rows) => {
+            InputValues::SparseFloatVector(vec![crate::data::sparse::decode(rows.row(row))?])
+        }
+    })
 }
 
-pub(crate) fn input_from_column_all(column: &ColumnData) -> InputValues {
-    match column {
+pub(crate) fn input_from_column_all(column: &ColumnData) -> Result<InputValues> {
+    Ok(match column {
         ColumnData::Array(array) => {
             InputValues::Array((0..array.len()).map(|row| Some(array.input(row))).collect())
         }
         ColumnData::Nullable { values, validity } => InputValues::Nullable {
-            values: Box::new(input_from_column_all(values)),
+            values: Box::new(input_from_column_all(values)?),
             validity: validity.clone(),
         },
         ColumnData::Bool(v) => InputValues::Bool(v.clone()),
@@ -4352,7 +4926,12 @@ pub(crate) fn input_from_column_all(column: &ColumnData) -> InputValues {
             dim: *dim,
             values: values.clone(),
         },
-    }
+        ColumnData::SparseFloatVector(rows) => InputValues::SparseFloatVector(
+            rows.rows()
+                .map(crate::data::sparse::decode)
+                .collect::<Result<_>>()?,
+        ),
+    })
 }
 
 fn pk_at(column: &ColumnData, row: usize) -> Pk {
@@ -4409,6 +4988,13 @@ fn to_json(name: &str, values: &InputValues, row: usize) -> Result<Value> {
             values[row * dim..(row + 1) * dim]
                 .iter()
                 .map(|x| json_number(name, f64::from(*x)))
+                .collect::<Result<_>>()?,
+        ),
+        // 3.x 的 dict 经 `json.dumps` 把整数键写成字符串。
+        InputValues::SparseFloatVector(rows) => Value::Object(
+            rows[row]
+                .iter()
+                .map(|&(dim, weight)| Ok((dim.to_string(), json_number(name, f64::from(weight))?)))
                 .collect::<Result<_>>()?,
         ),
     })
@@ -4511,7 +5097,7 @@ fn check_value(field: &FieldSchema, values: &InputValues, row: usize) -> Result<
                 true
             }
             DataType::Array => unreachable!("ARRAY has separate outer validation"),
-            DataType::FloatVector => false,
+            DataType::FloatVector | DataType::SparseFloatVector => false,
         };
         return if ok {
             Ok(())
@@ -4773,6 +5359,16 @@ fn convert_nonnull(field: &FieldSchema, values: &InputValues) -> Result<ColumnDa
                 values: values.clone(),
             }
         }
+        // 已经过 `check_sparse`；存规范化后按维度排序的字节，与 3.x `sparse_to_bytes` 相同。
+        (DataType::SparseFloatVector, InputValues::SparseFloatVector(rows)) => {
+            ColumnData::SparseFloatVector(crate::data::SparseData::from_rows(
+                rows.iter()
+                    .map(|pairs| {
+                        sparse_value(&field.name, pairs).map(|v| crate::data::sparse::encode(&v))
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+            ))
+        }
         _ => return Err(mismatch()),
     })
 }
@@ -4828,6 +5424,7 @@ pub(crate) fn py_type_name(values: &InputValues, row: usize) -> &'static str {
         InputValues::Float(_) => "float",
         InputValues::Str(_) => "str",
         InputValues::FloatVector { .. } => "list",
+        InputValues::SparseFloatVector(_) => "dict",
         InputValues::Json(v) => match crate::json_text::value(&v[row]) {
             Ok(Value::Object(_)) => "dict",
             Ok(Value::Array(_)) => "list",
@@ -4875,10 +5472,56 @@ pub(crate) fn py_value_repr(values: &InputValues, row: usize) -> String {
                 .collect();
             format!("[{}]", items.join(", "))
         }
+        InputValues::SparseFloatVector(rows) => {
+            let items: Vec<String> = rows[row]
+                .iter()
+                .map(|&(dim, weight)| format!("{dim}: {}", py_float_repr(f64::from(weight))))
+                .collect();
+            format!("{{{}}}", items.join(", "))
+        }
         InputValues::Json(v) => match crate::json_text::value(&v[row]) {
             Ok(value) => py_json_repr(&value),
             Err(_) => py_repr(&String::from_utf8_lossy(&v[row])),
         },
+    }
+}
+
+/// 3.x `_validate_sparse_vector`：规范化并要求至少一个非零权重，错误带字段前缀（code 6）。
+/// 引擎接口的调用方可能给出重复维度，先按 dict 语义合并，与 gRPC 的解码结果一致。
+fn sparse_value(name: &str, pairs: &[(u32, f32)]) -> Result<Vec<(u32, f32)>> {
+    let pairs = crate::data::sparse::dict_pairs(pairs.to_vec());
+    crate::data::sparse::normalize(&pairs, false).map_err(|message| {
+        EngineError::schema(format!("sparse vector field {}: {message}", py_repr(name)))
+    })
+}
+
+/// 稀疏字段的非空写入值。gRPC 只会给出解码后的 dict；JSON 值来自 json_data，键是字符串。
+fn check_sparse(field: &FieldSchema, values: &InputValues, row: usize) -> Result<()> {
+    let prefix = |message: String| {
+        EngineError::schema(format!(
+            "sparse vector field {}: {message}",
+            py_repr(&field.name)
+        ))
+    };
+    let object = match values {
+        InputValues::SparseFloatVector(rows) => {
+            return sparse_value(&field.name, &rows[row]).map(drop);
+        }
+        InputValues::JsonValues(v) => v[row].as_object().cloned(),
+        InputValues::Json(v) => crate::json_text::value(&v[row])
+            .ok()
+            .and_then(|value| value.as_object().cloned()),
+        _ => None,
+    };
+    match object {
+        Some(map) => Err(prefix(match map.keys().next() {
+            Some(key) => format!("sparse dimension {} must be int", py_repr(key)),
+            None => "sparse vector must contain at least one nonzero float32 weight".to_owned(),
+        })),
+        None => Err(prefix(format!(
+            "sparse vector must be a dict, got {}",
+            py_type_name(values, row)
+        ))),
     }
 }
 
@@ -5011,6 +5654,8 @@ mod tests {
                     limit: call.limit,
                     offset: call.offset,
                     output_fields: call.output,
+                    params: Default::default(),
+                    negative_top_k: false,
                 },
                 &compute,
                 BoostedFilter {
@@ -5366,6 +6011,8 @@ mod tests {
                         limit: 2,
                         offset: 0,
                         output_fields: Vec::new(),
+                        params: Default::default(),
+                        negative_top_k: false,
                     },
                     &compute,
                 )
@@ -6145,6 +6792,8 @@ mod tests {
             limit: 10,
             offset: 0,
             output_fields: vec![],
+            params: Default::default(),
+            negative_top_k: false,
         };
         assert_eq!(
             c.search(req, db.compute()).unwrap().hits[0].rows.pks,
@@ -6220,6 +6869,8 @@ mod tests {
             limit: 100,
             offset: 0,
             output_fields: vec!["*".into()],
+            params: Default::default(),
+            negative_top_k: false,
         };
         for step in 0..180 {
             let pk = rng.below(13) as i64;
@@ -6566,7 +7217,7 @@ mod tests {
                 let q = flat::Query::new(metric, v);
                 let mut scored = Vec::new();
                 for chunk in c.chunks.values() {
-                    let (dim, values) = vector_values(&chunk.columns[c.vector_pos]);
+                    let (dim, values) = vector_values(&chunk.columns[c.vector_pos.unwrap()]);
                     for row in 0..chunk.live.len {
                         if chunk.live.get(row) {
                             let cand = &values[row * dim..(row + 1) * dim];
@@ -6616,6 +7267,8 @@ mod tests {
                 limit,
                 offset,
                 output_fields: Vec::new(),
+                params: Default::default(),
+                negative_top_k: false,
             };
             let expected = reference(&c, &req, metric);
             let run = |pool, rows_per_block| -> Vec<Vec<(u32, Pk)>> {
@@ -6700,6 +7353,8 @@ mod tests {
                         score,
                         RankedRow {
                             source_rank: 0,
+                            exact: 0,
+                            first_hit: 0,
                             at: RowRef {
                                 order: i as u64,
                                 chunk: i / 50,
@@ -6734,6 +7389,8 @@ mod tests {
     fn top_k_reads_position_only_when_score_can_reach_the_bound() {
         let position = |source_rank, order| RankedRow {
             source_rank,
+            exact: 0,
+            first_hit: 0,
             at: RowRef {
                 order,
                 chunk: 1,
@@ -6802,6 +7459,8 @@ mod tests {
                             palette[rng.below(palette.len())],
                             RankedRow {
                                 source_rank: rng.below(5),
+                                exact: 0,
+                                first_hit: 0,
                                 at: RowRef {
                                     order: rng.below(20) as u64,
                                     chunk: rng.below(4),
@@ -6831,5 +7490,108 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// 0030：已提交块的倒排在首次检索时缓存；release、create_index、drop_index 后清空并重建。
+    /// 作废前取的快照晚到的构建结果不写回槽位（代号已变）。
+    #[test]
+    fn sparse_postings_cache_follows_release_and_index_changes() {
+        use crate::{Compute, DataDir, Db};
+        let root = tempfile::tempdir().unwrap();
+        let db = Db::new(
+            DataDir::open(root.path()).unwrap(),
+            Compute::new(std::num::NonZeroUsize::MIN).unwrap(),
+        )
+        .unwrap();
+        db.create_collection(
+            "",
+            "c",
+            CollectionSchema {
+                fields: vec![
+                    FieldSchema {
+                        is_primary: true,
+                        ..FieldSchema::new("id", DataType::Int64)
+                    },
+                    FieldSchema::new("sp", DataType::SparseFloatVector),
+                ],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        for id in [1, 2] {
+            db.insert(
+                "",
+                "c",
+                InsertBatch {
+                    num_rows: 1,
+                    columns: vec![
+                        ("id".into(), InputValues::Int(vec![id])),
+                        (
+                            "sp".into(),
+                            InputValues::SparseFloatVector(vec![vec![(1, id as f32)]]),
+                        ),
+                    ],
+                },
+            )
+            .unwrap();
+            db.flush_collection("", "c").unwrap();
+        }
+        let handle = db.collection("", "c").unwrap();
+        let search = |snapshot: &ReadSnapshot| {
+            let result = snapshot
+                .search(
+                    SearchRequest {
+                        anns_field: Some("sp".into()),
+                        vectors: QueryVectors::Sparse(vec![vec![(1, 1.0)]]),
+                        metric_type: None,
+                        limit: 10,
+                        offset: 0,
+                        output_fields: Vec::new(),
+                        params: Map::new(),
+                        negative_top_k: false,
+                    },
+                    db.compute(),
+                )
+                .unwrap();
+            result.hits[0].scores.clone()
+        };
+        let cached = || {
+            handle
+                .read()
+                .chunks
+                .values()
+                .filter(|chunk| chunk.data.sparse.get(1).is_some())
+                .count()
+        };
+        let index = || IndexRequest {
+            index_type: "SPARSE_INVERTED_INDEX".into(),
+            metric_type: Some("IP".into()),
+            params: Map::new(),
+            search_params: Map::new(),
+        };
+        assert_eq!(cached(), 0);
+        assert_eq!(search(&handle.read().read_snapshot()), vec![2.0, 1.0]);
+        assert_eq!(cached(), 2);
+        // 命中缓存的检索结果不变。
+        assert_eq!(search(&handle.read().read_snapshot()), vec![2.0, 1.0]);
+
+        db.create_index("", "c", "sp", index()).unwrap();
+        assert_eq!(cached(), 0);
+        assert_eq!(search(&handle.read().read_snapshot()), vec![2.0, 1.0]);
+        assert_eq!(cached(), 2);
+
+        handle.write().release();
+        assert_eq!(cached(), 0);
+        db.drop_index("", "c", "sp", "").unwrap();
+        assert_eq!(cached(), 0);
+        handle.write().load().unwrap();
+        // 作废之前取的快照：它的构建结果不写回。
+        let stale = handle.read().read_snapshot();
+        handle.write().release();
+        assert_eq!(search(&stale), vec![2.0, 1.0]);
+        assert_eq!(cached(), 0);
+        assert_eq!(search(&handle.read().read_snapshot()), vec![2.0, 1.0]);
+        assert_eq!(cached(), 2);
+        db.close();
     }
 }

@@ -91,7 +91,10 @@ fn nullable_typed_columns_match_reference_all_routes() {
                     .map(|v| v.as_str().unwrap_or("null").as_bytes().to_vec())
                     .collect(),
             ),
-            DataType::FloatVector | DataType::Array | DataType::Timestamptz => {
+            DataType::FloatVector
+            | DataType::SparseFloatVector
+            | DataType::Array
+            | DataType::Timestamptz => {
                 panic!("type outside scalar fixture")
             }
         }
@@ -271,6 +274,7 @@ fn all_routes_match_reference_tree_corpus() {
                     },
                     DataType::Array => panic!("ARRAY is covered by its own truth fixture"),
                     DataType::Timestamptz => panic!("TIMESTAMPTZ has its own fixtures"),
+                    DataType::SparseFloatVector => panic!("sparse vectors are not in this fixture"),
                 }
             })
             .collect();

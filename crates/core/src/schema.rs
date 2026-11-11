@@ -21,6 +21,8 @@ pub enum DataType {
     /// UTC Unix 微秒的 int64（0025）；列沿用 `ColumnData::Int64`，类型差异只在 schema。
     Timestamptz,
     FloatVector,
+    /// 每行是按维度排序的 `<uint32, float32>` 小端对（0030）。
+    SparseFloatVector,
 }
 
 impl DataType {
@@ -39,6 +41,7 @@ impl DataType {
             Self::Array => "ARRAY",
             Self::Timestamptz => "TIMESTAMPTZ",
             Self::FloatVector => "FLOAT_VECTOR",
+            Self::SparseFloatVector => "SPARSE_FLOAT_VECTOR",
         }
     }
 
@@ -47,8 +50,18 @@ impl DataType {
         format!("DataType.{}", self.name())
     }
 
-    pub fn is_vector(self) -> bool {
+    /// FLOAT_VECTOR：有 dim、范数，可作为默认检索字段（3.x 的 `_vector_name`）。
+    pub fn is_dense_vector(self) -> bool {
         self == Self::FloatVector
+    }
+
+    pub fn is_sparse_vector(self) -> bool {
+        self == Self::SparseFloatVector
+    }
+
+    /// 3.x 的 `all_vector_fields`：可作为检索字段、建索引时必须给度量。
+    pub fn is_any_vector(self) -> bool {
+        matches!(self, Self::FloatVector | Self::SparseFloatVector)
     }
 }
 
@@ -101,6 +114,33 @@ pub struct CollectionSchema {
     /// collection properties，按 Python dict 的语义：key 唯一、保持首次出现的位置。
     /// 3.x 原样保存与回显，只有 `timezone` 有语义（见 [`CollectionSchema::validate`]）。
     pub properties: Vec<(String, String)>,
+}
+
+/// 3.x 用 `_validate_sparse_vector` 校验默认值。gRPC 的默认值只能是标量，得到 3.x 的类型错误；dict 只能来自
+/// 3.x Python API 写的 schema，按登记的差异拒绝（0030）。
+fn check_sparse_default(name: &str, value: &serde_json::Value) -> Result<()> {
+    use serde_json::Value;
+    let kind = match value {
+        Value::Object(_) => {
+            return Err(EngineError::unsupported(
+                "sparse vector default values",
+                format!(
+                    "default value of sparse vector field {} is not supported in this build of milvus-lite-rust",
+                    py_repr(name)
+                ),
+            ));
+        }
+        Value::Bool(_) => "bool",
+        Value::Number(n) if n.as_str().contains(['.', 'e', 'E']) => "float",
+        Value::Number(_) => "int",
+        Value::String(_) => "str",
+        Value::Array(_) => "list",
+        Value::Null => "NoneType",
+    };
+    Err(EngineError::schema(format!(
+        "sparse vector field {}: sparse vector must be a dict, got {kind}",
+        py_repr(name)
+    )))
 }
 
 /// 3.x 的保留字段名；`iso` 与 `interval` 不区分大小写。
@@ -183,6 +223,11 @@ impl CollectionSchema {
                     py_repr(&f.name)
                 )));
             }
+            if f.data_type == DataType::SparseFloatVector
+                && let Some(default) = f.default_value.as_ref().filter(|v| !v.is_null())
+            {
+                check_sparse_default(&f.name, default)?;
+            }
             if f.data_type == DataType::Array {
                 let element = f.element_type.ok_or_else(|| {
                     EngineError::schema(format!(
@@ -195,6 +240,7 @@ impl CollectionSchema {
                     DataType::Array
                         | DataType::Json
                         | DataType::FloatVector
+                        | DataType::SparseFloatVector
                         | DataType::Timestamptz
                 ) {
                     return Err(EngineError::unsupported(
@@ -248,7 +294,7 @@ impl CollectionSchema {
         let vectors = self
             .fields
             .iter()
-            .filter(|f| f.data_type.is_vector())
+            .filter(|f| f.data_type.is_any_vector())
             .count();
         if vectors == 0 {
             return Err(EngineError::schema(
@@ -280,7 +326,7 @@ impl CollectionSchema {
         if self
             .fields
             .iter()
-            .any(|f| f.data_type.is_vector() && (f.nullable || f.default_value.is_some()))
+            .any(|f| f.data_type.is_dense_vector() && (f.nullable || f.default_value.is_some()))
         {
             return Err(EngineError::unsupported(
                 "nullable vectors and vector defaults",
@@ -328,7 +374,7 @@ impl CollectionSchema {
 
     /// 第一个 FLOAT_VECTOR 字段，与 3.x 的 `_vector_name` 相同。
     pub fn vector_field(&self) -> Option<&FieldSchema> {
-        self.fields.iter().find(|f| f.data_type.is_vector())
+        self.fields.iter().find(|f| f.data_type.is_dense_vector())
     }
 
     /// FLOAT_VECTOR 字段数，也是内存范数每行的个数（[0028](../../../docs/decisions/0028-multi-vector-fields.md)）。
@@ -373,6 +419,66 @@ fn default_limit(value: &serde_json::Value) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sparse(name: &str) -> FieldSchema {
+        FieldSchema::new(name, DataType::SparseFloatVector)
+    }
+
+    /// 3.x `validate_schema`：稀疏字段算作向量字段，可以 nullable；默认值经 `_validate_sparse_vector` 校验，
+    /// gRPC 只能给出标量默认值，dict 默认值按登记的差异拒绝（0030）。
+    #[test]
+    fn sparse_fields_count_as_vectors_and_check_defaults_like_3x() {
+        let mut nullable = sparse("sp");
+        nullable.nullable = true;
+        let only_sparse = CollectionSchema {
+            fields: vec![pk("id"), nullable],
+            enable_dynamic_field: false,
+            properties: Vec::new(),
+        };
+        only_sparse.validate().unwrap();
+        assert!(only_sparse.vector_field().is_none());
+        assert_eq!(only_sparse.vector_count(), 0);
+
+        let with_default = |value: serde_json::Value| {
+            let mut field = sparse("sp");
+            field.default_value = Some(value);
+            CollectionSchema {
+                fields: vec![pk("id"), vec("v", 2), field],
+                enable_dynamic_field: false,
+                properties: Vec::new(),
+            }
+            .validate()
+            .unwrap_err()
+            .to_string()
+        };
+        for (value, kind) in [
+            (serde_json::json!(5), "int"),
+            (serde_json::json!(0.5), "float"),
+            (serde_json::json!("x"), "str"),
+            (serde_json::json!(true), "bool"),
+        ] {
+            assert_eq!(
+                with_default(value),
+                format!("sparse vector field 'sp': sparse vector must be a dict, got {kind}")
+            );
+        }
+        assert!(
+            with_default(serde_json::json!({"1": 0.5}))
+                .contains("default value of sparse vector field 'sp' is not supported")
+        );
+
+        let mut dense = vec("v", 2);
+        dense.nullable = true;
+        assert!(matches!(
+            CollectionSchema {
+                fields: vec![pk("id"), dense],
+                enable_dynamic_field: false,
+                properties: Vec::new(),
+            }
+            .validate(),
+            Err(EngineError::Unsupported { .. })
+        ));
+    }
 
     #[test]
     fn default_metadata_rejects_unreadable_python_integers_without_rejecting_strings() {

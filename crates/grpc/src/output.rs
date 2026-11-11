@@ -275,6 +275,8 @@ fn field_data(
                         data: values,
                     })),
                 })
+            } else if data_type == DataType::SparseFloatVector {
+                field_data::Field::Vectors(sparse_vectors(parts)?)
             } else {
                 field_data::Field::Scalars(pb::ScalarField {
                     data: Some(scalar(data_type, element_type, parts)?),
@@ -294,6 +296,32 @@ fn field_data(
             _ => Vec::new(),
         },
         ..Default::default()
+    })
+}
+
+/// 有效行的字节原样输出（3.x 对 bytes 行直接 append），`dim` 取解码出的最大维度号加 1，长度不对时报 3.x 的错误。
+/// 有空值时 `contents` 只含有效行，与 `valid_data` 一起按 pymilvus 的紧凑约定解码；3.x 把空值行也写成 `b""`，
+/// pymilvus 因此把有效行读错，这一差异见 0030。
+fn sparse_vectors(parts: &[&ColumnData]) -> Result<pb::VectorField, EngineError> {
+    let mut contents = Vec::new();
+    let mut dim = 0;
+    for column in parts {
+        let ColumnData::SparseFloatVector(rows) = column.values() else {
+            unreachable!("{MISMATCH}");
+        };
+        for (row, bytes) in rows.rows().enumerate() {
+            if column.is_null(row) {
+                continue;
+            }
+            dim = dim.max(milvus_lite_core::data::sparse::output_dim(bytes)?);
+            contents.push(bytes.to_vec());
+        }
+    }
+    Ok(pb::VectorField {
+        dim: 0,
+        data: Some(vector_field::Data::SparseFloatVector(
+            pb::SparseFloatArray { contents, dim },
+        )),
     })
 }
 
@@ -464,6 +492,94 @@ fn scalar(
                 .collect(),
         }),
         // 向量列在 field_data 中单独处理。
-        DataType::FloatVector => Data::FloatData(pb::FloatArray { data: Vec::new() }),
+        DataType::FloatVector | DataType::SparseFloatVector => {
+            Data::FloatData(pb::FloatArray { data: Vec::new() })
+        }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use milvus_lite_core::data::{SparseData, Validity};
+
+    fn pack(pairs: &[(u32, f32)]) -> Vec<u8> {
+        pairs
+            .iter()
+            .flat_map(|(d, w)| d.to_le_bytes().into_iter().chain(w.to_le_bytes()))
+            .collect()
+    }
+
+    fn sparse_field(parts: &[&ColumnData]) -> Result<pb::FieldData, EngineError> {
+        field_data(
+            "sp",
+            DataType::SparseFloatVector,
+            None,
+            None,
+            &Column::Data(parts.to_vec()),
+        )
+    }
+
+    fn contents(fd: &pb::FieldData) -> (&[Vec<u8>], i64, i64) {
+        let Some(field_data::Field::Vectors(vectors)) = &fd.field else {
+            panic!("sparse output is not a vector field");
+        };
+        let Some(vector_field::Data::SparseFloatVector(array)) = &vectors.data else {
+            panic!("sparse output lost its slot");
+        };
+        (&array.contents, array.dim, vectors.dim)
+    }
+
+    /// 没有空值时与 3.x 相同：按行原样输出字节（乱序与零权重不改写），`dim` 含零权重维度。
+    #[test]
+    fn rows_pass_through_and_dim_counts_every_decoded_dimension() {
+        let unsorted = pack(&[(9, 1.0), (2, 0.0)]);
+        let column =
+            ColumnData::SparseFloatVector(SparseData::from_rows([unsorted.clone(), Vec::new()]));
+        let fd = sparse_field(&[&column]).unwrap();
+        assert!(fd.valid_data.is_empty());
+        assert_eq!(fd.r#type, 104);
+        let (rows, dim, vector_dim) = contents(&fd);
+        assert_eq!(rows, &[unsorted, Vec::new()]);
+        assert_eq!((dim, vector_dim), (10, 0));
+    }
+
+    /// 有空值时 contents 只含有效行，与 valid_data 一起按 pymilvus 的紧凑约定解码；3.x 的补齐写法是登记的差异。
+    #[test]
+    fn nulls_use_compact_contents_and_valid_rows_only_for_dim() {
+        let nullable = |rows: SparseData, valid: &[bool]| ColumnData::Nullable {
+            values: Box::new(ColumnData::SparseFloatVector(rows)),
+            validity: Validity::from_bools(valid),
+        };
+        let first = nullable(
+            SparseData::from_rows([Vec::new(), pack(&[(3, 1.0)])]),
+            &[false, true],
+        );
+        let second = ColumnData::SparseFloatVector(SparseData::from_rows([pack(&[(1, 2.0)])]));
+        let fd = sparse_field(&[&first, &second]).unwrap();
+        assert_eq!(fd.valid_data, vec![false, true, true]);
+        let (rows, dim, _) = contents(&fd);
+        assert_eq!(rows, &[pack(&[(3, 1.0)]), pack(&[(1, 2.0)])]);
+        assert_eq!(dim, 4);
+
+        let all_null = nullable(SparseData::from_rows([Vec::<u8>::new()]), &[false]);
+        let fd = sparse_field(&[&all_null]).unwrap();
+        assert_eq!(fd.valid_data, vec![false]);
+        let (rows, dim, _) = contents(&fd);
+        assert!(rows.is_empty());
+        assert_eq!(dim, 0);
+    }
+
+    /// 3.x 为算 `dim` 解码每个 bytes 行，所以长度不对的历史行在输出时报 code 1。
+    #[test]
+    fn malformed_stored_row_fails_output_like_3x() {
+        let column =
+            ColumnData::SparseFloatVector(SparseData::from_rows([vec![1, 2, 3, 4, 5, 6, 7]]));
+        let error = sparse_field(&[&column]).unwrap_err();
+        assert!(matches!(error, EngineError::InvalidArgument(_)));
+        assert_eq!(
+            error.to_string(),
+            "sparse vector bytes length 7 is not a multiple of 8"
+        );
+    }
 }

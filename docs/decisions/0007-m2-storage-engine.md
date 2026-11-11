@@ -103,7 +103,7 @@ WAL 追加（每次写入调用一个 batch，dim 128）：
   - 名字锁是 db 级的、每个（数据库，名字）一把：打开、drop、create 都持有它；改名同时持旧名与新名两把（见下）。
   - flush 锁是每个 collection 一把互斥锁：串行化所有写 manifest 的操作（flush、CreateIndex 等）与 drop。
   - 状态读写锁保护 collection 的全部可变状态。
-- 叶子锁：collection 表锁、名字锁注册表、失败判定缓存、aliases 锁、关闭闸门与 WAL 文件锁。持有任何锁时都可以取叶子锁，持有叶子锁时不取任何其他锁。
+- 叶子锁：collection 表锁、名字锁注册表、失败判定缓存、aliases 锁、关闭闸门、WAL 文件锁与已提交块上的稀疏倒排槽位（[0030](0030-sparse-vectors.md)，只在 RPC 线程上存取，计算任务不碰）。持有任何锁时都可以取叶子锁，持有叶子锁时不取任何其他锁。
   - collection 表锁只保护查表、登记与移除。打开时持名字锁登记句柄、drop 在移出句柄时已持有外层的数据库写入闸门、目录变更锁、名字锁与 collection 锁，都是这种用法。
   - aliases 叶子锁独立保护 `aliases.json` 的完整读改写与原子改名；create 在该叶子临界区内清理悬空别名并判断名字，随后释放它；drop 在目录提交后重新取得它、重新读取别名并清理目标。前置元数据校验只短暂持锁，不能跨 flush 锁或状态锁持有叶子锁。create/drop 的数据库独占许可与目录变更锁仍保留，两个别名事务的串行与不丢更新分别有用例。tmp 用 `create_new` 的唯一名字，避免共享 tmp 覆盖。
 - **0023 的扩展**（细节与理由见 [0023 A 实施设计](0023-aliases-rename-truncate-databases.md#a-实施设计终稿)）：
@@ -113,7 +113,7 @@ WAL 追加（每次写入调用一个 batch，dim 128）：
   - **数据库生命周期**（0023 B，设计与理由见 [B 实施设计](0023-aliases-rename-truncate-databases.md#b-实施设计评审稿)）：CreateDatabase、DropDatabase 持独占许可与目录变更锁（`databases/` 与 `.database-staging/` 也由目录变更锁保护），AlterDatabase 持独占许可与该库的属性叶子锁；三者与所有集合写入、首次懒打开、合并互斥，已打开集合的纯读不受影响。数据库注册表（`databases`）是叶子锁，打开时枚举 `databases/` 建立，运行期只由 Create / Drop 在独占许可内增删，取出 `Arc` 即放；取得许可之后的路径重新取数据库状态，不沿用许可之前的 `Arc`。每个库各有一份别名叶子锁、属性叶子锁与改名未完成状态。Drop 要求库内无集合，因此没有需要排空的句柄、维护任务或意图；写入封锁仍是整个服务实例一个标志，不按数据库拆分。
   - **名字锁与状态写锁的覆盖面**：AlterCollection、清空只在打开期间持名字锁；AlterCollection 只在发布新属性时持状态写锁（写文件与 fsync 不持）；清空从第 2 步 flush 到第 5 步发布新读视图之前全程持状态写锁（flush、WAL 迁移、manifest 替换与重建的磁盘 I/O 都在锁内），第 6 步清理不持。
 - 0005 的计算池任务不取任何锁，不变。
-- [lock_order](../../crates/core/src/lock_order.rs) 在 debug 构建中检查五层锁及 collection 表、名字锁注册表、判定缓存与 aliases 的叶子锁；反向、同层嵌套与同锁重入在阻塞之前报错，禁止共享许可升级。失败的非阻塞探测不登记临界区；测试观察锁占用使用不构造业务守卫的独立接口。release 不注册线程局部状态或执行顺序断言。关闭闸门和 `wal_files` 的内部锁仍由结构保证叶子性质，不在该包装器内；其临界区不得获取五层锁。
+- [lock_order](../../crates/core/src/lock_order.rs) 在 debug 构建中检查五层锁及 collection 表、名字锁注册表、判定缓存、aliases 与稀疏倒排槽位的叶子锁；反向、同层嵌套与同锁重入在阻塞之前报错，禁止共享许可升级。失败的非阻塞探测不登记临界区；测试观察锁占用使用不构造业务守卫的独立接口。release 不注册线程局部状态或执行顺序断言。关闭闸门和 `wal_files` 的内部锁仍由结构保证叶子性质，不在该包装器内；其临界区不得获取五层锁。
 
 ### 写入
 

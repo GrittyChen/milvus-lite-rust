@@ -160,8 +160,9 @@ const KNOWN_VECTOR_INDEX_TYPES: [&str; 9] = [
 const KNOWN_SCALAR_INDEX_TYPES: [&str; 5] = ["INVERTED", "BITMAP", "STL_SORT", "TRIE", "NGRAM"];
 const SPEC_METRICS: [&str; 5] = ["COSINE", "L2", "IP", "BM25", "NONE"];
 const FAISS_DENSE_TYPES: [&str; 5] = ["AUTOINDEX", "HNSW", "HNSW_SQ", "IVF_FLAT", "IVF_SQ8"];
-/// 接受 3.x 可构建的稠密向量定义；实际检索保持 FLAT（0014）。
-const ACCEPTED_DENSE_INDEX_TYPES: [&str; 7] = [
+/// 接受 3.x 可构建的稠密向量定义；实际检索保持 FLAT（0014）。稠密字段上的 SPARSE_INVERTED_INDEX
+/// 在 3.x 中按字段类型走稠密检索、load 时不建任何索引，同样接受（0030）。
+const ACCEPTED_DENSE_INDEX_TYPES: [&str; 8] = [
     "FLAT",
     "BRUTE_FORCE",
     "AUTOINDEX",
@@ -169,17 +170,86 @@ const ACCEPTED_DENSE_INDEX_TYPES: [&str; 7] = [
     "HNSW_SQ",
     "IVF_FLAT",
     "IVF_SQ8",
+    SPARSE_INDEX,
 ];
+pub(crate) const SPARSE_INDEX: &str = "SPARSE_INVERTED_INDEX";
+
+/// 3.x `_validate_sparse_index_config`：普通稀疏字段只接受 SPARSE_INVERTED_INDEX + IP，再校验
+/// build 与 search 两组参数里的调参项。create_index、load 与每次检索都用它校验同一份定义。
+pub(crate) fn check_sparse_config(
+    field: &str,
+    index_type: &str,
+    metric_type: &str,
+    params: &Map<String, Value>,
+    search_params: &Map<String, Value>,
+) -> Result<()> {
+    if index_type != SPARSE_INDEX || metric_type != "IP" {
+        return Err(EngineError::schema(format!(
+            "sparse field {} requires SPARSE_INVERTED_INDEX with metric IP; got {}/{}. \
+             For an existing index, release, drop, and recreate it with the allowed metric.",
+            py_repr(field),
+            py_repr(index_type),
+            py_repr(metric_type)
+        )));
+    }
+    check_sparse_tuning(field, params)?;
+    check_sparse_tuning(field, search_params)
+}
+
+/// 3.x `_validate_sparse_tuning`：数值按 Python `float()` 转换（`"0"`、`False` 可以，`True`、`None` 不行）。
+/// 普通稀疏字段的度量只能是 IP，所以 BM25 参数一律拒绝；BM25 字段的取值校验随第 6 步加入。
+pub(crate) fn check_sparse_tuning(field: &str, params: &Map<String, Value>) -> Result<()> {
+    use crate::rerank::pyval::PyVal;
+    let float = |value: &Value| PyVal::from_json(value).to_float().ok();
+    if let Some(name) = ["bm25_k1", "bm25_b"]
+        .into_iter()
+        .find(|name| params.contains_key(*name))
+    {
+        return Err(EngineError::schema(format!(
+            "IP field {} does not accept {name}",
+            py_repr(field)
+        )));
+    }
+    for name in ["drop_ratio_build", "drop_ratio_search"] {
+        if let Some(value) = params.get(name)
+            && float(value) != Some(0.0)
+        {
+            return Err(EngineError::schema(format!(
+                "field {}: only {name}=0 is supported",
+                py_repr(field)
+            )));
+        }
+    }
+    match params.get("inverted_index_algo") {
+        None => Ok(()),
+        Some(Value::String(algo)) if algo.to_uppercase() == "TAAT_NAIVE" => Ok(()),
+        Some(other) => Err(EngineError::schema(format!(
+            "field {}: unsupported sparse algorithm {}; use TAAT_NAIVE",
+            py_repr(field),
+            crate::error::py_json_repr(other)
+        ))),
+    }
+}
 
 /// 按 3.x `Collection.create_index` 的顺序校验，再拒绝本阶段无法写出的类型。
 /// 调用方已检查「索引已存在」与「字段不存在」。
 pub(crate) fn build_spec(field: &FieldSchema, req: IndexRequest) -> Result<IndexSpec> {
     let index_type = req.index_type.to_uppercase();
     let requested_metric = req.metric_type.map(|m| m.to_uppercase());
-    let metric_type = if field.data_type.is_vector() {
-        requested_metric.ok_or_else(|| {
+    let metric_type = if field.data_type.is_any_vector() {
+        let metric = requested_metric.ok_or_else(|| {
             EngineError::schema("create_index missing required 'metric_type' parameter")
-        })?
+        })?;
+        if field.data_type.is_sparse_vector() {
+            check_sparse_config(
+                &field.name,
+                &index_type,
+                &metric,
+                &req.params,
+                &req.search_params,
+            )?;
+        }
+        metric
     } else {
         if KNOWN_VECTOR_INDEX_TYPES.contains(&index_type.as_str()) {
             return Err(EngineError::schema(format!(
@@ -204,7 +274,7 @@ pub(crate) fn build_spec(field: &FieldSchema, req: IndexRequest) -> Result<Index
 
     // 3.x 的必装 FAISS 后端（含 AUTOINDEX → HNSW）只构建这三种度量。
     // 先保留 IndexSpec 的原有校验，再拒绝能解析、但切回 3.x 无法 load 的组合。
-    if field.data_type.is_vector()
+    if field.data_type.is_dense_vector()
         && FAISS_DENSE_TYPES.contains(&index_type.as_str())
         && !matches!(metric_type.as_str(), "COSINE" | "L2" | "IP")
     {
@@ -219,12 +289,15 @@ pub(crate) fn build_spec(field: &FieldSchema, req: IndexRequest) -> Result<Index
     }
 
     // 3.x 会保存无法构建的定义；本实现只写它能构建的类型（0002 约束 1、0014）。
-    if field.data_type.is_vector() && !ACCEPTED_DENSE_INDEX_TYPES.contains(&index_type.as_str()) {
+    if field.data_type.is_dense_vector()
+        && !ACCEPTED_DENSE_INDEX_TYPES.contains(&index_type.as_str())
+    {
         return Err(EngineError::unsupported(
             "vector index type",
             format!(
                 "index_type {} is not supported in this build of milvus-lite-rust yet; \
-                     supported: FLAT, BRUTE_FORCE, AUTOINDEX, HNSW, HNSW_SQ, IVF_FLAT, IVF_SQ8 (executed as FLAT)",
+                     supported: FLAT, BRUTE_FORCE, AUTOINDEX, HNSW, HNSW_SQ, IVF_FLAT, IVF_SQ8, \
+                     SPARSE_INVERTED_INDEX (executed as FLAT)",
                 py_repr(&index_type)
             ),
         ));
@@ -273,7 +346,7 @@ pub(crate) fn unbuildable(spec: &IndexSpec, field: &FieldSchema) -> Option<Engin
             "scalar index INVERTED does not support field type ARRAY",
         ));
     }
-    if !field.data_type.is_vector() {
+    if !field.data_type.is_dense_vector() {
         return None;
     }
     let message = match spec.index_type.as_str() {
@@ -301,7 +374,7 @@ pub(crate) fn unbuildable(spec: &IndexSpec, field: &FieldSchema) -> Option<Engin
 
 /// 已有侧车的 load 不校验度量；调用方仅在至少一个非空 segment 缺少侧车时使用此错误。
 pub(crate) fn unbuildable_metric(spec: &IndexSpec, field: &FieldSchema) -> Option<EngineError> {
-    (field.data_type.is_vector()
+    (field.data_type.is_dense_vector()
         && FAISS_DENSE_TYPES.contains(&spec.index_type.as_str())
         && matches!(spec.metric_type.as_str(), "BM25" | "NONE"))
     .then(|| {
@@ -371,6 +444,137 @@ mod tests {
 
     fn err(field: &FieldSchema, r: IndexRequest) -> EngineError {
         build_spec(field, r).unwrap_err()
+    }
+
+    fn params(json: serde_json::Value) -> Map<String, Value> {
+        json.as_object().unwrap().clone()
+    }
+
+    /// 3.x `create_index`：先要求度量，再按 `_validate_sparse_index_config` 只接受 SPARSE_INVERTED_INDEX + IP。
+    #[test]
+    fn sparse_fields_accept_only_sparse_inverted_index_with_ip() {
+        let field = FieldSchema::new("sp", DataType::SparseFloatVector);
+        for index_type in ["INVERTED", "SPARSE_INVERTED_INDEX", "FLAT"] {
+            assert_eq!(
+                build_spec(&field, req(index_type, None))
+                    .unwrap_err()
+                    .to_string(),
+                "create_index missing required 'metric_type' parameter"
+            );
+        }
+        for (index_type, metric) in [
+            ("INVERTED", "IP"),
+            ("FLAT", "IP"),
+            ("AUTOINDEX", "IP"),
+            ("SPARSE_INVERTED_INDEX", "BM25"),
+            ("SPARSE_INVERTED_INDEX", "L2"),
+            ("SPARSE_INVERTED_INDEX", "FOO"),
+        ] {
+            let error = build_spec(&field, req(index_type, Some(metric))).unwrap_err();
+            assert!(
+                matches!(error, EngineError::SchemaValidation(_)),
+                "{error:?}"
+            );
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "sparse field 'sp' requires SPARSE_INVERTED_INDEX with metric IP; got '{index_type}'/'{metric}'. \
+                     For an existing index, release, drop, and recreate it with the allowed metric."
+                )
+            );
+        }
+        let spec = build_spec(&field, req("sparse_inverted_index", Some("ip"))).unwrap();
+        assert_eq!(
+            (spec.index_type.as_str(), spec.metric_type.as_str()),
+            ("SPARSE_INVERTED_INDEX", "IP")
+        );
+    }
+
+    /// 3.x `_validate_sparse_tuning` 的 Python `float()` 规则；build 与 search 两组参数都校验。
+    #[test]
+    fn sparse_tuning_follows_python_float_rules() {
+        let check = |json| check_sparse_tuning("sp", &params(json));
+        for ok in [
+            serde_json::json!({}),
+            serde_json::json!({"drop_ratio_build": 0}),
+            serde_json::json!({"drop_ratio_build": "0", "drop_ratio_search": -0.0}),
+            serde_json::json!({"drop_ratio_search": false}),
+            serde_json::json!({"drop_ratio_build": " 0e5 "}),
+            serde_json::json!({"inverted_index_algo": "taat_naive"}),
+            serde_json::json!({"unrelated": [1]}),
+        ] {
+            assert!(check(ok.clone()).is_ok(), "{ok}");
+        }
+        for (bad, message) in [
+            (
+                serde_json::json!({"drop_ratio_build": true}),
+                "field 'sp': only drop_ratio_build=0 is supported",
+            ),
+            (
+                serde_json::json!({"drop_ratio_build": null}),
+                "field 'sp': only drop_ratio_build=0 is supported",
+            ),
+            (
+                serde_json::json!({"drop_ratio_search": "0.1"}),
+                "field 'sp': only drop_ratio_search=0 is supported",
+            ),
+            (
+                serde_json::json!({"drop_ratio_search": [0]}),
+                "field 'sp': only drop_ratio_search=0 is supported",
+            ),
+            (
+                serde_json::json!({"bm25_k1": 1.2}),
+                "IP field 'sp' does not accept bm25_k1",
+            ),
+            (
+                serde_json::json!({"drop_ratio_build": 0.5, "bm25_b": 0.5}),
+                "IP field 'sp' does not accept bm25_b",
+            ),
+            (
+                serde_json::json!({"inverted_index_algo": "DAAT"}),
+                "field 'sp': unsupported sparse algorithm 'DAAT'; use TAAT_NAIVE",
+            ),
+            (
+                serde_json::json!({"inverted_index_algo": null}),
+                "field 'sp': unsupported sparse algorithm None; use TAAT_NAIVE",
+            ),
+            (
+                serde_json::json!({"inverted_index_algo": 1}),
+                "field 'sp': unsupported sparse algorithm 1; use TAAT_NAIVE",
+            ),
+        ] {
+            assert_eq!(
+                check(bad.clone()).unwrap_err().to_string(),
+                message,
+                "{bad}"
+            );
+        }
+        let mut request = req("SPARSE_INVERTED_INDEX", Some("IP"));
+        request.search_params = params(serde_json::json!({"drop_ratio_search": 0.2}));
+        assert_eq!(
+            build_spec(
+                &FieldSchema::new("sp", DataType::SparseFloatVector),
+                request
+            )
+            .unwrap_err()
+            .to_string(),
+            "field 'sp': only drop_ratio_search=0 is supported"
+        );
+    }
+
+    /// 稠密字段上的 SPARSE_INVERTED_INDEX：五种度量都能建，调参项不校验，load 时不建任何东西（3.x 实测）。
+    #[test]
+    fn dense_fields_keep_sparse_inverted_index_definitions_unvalidated() {
+        for metric in ["IP", "COSINE", "L2", "BM25", "NONE"] {
+            let mut request = req("SPARSE_INVERTED_INDEX", Some(metric));
+            request.params = params(serde_json::json!({
+                "drop_ratio_build": 0.5, "bm25_k1": 1, "inverted_index_algo": "DAAT"
+            }));
+            let spec = build_spec(&vector(), request).unwrap();
+            assert_eq!(spec.metric_type, metric);
+            assert!(unbuildable(&spec, &vector()).is_none());
+            assert!(unbuildable_metric(&spec, &vector()).is_none());
+        }
     }
 
     #[test]

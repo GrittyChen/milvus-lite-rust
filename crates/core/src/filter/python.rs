@@ -476,6 +476,12 @@ fn column_value(column: &ColumnData, index: usize) -> Result<Value<'_>> {
             ColumnData::FloatVector { dim, values } => {
                 Value::Vector(&values[index * dim..(index + 1) * dim])
             }
+            // 绑定阶段已拒绝在过滤中引用稀疏字段。
+            ColumnData::SparseFloatVector(_) => {
+                return Err(EngineError::Storage(
+                    "sparse vector column reached filter evaluation".into(),
+                ));
+            }
         }
     })
 }

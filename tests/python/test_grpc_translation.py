@@ -1248,7 +1248,6 @@ def test_pymilvus_entry_points_remaining_unsupported(env):
                      params={"reranker": "model", "provider": "cohere", "queries": ["q"]})
     cases = [
         (with_field("n", DataType.FLOAT_VECTOR, dim=2, nullable=True), f"nullable vectors: {feature}"),
-        (with_field("s", DataType.SPARSE_FLOAT_VECTOR), f"SPARSE_FLOAT_VECTOR fields: {feature}"),
         (with_field("g", DataType.GEOMETRY), f"GEOMETRY fields: {feature}"),
         # pymilvus 3.0 先发 AlterCollectionSchema，收到 UNIMPLEMENTED 后回退到 AddCollectionField。
         (lambda: client.add_collection_field("q", "x", DataType.INT64, nullable=True), f"AddCollectionField: {rpc}"),

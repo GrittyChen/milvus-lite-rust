@@ -46,6 +46,8 @@ pub(crate) struct Parsed {
     /// 请求里的 `timezone` / `time_fields`（空串与非字符串视为没有，同 3.x `translators/search.py`）。
     pub(crate) timezone: Option<String>,
     pub(crate) time_fields: Option<String>,
+    /// 3.x 的引擎检索参数：`params` 为对象时取它，否则为空（稀疏检索按它校验调参项）。
+    pub(crate) params: serde_json::Map<String, Value>,
 }
 
 impl Parsed {
@@ -88,6 +90,7 @@ pub(crate) fn search(
         c.schema().timezone().map(str::to_owned),
         database_timezone,
     );
+    let negative_top_k = effective_top_k(&parsed) < 0;
     let request = SearchRequest {
         anns_field: parsed.anns_field,
         vectors: parsed.vectors,
@@ -95,6 +98,8 @@ pub(crate) fn search(
         limit,
         offset: usize::try_from(skip).unwrap_or(usize::MAX),
         output_fields,
+        params: parsed.params,
+        negative_top_k,
     };
     let filter = BoostedFilter {
         expr: &parsed.expr,
@@ -267,7 +272,7 @@ fn pk_from_override(id: &PyVal, varchar: bool) -> Result<Pk, EngineError> {
                 "Value out of range: {text}"
             )));
         }
-        PyVal::None | PyVal::List(_) | PyVal::Dict(_) | PyVal::DateTime(_) => {
+        PyVal::None | PyVal::List(_) | PyVal::Dict(_) | PyVal::DateTime(_) | PyVal::Bytes(_) => {
             return Err(EngineError::InvalidArgument(format!(
                 "int() argument must be a string, a bytes-like object or a real number, not {}",
                 py_repr(id.type_name())
@@ -455,7 +460,25 @@ fn parse_request(req: &svc::SearchRequest, route: bool) -> Result<Parsed, Engine
         l2: decoded.l2,
         timezone: non_empty_string(raw.get("timezone")),
         time_fields: non_empty_string(raw.get("time_fields")),
+        params: inner.cloned().unwrap_or_default(),
     })
+}
+
+/// 3.x `Collection.search` 的 `effective_top_k`：`top_k + offset`，分组时取 `max(× group_size × 3, × 10)`，
+/// 有范围参数时不小于 `× 5`，有 boost 时不小于 `× 10`。负的 `group_size` 可以让它变正。
+fn effective_top_k(parsed: &Parsed) -> i128 {
+    let end = i128::from(parsed.top_k) + i128::from(parsed.offset);
+    let mut effective = end;
+    if let Some(group) = &parsed.group {
+        effective = (end * i128::from(group.size) * 3).max(end * 10);
+    }
+    if parsed.range.is_some() {
+        effective = effective.max(end * 5);
+    }
+    if parsed.boost.is_some() {
+        effective = effective.max(end * 10);
+    }
+    effective
 }
 
 fn non_empty_string(value: Option<&Value>) -> Option<String> {
@@ -517,16 +540,14 @@ fn placeholders(req: &svc::SearchRequest) -> Result<QueryVectors, EngineError> {
         PLACEHOLDER_SPARSE_FLOAT_VECTOR | PLACEHOLDER_VARCHAR if first.values.is_empty() => {
             Err(no_vectors())
         }
-        PLACEHOLDER_SPARSE_FLOAT_VECTOR => {
-            // 3.x `bytes_to_sparse`：每个非零项是 (u32 下标, f32 值) 共 8 字节。
-            if let Some(blob) = first.values.iter().find(|b| b.len() % 8 != 0) {
-                return Err(EngineError::InvalidArgument(format!(
-                    "sparse vector bytes length {} is not a multiple of 8",
-                    blob.len()
-                )));
-            }
-            Ok(QueryVectors::Sparse)
-        }
+        // 3.x `bytes_to_sparse`：每个非零项是 (u32 下标, f32 值) 共 8 字节，空值为空 dict。
+        PLACEHOLDER_SPARSE_FLOAT_VECTOR => Ok(QueryVectors::Sparse(
+            first
+                .values
+                .iter()
+                .map(|blob| milvus_lite_core::data::sparse::decode(blob))
+                .collect::<Result<_, _>>()?,
+        )),
         PLACEHOLDER_VARCHAR => Ok(QueryVectors::Text),
         t => Err(schema_err(format!(
             "PlaceholderValue type {t} not supported \

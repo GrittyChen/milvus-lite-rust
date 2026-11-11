@@ -25,6 +25,7 @@ fn m1_type(t: i32) -> Option<DataType> {
         22 => DataType::Array,
         26 => DataType::Timestamptz,
         101 => DataType::FloatVector,
+        104 => DataType::SparseFloatVector,
         _ => return None,
     })
 }
@@ -43,14 +44,14 @@ pub(crate) fn milvus_type(t: DataType) -> i32 {
         DataType::Array => 22,
         DataType::Timestamptz => 26,
         DataType::FloatVector => 101,
+        DataType::SparseFloatVector => 104,
     }
 }
 
-/// 3.x 支持、当前尚不支持的类型（GEOMETRY、稀疏向量）。
+/// 3.x 支持、当前尚不支持的类型（GEOMETRY）。
 fn unsupported_in_m1(t: i32) -> Option<&'static str> {
     Some(match t {
         24 => "GEOMETRY fields",
-        104 => "SPARSE_FLOAT_VECTOR fields",
         _ => return None,
     })
 }
@@ -408,7 +409,9 @@ fn encode_default(dtype: DataType, value: &Value) -> Result<Option<pb::ValueFiel
             Value::String(v) => v.clone(),
             other => milvus_lite_core::error::py_json_repr(other),
         }),
-        DataType::Json | DataType::FloatVector | DataType::Array => return Ok(None),
+        DataType::Json | DataType::FloatVector | DataType::SparseFloatVector | DataType::Array => {
+            return Ok(None);
+        }
     };
     Ok(Some(pb::ValueField { data: Some(data) }))
 }

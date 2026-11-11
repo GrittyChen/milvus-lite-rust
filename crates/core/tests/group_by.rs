@@ -102,6 +102,8 @@ fn request(limit: usize, offset: usize) -> SearchRequest {
         limit,
         offset,
         output_fields: vec!["grp".into()],
+        params: Default::default(),
+        negative_top_k: false,
     }
 }
 

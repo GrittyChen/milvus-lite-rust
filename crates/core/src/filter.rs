@@ -188,6 +188,35 @@ impl RowFilter {
     }
 }
 
+/// 3.x 稀疏检索在 MemTable 上对每条记录调用 `_eval_row`（记录含 `$meta`，动态字段可见），不按整条表达式
+/// 选择路线（0030）；与 boost 的 [`RowFilter`] 不同，主键不改绑、动态字段照常可见。
+pub(crate) struct RecordFilter {
+    tree: tree::Tree,
+}
+
+impl RecordFilter {
+    /// 表达式为空时返回 None。调用方已用 [`Predicate::from_parsed`] 报出编译与范围外错误。
+    pub(crate) fn compile(
+        parsed: &ParsedFilter,
+        schema: &crate::schema::CollectionSchema,
+    ) -> Result<Option<Self>> {
+        if parsed.ast.is_none() {
+            return Ok(None);
+        }
+        Ok(Some(Self {
+            tree: tree::Tree::compile(parsed, schema)?,
+        }))
+    }
+
+    /// 按给出的先后逐行求值：第一个出错的行决定报出的错误。
+    pub(crate) fn evaluate(
+        &self,
+        rows: &[DynamicRow<'_>],
+    ) -> Result<crate::storage::visibility::SourceBits> {
+        python::evaluate_tree(&self.tree, rows)
+    }
+}
+
 /// 列表中的一个字面量。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PkLiteral {

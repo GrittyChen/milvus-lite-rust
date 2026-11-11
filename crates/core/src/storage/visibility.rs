@@ -317,6 +317,18 @@ impl Visibility {
         snapshot
     }
 
+    /// 稀疏检索的分区选择（见 [`partitions::PartitionVisibility::sparse_snapshot`]）；未启用分区时只有
+    /// `_default`，与 [`Self::selected_snapshot`] 相同。
+    pub fn sparse_selected_snapshot(
+        &self,
+        selected: &[partitions::PartitionId],
+    ) -> VisibilitySnapshot {
+        match &self.partitions {
+            Some(parts) => parts.sparse_snapshot(selected),
+            None => self.selected_snapshot(Some(selected)),
+        }
+    }
+
     pub(crate) fn freeze_source(&mut self, source: SourceId) -> Result<(), VisibilityError> {
         if let Some(parts) = self.partitions.as_mut() {
             parts.freeze(source)?;

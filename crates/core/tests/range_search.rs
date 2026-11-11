@@ -56,6 +56,8 @@ fn range_window_float64_thresholds_parallel_queries_and_old_snapshot() {
         limit,
         offset,
         output_fields: vec![],
+        params: Default::default(),
+        negative_top_k: false,
     };
     let range = Some(SearchRange {
         radius: Some(10000.),

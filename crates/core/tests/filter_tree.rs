@@ -148,6 +148,8 @@ fn late_source_failure_never_publishes_masks_or_writes_a_delete() {
                     limit: 2,
                     offset: 0,
                     output_fields: vec![],
+                    params: Default::default(),
+                    negative_top_k: false,
                 },
                 db.compute(),
                 expr,

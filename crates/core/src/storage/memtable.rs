@@ -654,6 +654,10 @@ fn validate_decoded(schema: &CollectionSchema, decoded: &DecodedData) -> Result<
                 | (DataType::Json, ColumnData::Json(_))
                 | (DataType::Array, ColumnData::Array(_))
                 | (DataType::FloatVector, ColumnData::FloatVector { .. })
+                | (
+                    DataType::SparseFloatVector,
+                    ColumnData::SparseFloatVector(_)
+                )
         );
         if !matches_type || column.len() != n {
             return Err(MemTableError::Column(field.name.clone()));

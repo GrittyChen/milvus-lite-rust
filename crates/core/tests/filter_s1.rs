@@ -322,6 +322,8 @@ fn float_comparisons_validate_all_live_operands_and_never_inspect_dead_integer_v
                 limit: 3,
                 offset: 0,
                 output_fields: vec![],
+                params: Default::default(),
+                negative_top_k: false,
             },
             engine.compute(),
             "age>1.0",

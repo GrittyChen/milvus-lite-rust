@@ -26,6 +26,7 @@ pub mod projection;
 pub mod pyjson;
 pub mod rerank;
 pub mod schema;
+mod sparse_index;
 pub mod storage;
 pub mod timestamptz;
 pub mod timezone;

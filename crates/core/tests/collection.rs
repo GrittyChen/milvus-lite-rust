@@ -101,6 +101,8 @@ fn search(c: &Collection, q: [f32; 2], limit: usize, metric: Option<&str>) -> (V
                 limit,
                 offset: 0,
                 output_fields: vec![],
+                params: Default::default(),
+                negative_top_k: false,
             },
             &compute(),
         )
@@ -500,6 +502,8 @@ fn no_query_vectors_returns_before_any_check() {
                 limit: 1,
                 offset: 0,
                 output_fields: vec![],
+                params: Default::default(),
+                negative_top_k: false,
             },
             &compute(),
         )
@@ -640,6 +644,8 @@ fn limit_offset_and_multiple_queries() {
         limit,
         offset,
         output_fields: vec![],
+        params: Default::default(),
+        negative_top_k: false,
     };
     let r = c.search(req(1, 2), &compute()).unwrap();
     assert_eq!(ints(&r.hits[0].rows.pks), [2, 3]);
@@ -675,6 +681,8 @@ fn search_default_output_includes_vector_and_meta_but_not_pk_field() {
                 limit: 1,
                 offset: 0,
                 output_fields: vec![],
+                params: Default::default(),
+                negative_top_k: false,
             },
             &compute(),
         )
@@ -705,6 +713,8 @@ fn search_metric_is_case_insensitive_and_empty_means_unset() {
                 limit: 1,
                 offset: 0,
                 output_fields: vec![],
+                params: Default::default(),
+                negative_top_k: false,
             },
             &compute(),
         )
@@ -736,6 +746,8 @@ fn search_argument_errors() {
         limit: 1,
         offset: 0,
         output_fields: vec![],
+        params: Default::default(),
+        negative_top_k: false,
     };
     let err = |r| c.search(r, &compute()).unwrap_err();
     // 0004「决策」：维度不符与非法度量在空 collection 上同样报错。
@@ -783,6 +795,8 @@ fn load_state_semantics_match_3x() {
                 limit: 1,
                 offset: 0,
                 output_fields: vec![],
+                params: Default::default(),
+                negative_top_k: false,
             },
             &compute(),
         )
@@ -992,6 +1006,8 @@ fn search_on_empty_collection_returns_empty_hits() {
                 limit: 3,
                 offset: 0,
                 output_fields: vec![],
+                params: Default::default(),
+                negative_top_k: false,
             },
             &compute(),
         )
@@ -1013,6 +1029,8 @@ fn search_with(c: &Collection, anns: Option<&str>, vectors: QueryVectors) -> Eng
             limit: 1,
             offset: 0,
             output_fields: vec![],
+            params: Default::default(),
+            negative_top_k: false,
         },
         &compute(),
     )
@@ -1028,7 +1046,7 @@ fn sparse_and_text_queries_fail_where_3x_fails() {
         text.to_string(),
         "Text query on field 'v' requires a TEXT_EMBEDDING function targeting that field"
     );
-    let sparse = search_with(&c, None, QueryVectors::Sparse);
+    let sparse = search_with(&c, None, QueryVectors::Sparse(vec![vec![(1, 1.0)]]));
     assert!(matches!(sparse, EngineError::InvalidArgument(_)));
     assert_eq!(
         sparse.to_string(),
@@ -1042,7 +1060,7 @@ fn sparse_and_text_queries_fail_where_3x_fails() {
     flat_index(&mut c, "L2");
     c.release();
     assert!(matches!(
-        search_with(&c, Some("nope"), QueryVectors::Sparse),
+        search_with(&c, Some("nope"), QueryVectors::Sparse(vec![vec![(1, 1.0)]])),
         EngineError::CollectionNotLoaded(_)
     ));
 }

@@ -79,6 +79,8 @@ fn snapshot_ids(snapshot: &milvus_lite_core::collection::ReadSnapshot, db: &Db) 
                 limit: 5,
                 offset: 0,
                 output_fields: Vec::new(),
+                params: Default::default(),
+                negative_top_k: false,
             },
             db.compute(),
         )

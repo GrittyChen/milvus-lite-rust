@@ -70,8 +70,9 @@ impl Collection {
                     py_repr(&pk_field.name)
                 )));
             }
-            let vector = &self.schema.fields[self.vector_pos];
-            if !has(&vector.name) {
+            if let Some(vector) = self.vector_pos.map(|pos| &self.schema.fields[pos])
+                && !has(&vector.name)
+            {
                 return Err(EngineError::schema(format!(
                     "vector field {} missing or None",
                     py_repr(&vector.name)
@@ -90,6 +91,9 @@ impl Collection {
             }
         }
         retain_masked_json(&supplied, &mut checks);
+        if upsert {
+            self.decode_inherited_sparse(&supplied, n)?;
+        }
         let mut merged = Vec::with_capacity(if upsert { n } else { 0 });
         // P1：仅访问请求前的主键表。不得把同批上一行放入这里的旧值候选。
         for row in 0..n {
@@ -106,14 +110,15 @@ impl Collection {
                     .map(|(i, field)| {
                         supplied
                             .get(field.name.as_str())
-                            .map(|input| input_row(input, row))
+                            .map(|input| Ok(input_row(input, row)))
                             .or_else(|| {
                                 old.map(|at| {
                                     input_from_column(&self.chunks[&at.chunk].columns[i], at.row)
                                 })
                             })
+                            .transpose()
                     })
-                    .collect();
+                    .collect::<Result<_>>()?;
                 let mut meta = old
                     .and_then(|at| {
                         self.chunks[&at.chunk]

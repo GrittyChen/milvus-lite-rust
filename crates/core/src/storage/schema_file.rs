@@ -188,6 +188,13 @@ impl SchemaFile {
             .fields
             .iter()
             .map(|field| {
+                // 稀疏默认值只能由 3.x 的 Python API 写出，按登记的差异拒绝（0030）；稀疏字段允许 nullable。
+                if field.dtype == "sparse_float_vector" && field.default_value.is_some() {
+                    return Err(SchemaFileError::Unsupported(format!(
+                        "default value of sparse vector field {:?}",
+                        field.name
+                    )));
+                }
                 if (field.dtype == "float_vector"
                     && (field.nullable || field.default_value.is_some()))
                     || (field.dtype != "array"
@@ -212,6 +219,7 @@ impl SchemaFile {
                     "array" => DataType::Array,
                     "timestamptz" => DataType::Timestamptz,
                     "float_vector" => DataType::FloatVector,
+                    "sparse_float_vector" => DataType::SparseFloatVector,
                     _ => {
                         return Err(SchemaFileError::Unsupported(format!(
                             "field {:?} has dtype {:?}",
@@ -339,6 +347,7 @@ fn dtype_name(dtype: DataType) -> &'static str {
         DataType::Array => "array",
         DataType::Timestamptz => "timestamptz",
         DataType::FloatVector => "float_vector",
+        DataType::SparseFloatVector => "sparse_float_vector",
     }
 }
 
@@ -356,6 +365,7 @@ fn core_dtype(name: &str) -> Option<DataType> {
         "array" => DataType::Array,
         "timestamptz" => DataType::Timestamptz,
         "float_vector" => DataType::FloatVector,
+        "sparse_float_vector" => DataType::SparseFloatVector,
         _ => return None,
     })
 }
@@ -385,6 +395,40 @@ mod tests {
     use crate::schema::{CollectionSchema, FieldSchema};
 
     use super::*;
+
+    /// 3.x 的稀疏字段：`dim` 为 null，允许 nullable；默认值只能由 3.x Python API 写出，按差异拒绝（0030）。
+    #[test]
+    fn sparse_fields_round_trip_and_reject_3x_defaults() {
+        let text = |sparse: &str| {
+            format!(
+                r#"{{"collection_name":"c","version":1,"fields":[{{"name":"id","dtype":"int64","is_primary":true}},{sparse}]}}"#
+            )
+        };
+        let file = SchemaFile::parse(
+            text(r#"{"name":"sp","dtype":"sparse_float_vector","dim":null,"nullable":true,"default_value":null}"#)
+                .as_bytes(),
+        )
+        .unwrap();
+        let core = file.to_core().unwrap();
+        assert_eq!(core.fields[1].data_type, DataType::SparseFloatVector);
+        assert!(core.fields[1].nullable);
+        let written: Value =
+            crate::json_text::value(&SchemaFile::from_core("c", &core).to_bytes().unwrap())
+                .unwrap();
+        assert_eq!(written["fields"][1]["dtype"], "sparse_float_vector");
+        assert_eq!(written["fields"][1]["dim"], Value::Null);
+        assert_eq!(written["fields"][1]["nullable"], true);
+
+        let defaulted = SchemaFile::parse(
+            text(r#"{"name":"sp","dtype":"sparse_float_vector","default_value":{"1":0.5}}"#)
+                .as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(
+            defaulted.to_core().unwrap_err().to_string(),
+            r#"schema is outside M2 scope: default value of sparse vector field "sp""#
+        );
+    }
 
     #[test]
     fn writes_3x_field_shape() {

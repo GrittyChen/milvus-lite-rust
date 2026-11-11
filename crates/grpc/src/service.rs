@@ -694,7 +694,7 @@ impl Service for MilvusService {
                     parsed.metric_type.as_deref(),
                 )?;
                 parsed.check_function_chains()?;
-                guard.read_named_snapshot(&req.partition_names)?
+                guard.read_search_snapshot(&req.partition_names, parsed.anns_field.as_deref())?
             };
             #[cfg(test)]
             if let Some(pause) = after_snapshot {

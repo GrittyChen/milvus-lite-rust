@@ -141,6 +141,8 @@ fn nulls_defaults_snapshots_and_real_compaction_survive_reopen() {
                 limit: 20,
                 offset: 0,
                 output_fields: vec!["x".into()],
+                params: Default::default(),
+                negative_top_k: false,
             },
             reopened.compute(),
             "x is null",

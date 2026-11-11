@@ -37,7 +37,7 @@
 
 - 稠密向量字段在现有 FLAT、BRUTE_FORCE、AUTOINDEX 之外，接受 HNSW、HNSW_SQ、IVF_FLAT、IVF_SQ8。定义按 3.x 的形态持久化（类型大写、metric 原样、params 与 search_params 原样），DescribeIndex / list_indexes 照实返回；检索一律按 FLAT 精确执行，不建 ANN、不写索引文件。
 - 标量字段接受 INVERTED，类型范围沿用现有校验（3.x 另支持的 TIMESTAMPTZ 随该类型另行接入）；过滤按扫描执行。
-- 先保留 3.x 原有的校验顺序与错误原文，再做本实现的兼容性限制：解除 FLAT 阶段对上述类型的限制；AUTOINDEX 与这四种 ANN 类型只接受 COSINE / L2 / IP，BM25 / NONE 返回 UNIMPLEMENTED。3.x 自身无法构建的定义（IVF_PQ、DISKANN 等未知类型、向量字段上的 INVERTED）和稀疏字段上的任何索引，继续在创建时返回 UNIMPLEMENTED（见[已确认的取舍](#已确认的取舍) 2）。
+- 先保留 3.x 原有的校验顺序与错误原文，再做本实现的兼容性限制：解除 FLAT 阶段对上述类型的限制；AUTOINDEX 与这四种 ANN 类型只接受 COSINE / L2 / IP，BM25 / NONE 返回 UNIMPLEMENTED。3.x 自身无法构建的定义（IVF_PQ、DISKANN 等未知类型、向量字段上的 INVERTED）继续在创建时返回 UNIMPLEMENTED（见[已确认的取舍](#已确认的取舍) 2）。稀疏字段上的索引此前同样拒绝，[0030](0030-sparse-vectors.md) 起按 3.x 接受 SPARSE_INVERTED_INDEX + IP 并校验调参项；稠密字段上的 SPARSE_INVERTED_INDEX 与 3.x 一样接受五种度量、不校验调参项。
 - load / release 与 rc2 的 load 检查合同不变；已 load 时创建不改变状态。检索请求中的 ef、nprobe 等参数照常接受，不解析。
 
 ### 创建时的旧索引文件

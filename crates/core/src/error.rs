@@ -181,6 +181,8 @@ pub fn py_json_repr(value: &Value) -> String {
         Value::Number(n) => match (n.as_i64(), n.as_u64(), n.as_f64()) {
             (Some(i), _, _) => i.to_string(),
             (None, Some(u), _) => u.to_string(),
+            // 超出 u64 的整数在 Python 中仍是精确的 int；JSON 整数文本没有前导零或正号，原文即 repr。
+            _ if !n.as_str().contains(['.', 'e', 'E']) => n.as_str().to_owned(),
             (None, None, Some(f)) => py_float_repr(f),
             (None, None, None) => n.to_string(),
         },

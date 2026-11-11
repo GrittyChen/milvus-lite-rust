@@ -424,6 +424,8 @@ fn concurrent_database_zone_changes_never_deadlock_or_tear() {
                                 limit: 10,
                                 offset: 0,
                                 output_fields: vec![],
+                                params: Default::default(),
+                                negative_top_k: false,
                             },
                             db.compute(),
                             "ts == ISO '2025-01-01T10:00:00'",

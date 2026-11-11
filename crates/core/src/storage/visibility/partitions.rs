@@ -865,6 +865,47 @@ impl PartitionVisibility {
         result
     }
 
+    /// 3.x `_search_sparse` 的分区语义（0030），与上面的稠密语义不同：先在全部分区上判版本（全局有效位），
+    /// 再按选择集剪枝，所以被其他分区新版本遮住的旧版本不露出。选中分区的已提交 segment 即使没有有效行
+    /// 也保留，3.x 照样为它建倒排并校验其中的行；未选中分区的 segment 不建。
+    pub fn sparse_snapshot(&self, selected: &[PartitionId]) -> VisibilitySnapshot {
+        let mut result = VisibilitySnapshot {
+            sources: BTreeMap::new(),
+            empty_sources: BTreeMap::new(),
+            source_order: self.global.source_order.clone(),
+            live_count: 0,
+        };
+        for &source in &self.global.source_order {
+            let global = &self.global.sources[&source];
+            let bits = match self.source_partition(source) {
+                Some(part) if !selected.contains(&part) => {
+                    result.empty_sources.insert(source, global.len);
+                    continue;
+                }
+                Some(_) => global.clone(),
+                // MemTable 的一个源含多个分区的行：全局赢家一定也是它所在分区内的赢家。
+                None => {
+                    let mut bits = SourceBits::new(global.len);
+                    for ((_, part), local) in self.local.range((source, 0)..=(source, u32::MAX)) {
+                        if selected.contains(part) {
+                            for (word, local) in Arc::make_mut(&mut bits.bits)
+                                .iter_mut()
+                                .zip(local.bitmap.bits.iter())
+                            {
+                                *word |= local;
+                            }
+                        }
+                    }
+                    bits.intersect(global);
+                    bits
+                }
+            };
+            result.live_count += bits.count_live();
+            result.sources.insert(source, bits);
+        }
+        result
+    }
+
     pub fn stats(&self) -> PartitionVisibilityStats {
         PartitionVisibilityStats {
             keys: self.data.len(),

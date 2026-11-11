@@ -393,6 +393,8 @@ fn search_with_a_queued_writer_does_not_deadlock() {
         limit: 10,
         offset: 0,
         output_fields: Vec::new(),
+        params: Default::default(),
+        negative_top_k: false,
     };
     let db = Arc::new(db);
     let (done_tx, done_rx) = std::sync::mpsc::channel();

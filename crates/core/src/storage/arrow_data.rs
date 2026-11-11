@@ -3,8 +3,8 @@
 use std::sync::Arc;
 
 use arrow_array::{
-    Array, ArrayRef, BooleanArray, FixedSizeListArray, Float32Array, Float64Array, Int8Array,
-    Int16Array, Int32Array, Int64Array, ListArray, RecordBatch, StringArray,
+    Array, ArrayRef, BinaryArray, BooleanArray, FixedSizeListArray, Float32Array, Float64Array,
+    Int8Array, Int16Array, Int32Array, Int64Array, ListArray, RecordBatch, StringArray,
     TimestampMicrosecondArray, UInt64Array,
 };
 use arrow_schema::{DataType as ArrowType, Field, Schema, TimeUnit};
@@ -502,6 +502,7 @@ fn user_fields(schema: &CollectionSchema) -> Result<Vec<Field>, ArrowDataError> 
                         dim,
                     )
                 }
+                DataType::SparseFloatVector => ArrowType::Binary,
             };
             Ok(Field::new(&field.name, dtype, field.nullable))
         })
@@ -632,6 +633,9 @@ fn build_batch(
                     None,
                 )?)
             }
+            ColumnData::SparseFloatVector(rows) => {
+                Arc::new(BinaryArray::from_iter_values(rows.rows()))
+            }
         };
         arrays.push(array);
     }
@@ -705,6 +709,11 @@ fn nullable_array(
                 .map(|(i, v)| validity.get(i).then_some(v.as_str())),
         )),
         ColumnData::Json(v) => json_array(name, v, Some(validity), json_encoding)?,
+        ColumnData::SparseFloatVector(rows) => Arc::new(BinaryArray::from_iter(
+            rows.rows()
+                .enumerate()
+                .map(|(i, row)| validity.get(i).then_some(row)),
+        )),
         _ => return Err(ArrowDataError::TypeMismatch { name: name.into() }),
     })
 }
@@ -924,6 +933,20 @@ fn decode_column(field: &FieldSchema, array: &ArrayRef) -> Result<ColumnData, Ar
                 dim,
                 values: floats.values().to_vec(),
             }
+        }
+        // 只读出原始字节，不解码：3.x 打开与计数都不解码，坏行在使用时才报错（0030）。
+        DataType::SparseFloatVector => {
+            let binary = array
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .ok_or_else(bad)?;
+            ColumnData::SparseFloatVector(crate::data::SparseData::from_rows((0..n).map(|row| {
+                if binary.is_null(row) {
+                    &[][..]
+                } else {
+                    binary.value(row)
+                }
+            })))
         }
     };
     Ok(if array.null_count() == 0 {
@@ -1196,6 +1219,43 @@ mod tests {
             json_strings("j", &[huge_integer.as_bytes().to_vec()]).unwrap(),
             [huge_integer]
         );
+    }
+
+    /// 3.x 的稀疏列是 `pa.binary()`；读取只取原始字节，不解码也不重排（坏行在使用时才报错，0030）。
+    #[test]
+    fn sparse_column_is_raw_nullable_binary() {
+        let mut pk = FieldSchema::new("id", DataType::Int64);
+        pk.is_primary = true;
+        let mut sparse = FieldSchema::new("sp", DataType::SparseFloatVector);
+        sparse.nullable = true;
+        let schema = CollectionSchema {
+            fields: vec![pk, sparse],
+            enable_dynamic_field: false,
+            properties: Vec::new(),
+        };
+        // 乱序、重复与长度不是 8 的倍数的行原样保留。
+        let unsorted: Vec<u8> = [(5u32, 1.0f32), (1, 2.0), (5, 3.0)]
+            .iter()
+            .flat_map(|(d, w)| d.to_le_bytes().into_iter().chain(w.to_le_bytes()))
+            .collect();
+        let rows = crate::data::SparseData::from_rows([unsorted.clone(), vec![], vec![1, 2, 3]]);
+        let column = ColumnData::SparseFloatVector(rows).with_validity(&[true, false, true]);
+        let batch = data_batch(
+            &schema,
+            &[1, 2, 3],
+            &[ColumnData::Int64(vec![1, 2, 3]), column.clone()],
+            None,
+        )
+        .unwrap();
+        assert_eq!(batch.schema().field(2).data_type(), &ArrowType::Binary);
+        assert!(batch.schema().field(2).is_nullable());
+        let decoded = decode_data_batch(&schema, &batch).unwrap();
+        assert_eq!(decoded.columns[1], column);
+        let ColumnData::SparseFloatVector(rows) = decoded.columns[1].values() else {
+            panic!("sparse column lost its type");
+        };
+        assert_eq!(rows.row(0), unsorted.as_slice());
+        assert_eq!(rows.row(2), &[1, 2, 3]);
     }
 
     #[test]

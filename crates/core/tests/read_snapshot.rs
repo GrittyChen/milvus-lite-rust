@@ -54,6 +54,8 @@ fn request() -> SearchRequest {
         limit: 10,
         offset: 0,
         output_fields: vec!["*".into()],
+        params: Default::default(),
+        negative_top_k: false,
     }
 }
 

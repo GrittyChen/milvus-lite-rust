@@ -248,6 +248,7 @@ fn truthy(value: &PyVal) -> bool {
         PyVal::Bool(b) => *b,
         PyVal::Int(i) => *i != 0,
         PyVal::BigInt(_) | PyVal::DateTime(_) => true,
+        PyVal::Bytes(bytes) => !bytes.is_empty(),
         PyVal::Float(f) => *f != 0.0,
         PyVal::Str(s) => !s.is_empty(),
         PyVal::List(items) => !items.is_empty(),
@@ -1280,6 +1281,7 @@ enum Key {
     Nan(usize),
     Str(String),
     DateTime(i64),
+    Bytes(Vec<u8>),
 }
 
 impl Key {
@@ -1306,6 +1308,7 @@ impl Key {
             PyVal::Float(f) => Self::Fraction(f.to_bits()),
             PyVal::Str(s) => Self::Str(s.clone()),
             PyVal::DateTime(micros) => Self::DateTime(*micros),
+            PyVal::Bytes(bytes) => Self::Bytes(bytes.clone()),
             PyVal::List(_) | PyVal::Dict(_) => {
                 return Err(invalid(format!(
                     "unhashable type: {}",

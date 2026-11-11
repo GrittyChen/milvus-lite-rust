@@ -103,6 +103,8 @@ fn rows(view: &milvus_lite_core::collection::ReadSnapshot) -> BTreeMap<i64, i64>
                 limit: 10000,
                 offset: 0,
                 output_fields: vec![],
+                params: Default::default(),
+                negative_top_k: false,
             },
             &Compute::new(std::num::NonZeroUsize::new(2).unwrap()).unwrap(),
             "age >= 50",

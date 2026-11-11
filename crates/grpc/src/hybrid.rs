@@ -151,7 +151,9 @@ pub(crate) fn hybrid_search(
         } else {
             &sub.partition_names
         };
-        let snapshot = handle.read().read_named_snapshot(partitions)?;
+        let snapshot = handle
+            .read()
+            .read_search_snapshot(partitions, parsed.anns_field.as_deref())?;
         snapshot.require_loaded()?;
         if let Some(feature) = parsed.unsupported {
             return Err(unsupported(feature));
@@ -169,6 +171,8 @@ pub(crate) fn hybrid_search(
                 limit: usize::try_from(window.max(0)).unwrap_or(usize::MAX),
                 offset: 0,
                 output_fields: route_fields.clone(),
+                params: parsed.params,
+                negative_top_k: window < 0,
             },
             compute,
             RouteFilter {

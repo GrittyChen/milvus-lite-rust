@@ -82,6 +82,8 @@ fn cosine_on_b(db: &Db) -> Vec<(Pk, f32)> {
                 limit: 10,
                 offset: 0,
                 output_fields: Vec::new(),
+                params: Default::default(),
+                negative_top_k: false,
             },
             db.compute(),
         )

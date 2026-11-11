@@ -53,6 +53,7 @@ pub(super) fn legacy_shape(ast: &Ast, schema: &CollectionSchema) -> bool {
                     DataType::Json
                         | DataType::Array
                         | DataType::FloatVector
+                        | DataType::SparseFloatVector
                         | DataType::Timestamptz
                 )
         }),

@@ -38,7 +38,7 @@ pub(crate) fn decode(
     for fd in fields_data {
         let extracted = match fd.field {
             Some(field_data::Field::Scalars(sf)) => scalar(&fd.field_name, fd.r#type, sf),
-            Some(field_data::Field::Vectors(vf)) => vector(&fd.field_name, fd.r#type, vf),
+            Some(field_data::Field::Vectors(vf)) => vector(&fd.field_name, fd.r#type, vf, n),
             None | Some(field_data::Field::StructArrays(_)) => {
                 return Err(EngineError::SchemaValidation(format!(
                     "FieldData {} has neither scalars nor vectors",
@@ -253,9 +253,9 @@ fn map_texts(
     })
 }
 
-fn vector(name: &str, t: i32, vf: pb::VectorField) -> Result<InputValues, EngineError> {
+fn vector(name: &str, t: i32, vf: pb::VectorField, n: usize) -> Result<InputValues, EngineError> {
     if t == 104 {
-        return Err(unsupported("SPARSE_FLOAT_VECTOR values"));
+        return sparse(name, vf, n);
     }
     if t != 101 {
         return Err(EngineError::SchemaValidation(format!(
@@ -287,6 +287,30 @@ fn vector(name: &str, t: i32, vf: pb::VectorField) -> Result<InputValues, Engine
     })
 }
 
+/// 3.x `_extract_sparse_vector_column`：逐行 `bytes_to_sparse`（长度错误是 code 1），再检查行数；不看 valid_data，
+/// 所以经 gRPC 写不进空值（空字节解码成空 dict，由引擎按「至少一个非零权重」拒绝）。
+fn sparse(name: &str, vf: pb::VectorField, n: usize) -> Result<InputValues, EngineError> {
+    let Some(vector_field::Data::SparseFloatVector(array)) = vf.data else {
+        return Err(EngineError::SchemaValidation(format!(
+            "FieldData {} declared SparseFloatVector but no sparse_float_vector data is set",
+            py_repr(name)
+        )));
+    };
+    let rows = array
+        .contents
+        .iter()
+        .map(|bytes| milvus_lite_core::data::sparse::decode(bytes))
+        .collect::<Result<Vec<_>, _>>()?;
+    if rows.len() != n {
+        return Err(EngineError::SchemaValidation(format!(
+            "FieldData {} sparse_float_vector has {} rows, expected {n}",
+            py_repr(name),
+            rows.len()
+        )));
+    }
+    Ok(InputValues::SparseFloatVector(rows))
+}
+
 /// 3.x 用 valid_data 表示 nullable 字段的空值：标量列可以只带有效值（紧凑）或带全部行，向量列按完整长度
 /// 发送时 3.x 忽略 valid_data。M1 没有 nullable 字段，含空值的列一律不支持（3.x 在不同位置报错或忽略，
 /// 见 0004「决策」）；3.x 的长度检查先于空值报告。
@@ -296,7 +320,7 @@ fn check_valid_data(
     values: InputValues,
     n: usize,
 ) -> Result<InputValues, EngineError> {
-    if valid.is_empty() {
+    if valid.is_empty() || matches!(values, InputValues::SparseFloatVector(_)) {
         return Ok(values);
     }
     let n_valid = valid.iter().filter(|v| **v).count();
@@ -395,5 +419,77 @@ pub(crate) fn pb_ids(pks: &[Pk], varchar: bool) -> pb::IDs {
     };
     pb::IDs {
         id_field: Some(id_field),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pack(pairs: &[(u32, f32)]) -> Vec<u8> {
+        pairs
+            .iter()
+            .flat_map(|(d, w)| d.to_le_bytes().into_iter().chain(w.to_le_bytes()))
+            .collect()
+    }
+
+    fn sparse_column(contents: Vec<Vec<u8>>, valid: Vec<bool>) -> pb::FieldData {
+        pb::FieldData {
+            r#type: 104,
+            field_name: "sp".into(),
+            valid_data: valid,
+            field: Some(field_data::Field::Vectors(pb::VectorField {
+                dim: 0,
+                data: Some(vector_field::Data::SparseFloatVector(
+                    pb::SparseFloatArray { contents, dim: 0 },
+                )),
+            })),
+            ..Default::default()
+        }
+    }
+
+    fn decode_one(fd: pb::FieldData, n: u32) -> Result<InsertBatch, EngineError> {
+        let database = || Ok(None);
+        let timezone = TimezoneSource::new(None, None, &database);
+        decode(vec![fd], n, &[], &timezone)
+    }
+
+    /// 3.x `_extract_sparse_vector_column`：逐行按 dict 语义解码，不看 valid_data，再检查行数。
+    #[test]
+    fn sparse_contents_decode_like_3x_and_ignore_valid_data() {
+        let batch = decode_one(
+            sparse_column(
+                vec![pack(&[(5, 1.0), (1, 2.0), (5, 3.0)]), Vec::new()],
+                vec![true, false],
+            ),
+            2,
+        )
+        .unwrap();
+        assert_eq!(
+            batch.columns[0].1,
+            InputValues::SparseFloatVector(vec![vec![(5, 3.0), (1, 2.0)], vec![]])
+        );
+        assert_eq!(
+            decode_one(sparse_column(vec![pack(&[(1, 1.0)])], vec![false, true]), 2)
+                .unwrap_err()
+                .to_string(),
+            "FieldData 'sp' sparse_float_vector has 1 rows, expected 2"
+        );
+        // 长度错误在逐行解码时报出，先于行数检查。
+        let error = decode_one(sparse_column(vec![vec![0; 6]], Vec::new()), 2).unwrap_err();
+        assert!(matches!(error, EngineError::InvalidArgument(_)));
+        assert_eq!(
+            error.to_string(),
+            "sparse vector bytes length 6 is not a multiple of 8"
+        );
+        let mut empty = sparse_column(Vec::new(), Vec::new());
+        empty.field = Some(field_data::Field::Vectors(pb::VectorField {
+            dim: 0,
+            data: None,
+        }));
+        assert_eq!(
+            decode_one(empty, 1).unwrap_err().to_string(),
+            "FieldData 'sp' declared SparseFloatVector but no sparse_float_vector data is set"
+        );
     }
 }

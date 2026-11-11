@@ -282,7 +282,12 @@ impl Predicate {
                     .fields
                     .iter()
                     .find(|f| &f.name == name)
-                    .is_some_and(|f| matches!(f.data_type, DataType::Json | DataType::FloatVector))
+                    .is_some_and(|f| {
+                        matches!(
+                            f.data_type,
+                            DataType::Json | DataType::FloatVector | DataType::SparseFloatVector
+                        )
+                    })
                 {
                     return Err(unsupported());
                 }
