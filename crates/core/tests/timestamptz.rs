@@ -442,18 +442,26 @@ fn timestamp_filters_match_3x_results() {
         error.contains("cannot convert float infinity to integer"),
         "{error}"
     );
-    // 不涉及时间值的算术仍是范围外构造，先于任何语义检查。
-    for expr in [
-        "id + 1 > 2",
-        "-id > 0",
-        "id + 1 > 2 and ts > 5",
-        "ts > 5 and id + 1 > 2",
-        "(id + 1) + ts > 5",
+    // 不涉及时间值的算术（0032）与时间戳并存：数值算术按 Arrow 路线求值，时间戳的类型错误照常报出
+    // （期望值与文案按真实 3.x 核对过）。
+    assert_eq!(ids(&snapshot, "id + 1 > 2").unwrap(), vec![2, 3, 4]);
+    assert_eq!(ids(&snapshot, "-id > 0").unwrap(), Vec::<i64>::new());
+    for (expr, expected) in [
+        (
+            "id + 1 > 2 and ts > 5",
+            "comparison '>' between incompatible types at column 19",
+        ),
+        (
+            "ts > 5 and id + 1 > 2",
+            "comparison '>' between incompatible types at column 4",
+        ),
+        (
+            "(id + 1) + ts > 5",
+            "arithmetic '+' requires numeric operands, right side is timestamptz (field 'ts') at column 10",
+        ),
     ] {
-        assert!(
-            matches!(ids(&snapshot, expr), Err(EngineError::Unsupported { .. })),
-            "{expr}"
-        );
+        let error = ids(&snapshot, expr).unwrap_err().to_string();
+        assert!(error.contains(expected), "{expr}: {error}");
     }
 }
 

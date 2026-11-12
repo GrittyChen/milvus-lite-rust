@@ -121,12 +121,16 @@ impl RowFilter {
         let Some(ast) = &parsed.ast else {
             return Ok(None);
         };
-        if eval::general_arithmetic(ast, schema) {
+        if eval::out_of_scope(ast) {
             return Err(eval::unsupported());
         }
         let pk = schema.fields.iter().position(|f| f.is_primary);
         let is_pk = |op: &Operand| matches!(op, Operand::Column(i) if Some(*i) == pk);
         let mut tree = tree::Tree::compile(parsed, schema)?;
+        // 这里总走 Python 路线，而 Python 路线的数值算术尚未实现：拒绝，不能静默得到「未知」。
+        if tree.numeric_arithmetic {
+            return Err(eval::arithmetic_unsupported());
+        }
         // 同名的 schema 字段每行都在，直接改绑到这一列。
         let id_field = schema
             .fields
@@ -205,9 +209,12 @@ impl RecordFilter {
         if parsed.ast.is_none() {
             return Ok(None);
         }
-        Ok(Some(Self {
-            tree: tree::Tree::compile(parsed, schema)?,
-        }))
+        let tree = tree::Tree::compile(parsed, schema)?;
+        // 这里总走 Python 路线，而 Python 路线的数值算术尚未实现：自行拒绝，不依赖调用方的路线判断。
+        if tree.numeric_arithmetic {
+            return Err(eval::arithmetic_unsupported());
+        }
+        Ok(Some(Self { tree }))
     }
 
     /// 按给出的先后逐行求值：第一个出错的行决定报出的错误。
@@ -532,6 +539,26 @@ mod tests {
                         "{expr}"
                     );
                 }
+            }
+        }
+
+        // 稀疏检索 MemTable 的逐行过滤总走 Python 路线：纯 schema 字段的算术在普通过滤中走 Arrow 路线，
+        // 在这里也要拒绝，不能静默得到「未知」。
+        #[test]
+        fn record_filter_rejects_arithmetic_until_the_python_route_exists() {
+            for dynamic in [false, true] {
+                for expr in ["age + 1 > 5", "-age < 0", "age * 2 > 1 or id > 0"] {
+                    let parsed = ParsedFilter::parse_with(expr, &TimezoneSource::none()).unwrap();
+                    assert!(
+                        matches!(
+                            RecordFilter::compile(&parsed, &schema(dynamic)),
+                            Err(EngineError::Unsupported { .. })
+                        ),
+                        "{expr}"
+                    );
+                }
+                let parsed = ParsedFilter::parse_with("age > 5", &TimezoneSource::none()).unwrap();
+                assert!(RecordFilter::compile(&parsed, &schema(dynamic)).is_ok());
             }
         }
 

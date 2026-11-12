@@ -745,7 +745,11 @@ pub(super) fn evaluate_tree(tree: &Tree, rows: &[DynamicRow<'_>]) -> Result<Sour
                                 (Atom::Interval(d), Atom::Timestamp(t), "+") => {
                                     shifted(t, d, false)?
                                 }
-                                _ => Value::Null,
+                                // 时间戳与区间配上其他值：Python 的 TypeError，3.x 吞成未知。
+                                (Atom::Timestamp(_) | Atom::Interval(_), _, _)
+                                | (_, Atom::Timestamp(_) | Atom::Interval(_), _) => Value::Null,
+                                // 数值算术尚未实现；编译期的路线闸门保证到不了这里，到了也显式拒绝。
+                                _ => return Err(super::eval::arithmetic_unsupported()),
                             }
                         }
                         Kind::Not(value) => node_value(&values, *value)?

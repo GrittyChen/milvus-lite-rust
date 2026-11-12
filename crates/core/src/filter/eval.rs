@@ -71,37 +71,26 @@ pub(crate) struct Predicate {
 pub(super) fn unsupported() -> EngineError {
     EngineError::unsupported(
         "filter expressions",
-        "arithmetic and geometry predicates are not supported",
+        "geometry predicates are not supported",
     )
 }
-/// 含范围外构造，或含不涉及时间戳的算术：时间戳 / 区间的加减由求值器支持，其余算术仍是范围外。
-pub(super) fn general_arithmetic(ast: &Ast, schema: &CollectionSchema) -> bool {
-    // 子节点总先于父节点创建，顺序扫描即可得到每个子树是否含时间值。
-    let mut temporal = vec![false; ast.nodes.len()];
-    for (id, node) in ast.nodes.iter().enumerate() {
-        temporal[id] = match &node.kind {
-            Kind::Unsupported => return true,
-            Kind::Lit(Literal::Timestamp(_) | Literal::Interval(_)) => true,
-            Kind::Field(name) => schema
-                .fields
-                .iter()
-                .any(|f| &f.name == name && f.data_type == DataType::Timestamptz),
-            Kind::Arith(_, a, b) => {
-                if !(temporal[*a] || temporal[*b]) {
-                    return true;
-                }
-                true
-            }
-            Kind::Neg(a) => {
-                if !temporal[*a] {
-                    return true;
-                }
-                true
-            }
-            _ => false,
-        };
-    }
-    false
+/// 数值算术只在 Arrow 路线实现；其余路线（hybrid 回退、Python、boost 与稀疏检索的逐行过滤）拒绝。
+pub(super) fn arithmetic_unsupported() -> EngineError {
+    EngineError::unsupported(
+        "filter expressions",
+        "arithmetic is only supported on schema fields in ordinary filters",
+    )
+}
+/// 含几何谓词这类范围外构造：它们先于语义检查报 UNIMPLEMENTED（0006 第 1 项）。
+pub(super) fn out_of_scope(ast: &Ast) -> bool {
+    ast.nodes
+        .iter()
+        .any(|node| matches!(node.kind, Kind::Unsupported))
+}
+
+/// 只有 Arrow 路线实现了数值算术：hybrid 回退与 Python 路线若收到它会静默得到「未知」，所以拒绝。
+pub(super) fn arithmetic_route_unsupported(tree: &super::tree::Tree) -> bool {
+    tree.numeric_arithmetic && tree.backend != super::tree::Backend::Arrow
 }
 pub(super) fn compatible(a: &str, b: &str) -> bool {
     a == b
@@ -237,14 +226,18 @@ impl Predicate {
             });
         };
         // 语法总是完整检查；范围外构造优先 UNIMPLEMENTED，不执行其语义检查（0006 第 1 项）。
-        if general_arithmetic(ast, schema) {
+        if out_of_scope(ast) {
             return Err(unsupported());
         }
         if !super::tree::legacy_shape(ast, schema) {
+            let tree = super::tree::Tree::compile(parsed, schema)?;
+            if arithmetic_route_unsupported(&tree) {
+                return Err(arithmetic_unsupported());
+            }
             return Ok(Self {
                 terms: Vec::new(),
                 field_names: Some(schema.fields.iter().map(|f| f.name.clone()).collect()),
-                tree: Some(super::tree::Tree::compile(parsed, schema)?),
+                tree: Some(tree),
             });
         }
         for node in &ast.nodes {

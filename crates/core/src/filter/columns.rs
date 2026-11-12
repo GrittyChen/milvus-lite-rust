@@ -26,6 +26,7 @@ enum Temporal {
     Timestamp,
     Interval,
 }
+#[derive(Clone)]
 struct Column<'a> {
     data: Cow<'a, ColumnData>,
     valid: SourceBits,
@@ -197,10 +198,34 @@ fn compare(
     if a.temporal != b.temporal {
         return Err(kernel("no matching comparison kernel"));
     }
+    // Arrow 按类型分派比较内核，不看值：没有有效行（例如空类型参与算术后的全 null 列）也报错。
+    let class = |shape: Shape| match shape {
+        Shape::Int | Shape::Float => Some(0),
+        Shape::Bool => Some(1),
+        Shape::String => Some(2),
+        Shape::Null | Shape::Complex => None,
+    };
+    if let (Some(x), Some(y)) = (class(a.shape), class(b.shape))
+        && x != y
+    {
+        return Err(kernel("no matching comparison kernel"));
+    }
     let pair = Pair(&a.data, &b.data);
     let (left, right) = (Operand::Column(0), Operand::Column(1));
     let precision =
         eval::operand_precision(&left, &pair).max(eval::operand_precision(&right, &pair));
+    // 整数一侧转浮点的安全检查按这一侧自己的有效位，与另一侧是否为 null 无关（3.x 先转换整列再比较）。
+    if precision != 0 {
+        for (side, operand) in [(a, &left), (b, &right)] {
+            if side.shape == Shape::Int {
+                for row in 0..extent(side, n) {
+                    if side.valid.get(row) {
+                        eval::value(operand, &pair, row, precision).map_err(Failure::Kernel)?;
+                    }
+                }
+            }
+        }
+    }
     let mut valid = SourceBits::new(n);
     let mut values = vec![false; n];
     for (row, value) in values.iter_mut().enumerate() {
@@ -224,8 +249,269 @@ fn interval_micros(micros: f64) -> ColumnResult<i64> {
     }
 }
 
-/// 时间戳 ± 区间（类型检查已保证两边是时间戳与区间）；Arrow 的非检查运算按 int64 回绕。
 fn arithmetic(op: &str, a: &Column<'_>, b: &Column<'_>, n: usize) -> ColumnResult<Column<'static>> {
+    if a.temporal != Temporal::None || b.temporal != Temporal::None {
+        temporal_arithmetic(op, a, b, n)
+    } else {
+        numeric_arithmetic(op, a, b, n)
+    }
+}
+
+/// 数值列的元素类型；类型提升与转换按 pyarrow 的 `add` / `subtract` / `multiply` / `divide`（0032）。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Numeric {
+    Int(u32),
+    Float32,
+    Float64,
+}
+fn numeric(column: &Column<'_>) -> Option<Numeric> {
+    match column.data.values() {
+        ColumnData::Int8(_) => Some(Numeric::Int(8)),
+        ColumnData::Int16(_) => Some(Numeric::Int(16)),
+        ColumnData::Int32(_) => Some(Numeric::Int(32)),
+        ColumnData::Int64(_) => Some(Numeric::Int(64)),
+        ColumnData::Float(_) => Some(Numeric::Float32),
+        ColumnData::Double(_) => Some(Numeric::Float64),
+        _ => None,
+    }
+}
+fn int_at(data: &ColumnData, index: usize) -> i64 {
+    match data.values() {
+        ColumnData::Int8(v) => i64::from(v[index]),
+        ColumnData::Int16(v) => i64::from(v[index]),
+        ColumnData::Int32(v) => i64::from(v[index]),
+        ColumnData::Int64(v) => v[index],
+        // 调用方先经 `numeric` 判定为整数列。
+        _ => {
+            debug_assert!(false, "int_at on a non-integer column");
+            0
+        }
+    }
+}
+fn float_at(data: &ColumnData, index: usize) -> f64 {
+    match data.values() {
+        ColumnData::Float(v) => f64::from(v[index]),
+        ColumnData::Double(v) => v[index],
+        // 整数列（调用方先经 `numeric` 判定为数值列）。
+        other => int_at(other, index) as f64,
+    }
+}
+/// 一侧（列或标量）的行数：标量只有一个值。
+fn extent(column: &Column<'_>, n: usize) -> usize {
+    if column.scalar { 1 } else { n }
+}
+/// Arrow 隐式把整数转成浮点时的安全检查：只看这一侧自己的有效位（与另一侧是否为 null 无关），按行序报第一个越界值。
+fn check_int_to_float(column: &Column<'_>, float: Numeric, n: usize) -> ColumnResult<()> {
+    let bound: i64 = if float == Numeric::Float32 {
+        16_777_216
+    } else {
+        9_007_199_254_740_992
+    };
+    for row in 0..extent(column, n) {
+        if column.valid.get(row) {
+            let value = int_at(&column.data, row);
+            if !(-bound..=bound).contains(&value) {
+                return Err(kernel(format!(
+                    "Integer value {value} not in range: -{bound} to {bound}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+/// 3.x `_to_float`：`/` 之前把整数列安全转换成 double，整数标量用 Python `float()`（正确舍入、不检查）。
+fn divide_operand<'a>(column: &'a Column<'a>, n: usize) -> ColumnResult<Cow<'a, Column<'a>>> {
+    if !matches!(numeric(column), Some(Numeric::Int(_))) || column.shape == Shape::Null {
+        return Ok(Cow::Borrowed(column));
+    }
+    if !column.scalar {
+        check_int_to_float(column, Numeric::Float64, n)?;
+    }
+    let rows = extent(column, n);
+    Ok(Cow::Owned(Column {
+        data: Cow::Owned(ColumnData::Double(
+            (0..rows)
+                .map(|row| int_at(&column.data, row) as f64)
+                .collect(),
+        )),
+        valid: column.valid.clone(),
+        shape: Shape::Float,
+        scalar: column.scalar,
+        temporal: Temporal::None,
+    }))
+}
+
+/// 数值算术（0032）：整数按结果宽度回绕，整数转浮点带检查，浮点按结果类型的 IEEE 运算；
+/// 只对两侧都有效的行计算，null 传播为 null。
+fn numeric_arithmetic(
+    op: &str,
+    a: &Column<'_>,
+    b: &Column<'_>,
+    n: usize,
+) -> ColumnResult<Column<'static>> {
+    let (a, b) = if op == "/" {
+        (divide_operand(a, n)?, divide_operand(b, n)?)
+    } else {
+        (Cow::Borrowed(a), Cow::Borrowed(b))
+    };
+    let (a, b) = (a.as_ref(), b.as_ref());
+    let scalar = a.scalar && b.scalar;
+    let rows = if scalar { 1 } else { n };
+    let null = |data: ColumnData, shape: Shape| Column {
+        data: Cow::Owned(data),
+        valid: SourceBits::new(rows),
+        shape,
+        scalar,
+        temporal: Temporal::None,
+    };
+    let kind = |column: &Column<'_>| {
+        if column.shape == Shape::Null {
+            Ok(None)
+        } else {
+            numeric(column).map(Some).ok_or(())
+        }
+    };
+    let (left, right) = match (kind(a), kind(b)) {
+        (Ok(left), Ok(right)) => (left, right),
+        _ => {
+            let name = match op {
+                "+" => "add",
+                "-" => "subtract",
+                "*" => "multiply",
+                _ => "divide",
+            };
+            // 空类型与有类型的一侧运算时先转成那一侧的类型，所以文案里两侧同型。
+            let (ta, tb) = match (a.shape, b.shape) {
+                (Shape::Null, _) => (column_type(b), column_type(b)),
+                (_, Shape::Null) => (column_type(a), column_type(a)),
+                _ => (column_type(a), column_type(b)),
+            };
+            return Err(kernel(format!(
+                "Function '{name}' has no kernel matching input types ({ta}, {tb})"
+            )));
+        }
+    };
+    let target = match (left, right) {
+        (None, None) => return Ok(null(ColumnData::Bool(vec![false; rows]), Shape::Null)),
+        (Some(t), None) | (None, Some(t)) => t,
+        (Some(Numeric::Int(x)), Some(Numeric::Int(y))) => Numeric::Int(x.max(y)),
+        (Some(Numeric::Float64), _) | (_, Some(Numeric::Float64)) => Numeric::Float64,
+        _ => Numeric::Float32,
+    };
+    // 空类型一侧：结果是目标类型的全 null 列。
+    if left.is_none() || right.is_none() {
+        return Ok(null(empty_numeric(target, rows), shape_of(target)));
+    }
+    if !matches!(target, Numeric::Int(_)) {
+        for (side, kind) in [(a, left), (b, right)] {
+            if matches!(kind, Some(Numeric::Int(_))) {
+                check_int_to_float(side, target, n)?;
+            }
+        }
+    }
+    let mut valid = SourceBits::new(rows);
+    for row in 0..rows {
+        valid.set(row, a.valid(row) && b.valid(row));
+    }
+    let data = match target {
+        Numeric::Int(bits) => {
+            let values = (0..rows).map(|row| {
+                if !valid.get(row) {
+                    return 0;
+                }
+                let (x, y) = (int_at(&a.data, a.index(row)), int_at(&b.data, b.index(row)));
+                match op {
+                    "+" => x.wrapping_add(y),
+                    "-" => x.wrapping_sub(y),
+                    _ => x.wrapping_mul(y),
+                }
+            });
+            // 截断到结果宽度即按该宽度回绕（二进制补码）。
+            match bits {
+                8 => ColumnData::Int8(values.map(|v| v as i8).collect()),
+                16 => ColumnData::Int16(values.map(|v| v as i16).collect()),
+                32 => ColumnData::Int32(values.map(|v| v as i32).collect()),
+                _ => ColumnData::Int64(values.collect()),
+            }
+        }
+        Numeric::Float32 => ColumnData::Float(
+            (0..rows)
+                .map(|row| {
+                    if !valid.get(row) {
+                        return 0.0;
+                    }
+                    // 整数已检查在 ±2^24 内，转成 float32 是精确的；float32 运算保持单精度舍入。
+                    let x = float_at(&a.data, a.index(row)) as f32;
+                    let y = float_at(&b.data, b.index(row)) as f32;
+                    float_op(op, x, y)
+                })
+                .collect(),
+        ),
+        Numeric::Float64 => ColumnData::Double(
+            (0..rows)
+                .map(|row| {
+                    if !valid.get(row) {
+                        return 0.0;
+                    }
+                    float_op(
+                        op,
+                        float_at(&a.data, a.index(row)),
+                        float_at(&b.data, b.index(row)),
+                    )
+                })
+                .collect(),
+        ),
+    };
+    Ok(Column {
+        data: Cow::Owned(data),
+        valid,
+        shape: shape_of(target),
+        scalar,
+        temporal: Temporal::None,
+    })
+}
+fn float_op<
+    T: std::ops::Add<Output = T>
+        + std::ops::Sub<Output = T>
+        + std::ops::Mul<Output = T>
+        + std::ops::Div<Output = T>,
+>(
+    op: &str,
+    x: T,
+    y: T,
+) -> T {
+    match op {
+        "+" => x + y,
+        "-" => x - y,
+        "*" => x * y,
+        _ => x / y,
+    }
+}
+fn shape_of(numeric: Numeric) -> Shape {
+    if matches!(numeric, Numeric::Int(_)) {
+        Shape::Int
+    } else {
+        Shape::Float
+    }
+}
+fn empty_numeric(numeric: Numeric, rows: usize) -> ColumnData {
+    match numeric {
+        Numeric::Int(8) => ColumnData::Int8(vec![0; rows]),
+        Numeric::Int(16) => ColumnData::Int16(vec![0; rows]),
+        Numeric::Int(32) => ColumnData::Int32(vec![0; rows]),
+        Numeric::Int(_) => ColumnData::Int64(vec![0; rows]),
+        Numeric::Float32 => ColumnData::Float(vec![0.0; rows]),
+        Numeric::Float64 => ColumnData::Double(vec![0.0; rows]),
+    }
+}
+
+/// 时间戳 ± 区间（类型检查已保证两边是时间戳与区间）；Arrow 的非检查运算按 int64 回绕。
+fn temporal_arithmetic(
+    op: &str,
+    a: &Column<'_>,
+    b: &Column<'_>,
+    n: usize,
+) -> ColumnResult<Column<'static>> {
     let (timestamp, interval) = match (a.temporal, b.temporal) {
         (Temporal::Timestamp, Temporal::Interval) => (a, b),
         (Temporal::Interval, Temporal::Timestamp) if op == "+" => (b, a),
@@ -701,5 +987,42 @@ pub(super) fn evaluate_rows(tree: &Tree, rows: &[DynamicRow<'_>]) -> Result<Sour
             super::python::evaluate_tree(tree, rows)
         }
         Err(Failure::Kernel(error) | Failure::Fatal(error)) => Err(error),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn column(data: ColumnData, valid: &[bool], scalar: bool) -> Column<'static> {
+        Column {
+            shape: shape(&data),
+            data: Cow::Owned(data),
+            valid: SourceBits::from_live(valid),
+            scalar,
+            temporal: Temporal::None,
+        }
+    }
+
+    // Arrow 按类型分派比较内核：全 null 的整数列（空类型参与算术的结果）与字符串比较也报内核错误，
+    // hybrid 据此回退；空类型本身与字符串比较不报。
+    #[test]
+    fn comparison_kernel_is_chosen_by_type_not_by_values() {
+        let text = column(ColumnData::VarChar(vec!["a".into()]), &[true], true);
+        let ints = column(ColumnData::Int64(vec![0, 0]), &[false, false], false);
+        assert!(matches!(
+            compare(&ints, &text, Comparison::Equal, 2),
+            Err(Failure::Kernel(_))
+        ));
+        let flags = column(ColumnData::Bool(vec![false, false]), &[false, false], false);
+        assert!(matches!(
+            compare(&flags, &ints, Comparison::Less, 2),
+            Err(Failure::Kernel(_))
+        ));
+        let mut null = column(ColumnData::Bool(vec![false, false]), &[false, false], false);
+        null.shape = Shape::Null;
+        assert!(compare(&null, &text, Comparison::Equal, 2).is_ok());
+        let floats = column(ColumnData::Double(vec![0.0, 0.0]), &[false, false], false);
+        assert!(compare(&ints, &floats, Comparison::Equal, 2).is_ok());
     }
 }

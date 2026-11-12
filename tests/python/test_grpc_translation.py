@@ -746,7 +746,7 @@ def test_search_m1_unsupported(env):
     _, stub, _ = env
     basic(stub)
     seed(stub)
-    unimplemented(stub.Search, search_req(dsl="id + 1 > 0"))
+    unimplemented(stub.Search, search_req(dsl="st_isvalid(id)"))
     response = stub.Search(search_req(params={"metric_type": '"L2"', "params": '{"radius": 6, "range_filter": 1}'}))
     assert status_of(response)[0] == 0
     assert list(response.results.ids.int_id.data) == [1, 2]
@@ -995,8 +995,9 @@ def test_timestamptz_translation(env):
     assert status_of(reply)[0] == 6 and naive in status_of(reply)[2]
     reply = stub.Query(milvus_pb2.QueryRequest(collection_name="t", expr="ts + INTERVAL 'P106751992D' > ts2"))
     assert status_of(reply)[0::2] == (1, "Python int too large to convert to C long")
-    # 不涉及时间值的算术仍是范围外构造。
-    unimplemented(stub.Query, milvus_pb2.QueryRequest(collection_name="t", expr="id + 1 > 2"))
+    # 不涉及时间值的算术走 Arrow 路线（0032），与时间戳并存时照常求值。
+    reply = stub.Query(milvus_pb2.QueryRequest(collection_name="t", expr="id + 1 > 2"))
+    assert status_of(reply)[0] == 0
     # schema 规则。
     for name, build in {
         "pk": lambda s: s.add_field("p", DataType.TIMESTAMPTZ, is_primary=True),
@@ -1082,13 +1083,13 @@ def test_query_m1_unsupported(env):
     _, stub, _ = env
     basic(stub)
     seed(stub)
-    unimplemented(stub.Query, query_req(expr="id + 1 > 0", output_fields=["count(*)"]))
+    unimplemented(stub.Query, query_req(expr="st_isvalid(id)", output_fields=["count(*)"]))
     iterator = [common_pb2.KeyValuePair(key="iterator", value="False")]
     response = stub.Query(query_req(expr="id in [3, 1]", query_params=iterator + [
         common_pb2.KeyValuePair(key="limit", value="1")]))
     assert status_of(response)[0] == 0
     assert list(response.fields_data[0].scalars.long_data.data) == [1]
-    unimplemented(stub.Query, query_req(expr="id + 1 > 0"))
+    unimplemented(stub.Query, query_req(expr="st_isvalid(id)"))
     # 时间字面量的比较已支持（0025）：恒真时命中全部行。
     constant = stub.Query(query_req(
         expr="ISO '2025-01-01T00:00:00Z' == ISO '2025-01-01T00:00:00Z'", output_fields=["count(*)"]))
@@ -1251,7 +1252,7 @@ def test_pymilvus_entry_points_remaining_unsupported(env):
         (with_field("g", DataType.GEOMETRY), f"GEOMETRY fields: {feature}"),
         # pymilvus 3.0 先发 AlterCollectionSchema，收到 UNIMPLEMENTED 后回退到 AddCollectionField。
         (lambda: client.add_collection_field("q", "x", DataType.INT64, nullable=True), f"AddCollectionField: {rpc}"),
-        (lambda: client.search("q", [[1, 0]], filter="id + 1 > 0"), "filter expressions: arithmetic and geometry predicates are not supported"),
+        (lambda: client.search("q", [[1, 0]], filter="st_isvalid(id)"), "filter expressions: geometry predicates are not supported"),
         (lambda: client.search("m", [[1, 0]], ranker=model), f"rerank model providers: {feature}"),
         # 与分组同时出现时，model 的 UNIMPLEMENTED 不能被分组路径吞掉。
         (lambda: client.search("m", [[1, 0]], ranker=model, group_by_field="id"),

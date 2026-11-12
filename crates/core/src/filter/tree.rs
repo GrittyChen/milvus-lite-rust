@@ -2,7 +2,7 @@
 
 use super::dynamic::DynamicRow;
 use super::eval::{self, Operand};
-use super::parser::{self, Ast, Kind};
+use super::parser::{self, Ast, Kind, Literal};
 use crate::analyzer::TextQuery;
 use crate::error::{EngineError, Result, py_repr};
 use crate::schema::{CollectionSchema, DataType};
@@ -23,6 +23,19 @@ pub(super) struct Tree {
     pub(super) backend: Backend,
     pub(super) patterns: Vec<Option<super::python::LikePattern>>,
     pub(super) text_queries: Vec<Option<TextQuery>>,
+    /// 含时间戳 ± 区间以外的算术（0032）。
+    pub(super) numeric_arithmetic: bool,
+}
+
+/// 3.x `semantic.py`：任一侧动态则动态；`/` 或含 float 则 float；否则 int。
+fn numeric_result(op: &str, a: &'static str, b: &'static str) -> &'static str {
+    if a == "dynamic" || b == "dynamic" {
+        "dynamic"
+    } else if op == "/" || a == "float" || b == "float" {
+        "float"
+    } else {
+        "int"
+    }
 }
 
 fn numeric_operand(
@@ -95,6 +108,7 @@ impl Tree {
             .as_ref()
             .ok_or_else(|| EngineError::Storage("empty filter tree".into()))?;
         let source = &parsed.source;
+        let mut numeric_arithmetic = false;
         let mut types = vec![""; ast.nodes.len()];
         let mut work = vec![(ast.root, 0_u8, "")];
         while let Some((id, stage, boolean)) = work.pop() {
@@ -344,9 +358,11 @@ impl Tree {
                                 ));
                             }
                         }
-                        return Err(eval::unsupported());
+                        numeric_arithmetic = true;
+                        numeric_result(op, a, b)
                     }
                 }
+                // 3.x 把非字面量的一元负号解析成 `0 - x`，类型规则与二元减法相同。
                 Kind::Neg(child) => {
                     let t = types[*child];
                     if !matches!(t, "int" | "float" | "dynamic") {
@@ -354,7 +370,8 @@ impl Tree {
                             "-", "right", ast, *child, t, node.pos, source,
                         ));
                     }
-                    return Err(eval::unsupported());
+                    numeric_arithmetic = true;
+                    numeric_result("-", "int", t)
                 }
                 Kind::Unsupported => return Err(eval::unsupported()),
             };
@@ -370,6 +387,20 @@ impl Tree {
                 1,
                 None,
             ));
+        }
+        // 类型检查之后把一元负号改写成 `0 - x`（3.x 的 AST 形状），三条路线只处理二元算术；
+        // 解析结果不变，解析 fixture 仍看到 `Kind::Neg`。
+        let mut ast = ast.clone();
+        for id in 0..ast.nodes.len() {
+            if let Kind::Neg(child) = ast.nodes[id].kind {
+                let pos = ast.nodes[id].pos;
+                ast.nodes.push(parser::Node {
+                    kind: Kind::Lit(Literal::Int("0".into())),
+                    pos,
+                });
+                let zero = ast.nodes.len() - 1;
+                ast.nodes[id].kind = Kind::Arith("-".into(), zero, child);
+            }
         }
         let mut backend = Backend::Arrow;
         let operands = ast
@@ -430,12 +461,13 @@ impl Tree {
             })
             .collect();
         Ok(Self {
-            ast: ast.clone(),
+            ast,
             operands,
             names: schema.fields.iter().map(|f| f.name.clone()).collect(),
             backend,
             patterns,
             text_queries,
+            numeric_arithmetic,
         })
     }
 
