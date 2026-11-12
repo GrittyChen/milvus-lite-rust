@@ -6,6 +6,7 @@ mod eval;
 mod parser;
 mod python;
 mod python_json;
+mod python_num;
 pub(crate) mod temporal;
 mod tree;
 #[cfg(test)]
@@ -127,10 +128,6 @@ impl RowFilter {
         let pk = schema.fields.iter().position(|f| f.is_primary);
         let is_pk = |op: &Operand| matches!(op, Operand::Column(i) if Some(*i) == pk);
         let mut tree = tree::Tree::compile(parsed, schema)?;
-        // 这里总走 Python 路线，而 Python 路线的数值算术尚未实现：拒绝，不能静默得到「未知」。
-        if tree.numeric_arithmetic {
-            return Err(eval::arithmetic_unsupported());
-        }
         // 同名的 schema 字段每行都在，直接改绑到这一列。
         let id_field = schema
             .fields
@@ -210,10 +207,6 @@ impl RecordFilter {
             return Ok(None);
         }
         let tree = tree::Tree::compile(parsed, schema)?;
-        // 这里总走 Python 路线，而 Python 路线的数值算术尚未实现：自行拒绝，不依赖调用方的路线判断。
-        if tree.numeric_arithmetic {
-            return Err(eval::arithmetic_unsupported());
-        }
         Ok(Some(Self { tree }))
     }
 
@@ -456,7 +449,7 @@ mod tests {
                 ColumnData::Json(vec![
                     br#"{"k":1}"#.to_vec(),
                     br#"{"k":2}"#.to_vec(),
-                    br#"{"x":1}"#.to_vec(),
+                    br#"{"x":1,"s":"ab"}"#.to_vec(),
                 ]),
                 ColumnData::Int32(vec![7, 0, 7]).with_validity(&[true, false, true]),
                 // 2025-01-01T00:00:00Z 与它前后各一秒。
@@ -533,32 +526,82 @@ mod tests {
         #[test]
         fn out_of_scope_constructs_stay_unimplemented() {
             for dynamic in [false, true] {
-                for expr in ["age + 1 > 5", "geometry_contains(name, 'POINT (0 0)')"] {
-                    assert!(
-                        matches!(filter(expr, dynamic), Err(EngineError::Unsupported { .. })),
-                        "{expr}"
-                    );
-                }
+                let expr = "geometry_contains(name, 'POINT (0 0)')";
+                assert!(
+                    matches!(filter(expr, dynamic), Err(EngineError::Unsupported { .. })),
+                    "{expr}"
+                );
             }
         }
 
-        // 稀疏检索 MemTable 的逐行过滤总走 Python 路线：纯 schema 字段的算术在普通过滤中走 Arrow 路线，
-        // 在这里也要拒绝，不能静默得到「未知」。
+        // boost 过滤总是逐行走 Python 路线（0032）：同一个表达式在普通过滤中按 Arrow 回绕或报错，
+        // 这里是精确整数与 double。
         #[test]
-        fn record_filter_rejects_arithmetic_until_the_python_route_exists() {
-            for dynamic in [false, true] {
-                for expr in ["age + 1 > 5", "-age < 0", "age * 2 > 1 or id > 0"] {
-                    let parsed = ParsedFilter::parse_with(expr, &TimezoneSource::none()).unwrap();
-                    assert!(
-                        matches!(
-                            RecordFilter::compile(&parsed, &schema(dynamic)),
-                            Err(EngineError::Unsupported { .. })
-                        ),
-                        "{expr}"
-                    );
-                }
-                let parsed = ParsedFilter::parse_with("age > 5", &TimezoneSource::none()).unwrap();
-                assert!(RecordFilter::compile(&parsed, &schema(dynamic)).is_ok());
+        fn arithmetic_uses_python_values_row_by_row() {
+            for (expr, want) in [
+                ("age + 1 > 5", [false, true, true]),
+                ("-age < 0", [true, true, true]),
+                ("age * 2 > 1 or id > 0", [true, true, true]),
+                ("age + 9223372036854775807 > 0", [true, true, true]),
+                (
+                    "age * 9223372036854775807 > 9223372036854775807",
+                    [false, true, true],
+                ),
+                ("age / 2 == 2.5", [false, true, false]),
+                ("age / 0 > 0", [false, false, false]),
+                ("opt + 1 == 8", [true, false, true]),
+                ("j['k'] * 2 == 4", [false, true, false]),
+                ("j['s'] + j['s'] == 'abab'", [false, false, true]),
+                ("2 * j['s'] == 'abab'", [false, false, true]),
+            ] {
+                assert_eq!(hits(expr, false), want, "{expr}");
+                assert_eq!(hits(expr, true), want, "{expr}");
+            }
+            assert_eq!(hits("dyn + 1 > 0", true), [false; 3]);
+            // 3.x 的 OverflowError 照报，不被吞成未知。
+            let f = filter("j['s'] * 9223372036854775808 == ''", false)
+                .unwrap()
+                .unwrap();
+            assert!(!f.matches(&columns(), 0, None).unwrap());
+            assert_eq!(
+                f.matches(&columns(), 2, None).unwrap_err().to_string(),
+                "cannot fit 'int' into an index-sized integer"
+            );
+        }
+
+        // 稀疏检索 MemTable 的逐行过滤同样总走 Python 路线，动态字段照常可见。
+        #[test]
+        fn record_filter_evaluates_arithmetic_with_python_values() {
+            let columns = columns();
+            let metas = [
+                map(json!({"dyn": 2})),
+                map(json!({"dyn": "a"})),
+                map(json!({})),
+            ];
+            let rows: Vec<_> = (0..3)
+                .map(|row| DynamicRow {
+                    columns: &columns,
+                    meta: Some(&metas[row]),
+                    row,
+                    sequence: None,
+                })
+                .collect();
+            for (expr, want) in [
+                ("age + 9223372036854775807 > 0", [true, true, true]),
+                ("dyn * 2 == 4", [true, false, false]),
+                ("dyn * 2 == 'aa'", [false, true, false]),
+                ("dyn + age > 2", [true, false, false]),
+            ] {
+                let parsed = ParsedFilter::parse_with(expr, &TimezoneSource::none()).unwrap();
+                let f = RecordFilter::compile(&parsed, &schema(true))
+                    .unwrap()
+                    .unwrap();
+                let bits = f.evaluate(&rows).unwrap();
+                assert_eq!(
+                    (0..3).map(|i| bits.get(i)).collect::<Vec<_>>(),
+                    want,
+                    "{expr}"
+                );
             }
         }
 

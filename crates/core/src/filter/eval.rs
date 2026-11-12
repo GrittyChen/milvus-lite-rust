@@ -74,13 +74,6 @@ pub(super) fn unsupported() -> EngineError {
         "geometry predicates are not supported",
     )
 }
-/// 数值算术只在 Arrow 路线实现；其余路线（hybrid 回退、Python、boost 与稀疏检索的逐行过滤）拒绝。
-pub(super) fn arithmetic_unsupported() -> EngineError {
-    EngineError::unsupported(
-        "filter expressions",
-        "arithmetic is only supported on schema fields in ordinary filters",
-    )
-}
 /// 含几何谓词这类范围外构造：它们先于语义检查报 UNIMPLEMENTED（0006 第 1 项）。
 pub(super) fn out_of_scope(ast: &Ast) -> bool {
     ast.nodes
@@ -88,10 +81,6 @@ pub(super) fn out_of_scope(ast: &Ast) -> bool {
         .any(|node| matches!(node.kind, Kind::Unsupported))
 }
 
-/// 只有 Arrow 路线实现了数值算术：hybrid 回退与 Python 路线若收到它会静默得到「未知」，所以拒绝。
-pub(super) fn arithmetic_route_unsupported(tree: &super::tree::Tree) -> bool {
-    tree.numeric_arithmetic && tree.backend != super::tree::Backend::Arrow
-}
 pub(super) fn compatible(a: &str, b: &str) -> bool {
     a == b
         || a == "dynamic"
@@ -231,9 +220,6 @@ impl Predicate {
         }
         if !super::tree::legacy_shape(ast, schema) {
             let tree = super::tree::Tree::compile(parsed, schema)?;
-            if arithmetic_route_unsupported(&tree) {
-                return Err(arithmetic_unsupported());
-            }
             return Ok(Self {
                 terms: Vec::new(),
                 field_names: Some(schema.fields.iter().map(|f| f.name.clone()).collect()),

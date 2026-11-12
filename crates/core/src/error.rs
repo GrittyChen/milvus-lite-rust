@@ -66,6 +66,9 @@ pub enum EngineError {
     /// 文件、格式或提交协议失败；不伪装成用户输入错误。
     #[error("storage error: {0}")]
     Storage(String),
+    /// 过滤求值中的值超出本实现的资源上限（0032「资源上限」）；3.x 没有上限，是登记的差异。
+    #[error("{0}")]
+    FilterResourceExhausted(String),
 }
 
 impl EngineError {

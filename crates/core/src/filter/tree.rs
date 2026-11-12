@@ -23,8 +23,8 @@ pub(super) struct Tree {
     pub(super) backend: Backend,
     pub(super) patterns: Vec<Option<super::python::LikePattern>>,
     pub(super) text_queries: Vec<Option<TextQuery>>,
-    /// 含时间戳 ± 区间以外的算术（0032）。
-    pub(super) numeric_arithmetic: bool,
+    /// 算术操作数中的整数字面量，编译期解析一次供 Python 路线各行共享（0032）。
+    pub(super) integers: Vec<Option<super::python_num::Integer>>,
 }
 
 /// 3.x `semantic.py`：任一侧动态则动态；`/` 或含 float 则 float；否则 int。
@@ -108,7 +108,6 @@ impl Tree {
             .as_ref()
             .ok_or_else(|| EngineError::Storage("empty filter tree".into()))?;
         let source = &parsed.source;
-        let mut numeric_arithmetic = false;
         let mut types = vec![""; ast.nodes.len()];
         let mut work = vec![(ast.root, 0_u8, "")];
         while let Some((id, stage, boolean)) = work.pop() {
@@ -358,7 +357,6 @@ impl Tree {
                                 ));
                             }
                         }
-                        numeric_arithmetic = true;
                         numeric_result(op, a, b)
                     }
                 }
@@ -370,7 +368,6 @@ impl Tree {
                             "-", "right", ast, *child, t, node.pos, source,
                         ));
                     }
-                    numeric_arithmetic = true;
                     numeric_result("-", "int", t)
                 }
                 Kind::Unsupported => return Err(eval::unsupported()),
@@ -460,6 +457,16 @@ impl Tree {
                 _ => None,
             })
             .collect();
+        let mut integers = vec![None; ast.nodes.len()];
+        for node in &ast.nodes {
+            if let Kind::Arith(_, a, b) = &node.kind {
+                for &child in [a, b] {
+                    if let Kind::Lit(Literal::Int(text)) = &ast.nodes[child].kind {
+                        integers[child] = Some(super::python_num::Integer::literal(text)?);
+                    }
+                }
+            }
+        }
         Ok(Self {
             ast,
             operands,
@@ -467,7 +474,7 @@ impl Tree {
             backend,
             patterns,
             text_queries,
-            numeric_arithmetic,
+            integers,
         })
     }
 

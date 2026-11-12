@@ -1,6 +1,6 @@
 # 0032：过滤表达式中的算术
 
-状态：设计经六轮独立复核与负责人两轮评审，2026-11-12 通过；第 1 步已实施并复核通过，第 2、3 步待实施。参照版本 `1320d26`。负责人于 2026-11-12 确认：大整数用 `num-bigint`；字符串 / 列表结果设 64 MiB 上限（按实际分配，每码位 4 字节），拼接与重复共用，先算大小再分配；大整数设 2^20 位上限；输入的解析和转换同样计入预算（表达式字面量已由解析器限制在 4300 位内，不另计）；3.x 的 OverflowError 情形照报原文，之后才是本实现的资源错误；已有比较的 null 错位检查一并修正；CPU 与时间不设上限，登记为残余风险；参照的内部测试只作真值来源。
+状态：设计经六轮独立复核与负责人两轮评审，2026-11-12 通过；第 1 步已实施并复核通过；第 2 步已实施并复核通过；第 3 步待实施。参照版本 `1320d26`。负责人于 2026-11-12 确认：大整数用 `num-bigint`；字符串 / 列表结果设 64 MiB 上限（按实际分配，每码位 4 字节），拼接与重复共用，先算大小再分配；大整数设 2^20 位上限；输入的解析和转换同样计入预算（表达式字面量已由解析器限制在 4300 位内，不另计）；3.x 的 OverflowError 情形照报原文，之后才是本实现的资源错误；已有比较的 null 错位检查一并修正；CPU 与时间不设上限，登记为残余风险；参照的内部测试只作真值来源。
 
 ## 范围
 
@@ -94,7 +94,7 @@ pymilvus 在客户端拒绝超过 64 位的 JSON 整数，所以经 SDK 写入�
 **Python 值**（[python.rs](../../crates/core/src/filter/python.rs)）：
 
 - 新依赖：`num-bigint` 0.5.1 成为 `milvus-lite-core` 的**直接运行时依赖**（默认 feature 只有 `std`）。它已经通过 arrow-buffer / parquet 60.0 出现在 `Cargo.lock` 中，不新增 crate、版本、构建脚本或 C 代码，但 core 的依赖列表多一项；纯 Rust，MIT / Apache-2.0。只在 Python 路线使用，Arrow 与 hybrid 快路径不使用。
-- `Value` 增加共享所有权的算术结果：整数 `Arc<BigInt>`（比较直接按数值，不转十进制文本），字符串 `Arc<Vec<u32>>`，列表 `Arc<Vec<SharedValue>>`。用 `Arc<Vec<T>>` 而不是 `Arc<[T]>`：先对 `Vec` 做 `try_reserve_exact` 再 `Arc::new`，数据不再搬动；`Arc<[T]>` 从 `Vec` 转换时会重新分配，且分配失败时 abort。`SharedValue` 是单独的类型，只含 clone 为 O(1) 的形式（`Null`、bool、float、`i64` 与 `Arc<BigInt>` 整数、借用的 JSON 节点、`Decoded`、保留「借用列 + 下标」以维持 NaN 身份的 `ArrayFloat`、`Arc<Vec<u32>>`、`Arc<Vec<SharedValue>>`；不含 `Cow::Owned`），列表元素只能是它，漏转时编译报错，元素按固定常量计费由类型保证。ARRAY 与 JSON 列表中的 null 元素转成 `SharedValue::Null`；ARRAY<TIMESTAMPTZ> 目前不存在，放开时再加时间戳形式。输入中的整数仍是现有的十进制文本，参与算术时才解析；表达式中的整数字面量在编译时解析一次。`node_value` 读取节点值时只增加引用计数，不深拷贝。比较（含大整数与 float、bool 与大整数、列表的相等与有序比较及 NaN 元素的身份语义）、`in`、LIKE、`text_match` 等已有逻辑要能接收这些结果。
+- `Value` 增加共享所有权的算术结果：整数 `Arc<BigInt>`（比较直接按数值，不转十进制文本），字符串 `Arc<Vec<u32>>`，列表 `Arc<Vec<SharedValue>>`。用 `Arc<Vec<T>>` 而不是 `Arc<[T]>`：先对 `Vec` 做 `try_reserve_exact` 再 `Arc::new`，数据不再搬动；`Arc<[T]>` 从 `Vec` 转换时会重新分配，且分配失败时 abort。`SharedValue` 是单独的类型，只含 clone 为 O(1) 的形式（`Null`、bool、float、`i64` 与 `Arc<BigInt>` 整数、借用的 JSON 节点、`Decoded`、保留「借用列 + 下标」以维持 NaN 身份的 `ArrayFloat`、`Arc<Vec<u32>>`、`Arc<Vec<SharedValue>>`；不含 `Cow::Owned`），列表元素只能是它，漏转时编译报错，元素按固定常量计费由类型保证。ARRAY 与 JSON 列表中的 null 元素转成 `SharedValue::Null`；ARRAY<TIMESTAMPTZ> 目前不存在，放开时再加时间戳形式。输入中的整数仍是现有的十进制文本，参与算术时才解析；表达式中的整数字面量在编译时解析一次。每个节点的值只被父节点读一次，`node_value` 读取时取走，不复制。比较（含大整数与 float、bool 与大整数、列表的相等与有序比较及 NaN 元素的身份语义）、`in`、LIKE、`text_match` 等已有逻辑要能接收这些结果。
 - [python.rs](../../crates/core/src/filter/python.rs) 中 `Kind::Arith` 现有的 `_ => Value::Null` 兜底改为按上表逐项列出的组合，只有表中的 TypeError / ZeroDivisionError 情形得到「未知」，不留默认分支。
 - 整数真除法：用 `div_rem` 取商和余数，按 CPython `long_true_divide` 的做法得到正确舍入（最近偶数）的 double，处理符号、次正规数与下溢；不先转 double 再除。int → float 同样正确舍入，超出报 `int too large to convert to float`。
 - 重复按上文四步的顺序：先检查次数的类型与范围，再处理空结果，再检查长度乘积，最后查资源上限并分配。
@@ -105,11 +105,11 @@ pymilvus 在客户端拒绝超过 64 位的 JSON 整数，所以经 SDK 写入�
 - `MAX_FILTER_INT_BITS = 2^20`（约 31.5 万位十进制）：大整数的位宽上限，以**估算值**为准：乘法为两侧 `bits()` 之和，加减为较大者加一；估算超过上限即拒绝（真实位宽可能小 1，边界测试按估算值写）。按位宽而不按 64 MiB，是因为大整数乘法的耗时随位宽超线性增长，64 MiB 的乘法每行就要数十秒。
 - **输入、字面量与转换同样计入**，都在分配之前检查：
   - 行内输入的十进制整数文本（含 `$meta` 值）在解析成 `BigInt` 之前，按 `ceil(位数 × log2 10)` 估算位宽，超过 `MAX_FILTER_INT_BITS` 直接报资源错误，不先解析再检查。表达式中的整数字面量已由解析器限制在 4300 位以内（超出是解析错误 `invalid integer literal`，与 3.x 相同），约 1.43 万比特，不需要预检；它在编译期解析一次、各行共享，不按行计费。
-  - 输入字符串转成共享形式：已拥有的 `Vec<u32>` 直接移入 `Arc`，不拷贝、不计费；借用的输入按码位数 × 4 字节拷贝并计费。
+  - 读取输入字符串时得到的码位数组（读 VARCHAR / JSON 列时由已有的取值逻辑生成，读 JSON 字符串时临时转换）是输入的表示，生成时不经预算：单个值的大小受输入本身约束。作为拼接或重复的操作数时，它只被读取、随即释放，不计费；成为结果列表的元素、被结果保留时才计费：已拥有的直接移入 `Arc`、不拷贝，此时它已经分配，计费只保证累计账目正确，不能阻止这次分配；借用的输入先计费、再按预算拷贝。两者都按码位数 × 4 字节计。
   - 输入列表 / ARRAY 转成共享形式：按元素数 × `FILTER_LIST_ELEMENT_BYTES` 计费，元素中的字符串按上一条处理。
   - 解析出的 `BigInt` 按 `bits / 8` 计费。
   - 这些转换与算术结果一样受单值上限约束，并计入每行累计。
-- **每行累计**：Python 路线逐行求值，同一行所有新分配（算术结果，以及上一条的解析与转换；大整数按 `bits / 8`）累计不超过 64 MiB，下一行清零。行与行串行，节点值共享不复制，所以一次过滤求值中因算术新增的内存峰值不超过这一份预算（不含输入数据本身已占用的内存）。
+- **每行累计**：Python 路线逐行求值，同一行所有新分配（算术结果，以及上一条的解析与转换；大整数按 `bits / 8`）累计不超过 64 MiB，下一行清零。行与行串行，节点值共享不复制，所以一次过滤求值中因算术新增的内存峰值不超过这一份预算（不含输入数据本身已占用的内存，也不含比较、LIKE 与读取 JSON 字符串时与输入或结果同量级的瞬时工作区）。
 - 超限报新增的 `EngineError::FilterResourceExhausted`，gRPC 为 code 1（与 3.x 的 MemoryError 同码），文案固定为 `filter value exceeds the 67108864-byte limit` / `filter integer exceeds the 1048576-bit limit`。这个错误不被 TypeError → 未知吞掉，不是 UNIMPLEMENTED，在 hybrid 中不回退；[status.rs](../../crates/grpc/src/status.rs) 的穷尽匹配同步加上 code 1。用于 Delete 时整个请求失败，行集与序号不变。
 - 先算大小再分配：长度与字节数用 `checked_mul` / `u128` 计算，`Vec` 的分配用 `try_reserve_exact`（按请求的确切容量计费，不让分配器多给的容量漏计），失败返回同一个资源错误（上限通过 crate 内的测试参数注入，使 `try_reserve_exact` 失败与边界路径可以在小尺寸上测试；正式构建中上限是常量）；不对不可信的大小直接 `with_capacity`、`repeat` 或 `vec!`。能保证不 abort 的只有这些 `Vec` 数据分配：`Arc::new` 的控制块分配（固定几十字节）与 `num-bigint` 内部的分配（位宽已先行受限）在内存耗尽时仍会 abort，登记为残余风险。
 - 顺序：3.x 报 OverflowError 的情形（第 1 步，及字符串的第 3 步）照报原文；之后才检查本实现的上限。3.x 在第 3 步对列表报 MemoryError、在第 4 步可能成功或 MemoryError 的情形，本实现超限时报资源错误。
@@ -122,6 +122,7 @@ pymilvus 在客户端拒绝超过 64 位的 JSON 整数，所以经 SDK 写入�
 | 差异 | 3.x | 本实现 | 理由 |
 | --- | --- | --- | --- |
 | 过滤中间值的大小上限 | 无上限；字符串 / 列表重复或拼接按需分配，内存不足或列表长度乘积越界时报 code 1 空文案的 MemoryError；大整数无界增长 | 单值 64 MiB（按实际分配字节）、整数 2^20 位（按估算）、每行累计 64 MiB，超限报 code 1 固定文案；作为算术操作数的输入转成共享形式时也计入（如 ARRAY<VARCHAR> 的 `arr + arr`） | 3.x 的结果取决于机器内存，无法逐位对齐；不设上限时一个请求就能让服务 OOM 或长时间占满 CPU。正常数据（VARCHAR、ARRAY、JSON 的取值）及其转换远低于上限 |
+| hybrid 动态列的类型推断：数字与其他类型混排（既有差异，算术让它改变数值） | pyarrow 按元素顺序推断并报错：`[2**64, 's', ...]` 先遇到超出 int64 的整数，物化时报 `OverflowError: Python int too large to convert to C long`，而 `['s', 2**64]` 报 ArrowTypeError、整源回退 Python；float 之后出现的 bool（`[1.5, 0.1, False, 0.1]`、`[0.0, 2, 1.5, True]`）推断为 double，bool 当作 0.0 / 1.0：`4611686018427387904 / x` 在 False 行得 inf、命中，`x * 1180591620717411303424` 与 `x + 1 == 2 and age == 9223372036854775808` 因字面量超出 int64 报 OverflowError | 数字与 bool、字符串、列表等混排时一律整源回退 Python 路线：上述 `[2**64, 's', ...]` 不报错、按 Python 求值（`'s' * 2**70` 报 `cannot fit 'int' into an index-sized integer`）；False 行除零得未知、不命中；乘以大字面量得到精确结果；`and` 按 Python 短路，不报字面量溢出 | 推断与报错先后改的是所有 hybrid 过滤共用的 [dynamic.rs](../../crates/core/src/filter/dynamic.rs) `infer`，不在算术切片中修改；复刻 pyarrow 的推断与报错顺序另开切片处理，届时注销本条。影响用例：[filter_arith.json](../../crates/core/tests/fixtures/filter_arith.json) 中这四组动态值，3.x 一侧留在语料，本实现一侧固定在 [tree_tests.rs](../../crates/core/src/filter/tree_tests.rs) 的 `REGISTERED_HYBRID_INFERENCE` |
 | 算术下的有效位差异（沿用 0006 / 0014 已登记的「只看活行」） | 已删除或被覆盖的旧版本行参与 hybrid 的类型推断与 Arrow 的转换检查 | 只看活行 | 原差异写的是「可能选择不同 backend / 报不报错」。有了算术后它还会改变**数值**：例如 3.x 因某个死行是字符串而整源回退到 Python（精确大整数），本实现只看活行、走 Arrow（int64 回绕），`x * x` 的结果不同。在 0006 的登记中补写这一后果 |
 
 接受的残余风险（见上文「资源上限」，验收时复述）：CPU 与时间不设上限，内存上限不等于 CPU 上限；`Arc` 控制块与 `num-bigint` 内部分配在内存耗尽时 abort。

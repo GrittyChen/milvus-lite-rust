@@ -69,6 +69,7 @@ pub(crate) fn from_engine(
         | EngineError::Closed
         | EngineError::DataDir(_)
         | EngineError::Storage(_)
+        | EngineError::FilterResourceExhausted(_)
         | EngineError::Unsupported { .. } => (1, 0),
     };
     Ok(status(code, error_code, e.to_string()))
@@ -160,6 +161,10 @@ mod tests {
         assert_eq!(codes(EngineError::IndexNotFound("x".into())), (700, 11));
         assert_eq!(codes(EngineError::InvalidArgument("x".into())), (1, 0));
         assert_eq!(codes(EngineError::Closed), (1, 0));
+        assert_eq!(
+            codes(EngineError::FilterResourceExhausted("x".into())),
+            (1, 0)
+        );
     }
 
     #[test]

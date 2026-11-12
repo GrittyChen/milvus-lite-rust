@@ -4,6 +4,10 @@ use super::dynamic::DynamicRow;
 use super::eval::{Comparison, Operand, Term};
 use super::parser::{Kind, Literal, PathPart};
 use super::python_json::{Document, JsonNode, decode};
+use super::python_num::{
+    self as num, Budget, FILTER_CODE_POINT_BYTES, FILTER_LIST_ELEMENT_BYTES, IntRef, Integer,
+    Limits,
+};
 use super::tree::Tree;
 use crate::data::ColumnData;
 use crate::error::{EngineError, Result};
@@ -95,11 +99,93 @@ pub(super) enum Value<'a> {
     Timestamp(i64),
     /// `timedelta`：微秒数（构造时已按 Python 的范围检查）。
     Interval(i128),
+    /// 算术得到的整数，以及编译期解析的算术字面量。
+    Integer(Integer),
+    /// 算术得到的字符串（码位）。
+    Str(Arc<Vec<u32>>),
+    /// 算术得到的列表；元素只能是 O(1) 克隆的共享形式。
+    List(Arc<Vec<Shared<'a>>>),
 }
+
+/// 算术结果列表的元素：只含克隆为 O(1) 的形式（不含 `Cow::Owned`），按固定常量计费由类型保证。
+/// 借用的 JSON 节点、`Decoded` 与「借用列 + 下标」的 `ArrayFloat` 保留 Python 对象身份，
+/// 列表相等比较对同一个 NaN 对象按身份判等。
+#[derive(Clone)]
+pub(super) enum Shared<'a> {
+    Null,
+    Bool(bool),
+    Float(f64, bool),
+    Integer(Integer),
+    Json(&'a Json),
+    Decoded(Arc<Document>, usize),
+    ArrayFloat(f64, &'a ColumnData, usize),
+    Str(Arc<Vec<u32>>),
+    List(Arc<Vec<Shared<'a>>>),
+}
+const _: () = assert!(std::mem::size_of::<Shared<'static>>() as u64 <= FILTER_LIST_ELEMENT_BYTES);
+
+impl<'a> Shared<'a> {
+    fn value(&self) -> Value<'a> {
+        match self {
+            Self::Null => Value::Null,
+            Self::Bool(b) => Value::Bool(*b),
+            Self::Float(v, nan) => Value::Float(*v, *nan),
+            Self::Integer(v) => Value::Integer(v.clone()),
+            Self::Json(v) => Value::Json(v),
+            Self::Decoded(doc, id) => Value::Decoded(Arc::clone(doc), *id),
+            Self::ArrayFloat(v, column, index) => Value::ArrayFloat(*v, column, *index),
+            Self::Str(v) => Value::Str(Arc::clone(v)),
+            Self::List(v) => Value::List(Arc::clone(v)),
+        }
+    }
+    /// 列表元素转成共享形式。新得到并被结果保留的字符串按码位计费：借用的先按预算拷贝，
+    /// 已拥有的（读列时为这一行新建的码位数组）直接移入。
+    fn new(value: Value<'a>, budget: &mut Budget) -> Result<Self> {
+        Ok(match value {
+            Value::Null => Self::Null,
+            Value::Bool(b) => Self::Bool(b),
+            Value::Float(v, nan) => Self::Float(v, nan),
+            Value::ArrayFloat(v, column, index) => Self::ArrayFloat(v, column, index),
+            Value::Int(text) => Self::Integer(Integer::from_ref(IntRef::Text(&text), budget)?),
+            Value::Integer(v) => Self::Integer(v),
+            // JSON 列表里的 null 元素就是 None，没有对象身份可保留。
+            Value::Json(Json::Null) => Self::Null,
+            Value::Json(v) => Self::Json(v),
+            Value::Decoded(doc, id) if matches!(doc.nodes[id], JsonNode::Null) => Self::Null,
+            Value::Decoded(doc, id) => Self::Decoded(doc, id),
+            Value::Str(v) => Self::Str(v),
+            Value::List(v) => Self::List(v),
+            Value::Text(text) => {
+                let len = text.len() as u128;
+                Self::Str(Arc::new(match text {
+                    Cow::Owned(text) => {
+                        budget.charge(len * u128::from(FILTER_CODE_POINT_BYTES))?;
+                        text
+                    }
+                    Cow::Borrowed(text) => {
+                        let mut copy = budget.vec(len, FILTER_CODE_POINT_BYTES)?;
+                        copy.extend_from_slice(text);
+                        copy
+                    }
+                }))
+            }
+            Value::Array(..)
+            | Value::Vector(_)
+            | Value::Targets(_)
+            | Value::Timestamp(_)
+            | Value::Interval(_) => {
+                return Err(EngineError::Storage(
+                    "list element has no shared Python form".into(),
+                ));
+            }
+        })
+    }
+}
+
 enum Atom<'a> {
     Null,
     Bool(bool),
-    Int(&'a str),
+    Int(IntRef<'a>),
     Float(f64, bool),
     Text(Cow<'a, [u32]>),
     List(usize),
@@ -113,7 +199,10 @@ impl Value<'_> {
             Self::Array(array, row) => Atom::List(array.range(*row).len()),
             Self::Null => Atom::Null,
             Self::Bool(b) => Atom::Bool(*b),
-            Self::Int(s) => Atom::Int(s),
+            Self::Int(s) => Atom::Int(IntRef::Text(s)),
+            Self::Integer(v) => Atom::Int(v.as_ref()),
+            Self::Str(v) => Atom::Text(Cow::Borrowed(v)),
+            Self::List(v) => Atom::List(v.len()),
             Self::Float(v, nan) => Atom::Float(*v, *nan),
             Self::ArrayFloat(v, _, _) => Atom::Float(*v, false),
             Self::Text(s) => Atom::Text(Cow::Borrowed(s)),
@@ -126,7 +215,7 @@ impl Value<'_> {
                         .map_err(|_| EngineError::invalid("invalid Python numeric value"))?,
                     false,
                 ),
-                Json::Number(n) => Atom::Int(n.as_str()),
+                Json::Number(n) => Atom::Int(IntRef::Text(n.as_str())),
                 Json::String(s) => Atom::Text(Cow::Owned(s.chars().map(u32::from).collect())),
                 Json::Array(v) => Atom::List(v.len()),
                 Json::Object(v) => Atom::Object(v.len()),
@@ -134,7 +223,7 @@ impl Value<'_> {
             Self::Decoded(doc, id) => match &doc.nodes[*id] {
                 JsonNode::Null => Atom::Null,
                 JsonNode::Bool(b) => Atom::Bool(*b),
-                JsonNode::Int(s) => Atom::Int(s),
+                JsonNode::Int(s) => Atom::Int(IntRef::Text(s)),
                 JsonNode::Float(f, n) => Atom::Float(*f, *n),
                 JsonNode::String(s) => Atom::Text(Cow::Borrowed(s)),
                 JsonNode::List(v) => Atom::List(v.len()),
@@ -181,6 +270,7 @@ impl Value<'_> {
             }
             Self::Vector(values) => values.get(i).map(|v| Self::Float(f64::from(*v), false)),
             Self::Targets(values) => values.get(i).cloned(),
+            Self::List(values) => values.get(i).map(Shared::value),
             _ => None,
         })
     }
@@ -265,23 +355,24 @@ pub(crate) fn int_float_cmp(integer: &str, float: f64) -> Option<Ordering> {
         order
     })
 }
-fn numeric<'a>(atom: &'a Atom<'_>) -> Option<Number<'a>> {
+fn numeric<'a>(atom: &Atom<'a>) -> Option<Number<'a>> {
     match atom {
-        Atom::Bool(v) => Some(Number::Int(if *v { "1" } else { "0" })),
-        Atom::Int(v) => Some(Number::Int(v)),
+        Atom::Bool(v) => Some(Number::Int(IntRef::Small(i64::from(*v)))),
+        Atom::Int(v) => Some(Number::Int(*v)),
         Atom::Float(v, _) => Some(Number::Float(*v)),
         _ => None,
     }
 }
+#[derive(Clone, Copy)]
 enum Number<'a> {
-    Int(&'a str),
+    Int(IntRef<'a>),
     Float(f64),
 }
 fn number_cmp(a: Number<'_>, b: Number<'_>) -> Option<Ordering> {
     match (a, b) {
-        (Number::Int(a), Number::Int(b)) => Some(int_cmp(a, b)),
-        (Number::Int(a), Number::Float(b)) => int_float_cmp(a, b),
-        (Number::Float(a), Number::Int(b)) => int_float_cmp(b, a).map(Ordering::reverse),
+        (Number::Int(a), Number::Int(b)) => Some(num::int_order(a, b)),
+        (Number::Int(a), Number::Float(b)) => num::int_float_order(a, b),
+        (Number::Float(a), Number::Int(b)) => num::int_float_order(b, a).map(Ordering::reverse),
         (Number::Float(a), Number::Float(b)) => a.partial_cmp(&b),
     }
 }
@@ -545,6 +636,183 @@ pub(super) fn evaluate_terms(terms: &[Term], rows: &[DynamicRow<'_>]) -> Result<
     Ok(matching)
 }
 
+/// 参与算术的 Python 值的类别；按 `Atom` 穷尽划分，新增的值形式必须在这里决定归类。
+#[derive(Clone, Copy)]
+enum Class<'a> {
+    Absent,
+    Temporal,
+    Number(Number<'a>),
+    Text,
+    List,
+    Dict,
+}
+fn class<'a>(atom: &Atom<'a>) -> Class<'a> {
+    match atom {
+        Atom::Null => Class::Absent,
+        Atom::Timestamp(_) | Atom::Interval(_) => Class::Temporal,
+        Atom::Bool(v) => Class::Number(Number::Int(IntRef::Small(i64::from(*v)))),
+        Atom::Int(v) => Class::Number(Number::Int(*v)),
+        Atom::Float(v, _) => Class::Number(Number::Float(*v)),
+        Atom::Text(_) => Class::Text,
+        Atom::List(_) => Class::List,
+        Atom::Object(_) => Class::Dict,
+    }
+}
+
+/// Python `operator.add / sub / mul / truediv`（3.x `_eval_row` 的 ArithOp）：任一侧为 None 得 None；
+/// TypeError 与 ZeroDivisionError 吞成未知；其余异常（OverflowError 与本实现的资源错误）向上传播。
+fn arithmetic<'a>(
+    op: &str,
+    a: &Value<'a>,
+    b: &Value<'a>,
+    budget: &mut Budget,
+) -> Result<Value<'a>> {
+    use Class::{Absent, Dict, List, Temporal, Text};
+    let (x, y) = (a.atom()?, b.atom()?);
+    Ok(match (class(&x), class(&y), op) {
+        (Absent, _, _) | (_, Absent, _) => Value::Null,
+        (Temporal, Temporal, _) => match (&x, &y, op) {
+            (Atom::Timestamp(t), Atom::Interval(d), "+" | "-") => shifted(*t, *d, op == "-")?,
+            (Atom::Interval(d), Atom::Timestamp(t), "+") => shifted(*t, *d, false)?,
+            // 其余时间值组合在语义检查中已被拒绝；到达时得到未知，与 0025 已实现的相同。
+            _ => Value::Null,
+        },
+        (Class::Number(p), Class::Number(q), _) => numbers(op, p, q, budget)?,
+        (Text | List, Class::Number(Number::Int(count)), "*") => repeat(a, &x, count, budget)?,
+        (Class::Number(Number::Int(count)), Text | List, "*") => repeat(b, &y, count, budget)?,
+        (Text, Text, "+") => {
+            let (Atom::Text(p), Atom::Text(q)) = (&x, &y) else {
+                return Err(EngineError::Storage("Python text lost its value".into()));
+            };
+            let mut text =
+                budget.vec(p.len() as u128 + q.len() as u128, FILTER_CODE_POINT_BYTES)?;
+            text.extend_from_slice(p);
+            text.extend_from_slice(q);
+            Value::Str(Arc::new(text))
+        }
+        (List, List, "+") => {
+            let (Atom::List(p), Atom::List(q)) = (&x, &y) else {
+                return Err(EngineError::Storage("Python list lost its length".into()));
+            };
+            let (p, q) = (shared_list(a, *p, budget)?, shared_list(b, *q, budget)?);
+            let mut list =
+                budget.vec(p.len() as u128 + q.len() as u128, FILTER_LIST_ELEMENT_BYTES)?;
+            list.extend(p.iter().cloned());
+            list.extend(q.iter().cloned());
+            Value::List(Arc::new(list))
+        }
+        // 0032 表中的 TypeError 一行：时间值配其他值、字符串或列表配 float、str 与 list 互相、
+        // `-` 与 `/` 作用于序列、dict 参与，3.x 都吞成未知。
+        (Temporal, Class::Number(_) | Text | List | Dict, _)
+        | (Class::Number(_) | Text | List | Dict, Temporal, _)
+        | (Text | List, Class::Number(_), _)
+        | (Class::Number(_), Text | List, _)
+        | (Text, List, _)
+        | (List, Text, _)
+        | (Text, Text, _)
+        | (List, List, _)
+        | (Dict, _, _)
+        | (_, Dict, _) => Value::Null,
+    })
+}
+
+/// int、float（bool 当作 int）之间的运算。
+fn numbers<'a>(op: &str, a: Number<'_>, b: Number<'_>, budget: &mut Budget) -> Result<Value<'a>> {
+    if let (Number::Int(a), Number::Int(b)) = (a, b) {
+        let (a, b) = (Integer::from_ref(a, budget)?, Integer::from_ref(b, budget)?);
+        if op == "/" {
+            return Ok(num::true_divide(&a, &b)?.map_or(Value::Null, |v| Value::Float(v, false)));
+        }
+        return Ok(Value::Integer(Integer::apply(op, &a, &b, budget)?));
+    }
+    // int 先正确舍入成 float，超出 double 报 OverflowError（先于判零）。
+    let float = |n: Number<'_>| match n {
+        Number::Int(i) => i.to_f64(),
+        Number::Float(v) => Ok(v),
+    };
+    let (a, b) = (float(a)?, float(b)?);
+    Ok(Value::Float(
+        match op {
+            "+" => a + b,
+            "-" => a - b,
+            "*" => a * b,
+            // ZeroDivisionError（含除以 -0.0）：未知。
+            _ if b == 0.0 => return Ok(Value::Null),
+            _ => a / b,
+        },
+        false,
+    ))
+}
+
+/// 序列重复（`str * int`、`list * int` 及交换）。判定顺序与 CPython 相同：次数须能放进 `Py_ssize_t`；
+/// 次数 ≤ 0 或基值为空得到空值；长度乘积超过 `Py_ssize_t` 时字符串报 OverflowError、列表是
+/// MemoryError（本实现报资源错误）；最后检查本实现的上限并分配。不是字符串或列表时是 TypeError。
+fn repeat<'a>(
+    base: &Value<'a>,
+    atom: &Atom<'_>,
+    count: IntRef<'_>,
+    budget: &mut Budget,
+) -> Result<Value<'a>> {
+    let len = match atom {
+        Atom::Text(text) => text.len(),
+        Atom::List(len) => *len,
+        _ => return Ok(Value::Null),
+    };
+    let count = count.repeat_count()?;
+    let text = matches!(atom, Atom::Text(_));
+    if count <= 0 || len == 0 {
+        return Ok(if text {
+            Value::Str(Arc::new(Vec::new()))
+        } else {
+            Value::List(Arc::new(Vec::new()))
+        });
+    }
+    let total = len as u128 * count as u128;
+    if total > i64::MAX as u128 {
+        return Err(if text {
+            EngineError::invalid("repeated string is too long")
+        } else {
+            budget.value_error()
+        });
+    }
+    Ok(match atom {
+        Atom::Text(source) => {
+            let mut out = budget.vec(total, FILTER_CODE_POINT_BYTES)?;
+            for _ in 0..count {
+                out.extend_from_slice(source);
+            }
+            Value::Str(Arc::new(out))
+        }
+        _ => {
+            let items = shared_list(base, len, budget)?;
+            let mut out = budget.vec(total, FILTER_LIST_ELEMENT_BYTES)?;
+            for _ in 0..count {
+                out.extend(items.iter().cloned());
+            }
+            Value::List(Arc::new(out))
+        }
+    })
+}
+
+/// 列表操作数转成共享元素：已是算术结果的直接共享；其余按元素数计费后逐个转换。
+fn shared_list<'a>(
+    value: &Value<'a>,
+    len: usize,
+    budget: &mut Budget,
+) -> Result<Arc<Vec<Shared<'a>>>> {
+    if let Value::List(items) = value {
+        return Ok(Arc::clone(items));
+    }
+    let mut items = budget.vec(len as u128, FILTER_LIST_ELEMENT_BYTES)?;
+    for i in 0..len {
+        let item = value
+            .list_item(i)?
+            .ok_or_else(|| EngineError::Storage("Python list lost element".into()))?;
+        items.push(Shared::new(item, budget)?);
+    }
+    Ok(Arc::new(items))
+}
+
 enum Task<'a> {
     Visit(usize),
     Finish(usize),
@@ -553,19 +821,34 @@ enum Task<'a> {
     Contains(usize),
     ContainsFinish(usize, Value<'a>),
 }
-fn node_value<'a>(values: &[Option<Value<'a>>], id: usize) -> Result<Value<'a>> {
+/// 每个节点的值只被它的父节点读一次，读时取走，不复制。
+fn node_value<'a>(values: &mut [Option<Value<'a>>], id: usize) -> Result<Value<'a>> {
     values[id]
-        .clone()
+        .take()
         .ok_or_else(|| EngineError::Storage("Python filter lost evaluated operand".into()))
 }
 pub(super) fn evaluate_tree(tree: &Tree, rows: &[DynamicRow<'_>]) -> Result<SourceBits> {
+    evaluate_tree_with(tree, rows, num::LIMITS)
+}
+/// `limits` 只在测试中替换，用小尺寸覆盖边界与分配失败路径。
+pub(super) fn evaluate_tree_with(
+    tree: &Tree,
+    rows: &[DynamicRow<'_>],
+    limits: Limits,
+) -> Result<SourceBits> {
     let mut matching = SourceBits::new(rows.len());
+    let mut budget = Budget::new(limits);
     for (row_index, row) in rows.iter().enumerate() {
+        budget.reset();
         let mut values = vec![None; tree.ast.nodes.len()];
         let mut tasks = vec![Task::Visit(tree.ast.root)];
         while let Some(task) = tasks.pop() {
             match task {
                 Task::Visit(id) => {
+                    if let Some(integer) = &tree.integers[id] {
+                        values[id] = Some(Value::Integer(integer.clone()));
+                        continue;
+                    }
                     if let Some(op) = &tree.operands[id] {
                         values[id] = Some(operand(op, row)?);
                         continue;
@@ -635,7 +918,7 @@ pub(super) fn evaluate_tree(tree: &Tree, rows: &[DynamicRow<'_>]) -> Result<Sour
                             ));
                         }
                     };
-                    let b = node_value(&values, ids[index])?.boolean()?;
+                    let b = node_value(&mut values, ids[index])?.boolean()?;
                     let short = if matches!(tree.ast.nodes[id].kind, Kind::And(_)) {
                         Some(false)
                     } else {
@@ -660,7 +943,7 @@ pub(super) fn evaluate_tree(tree: &Tree, rows: &[DynamicRow<'_>]) -> Result<Sour
                             "Python contains continuation lost node".into(),
                         ));
                     };
-                    let array = node_value(&values, *value)?.parsed()?;
+                    let array = node_value(&mut values, *value)?.parsed()?;
                     if !matches!(array.atom()?, Atom::List(_)) {
                         values[id] = Some(Value::Bool(false));
                         continue;
@@ -687,7 +970,7 @@ pub(super) fn evaluate_tree(tree: &Tree, rows: &[DynamicRow<'_>]) -> Result<Sour
                             "Python contains continuation lost node".into(),
                         ));
                     };
-                    let target = node_value(&values, *targets)?;
+                    let target = node_value(&mut values, *targets)?;
                     let targets = if mode == "any_one" {
                         vec![target]
                     } else if let Atom::List(len) = target.atom()? {
@@ -730,59 +1013,52 @@ pub(super) fn evaluate_tree(tree: &Tree, rows: &[DynamicRow<'_>]) -> Result<Sour
                 Task::Finish(id) => {
                     values[id] = Some(match &tree.ast.nodes[id].kind {
                         Kind::Cmp(op, a, b) => compare(
-                            &node_value(&values, *a)?,
-                            &node_value(&values, *b)?,
+                            &node_value(&mut values, *a)?,
+                            &node_value(&mut values, *b)?,
                             Comparison::parse(op)?,
                         )?
                         .map_or(Value::Null, Value::Bool),
                         Kind::Arith(op, a, b) => {
-                            let (a, b) = (node_value(&values, *a)?, node_value(&values, *b)?);
-                            match (a.atom()?, b.atom()?, op.as_str()) {
-                                (Atom::Null, _, _) | (_, Atom::Null, _) => Value::Null,
-                                (Atom::Timestamp(t), Atom::Interval(d), "+" | "-") => {
-                                    shifted(t, d, op == "-")?
-                                }
-                                (Atom::Interval(d), Atom::Timestamp(t), "+") => {
-                                    shifted(t, d, false)?
-                                }
-                                // 时间戳与区间配上其他值：Python 的 TypeError，3.x 吞成未知。
-                                (Atom::Timestamp(_) | Atom::Interval(_), _, _)
-                                | (_, Atom::Timestamp(_) | Atom::Interval(_), _) => Value::Null,
-                                // 数值算术尚未实现；编译期的路线闸门保证到不了这里，到了也显式拒绝。
-                                _ => return Err(super::eval::arithmetic_unsupported()),
-                            }
+                            let (a, b) =
+                                (node_value(&mut values, *a)?, node_value(&mut values, *b)?);
+                            arithmetic(op, &a, &b, &mut budget)?
                         }
-                        Kind::Not(value) => node_value(&values, *value)?
+                        Kind::Not(value) => node_value(&mut values, *value)?
                             .boolean()?
                             .map_or(Value::Null, |b| Value::Bool(!b)),
                         Kind::IsNull { value, negate, .. } => Value::Bool(
-                            matches!(node_value(&values, *value)?.atom()?, Atom::Null) != *negate,
+                            matches!(node_value(&mut values, *value)?.atom()?, Atom::Null)
+                                != *negate,
                         ),
-                        Kind::Like { value, .. } => match node_value(&values, *value)?.atom()? {
-                            Atom::Null => Value::Null,
-                            Atom::Text(text) => Value::Bool(
-                                tree.patterns[id]
-                                    .as_ref()
-                                    .ok_or_else(|| {
-                                        EngineError::Storage("LIKE pattern was not prepared".into())
-                                    })?
-                                    .matches(&text, true),
-                            ),
-                            _ => Value::Bool(false),
-                        },
+                        Kind::Like { value, .. } => {
+                            match node_value(&mut values, *value)?.atom()? {
+                                Atom::Null => Value::Null,
+                                Atom::Text(text) => Value::Bool(
+                                    tree.patterns[id]
+                                        .as_ref()
+                                        .ok_or_else(|| {
+                                            EngineError::Storage(
+                                                "LIKE pattern was not prepared".into(),
+                                            )
+                                        })?
+                                        .matches(&text, true),
+                                ),
+                                _ => Value::Bool(false),
+                            }
+                        }
                         Kind::TextMatch { field, .. } => {
                             let query = tree.text_queries[id].as_ref().ok_or_else(|| {
                                 EngineError::Storage("text_match lost its query".into())
                             })?;
                             // 3.x 只对 str 分词；NULL 和其他类型都是 False，不是未知。
-                            let value = node_value(&values, *field)?;
+                            let value = node_value(&mut values, *field)?;
                             Value::Bool(match value.atom()? {
                                 Atom::Text(text) => query.matches(&text),
                                 _ => false,
                             })
                         }
                         Kind::Path { base, parts } => {
-                            let mut value = node_value(&values, *base)?.parsed()?;
+                            let mut value = node_value(&mut values, *base)?.parsed()?;
                             for part in parts {
                                 value = match part {
                                     PathPart::Key(key) => value
@@ -797,7 +1073,7 @@ pub(super) fn evaluate_tree(tree: &Tree, rows: &[DynamicRow<'_>]) -> Result<Sour
                             value
                         }
                         Kind::Length(value) => {
-                            let value = node_value(&values, *value)?.parsed()?;
+                            let value = node_value(&mut values, *value)?.parsed()?;
                             Value::Int(Cow::Owned(
                                 if let Atom::List(len) = value.atom()? {
                                     len
@@ -822,7 +1098,7 @@ pub(super) fn evaluate_tree(tree: &Tree, rows: &[DynamicRow<'_>]) -> Result<Sour
                                     _ => Err(super::eval::unsupported()),
                                 })
                                 .collect::<Result<Vec<_>>>()?;
-                            membership(&node_value(&values, *field)?, &literals)?
+                            membership(&node_value(&mut values, *field)?, &literals)?
                                 .map_or(Value::Null, |b| Value::Bool(b != *negate))
                         }
                         _ => return Err(super::eval::unsupported()),
@@ -832,7 +1108,7 @@ pub(super) fn evaluate_tree(tree: &Tree, rows: &[DynamicRow<'_>]) -> Result<Sour
         }
         matching.set(
             row_index,
-            node_value(&values, tree.ast.root)?.boolean()? == Some(true),
+            node_value(&mut values, tree.ast.root)?.boolean()? == Some(true),
         );
     }
     Ok(matching)

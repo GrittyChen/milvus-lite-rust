@@ -491,8 +491,96 @@ fn array_columns_match_reference_routes_and_masks() {
     );
 }
 
+/// 0032 登记的 hybrid 推断差异：pyarrow 按元素顺序推断类型与报错（`[2**64, 's', ...]` 在物化时报
+/// OverflowError；float 之后出现的 bool 推断为 double、按 0.0 / 1.0 参与运算），本实现对数字与其他
+/// 类型的混排一律整源回退 Python 路线。3.x 一侧的结果留在语料里，这里固定本实现一侧的结果。
+const REGISTERED_HYBRID_INFERENCE: &[(&str, u64, &str)] = &[
+    ("x + 1 > 1", 7, r#"{"mask":[true,false,false,true]}"#),
+    ("x * 2 == 2", 7, r#"{"mask":[false,false,false,false]}"#),
+    ("x / y > 0", 7, r#"{"mask":[true,false,false,true]}"#),
+    ("-x < 0", 7, r#"{"mask":[true,false,false,true]}"#),
+    ("x + age > 0", 7, r#"{"mask":[true,false,false,false]}"#),
+    ("x * x > 0", 7, r#"{"mask":[true,false,false,true]}"#),
+    (
+        "x + 1 == 'a' and age == 9223372036854775808",
+        7,
+        r#"{"mask":[false,false,false,false]}"#,
+    ),
+    (
+        "x == 'a' and age == 9223372036854775808",
+        7,
+        r#"{"mask":[false,false,false,false]}"#,
+    ),
+    (
+        "x + 1 == 2 and age == 9223372036854775808",
+        7,
+        r#"{"mask":[false,false,false,false]}"#,
+    ),
+    (
+        "x + 1 == 2 and age == 9223372036854775808",
+        9,
+        r#"{"mask":[false,false,false,false]}"#,
+    ),
+    (
+        "x + 1 == 2 and age == 9223372036854775808",
+        10,
+        r#"{"mask":[false,false,false,false]}"#,
+    ),
+    ("x * 2 == x + x", 7, r#"{"mask":[true,true,true,true]}"#),
+    ("x * y == x + x", 7, r#"{"mask":[false,true,false,false]}"#),
+    ("x + 0.5 > 1", 7, r#"{"mask":[true,false,false,true]}"#),
+    ("x - x == 0", 7, r#"{"mask":[true,false,false,true]}"#),
+    ("x == 'a'", 7, r#"{"mask":[false,false,false,false]}"#),
+    ("x > 0", 7, r#"{"mask":[true,false,false,true]}"#),
+    (
+        "4611686018427387904 / x > 0",
+        7,
+        r#"{"mask":[true,false,false,true]}"#,
+    ),
+    (
+        "4611686018427387904 / x > 0",
+        9,
+        r#"{"mask":[true,true,false,true]}"#,
+    ),
+    (
+        "4611686018427387904 / x > 0",
+        10,
+        r#"{"mask":[false,true,true,true]}"#,
+    ),
+    (
+        "x * 1180591620717411303424 > 0",
+        7,
+        r#"{"error":"cannot fit 'int' into an index-sized integer","phase":"evaluate"}"#,
+    ),
+    (
+        "x * 1180591620717411303424 > 0",
+        9,
+        r#"{"mask":[true,true,false,true]}"#,
+    ),
+    (
+        "x * 1180591620717411303424 > 0",
+        10,
+        r#"{"mask":[false,true,true,true]}"#,
+    ),
+    (
+        "(x * 1180591620717411303424) - (x * x) == 0",
+        7,
+        r#"{"error":"cannot fit 'int' into an index-sized integer","phase":"evaluate"}"#,
+    ),
+    (
+        "(x * 1180591620717411303424) - (x * x) == 0",
+        9,
+        r#"{"mask":[false,false,true,false]}"#,
+    ),
+    (
+        "(x * 1180591620717411303424) - (x * x) == 0",
+        10,
+        r#"{"mask":[true,false,false,false]}"#,
+    ),
+];
+
 /// 0032：算术的组件真值（[generate_filter_arith_fixtures.py](../../../tests/differential/generate_filter_arith_fixtures.py)）。
-/// 第 1 步只放开 Arrow 路线；hybrid 与 Python 路线的用例在 Rust 一侧仍应是 UNIMPLEMENTED。
+/// 三条路线逐条对照；3.x 的 MemoryError 对应本实现的资源错误（登记的差异）。
 #[test]
 fn arithmetic_matches_reference_corpus() {
     let fixture: Value =
@@ -572,7 +660,7 @@ fn arithmetic_matches_reference_corpus() {
             DataType::Json => ColumnData::Json(
                 values
                     .iter()
-                    .map(|v| v.as_str().unwrap().as_bytes().to_vec())
+                    .map(|v| v.as_str().unwrap_or("null").as_bytes().to_vec())
                     .collect(),
             ),
             DataType::FloatVector => ColumnData::FloatVector {
@@ -630,6 +718,7 @@ fn arithmetic_matches_reference_corpus() {
         .collect();
     let mut failures = Vec::new();
     let mut evaluated = 0;
+    let mut registered = 0;
     for (index, case) in fixture["cases"].as_array().unwrap().iter().enumerate() {
         let meta = &metas[case["meta"].as_u64().unwrap() as usize];
         let rows: Vec<_> = (0..4)
@@ -652,21 +741,41 @@ fn arithmetic_matches_reference_corpus() {
                 predicate.evaluate(&columns, &SourceBits::from_live(&[true; 4]))
             }
         });
-        let backend = case["backend"].as_str();
-        let unquoted: String = expr.split('\'').step_by(2).collect();
-        if matches!(backend, Some("hybrid" | "python")) && unquoted.contains(['+', '-', '*', '/']) {
-            if !matches!(result, Err(crate::error::EngineError::Unsupported { .. })) {
-                failures.push(format!("case {index}: {expr}; non-Arrow route not gated"));
+        evaluated += 1;
+        // 3.x 在分配失败时报 MemoryError（取决于机器内存，文案为空）；本实现超出资源上限时报
+        // 固定文案的资源错误（0032 登记的差异）。
+        if case["error_type"] == "MemoryError" {
+            if !matches!(
+                result,
+                Err(crate::error::EngineError::FilterResourceExhausted(_))
+            ) || phase != "evaluate"
+            {
+                failures.push(format!("case {index}: {expr}; expected resource error"));
             }
             continue;
         }
-        evaluated += 1;
         let actual = match result {
             Ok(mask) => {
                 serde_json::json!({"mask":(0..4).map(|row|mask.get(row)).collect::<Vec<_>>()})
             }
             Err(error) => serde_json::json!({"error":error.to_string(),"phase":phase}),
         };
+        let group = case["meta"].as_u64().unwrap();
+        if let Some((_, _, rust)) = REGISTERED_HYBRID_INFERENCE
+            .iter()
+            .find(|(e, g, _)| *e == expr && *g == group)
+        {
+            registered += 1;
+            let rust: Value = crate::json_text::value_str(rust).unwrap();
+            let reference_differs =
+                rust.get("mask") != case.get("mask") || rust.get("error") != case.get("error");
+            if actual != rust || !reference_differs {
+                failures.push(format!(
+                    "case {index}: {expr}; registered {rust}, actual={actual}, reference differs={reference_differs}"
+                ));
+            }
+            continue;
+        }
         if actual.get("mask") != case.get("mask")
             || actual.get("error") != case.get("error")
             || actual.get("phase") != case.get("phase")
@@ -677,7 +786,12 @@ fn arithmetic_matches_reference_corpus() {
             ));
         }
     }
-    assert!(evaluated > 1000, "corpus lost its Arrow cases: {evaluated}");
+    assert!(evaluated > 1300, "corpus lost cases: {evaluated}");
+    assert_eq!(
+        registered,
+        REGISTERED_HYBRID_INFERENCE.len(),
+        "registered cases not all visited"
+    );
     assert!(
         failures.is_empty(),
         "{} divergences:\n{}",
@@ -755,5 +869,297 @@ fn arithmetic_ignores_out_of_range_values_in_null_slots() {
     assert_eq!(
         error.to_string(),
         "Integer value 4611686018427387904 not in range: -16777216 to 16777216"
+    );
+}
+
+/// 0032 的资源上限：3.x 没有，本实现单侧的边界。上限经测试参数注入，用小尺寸覆盖恰在上限、
+/// 上限加一、每行累计与清零、位宽估算、输入预检、列表转换只计一次与分配失败。
+#[test]
+fn python_arithmetic_respects_resource_limits() {
+    use super::python::evaluate_tree_with;
+    use super::python_num::Limits;
+    use super::tree::Tree;
+    let mut id = FieldSchema::new("id", DataType::Int64);
+    id.is_primary = true;
+    let mut v = FieldSchema::new("v", DataType::FloatVector);
+    v.dim = Some(2);
+    let mut arr = FieldSchema::new("arr", DataType::Array);
+    arr.element_type = Some(DataType::VarChar);
+    arr.max_length = Some(1000);
+    arr.max_capacity = Some(10);
+    let schema = CollectionSchema {
+        functions: Vec::new(),
+        fields: vec![id, v, arr.clone()],
+        enable_dynamic_field: true,
+        properties: vec![],
+    };
+    let strings = serde_json::json!(["x".repeat(100), "y".repeat(50)]);
+    let columns = vec![
+        ColumnData::Int64(vec![1, 2]),
+        ColumnData::FloatVector {
+            dim: 2,
+            values: vec![1.0, 0.0, 1.0, 0.0],
+        },
+        crate::data::array::convert(
+            &arr,
+            &crate::data::InputValues::Array(vec![
+                Some(crate::data::InputValues::JsonValues(
+                    strings.as_array().unwrap().clone(),
+                )),
+                Some(crate::data::InputValues::JsonValues(
+                    strings.as_array().unwrap().clone(),
+                )),
+            ]),
+        )
+        .unwrap(),
+    ];
+    let run = |expr: &str, metas: &[serde_json::Value], value_bytes: u64, int_bits: u64| {
+        let metas: Vec<_> = metas
+            .iter()
+            .map(|m| m.as_object().unwrap().clone())
+            .collect();
+        let rows: Vec<_> = metas
+            .iter()
+            .enumerate()
+            .map(|(row, meta)| DynamicRow {
+                columns: &columns,
+                meta: Some(meta),
+                row,
+                sequence: None,
+            })
+            .collect();
+        let tree = Tree::compile(&ParsedFilter::parse(expr).unwrap(), &schema).unwrap();
+        evaluate_tree_with(
+            &tree,
+            &rows,
+            Limits {
+                value_bytes,
+                int_bits,
+            },
+        )
+        .map(|bits| (0..rows.len()).map(|i| bits.get(i)).collect::<Vec<_>>())
+        .map_err(|error| error.to_string())
+    };
+    let value_error = |limit: u64| Err(format!("filter value exceeds the {limit}-byte limit"));
+    let int_error = |limit: u64| Err(format!("filter integer exceeds the {limit}-bit limit"));
+    let a = serde_json::json!({"x": "a", "n": 3});
+    // 字符串每码位 4 字节：'a' * 10 恰为 40 字节。
+    assert_eq!(
+        run("x * 10 == x * 10", std::slice::from_ref(&a), 80, 64),
+        Ok(vec![true])
+    );
+    assert_eq!(
+        run("x * 10 == x * 10", std::slice::from_ref(&a), 79, 64),
+        value_error(79)
+    );
+    // 同一行累计：两个 12 字节的重复加 24 字节的拼接共 48 字节；下一行重新计。
+    let two = [a.clone(), a.clone()];
+    assert_eq!(
+        run("x * n + x * n == x * 6", &two, 72, 64),
+        Ok(vec![true, true])
+    );
+    assert_eq!(run("x * n + x * n == x * 6", &two, 71, 64), value_error(71));
+    // 3.x 的 OverflowError 先于本实现的上限。
+    let ab = serde_json::json!({"x": "ab"});
+    assert_eq!(
+        run(
+            "x * 4611686018427387904 == ''",
+            std::slice::from_ref(&ab),
+            1,
+            64
+        ),
+        Err("repeated string is too long".into())
+    );
+    // 预算放行、分配器给不出的容量：返回同一个资源错误，不 abort。
+    assert_eq!(
+        run("x * 4611686018427387903 == ''", &[ab], u64::MAX, 64),
+        value_error(u64::MAX)
+    );
+    // 大整数按估算位宽：乘法取两侧之和，加减取较大者加一。
+    let number = |text: String| crate::json_text::value_str(&format!("{{\"x\": {text}}}")).unwrap();
+    let power = |bits: u32| number((num_bigint::BigInt::from(1) << bits).to_string());
+    assert_eq!(run("x * x > 0", &[power(99)], 1 << 20, 200), Ok(vec![true]));
+    assert_eq!(
+        run("x * x > 0", &[power(100)], 1 << 20, 200),
+        int_error(200)
+    );
+    assert_eq!(
+        run("x + x > 0", &[power(199)], 1 << 20, 200),
+        int_error(200)
+    );
+    assert_eq!(
+        run("x + 1 > 0", &[power(198)], 1 << 20, 200),
+        Ok(vec![true])
+    );
+    // 解析出的大整数与大整数结果都按 bits / 8 计费：2^198 与 2^198 + 1 各占 25 字节。
+    assert_eq!(run("x + 1 > 0", &[power(198)], 50, 200), Ok(vec![true]));
+    assert_eq!(run("x + 1 > 0", &[power(198)], 49, 200), value_error(49));
+    assert_eq!(run("x + 1 > 0", &[power(198)], 24, 200), value_error(24));
+    // 输入的十进制文本在解析之前预检：60 位估算 200 位，61 位估算 203 位。
+    let text = |n: usize| number("9".repeat(n));
+    assert_eq!(run("x / 1 > 0", &[text(60)], 1 << 20, 200), Ok(vec![true]));
+    assert_eq!(run("x / 1 > 0", &[text(61)], 1 << 20, 200), int_error(200));
+    // 比较时为文本整数临时解析的大整数是 0032 所说的瞬时工作区，不计入预算：x = 2^400 + 1 与
+    // y * y = 2^400 位数相近、必须解析，预算只够两侧各解析一次的 y（各 26 字节）与 y * y（51 字节）。
+    let close =
+        number((num_bigint::BigInt::from(1) << 400u32 | num_bigint::BigInt::from(1)).to_string());
+    let mut meta = close.as_object().unwrap().clone();
+    meta.insert("y".into(), power(200)["x"].clone());
+    let meta = Value::Object(meta);
+    assert_eq!(
+        run("x > y * y", std::slice::from_ref(&meta), 103, 1 << 20),
+        Ok(vec![true])
+    );
+    assert_eq!(
+        run("x > y * y", std::slice::from_ref(&meta), 102, 1 << 20),
+        value_error(102)
+    );
+    // 只比较、不参与算术的输入不解析，也不受位宽上限约束。
+    assert_eq!(run("x > 1", &[text(5000)], 1 << 20, 200), Ok(vec![true]));
+    // ARRAY<VARCHAR> 重复：元素转成共享形式只计一次（2 个元素 × 64 + 150 码位 × 4 = 728 字节），
+    // 结果按元素数计（2 × 1000 × 64 = 128000 字节），字符串内容不随次数放大。
+    let empty = [serde_json::json!({})];
+    let need = 2 * 64 + 150 * 4 + 2 * 1000 * 64;
+    assert_eq!(
+        run(
+            "array_length(arr) > 0 and arr * 1000 > arr",
+            &empty,
+            need,
+            64
+        ),
+        Ok(vec![true])
+    );
+    assert_eq!(
+        run(
+            "array_length(arr) > 0 and arr * 1000 > arr",
+            &empty,
+            need - 1,
+            64
+        ),
+        value_error(need - 1)
+    );
+}
+
+/// Python 路线的值规则中，组件真值语料造不出的输入：超出 int64 的输入整数作重复次数、除以 -0.0、
+/// ARRAY 中同一个 NaN 对象在重复与拼接后的身份，以及列表拼接的转换计费。
+#[test]
+fn python_arithmetic_edge_values() {
+    use super::python::evaluate_tree_with;
+    use super::python_num::{LIMITS, Limits};
+    use super::tree::Tree;
+    let mut id = FieldSchema::new("id", DataType::Int64);
+    id.is_primary = true;
+    let mut v = FieldSchema::new("v", DataType::FloatVector);
+    v.dim = Some(2);
+    let mut af = FieldSchema::new("af", DataType::Array);
+    af.element_type = Some(DataType::Double);
+    af.max_capacity = Some(4);
+    let schema = CollectionSchema {
+        functions: Vec::new(),
+        fields: vec![id, v, af],
+        enable_dynamic_field: true,
+        properties: vec![],
+    };
+    let columns = vec![
+        ColumnData::Int64(vec![1, 2]),
+        ColumnData::FloatVector {
+            dim: 2,
+            values: vec![1.0, 0.0, 1.0, 0.0],
+        },
+        ColumnData::Array(crate::data::array::ArrayData {
+            element_type: DataType::Double,
+            element_name: "item".into(),
+            offsets: vec![0, 1, 2],
+            values: Box::new(ColumnData::Double(vec![f64::NAN, 1.0])),
+        }),
+    ];
+    let run = |expr: &str, metas: &[&str], limits: Limits| {
+        let metas: Vec<serde_json::Map<String, Value>> = metas
+            .iter()
+            .map(|m| {
+                crate::json_text::value_str(m)
+                    .unwrap()
+                    .as_object()
+                    .unwrap()
+                    .clone()
+            })
+            .collect();
+        let rows: Vec<_> = metas
+            .iter()
+            .enumerate()
+            .map(|(row, meta)| DynamicRow {
+                columns: &columns,
+                meta: Some(meta),
+                row,
+                sequence: None,
+            })
+            .collect();
+        let tree = Tree::compile(&ParsedFilter::parse(expr).unwrap(), &schema).unwrap();
+        evaluate_tree_with(&tree, &rows, limits)
+            .map(|bits| (0..rows.len()).map(|i| bits.get(i)).collect::<Vec<_>>())
+            .map_err(|error| error.to_string())
+    };
+    let index = Err("cannot fit 'int' into an index-sized integer".to_owned());
+    for count in [
+        "9223372036854775808",
+        "-9223372036854775809",
+        "100000000000000000000000",
+    ] {
+        let meta = format!(r#"{{"x": "ab", "n": {count}}}"#);
+        assert_eq!(run("x * n == ''", &[&meta], LIMITS), index, "{count}");
+        assert_eq!(run("n * x == ''", &[&meta], LIMITS), index, "{count}");
+    }
+    assert_eq!(
+        run(
+            "x * n == ''",
+            &[r#"{"x": "ab", "n": 4611686018427387904}"#],
+            LIMITS
+        ),
+        Err("repeated string is too long".to_owned())
+    );
+    assert_eq!(
+        run(
+            "x * n == ''",
+            &[r#"{"x": "ab", "n": -9223372036854775808}"#],
+            LIMITS
+        ),
+        Ok(vec![true])
+    );
+    // float 除以 -0.0 与 0.0 一样是 ZeroDivisionError：未知，取反后仍不命中。
+    let zeros = [r#"{"x": 1, "y": -0.0}"#, r#"{"x": 1, "y": 0.5}"#];
+    assert_eq!(run("x / y > 0", &zeros, LIMITS), Ok(vec![false, true]));
+    assert_eq!(
+        run("not (x / y > 0)", &zeros, LIMITS),
+        Ok(vec![false, false])
+    );
+    // 同一行的 ARRAY 元素是同一个 float 对象：重复与拼接后列表相等按身份判等，NaN 也相等。
+    let empty = ["{}", "{}"];
+    assert_eq!(
+        run("array_length(af) > 0 and af * 2 == af * 2", &empty, LIMITS),
+        Ok(vec![true, true])
+    );
+    assert_eq!(
+        run("array_length(af) > 0 and af + af == af * 2", &empty, LIMITS),
+        Ok(vec![true, true])
+    );
+    assert_eq!(
+        run(
+            "array_length(af) > 0 and af[0] + 0 == af[0] + 0",
+            &empty,
+            LIMITS
+        ),
+        Ok(vec![false, true])
+    );
+    // 拼接：两个操作数各转换 3 × 64 字节，结果 6 × 64；右侧的重复再转换 3 × 64、结果 6 × 64。
+    let list = [r#"{"x": [1, 2, 3]}"#];
+    let need = 3 * 64 * 2 + 6 * 64 + 3 * 64 + 6 * 64;
+    let limits = |value_bytes| Limits {
+        value_bytes,
+        int_bits: LIMITS.int_bits,
+    };
+    assert_eq!(run("x + x == x * 2", &list, limits(need)), Ok(vec![true]));
+    assert_eq!(
+        run("x + x == x * 2", &list, limits(need - 1)),
+        Err(format!("filter value exceeds the {}-byte limit", need - 1))
     );
 }

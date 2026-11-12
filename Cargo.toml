@@ -20,6 +20,8 @@ arrow-ipc = "~60.0"
 arrow-schema = "~60.0"
 milvus-lite-core = { path = "crates/core" }
 milvus-lite-grpc = { path = "crates/grpc" }
+# 过滤 Python 路线的精确整数（0032）；已经随 arrow-buffer 出现在依赖图中。
+num-bigint = { version = "=0.5.1", default-features = false, features = ["std"] }
 parking_lot = "0.12.5"
 prost = "0.14.4"
 prost-types = "0.14.4"

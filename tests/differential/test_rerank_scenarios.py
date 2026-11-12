@@ -20,9 +20,6 @@ MODEL_RUST = [UNIMPLEMENTED, "MilvusLite does not support rerank model providers
 RANDOM = {"s boost random_score", "s boost random_score noseed", "s random_score valid", "route fs boost random"}
 RANDOM_RUST = [UNIMPLEMENTED,
                "MilvusLite does not support random_score in boost functions: not supported in this build of milvus-lite-rust yet"]
-FILTER_RANGE = {"s boost filter arithmetic", "dyn boost filter age + 1 > 5", "nodyn boost filter age + 1 > 5"}
-FILTER_RUST = [UNIMPLEMENTED,
-               "MilvusLite does not support filter expressions: arithmetic is only supported on schema fields in ordinary filters"]
 # 0004：本实现按严格的维度校验报错；3.x 的文案来自 numpy，不比较。
 DIM = "h bad dim"
 DIM_RUST = [1, "query vector has dim 2, but field 'v' expects dim 4"]
@@ -160,8 +157,6 @@ def category(name, outcome):
         return "model"
     if name in RANDOM:
         return "random_score"
-    if name in FILTER_RANGE:
-        return "filter"
     if name == DIM:
         return "0004"
     if name in BUGS:
@@ -188,8 +183,6 @@ def check(name, rust, ref, kind):
         ok = failed(ref, MODEL_REF) and failed(rust, MODEL_RUST)
     elif kind == "random_score":
         ok = "error" not in ref and failed(rust, RANDOM_RUST)
-    elif kind == "filter":
-        ok = "error" not in ref and failed(rust, FILTER_RUST)
     elif kind == "0004":
         ok = ref.get("error", [None])[0] == 1 and failed(ref, ref["error"]) and failed(rust, DIM_RUST)
     elif kind == "0024":
@@ -220,8 +213,8 @@ def test_rerank_probe_scenarios_match_3x(pair, monkeypatch):
     monkeypatch.delenv("COHERE_API_KEY", raising=False)
     d = pair.open()
     sdk = compare(cases.collect(d.rust), cases.collect(d.ref),
-                  {"pass": 2755 - len(SDK_ONLY), "setup": 13, "sdk": len(SDK_ONLY), "model": 4, "random_score": 4,
-                   "filter": 3, "0004": 1, "0024": 42})
+                  {"pass": 2758 - len(SDK_ONLY), "setup": 13, "sdk": len(SDK_ONLY), "model": 4, "random_score": 4,
+                   "0004": 1, "0024": 42})
     assert sdk == SDK_ONLY
 
 

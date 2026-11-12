@@ -28,7 +28,18 @@ FIELDS = [
     ("i32", "INT32", True, None), ("n", "INT64", True, None), ("age", "INT64", False, None),
     ("f", "FLOAT", True, None), ("d", "DOUBLE", True, None), ("flag", "BOOL", False, None),
     ("s", "VARCHAR", False, None), ("a", "ARRAY", True, "INT64"), ("af", "ARRAY", False, "DOUBLE"),
-    ("j", "JSON", True, None), ("vector", "FLOAT_VECTOR", False, None),
+    ("j", "JSON", True, None), ("vector", "FLOAT_VECTOR", False, None), ("p", "JSON", True, None),
+]
+# Python 路线（经 JSON 路径）的取值：大整数、真除法的被除数 q 与除数 r、bool、字符串、列表与 JSON NaN。
+# h 只在第 0 行，专供会报错的表达式使用。
+P_ROWS = [
+    {"i": 3, "b": 2**70, "f": 1.5, "s": "ab", "l": [1, "x"], "t": True, "z": 0, "e": "", "el": [],
+     "q": 2**70 + 1, "r": 3, "u": "\u00e9", "h": 10**400},
+    {"i": -2, "b": -(2**70), "f": -0.0, "s": "", "l": [], "t": False, "z": 0.0, "e": "", "el": [],
+     "q": -(2**60 + 1), "r": 7, "u": "x"},
+    {"i": 0, "b": 2**64, "f": float("nan"), "s": "x", "l": [float("nan"), [1]], "t": True, "z": 0,
+     "e": "", "el": [], "q": 1, "r": 2**1075, "u": "y"},
+    None,
 ]
 COLUMNS = {
     "id": [1, 2, 3, 4],
@@ -45,13 +56,23 @@ COLUMNS = {
     "af": [[1.0], [], [2.5], []],
     "j": [json.dumps(x) for x in [{"k": 1}, {"k": 2.5}, {"k": "a"}, {"k": None}]],
     "vector": [[1.0, 0.0]] * 4,
+    "p": [None if row is None else json.dumps(row) for row in P_ROWS],
 }
-# 动态字段的几组取值：hybrid 的推断、回退与 Python 路线（0032 第 2 步启用）。
+# 动态字段的几组取值：hybrid 的推断、回退与 Python 路线。
 META = [
     [{"x": 1, "y": 2}, {"x": 2, "y": 0}, {"x": None}, {}],
     [{"x": 1.5, "y": 0.0}, {"x": -0.0, "y": 2}, {"x": 2**62}, {"x": 3}],
     [{"x": True, "y": 1}, {"x": "a", "y": 2}, {"x": [1], "y": 2}, {"x": None}],
     [{}, {}, {}, {}],
+    [{"x": 2**64, "y": 3}, {"x": 1.5, "y": 2}, {"x": None, "y": 0}, {"x": -(2**70), "y": 4}],
+    [{"x": 2**64, "y": 3}, {"x": 1, "y": 2}, {}, {"x": -3, "y": 4}],
+    [{"x": "ab", "y": True}, {"x": [1, "a"], "y": 2}, {"x": "", "y": 0}, {"x": [], "y": 3}],
+    # 以下四组是登记的 hybrid 推断差异（0032「与 3.x 的差异」）：pyarrow 按元素顺序推断与报错，
+    # 本实现对数字与其他类型的混排一律整源回退 Python 路线。
+    [{"x": 2**64, "y": 3}, {"x": "s", "y": 2}, {"x": [1, 2], "y": 0}, {"x": 1.5, "y": 4}],
+    [{"x": "s", "y": 3}, {"x": 2**64, "y": 2}, {}, {"x": 1, "y": 4}],
+    [{"x": 1.5, "y": 1}, {"x": 0.1, "y": 2}, {"x": False, "y": 3}, {"x": 0.1, "y": 4}],
+    [{"x": 0.0, "y": 1}, {"x": 2, "y": 2}, {"x": 1.5, "y": 3}, {"x": True, "y": 4}],
 ]
 NUMERIC = ["i8", "i16", "i32", "n", "age", "f", "d"]
 LITERALS = ["1", "1.5", "-1", "16777217", "9007199254740993", "9223372036854775807"]
@@ -102,14 +123,67 @@ def expressions():
         # 类型检查
         "flag + 1 > 0", "s + 1 > 0", "j + 1 > 0", "-flag > 0", "-s > 0", "-vector > 0", "vector + 1 > 0",
         "id + 'a' > 0", "id % 2 == 0", "id ** 2 == 4", "id + 1 in [2]", "(id + 1) is null", "id + 1",
-        # 动态字段与路径（第 2 步才放开；第 1 步 Rust 一侧应为 UNIMPLEMENTED）
+        # 动态字段与路径
         "x + 1 > 1", "x * 2 == 2", "x / y > 0", "-x < 0", "x + age > 0", "x * x > 0",
         "x + 1 == 'a' and age == 9223372036854775808", "x == 'a' and age == 9223372036854775808",
         "x + 1 == 2 and age == 9223372036854775808", "j['k'] + 1 > 1", "j['k'] * 2 == 'aa'",
         "text_match(s, 'a') and id + 1 > 0",
     ]
     result += SOURCE_EXPRESSIONS
+    result += python_expressions()
     return list(dict.fromkeys(result))
+
+
+def python_expressions():
+    """Python 路线（JSON 路径、array_length）与 hybrid 回退中的 Python 值规则。"""
+    big = 9223372036854775808
+    result = [
+        # 精确大整数与 bool
+        "p['i'] + p['i'] == 6", "p['i'] - p['b'] < 0", "p['i'] * p['b'] > 0", "p['b'] * p['b'] > p['b']",
+        f"p['b'] + 1 == {2**70 + 1}", f"p['b'] * p['b'] == {2**140}", f"p['b'] - 1 < {2**70}",
+        "p['b'] * 1.0 > 0", "p['b'] * 1.0 == p['b']", "p['b'] > 1.5", "p['b'] + 0.5 > p['b']",
+        "-p['i'] < 0", "-p['b'] < 0", "-p['s'] == ''", "-p['t'] == -1", "- -p['i'] == p['i']",
+        "p['t'] + 1 == 2", "p['t'] / 2 == 0.5", "p['t'] - p['t'] == 0", "p['t'] * p['b'] == p['b']",
+        # 真除法、int 与 float、除零
+        "p['b'] / p['i'] > 0", "p['i'] / 2 == 1.5", "p['b'] / 0 > 0", "p['f'] / 0 > 0", "p['i'] / p['z'] > 0",
+        "p['f'] / p['z'] > 0", "p['f'] + 0 == p['f'] + 0", "p['f'] * 2 > 0", "p['f'] - p['f'] == 0",
+        "p['i'] * 1e308 * 10 > 0", "p['i'] / 3 * 3 == p['i']",
+        # 字符串
+        "p['s'] + p['s'] == 'abab'", "p['s'] * 2 == 'abab'", "2 * p['s'] == p['s'] + p['s']",
+        "p['s'] * -1 == ''", "p['s'] * 0 == p['e']", "p['s'] + p['u'] > 'ab'", "p['s'] + 1 > 0",
+        "p['s'] * 1.5 == 'ab'", "p['s'] * p['s'] == ''", "p['s'] * p['t'] == p['s']", "p['s'] + p['l'] == p['s']",
+        "p['s'] + 'c' like 'ab%'", "p['s'] * 2 like 'abab'",
+        # 列表（JSON NaN 是同一个 Python 对象，列表相等按身份判等）
+        "p['l'] + p['l'] == p['l'] * 2", "p['l'] * 2 == p['l'] * 2", "p['l'] + p['l'] > p['l']",
+        "p['l'] * 0 == p['el']", "p['l'] * p['t'] == p['l']", "p['l'] * 1.5 == p['l']",
+        "p['l'] + p['l'] == p['l']", "p['l'] + p['el'] == p['l']", "p['l'][0] + 1 == 2", "p['n'] + 1 > 0",
+        # 重复的判定顺序：次数放不进 Py_ssize_t → 空结果 → 长度乘积 → 分配
+        f"p['s'] * {big} == ''", f"p['e'] * {big} == ''", f"p['s'] * -{big + 1} == ''", f"p['s'] * -{big} == ''",
+        f"p['l'] * {big} == p['l']", f"p['el'] * {big} == p['l']", f"{big} * p['s'] == ''",
+        f"p['s'] * {2**62} == ''", f"p['e'] * {2**62} == ''", f"p['s'] * {2**62 - 1} == ''",
+        f"p['l'] * {2**62} == p['l']", f"p['el'] * {2**62} == p['el']", f"p['l'] * {2**61} == p['l']",
+        # 会报错的大整数与 Python 的短路
+        "p['h'] + 1 > 0", "p['h'] + 1.5 > 0", "1.5 * p['h'] > 0", "p['h'] / 1 > 0", "p['h'] / p['h'] == 1",
+        "p['h'] * 0 == 0", "p['h'] > 1.5", "p['h'] - p['h'] == 0", "p['h'] / 0 > 0",
+        "p['i'] > 100 and p['h'] + 1.5 > 0", "p['h'] + 1.5 > 0 and p['i'] > 100",
+        "p['i'] < 100 or p['h'] + 1.5 > 0", "p['h'] * 1.5 > 0 or p['i'] < 100",
+        # ARRAY 字段经 Python 路线：列表拼接与重复
+        "array_length(a) >= 0 and a + a == a * 2", "array_length(a) >= 0 and a * 2 > a",
+        "array_length(af) >= 0 and af + af == af * 2", "array_length(a) >= 0 and a + af > a",
+        "array_length(a) >= 0 and a + 1 > 0", f"array_length(a) >= 0 and a * {big} == a",
+        f"array_length(a) >= 0 and a * {2**62} == a", "array_length(a) >= 0 and i8 + 1 > 127",
+        "array_length(a) >= 0 and age * age > 0", "array_length(a) >= 0 and f * f == 1.21",
+        "array_length(a) >= 0 and n + f > 0", "array_length(a) >= 0 and id / 0 > 1",
+        # hybrid 回退后的 Python 值规则
+        "x * 2 == x + x", "x + 'b' == 'ab'", "x * y == x + x", "x + 0.5 > 1", "x - x == 0",
+        "x == 'a'", "x > 0", "4611686018427387904 / x > 0", "x * 1180591620717411303424 > 0",
+        "(x * 1180591620717411303424) - (x * x) == 0",
+    ]
+    # 正确舍入的整数真除法：期望值由 Python 自己算出，字面量按 repr 往返。
+    for row in P_ROWS:
+        if row is not None:
+            result.append(f"p['q'] / p['r'] == {row['q'] / row['r']!r}")
+    return result
 
 
 def cases():

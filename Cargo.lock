@@ -898,6 +898,7 @@ dependencies = [
  "jiff",
  "libc",
  "md5",
+ "num-bigint",
  "parking_lot",
  "parquet",
  "rayon-core",
