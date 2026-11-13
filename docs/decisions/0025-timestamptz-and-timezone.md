@@ -17,7 +17,7 @@
 3. 时区：请求 `timezone` 参数、集合 `timezone` 属性、数据库 `timezone` 属性，以及它们对「没有偏移的时间字符串」的解释；`time_fields` 输出。
 4. 持久化：与 3.x 双向互通（`schema.json`、WAL、Parquet、INVERTED 索引定义）。
 
-不在范围内：一般数值算术（`id % 2`、`n + 1` 等，仍为 UNIMPLEMENTED，只放开「时间戳 ± 区间」）、ARRAY 的 TIMESTAMPTZ 元素（3.x 能建表，本切片保持 UNIMPLEMENTED，见差异）、函数链与 rerank 里的时间衰减、分组（3.x 对 TIMESTAMPTZ 报类型错误，沿用现有文案）。
+不在范围内：一般数值算术（`n + 1` 等，本切片只放开「时间戳 ± 区间」；之后由 [0032](0032-arithmetic-filters.md) 放开，`%` 两边都是解析错误）、ARRAY 的 TIMESTAMPTZ 元素（3.x 能建表，本切片保持 UNIMPLEMENTED，见差异）、函数链与 rerank 里的时间衰减、分组（3.x 对 TIMESTAMPTZ 报类型错误，沿用现有文案）。
 
 ## 参照行为（3.x 实测）
 
@@ -109,7 +109,7 @@ pymilvus 把时间值作为字符串（`string_data`）发送；原始 gRPC 还�
 
 - 解析阶段把 `ISO` 字面量算成 UTC 微秒（`Literal::Timestamp`）、`INTERVAL` 算成向零截断的微秒（`Literal::Interval(f64)`，浮点运算次序同 3.x：周先乘 7 再乘 86400）；错误位置是字符串字面量。无偏移的 ISO 先走第 3 步给出的时区，未配置时给出 3.x 的 6 错误。四百位数字的区间在解析阶段得到无穷大，报 6 `cannot convert float infinity to integer`。
 - 语义检查增加 `timestamptz` / `interval` 两个类型（文案与 3.x 相同，字段描述为 `timestamptz (field 'ts')`）：比较与 `in` 只允许同类型或动态字段；加减只放开「时间戳 ± 区间」「区间 + 时间戳」；其余组合报 6 `arithmetic '+' requires numeric operands, left|right side is ...`，一元负号作用在非数字上同理（位置是 `-`）。
-- **范围外的算术**：不涉及时间值的算术（`n + 1`、`-n`）仍是 UNIMPLEMENTED，并且与既有约定一致，先于该表达式里的语义错误（3.x 对 `n + 1 > 2 and ts > 5` 报类型错误，本实现报 UNIMPLEMENTED）。解析阶段的错误（无偏移 / 非法字面量 / 非法区间）两边相同，先于 UNIMPLEMENTED。判定：算术节点的子树里没有时间字面量也没有 TIMESTAMPTZ 字段，即为范围外。
+- **范围外的算术**（已由 [0032](0032-arithmetic-filters.md) 取代）：本切片时不涉及时间值的算术（`n + 1`、`-n`）是 UNIMPLEMENTED，先于该表达式里的语义错误（3.x 对 `n + 1 > 2 and ts > 5` 报类型错误）。0032 放开一般算术后，这些表达式与时间值同在一个表达式里时按 3.x 报语义错误或给出结果，两边逐条对照，下表的对应差异已注销。
 - **求值沿用三条路线，语义随路线而不同**（3.x 实测，探针 147 个场景）：
   - Arrow 路线（只含 schema 字段）：时间戳与区间都是 int64 微秒，加减按 **int64 回绕**（`wrapping_add` / `wrapping_sub`）；区间超出 int64 时在把标量交给 Arrow 处报 1 `Python int too large to convert to C long`，只在真正对行求值时发生（空集合不报，`count(*)` 与 search 报）。
   - Hybrid 路线（含动态字段）：先走与 Arrow 相同的列式求值；遇到内核错误（动态列与时间戳列的比较、不支持的 `in` 类型配对、ARRAY 与时间值的比较）退回 Python 求值器。区间超出 int64 的 OverflowError 不退回，直接报错。
@@ -179,7 +179,7 @@ Query、Search 输出支持（Hybrid 随 HybridSearch）；非 TIMESTAMPTZ 字�
 | 高端边界附近（`9999-12-29` 起）无偏移时间的换算 | 由 zoneinfo 精确换算 | 用 `9999-12-30T22:00Z` 处的偏移补算（该处没有偏移变换），结果与 3.x 一致，越界同样报 1 | jiff 的 `Timestamp` 上界比 Python 低约 26 小时 |
 | ARRAY 的 TIMESTAMPTZ 元素 | 能建表（pymilvus 无法写入元素，数据为空） | 创建 UNIMPLEMENTED；打开含该字段的 3.x 目录时，访问该集合 fail-closed 为带明确文案的 UNIMPLEMENTED（不是 100），其他集合不受影响，互通用例钉住 | 范围外，需要时单独做 |
 | 区间微秒超出 int64 | 1 `Python int too large to convert to C long` | 同 3.x | 复刻 |
-| 不涉及时间值的算术与时间值同在一个表达式里（`n + 1 > 2 and ts > 5`、`(n + 1) + ts > 5`） | 报类型错误（6） | UNIMPLEMENTED | 一般算术仍在范围外，沿用「范围外构造先于语义检查」（0006 第 1 项）；纯时间值的算术、解析阶段的错误与 3.x 相同 |
+| ~~不涉及时间值的算术与时间值同在一个表达式里（`n + 1 > 2 and ts > 5`、`(n + 1) + ts > 5`）~~ | 报类型错误（6） | 已注销：[0032](0032-arithmetic-filters.md) 放开一般算术后与 3.x 相同 | 本切片时一般算术在范围外、报 UNIMPLEMENTED；[test_timestamp_filters.py](../../tests/differential/test_timestamp_filters.py) 现在两边逐条对照 |
 | 数据库 `database_properties.json` 不可读时的 naive 时间字符串 / `time_fields` / naive 默认值 | 数据库打开时已经读过该文件，损坏的库根本打不开 | 只有这些操作报 1/0 存储错误，零写入；其余操作不读该文件 | 0023 B 已登记「集合操作不读属性」，只对需要时区的操作例外 |
 | 手改的 `schema.json` 里 TIMESTAMPTZ 的字符串默认值 | 打开时按集合、数据库时区规范化 | 该集合按范围外 schema 处理（fail-closed）：`DescribeCollection` 返回 UNIMPLEMENTED，`DropCollection`、别名与改名可用，清空与改属性按 0023 的差异表拒绝，不会半打开 | 3.x 只会写出微秒整数，字符串只可能来自手改文件；打开路径没有数据库时区上下文 |
 | type 21 字符串需要数据库时区而属性文件不可读 | 库打不开 | 报存储错误（1/0），零写入；其余行为同 3.x | 本实现不读无关的数据库属性（0023 B） |

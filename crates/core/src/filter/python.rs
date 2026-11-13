@@ -1172,6 +1172,29 @@ mod tests {
     }
 
     #[test]
+    fn list_null_elements_become_shared_null() {
+        // JSON 列表的 null 元素就是 None：serde 节点与平面解码的节点都归一为 Shared::Null，
+        // 其余元素保留原来的借用 / 节点形式（对象身份）。
+        let mut budget = Budget::new(num::LIMITS);
+        let json = serde_json::json!([null, 1, [null]]);
+        let items = shared_list(&Value::Json(&json), 3, &mut budget).unwrap();
+        assert!(matches!(items[0], Shared::Null));
+        assert!(matches!(items[1], Shared::Json(Json::Number(_))));
+        assert!(matches!(items[2], Shared::Json(Json::Array(_))));
+        let text: Vec<u32> = "[null, 1, [null]]".chars().map(u32::from).collect();
+        let doc = decode(&text).unwrap().unwrap();
+        let root = doc.root;
+        let items = shared_list(&Value::Decoded(doc, root), 3, &mut budget).unwrap();
+        assert!(matches!(items[0], Shared::Null));
+        assert!(
+            matches!(&items[1], Shared::Decoded(doc, id) if matches!(doc.nodes[*id], JsonNode::Int(_)))
+        );
+        assert!(
+            matches!(&items[2], Shared::Decoded(doc, id) if matches!(doc.nodes[*id], JsonNode::List(_)))
+        );
+    }
+
+    #[test]
     fn python_comparison_separates_nan_from_unknown_type_ordering() {
         let ops = [
             Comparison::Equal,

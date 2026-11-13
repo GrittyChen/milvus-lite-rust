@@ -183,6 +183,53 @@ fn late_source_failure_never_publishes_masks_or_writes_a_delete() {
     db.close();
 }
 #[test]
+fn filter_resource_errors_fail_the_request_without_writing_a_delete() {
+    // 0032：资源上限是本实现的错误，Delete 时整个请求失败，行集、文件与序号都不变。前一个数据源
+    // （已 flush 的 segment）已有命中行，后一个数据源（MemTable）才触及上限。
+    let root = tempfile::tempdir().unwrap();
+    let db = open(root.path());
+    db.create_collection("", "c", schema()).unwrap();
+    insert(&db, 1, &[json!({"x":"ab"})]);
+    db.flush_collection("", "c").unwrap();
+    insert(&db, 2, &[json!({"x":"a"})]);
+    let snapshot = db.collection("", "c").unwrap().read().read_snapshot();
+    let before_rows = snapshot.query("", &[], None, 0).unwrap();
+    let before_files = files(root.path());
+    for expr in [
+        "id == 1 or $meta['x'] * 4611686018427387904 == 'a'",
+        "id == 1 or x * 4611686018427387904 == 'a'",
+    ] {
+        for result in [
+            snapshot.count_filtered(expr).map(|_| ()),
+            snapshot.query(expr, &[], None, 0).map(|_| ()),
+            db.delete_expr("", "c", expr, "").map(|_| ()),
+        ] {
+            assert!(
+                matches!(result, Err(EngineError::FilterResourceExhausted(ref text)) if text == "filter value exceeds the 67108864-byte limit"),
+                "{expr}: {result:?}"
+            );
+        }
+    }
+    assert_eq!(files(root.path()), before_files);
+    assert_eq!(
+        db.collection("", "c")
+            .unwrap()
+            .read()
+            .read_snapshot()
+            .query("", &[], None, 0)
+            .unwrap(),
+        before_rows
+    );
+    insert(&db, 3, &[json!({"x":2})]);
+    db.flush_collection("", "c").unwrap();
+    let manifest: Value = milvus_lite_core::json_text::value(
+        &std::fs::read(root.path().join("collections/c/manifest.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(manifest["current_seq"], 3);
+    db.close();
+}
+#[test]
 fn routing_short_circuit_unknown_and_overflow_are_independent() {
     let root = tempfile::tempdir().unwrap();
     let db = open(root.path());

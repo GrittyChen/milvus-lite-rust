@@ -29,14 +29,23 @@ FIELDS = [
     ("f", "FLOAT", True, None), ("d", "DOUBLE", True, None), ("flag", "BOOL", False, None),
     ("s", "VARCHAR", False, None), ("a", "ARRAY", True, "INT64"), ("af", "ARRAY", False, "DOUBLE"),
     ("j", "JSON", True, None), ("vector", "FLOAT_VECTOR", False, None), ("p", "JSON", True, None),
+    ("m", "INT64", True, None), ("an", "ARRAY", True, "INT64"),
 ]
 # Python 路线（经 JSON 路径）的取值：大整数、真除法的被除数 q 与除数 r、bool、字符串、列表与 JSON NaN。
 # h 只在第 0 行，专供会报错的表达式使用。
+# 正确舍入的整数真除法（只在第 0 行）：恰在中点向偶数舍入、次正规数、下溢到 ±0、最大有限值、
+# 两侧都不超过 2^53 的快路径与一般路径。期望值由 Python 自己算出。
+DIVISIONS = [
+    (2**53 + 1, 1), (2**54 + 3, 2), (-(2**53 + 1), 1), (3, 2**1075), (1, 2**1075), (1, 2**1076),
+    (-1, 2**1076), (2**1024 - 2**971, 1), (10**400, 10**399), (7, 2), (-7, 2), (2**60 + 1, 2**60),
+    (2**1023 * 3, 2**1022 * 3), (1, 3), (-(10**30), 7),
+]
 P_ROWS = [
     {"i": 3, "b": 2**70, "f": 1.5, "s": "ab", "l": [1, "x"], "t": True, "z": 0, "e": "", "el": [],
-     "q": 2**70 + 1, "r": 3, "u": "\u00e9", "h": 10**400},
+     "q": 2**70 + 1, "r": 3, "u": "\u00e9", "h": 10**400, "ln": [None, 1],
+     "oq": 2**1024 - 2**970, "or": 1, **{f"d{k}{side}": v for k, pair in enumerate(DIVISIONS) for side, v in zip("qr", pair)}},
     {"i": -2, "b": -(2**70), "f": -0.0, "s": "", "l": [], "t": False, "z": 0.0, "e": "", "el": [],
-     "q": -(2**60 + 1), "r": 7, "u": "x"},
+     "q": -(2**60 + 1), "r": 7, "u": "x", "ln": [None]},
     {"i": 0, "b": 2**64, "f": float("nan"), "s": "x", "l": [float("nan"), [1]], "t": True, "z": 0,
      "e": "", "el": [], "q": 1, "r": 2**1075, "u": "y"},
     None,
@@ -57,7 +66,11 @@ COLUMNS = {
     "j": [json.dumps(x) for x in [{"k": 1}, {"k": 2.5}, {"k": "a"}, {"k": None}]],
     "vector": [[1.0, 0.0]] * 4,
     "p": [None if row is None else json.dumps(row) for row in P_ROWS],
+    "m": [None, 1, None, 2],
+    "an": [[1, None], None, [None], [2]],
 }
+# null 槽里存放的值（与有效位一起构造 Arrow 数组）：越界的整数不参与转换检查。
+SLOTS = {"m": [2**53 + 1, 1, -(2**62), 2]}
 # 动态字段的几组取值：hybrid 的推断、回退与 Python 路线。
 META = [
     [{"x": 1, "y": 2}, {"x": 2, "y": 0}, {"x": None}, {}],
@@ -80,6 +93,17 @@ SOURCE_EXPRESSIONS = [
     # test_e2e.py / test_semantic.py / test_collection_filter.py 中的算术形状。
     "age + 1 > 2", "age * 2 == 4", "age - 1 >= 0", "d / 2 > 0.4", "age / 2 == 0.5",
     "(age + 1) * 2 > 3", "-age < 0", "age * 1.5 > 1", "f * 2 > d",
+    # 逐条转写（score → d，title / category → s，active → flag，$meta["score"] → $meta["x"]）。
+    # test_e2e.py 的 EXPRESSIONS 与 F2a 用例：
+    "age + 1 > 25", "age - 5 > 20", "age * 2 >= 50", "age / 2 < 30", "d * 2 > 1.0", "d + 0.1 < 0.6",
+    "age + d > 25.5", "age * 2 + 1 > 50", "(age + 5) * 2 > 60", "-age + 100 > 50", "age + 1 > age",
+    "age - 1 == 24", "age + 1 > 20 and s like '%i%'", "s is not null and age * 2 > 30",
+    "(age - 10) * 2 < 50 or d / 2 > 0.4", '$meta["x"] * 2 > 1.0', '$meta["x"] + 0.1 >= 0.6',
+    # test_semantic.py：
+    "age + 1 > 20", "age + 0.5 > 20", "d * 2.0 > 1.5", "s + 1 > 0", "flag + 1 > 0", "-age > -50",
+    "age / 2 >= 10", "age * 2 + 1 < 100 and d - 0.1 > 0",
+    # test_collection_filter.py：
+    "age / 2 > 12", "-age < -25",
 ]
 
 
@@ -112,6 +136,10 @@ def expressions():
         "n + f > 0 and n < 0", "n + f > 0 or true", "true or n + f > 0",
         "age + 9223372036854775808 > 0", "age > 0 or age + 9223372036854775808 > 0",
         "n + f > 0 and age + 9223372036854775808 > 0", "age + 9223372036854775808 > 0 and n + f > 0",
+        # null 槽中的越界值：原始列（SLOTS）与派生列（null 槽加减后仍越界）
+        "m == f", "f == m", "m + f > 0", "f + m > 0", "m / 2 > 0", "m / f > 0", "m * 1.0 > 0", "m < d",
+        "m + 16777216.0 > 0", "-m < 0", "(m + 1) == f", "f == (m + 1)", "(m + 1) / 2 > 0",
+        "(m - 1) * 1.0 > 0", "(m * 2) + f > 0", "(m + 1) == d", "(m + 1) + (m + 1) > f",
         # 浮点精度与除零
         "f * f == 1.21", "f * f > 1.2099", "f + 0.1 == 1.2", "d + 0.1 == 1.1", "f / f == 1", "f / 0 > 1",
         "d / 0 > 1", "d / 0 < 0", "d / 0 == d / 0", "id / 0 > 1", "i8 / 0 < 0", "-d == 0", "1 / -d < 0",
@@ -120,11 +148,16 @@ def expressions():
         "a + 1 > 0", "1 + a > 0", "a - 1 > 0", "a * 1.5 > 0", "a / 1 > 0", "f / a > 0", "i8 / a > 0",
         "a + a > 0", "af + 1 > 0", "-a > 0", "-af > 0", "a + af > 0", "i8 + a > 0", "n / a > 0",
         "a + 1 > 0 and n + f > 0", "n + f > 0 and a + 1 > 0",
+        # ARRAY 上的 LIKE 同样是内核缺失（模糊对照发现的既有文案差异，随本切片修正）
+        "a like 'a%'", "not (a like 'a%')", "af like '%'", "a like 'a%' or n + f > 0",
         # 类型检查
         "flag + 1 > 0", "s + 1 > 0", "j + 1 > 0", "-flag > 0", "-s > 0", "-vector > 0", "vector + 1 > 0",
         "id + 'a' > 0", "id % 2 == 0", "id ** 2 == 4", "id + 1 in [2]", "(id + 1) is null", "id + 1",
         # 动态字段与路径
         "x + 1 > 1", "x * 2 == 2", "x / y > 0", "-x < 0", "x + age > 0", "x * x > 0",
+        # 空类型（全 null 的动态键）与各类型的组合，以及 Python 结果之间的比较
+        "x + f > 0", "f + x > 0", "x + i8 > -200", "x * i16 > 0", "x / 2 > 0", "i8 / x > 0", "x + d > 0",
+        "x - 1.5 < 0", "x * 2 == y + y", "x + y == x + y", "x * y > x",
         "x + 1 == 'a' and age == 9223372036854775808", "x == 'a' and age == 9223372036854775808",
         "x + 1 == 2 and age == 9223372036854775808", "j['k'] + 1 > 1", "j['k'] * 2 == 'aa'",
         "text_match(s, 'a') and id + 1 > 0",
@@ -157,11 +190,21 @@ def python_expressions():
         "p['l'] + p['l'] == p['l'] * 2", "p['l'] * 2 == p['l'] * 2", "p['l'] + p['l'] > p['l']",
         "p['l'] * 0 == p['el']", "p['l'] * p['t'] == p['l']", "p['l'] * 1.5 == p['l']",
         "p['l'] + p['l'] == p['l']", "p['l'] + p['el'] == p['l']", "p['l'][0] + 1 == 2", "p['n'] + 1 > 0",
+        # 含 null 元素的 JSON 列表与 ARRAY
+        "p['ln'] * 2 == p['ln'] + p['ln']", "p['ln'] + p['l'] > p['ln']", "p['ln'] * 1 == p['ln']",
+        "p['ln'] < p['l']", "p['ln'] + p['ln'] == p['ln']", "p['ln'] * 0 == p['el']",
+        "array_length(an) >= 0 and an + an == an * 2", "array_length(an) >= 0 and an * 2 > an",
+        "array_length(an) >= 0 and an * 1 == an", "array_length(an) >= 0 and an + a > an",
+        "array_length(an) >= 0 and an < a", "array_length(an) >= 0 and an * 0 == a",
+        # bool 与大整数的比较、bool 参与算术后的比较
+        "p['t'] < p['b']", "p['t'] == p['i'] - 2", "p['t'] * 2 == p['t'] + p['t']", "p['t'] + p['b'] > p['b']",
         # 重复的判定顺序：次数放不进 Py_ssize_t → 空结果 → 长度乘积 → 分配
         f"p['s'] * {big} == ''", f"p['e'] * {big} == ''", f"p['s'] * -{big + 1} == ''", f"p['s'] * -{big} == ''",
         f"p['l'] * {big} == p['l']", f"p['el'] * {big} == p['l']", f"{big} * p['s'] == ''",
         f"p['s'] * {2**62} == ''", f"p['e'] * {2**62} == ''", f"p['s'] * {2**62 - 1} == ''",
         f"p['l'] * {2**62} == p['l']", f"p['el'] * {2**62} == p['el']", f"p['l'] * {2**61} == p['l']",
+        # 3.x 中必然分配失败的确定点：长度 1 的字符串（第 0 行 'é'）与列表（第 1 行 [None]）乘 2^62。
+        f"p['u'] * {2**62} == ''", f"p['ln'] * {2**62} == p['ln']",
         # 会报错的大整数与 Python 的短路
         "p['h'] + 1 > 0", "p['h'] + 1.5 > 0", "1.5 * p['h'] > 0", "p['h'] / 1 > 0", "p['h'] / p['h'] == 1",
         "p['h'] * 0 == 0", "p['h'] > 1.5", "p['h'] - p['h'] == 0", "p['h'] / 0 > 0",
@@ -183,6 +226,10 @@ def python_expressions():
     for row in P_ROWS:
         if row is not None:
             result.append(f"p['q'] / p['r'] == {row['q'] / row['r']!r}")
+    for k, (q, r) in enumerate(DIVISIONS):
+        result.append(f"p['d{k}q'] / p['d{k}r'] == {q / r!r}")
+    # 恰在最大有限值与 2^1024 的中点，向偶数舍入为 2^1024：上溢。
+    result += ["p['oq'] / p['or'] > 0", "p['i'] > 100 and p['oq'] / p['or'] > 0"]
     return result
 
 
@@ -220,7 +267,10 @@ def table(group):
     columns = {}
     for name, dtype, _, element in FIELDS:
         arrow = pa.list_(types[element]) if dtype == "ARRAY" else types[dtype]
-        columns[name] = pa.array(COLUMNS[name], type=arrow)
+        if name in SLOTS:
+            columns[name] = pa.array(SLOTS[name], type=arrow, mask=[v is None for v in COLUMNS[name]])
+        else:
+            columns[name] = pa.array(COLUMNS[name], type=arrow)
     columns["_seq"] = pa.array([1, 2, 3, 4], type=pa.int64())
     columns["$meta"] = pa.array([json.dumps(row) for row in META[group]])
     return pa.table(columns)
@@ -254,6 +304,7 @@ def main():
         "reference": "3.2.2+3 / 1320d26",
         "fields": [list(field) for field in FIELDS],
         "columns": COLUMNS,
+        "slots": SLOTS,
         "meta": META,
         "cases": [run_case(case, compiled_schema) for case in cases()],
     }
@@ -270,7 +321,7 @@ def main():
         raw = subprocess.check_output([args.arrow15_python, str(Path(__file__).resolve()), "--dump-results"], text=True)
         # 两个 Arrow 版本的算术结果与文案实测完全相同；出现差异即停下，不登记例外。
         assert json.loads(raw) == payload, "Arrow 15 and 25 disagree on filter arithmetic"
-        header = json.dumps({key: payload[key] for key in ("reference", "fields", "columns", "meta")}, ensure_ascii=True, separators=(",", ":"))[:-1]
+        header = json.dumps({key: payload[key] for key in ("reference", "fields", "columns", "slots", "meta")}, ensure_ascii=True, separators=(",", ":"))[:-1]
         content = header + ',"cases":[\n' + ",\n".join(json.dumps(case, ensure_ascii=True, separators=(",", ":")) for case in payload["cases"]) + "\n]}\n"
         OUTPUT.write_text(content)
     print(f"{len(payload['cases'])} filter arithmetic cases verified with Arrow {pa.__version__}")

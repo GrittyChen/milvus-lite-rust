@@ -88,6 +88,7 @@
 | standard 分词与 `text_match`：固定 Unicode 表、hybrid 回退路线、`analyzer_params` 的判定与持久化、登记差异 | [0029](docs/decisions/0029-text-match.md) |
 | 稀疏向量与 IP：打包字节的存储与解码时机、SPARSE_INVERTED_INDEX 的定义与调参项、每个 segment 惰性倒排的缓存与作废、排序键与错误先后、带分区时先全局判版本、登记差异 | [0030](docs/decisions/0030-sparse-vectors.md) |
 | BM25 function 与全文检索：函数的校验与持久化、`analyzer_params` 原值与分词器、写入时生成输出字段、BM25 度量的换算表、k1 / b、按 segment 的统计与 NumPy 2 的 float32 打分、登记差异 | [0031](docs/decisions/0031-bm25.md)、[验收](docs/testing/0031-bm25-acceptance.md) |
+| 过滤中的算术：三条求值路线（pyarrow 的类型提升、回绕与带检查的转换；Python 的精确整数、正确舍入的真除法、字符串与列表的拼接和重复；hybrid 的整源回退）、资源上限与登记差异（资源上限、hybrid 推断、只看活行）；三步均已实施并复核通过（第 3 步为真值、模糊对照、差分、参照用例与文档） | [0032](docs/decisions/0032-arithmetic-filters.md)、[验收](docs/testing/0032-arithmetic-acceptance.md) |
 | JSON 文本解析与 serde_json 数字私有键：影响面、判别规则、唯一入口与 clippy 门、已有数据能否恢复 | [修复记录](docs/testing/json-private-number-key-fix.md) |
 | 验收与调查记录引用的证据分哪几类、谁能复核（仓库内可重跑 / 公开产物 / 本地留存），以及验收与调查记录的写法约定 | [证据的存放与复核范围](docs/testing/README.md) |
 | 性能基线怎么测 / 口径 / 注意事项 | [benchmarks/baseline/README.md](benchmarks/baseline/README.md) |
@@ -182,6 +183,8 @@ pymilvus ──server_manager──▶ adapter/grpc ──▶ db（多 collectio
 | 分区可见性隔离组件对照（不接入产品；含冻结代、快照与稀疏关系资源诊断） | `cargo test -p milvus-lite-core --example partition_visibility_probe`；构建、真值核验及 RSS 采样见 [组件 README](benchmarks/partition-visibility/README.md) |
 | ISO 时间组件直接模糊对照（不经服务；参照环境为 CPython 3.12，报告放仓库外） | `cargo build -p milvus-lite-core --example filter_parse_probe`，再 `<3.x 的 venv>/bin/python tests/differential/fuzz_temporal.py --cases 200000 --seed 29 --output <work_dir>/temporal.json` |
 | 时区换算真值核验（真实 CPython 3.12 zoneinfo；本地时间 → UTC、UTC → 各分量，含 `datetime` 范围两端） | `<参照 python> tests/differential/generate_timezone_fixtures.py --verify` |
+| 过滤算术组件真值核验（真实 3.x / `1320d26`；Arrow 15/25 各执行） | `<3.x 的 venv>/bin/python tests/differential/generate_filter_arith_fixtures.py --verify`；重新生成须用 Arrow 25 并指定 `--arrow15-python <Arrow15 的参照解释器>` |
+| 过滤算术直接模糊对照（不经服务；随机表与表达式覆盖三条路线；报告放仓库外） | `cargo build -p milvus-lite-core --example filter_arith_probe`，再 `<3.x 的 venv>/bin/python tests/differential/fuzz_arith.py --output <work_dir>/arith.json` |
 | S1 Unicode 分类表与小写表核验（CPython 3.12 / Unicode 15.0） | `<CPython 3.12>/bin/python tests/differential/generate_filter_unicode.py --verify` |
 | standard 分词真值核验（真实 3.x / `1320d26`） | `<3.x 的 venv>/bin/python tests/differential/generate_analyzer_fixtures.py --verify` |
 | standard 分词模糊对照（不经服务；参照环境为 CPython 3.12） | `cargo build -p milvus-lite-core --example analyzer_probe`，再 `<3.x 的 venv>/bin/python tests/differential/fuzz_analyzer.py --cases 200000 --seed 29` |
@@ -193,7 +196,7 @@ pymilvus ──server_manager──▶ adapter/grpc ──▶ db（多 collectio
 | 独立 CLI server | `.venv/bin/milvus-lite server --data-dir <data_dir> --host 127.0.0.1 --port 19530 --max-workers 10`；也可 `python -m milvus_lite server ...`，合同见 0012 |
 | 构建 wheel / sdist | `.venv/bin/maturin build --release -m crates/py/Cargo.toml` / `.venv/bin/maturin sdist -m crates/py/Cargo.toml` |
 | 核对依赖图中没有 C++ 构建与 protoc | `cargo tree --workspace -e all` |
-| 发行物与安装验收（本地诊断，候选以发行工作流为准；根配置；工作目录在仓库外） | `.venv/bin/python tests/packaging/run_acceptance.py --work-dir <work_dir> --constraints <constraints.txt> --suite --suite-expect 648`；约束文件与完整步骤见 [打包验收](tests/packaging/README.md) |
+| 发行物与安装验收（本地诊断，候选以发行工作流为准；根配置；工作目录在仓库外） | `.venv/bin/python tests/packaging/run_acceptance.py --work-dir <work_dir> --constraints <constraints.txt> --suite --suite-expect 652`；约束文件与完整步骤见 [打包验收](tests/packaging/README.md) |
 | 发行物/平台脚本自检 | `.venv/bin/python -m pytest tests/packaging tests/platform` |
 | CI 纯文档分类与汇总判定自检 | `.venv/bin/python -m pytest tests/ci` |
 | 发行工作流：演练 / 正式运行（0021；从以冻结提交为最新提交的已推送分支触发，正式运行引用同一提交含 PID 1 的成功演练） | `gh workflow run release.yml --repo <owner/repo> --ref <冻结分支> -f commit=<完整 SHA> -f version=<版本> -f dry_run=true`；正式运行改为 `-f dry_run=false -f pid1_dry_run=<演练运行 ID>.<attempt>` |

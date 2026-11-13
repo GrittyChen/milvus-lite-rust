@@ -1,6 +1,6 @@
 # 0032：过滤表达式中的算术
 
-状态：设计经六轮独立复核与负责人两轮评审，2026-11-12 通过；第 1 步已实施并复核通过；第 2 步已实施并复核通过；第 3 步待实施。参照版本 `1320d26`。负责人于 2026-11-12 确认：大整数用 `num-bigint`；字符串 / 列表结果设 64 MiB 上限（按实际分配，每码位 4 字节），拼接与重复共用，先算大小再分配；大整数设 2^20 位上限；输入的解析和转换同样计入预算（表达式字面量已由解析器限制在 4300 位内，不另计）；3.x 的 OverflowError 情形照报原文，之后才是本实现的资源错误；已有比较的 null 错位检查一并修正；CPU 与时间不设上限，登记为残余风险；参照的内部测试只作真值来源。
+状态：设计经六轮独立复核与负责人两轮评审，2026-11-12 通过；第 1 步已实施并复核通过；第 2 步已实施并复核通过；第 3 步已实施并复核通过（负责人 2026-11-13 确认：hybrid 推断的复刻另开切片，排在本切片之后、GEOMETRY 之前；模糊对照发现的 ARRAY 上 LIKE 文案差异在本切片修正，见「第 3 步修正的既有问题」）。参照版本 `1320d26`。负责人于 2026-11-12 确认：大整数用 `num-bigint`；字符串 / 列表结果设 64 MiB 上限（按实际分配，每码位 4 字节），拼接与重复共用，先算大小再分配；大整数设 2^20 位上限；输入的解析和转换同样计入预算（表达式字面量已由解析器限制在 4300 位内，不另计）；3.x 的 OverflowError 情形照报原文，之后才是本实现的资源错误；已有比较的 null 错位检查一并修正；CPU 与时间不设上限，登记为残余风险；参照的内部测试只作真值来源。
 
 ## 范围
 
@@ -131,6 +131,10 @@ pymilvus 在客户端拒绝超过 64 位的 JSON 整数，所以经 SDK 写入�
 
 复核发现：已有的列比较（[columns.rs](../../crates/core/src/filter/columns.rs) 的 `compare`）只在两侧都有效时才做整数转浮点的检查，而 3.x 按整数操作数自己的有效位检查，`n == f`（`n = [2^53+1, null]`、`f = [null, 1.0]`）在 3.x 中报 ArrowInvalid，本实现返回结果。这不是本切片引入的，也没有登记。负责人决定在本切片修正、不登记为差异：只改 `compare` 中转换检查的位置：比较只转换整数那一侧，按该操作数自己的有效位 ∩ 活行检查，文案与 3.x 相同；补对应的组件真值（两侧 null 错位、null 槽中的越界值不报）。「先左后右」只涉及两侧都要转换的 `/`。本切片的算术内核按同一规则实现。
 
+## 第 3 步修正的既有问题
+
+算术模糊对照发现一处与算术无关、0014 起就有但没有登记的文案差异：Arrow 路线上对 ARRAY 字段做 LIKE（ARRAY 的语义类型是动态值，能通过语义检查），3.x 报 `Function 'match_like' has no kernel matching input types (list<item: int64>)`，本实现报 `no matching LIKE kernel`；错误码同为 1，hybrid 中这类失败触发回退、文案不可见。负责人决定在本切片修正：[columns.rs](../../crates/core/src/filter/columns.rs) 的 LIKE 内核缺失改用 `pc.match_like` 的文案，类型名复用算术已有的 `column_type`；组件真值补四条（含 `not`、DOUBLE 元素与先左后右的错误先后）。
+
 ## 实施步骤
 
 每一步做完由子 agent 复核，直到没有问题。
@@ -154,7 +158,7 @@ pymilvus 在客户端拒绝超过 64 位的 JSON 整数，所以经 SDK 写入�
    - **模糊对照**：仿 [fuzz_temporal.py](../../tests/differential/fuzz_temporal.py) 增加算术的直接对照，覆盖 Arrow 的值 × 有效位 × 标量 / 列组合，以及 Python 路线随机的 int / float / str / list / bool / None 与四个运算符。
    - **资源上限**：本实现单侧的边界测试（恰在上限与上限加一，按估算值；每行累计；大元素的 ARRAY&lt;VARCHAR&gt; 乘大次数，验证按预期拒绝且共享转换不随次数放大；经注入的小上限测 `try_reserve_exact` 失败路径；资源错误使 Delete 失败、行集与序号不变）。3.x 一侧只固定确定的点（OverflowError 类，以及 `'a' * 2**62`、`[1] * 2**62` 这类必然分配失败的情形），不依赖取决于机器内存的结果；差分里两边分别断言。
    - **端到端差分**：Query / Search / Delete / HybridSearch / iterator 的算术过滤，覆盖 MemTable、flush 与重开（同一表达式在 MemTable 与 segment 上走不同路线时的结果）、死行改变 hybrid 推断导致的数值差异（按登记两边分别断言）、稀疏检索 MemTable 与 segment，两条 SDK 线。
-   - **参照测试**：[tests/adapter/test_milvus_compat_v2.py](https://github.com/milvus-io/milvus-lite/blob/1320d26/tests/adapter/test_milvus_compat_v2.py) 的 `test_add_in_filter`、`test_divide_in_filter`、`test_arithmetic_in_search_filter` 经 pymilvus 走 gRPC，按 adapter 规则复制并替换起服务的 fixture。[tests/search/filter/test_e2e.py](https://github.com/milvus-io/milvus-lite/blob/1320d26/tests/search/filter/test_e2e.py)、`test_semantic.py` 与 `tests/engine/test_collection_filter.py` 直接导入 3.x 的 `parse_expr`、`compile_expr`、各 backend 与 `Collection`，不能复制运行，只作真值来源：把其中的表达式、数据与期望（含错误）转成组件真值或差分用例。[INVENTORY](../../tests/python/adapter/INVENTORY.md) 只盘点 `tests/adapter`：把 `test_milvus_compat_v2.py` 的整文件条目拆出这三条标为已复制，并更新状态表的条数；内部测试不进 INVENTORY，作为真值来源的清单列在本切片的验收记录中。
+   - **参照测试**：[tests/adapter/test_milvus_compat_v2.py](https://github.com/milvus-io/milvus-lite/blob/1320d26/tests/adapter/test_milvus_compat_v2.py) 的 `test_add_in_filter`、`test_divide_in_filter`、`test_arithmetic_in_search_filter` 经 pymilvus 走 gRPC，按 adapter 规则复制并替换起服务的 fixture（同一个 `TestArithmeticFilters` 中的 `test_multiply_in_filter` 也是算术用例，一并复制，共 4 条）。[tests/search/filter/test_e2e.py](https://github.com/milvus-io/milvus-lite/blob/1320d26/tests/search/filter/test_e2e.py)、`test_semantic.py` 与 `tests/engine/test_collection_filter.py` 直接导入 3.x 的 `parse_expr`、`compile_expr`、各 backend 与 `Collection`，不能复制运行，只作真值来源：把其中的表达式、数据与期望（含错误）转成组件真值或差分用例。[INVENTORY](../../tests/python/adapter/INVENTORY.md) 只盘点 `tests/adapter`：把 `test_milvus_compat_v2.py` 的整文件条目拆出这四条标为已复制，并更新状态表的条数；内部测试不进 INVENTORY，作为真值来源的清单列在本切片的验收记录中。
    - **rerank**：[test_rerank_scenarios.py](../../tests/differential/test_rerank_scenarios.py) 中 `FILTER_RANGE` 的三条（`s boost filter arithmetic`、`dyn` / `nodyn boost filter age + 1 > 5`）改为两边对照。
    - **随开闸与文案改动同步的断言**：[test_grpc_translation.py](../../tests/python/test_grpc_translation.py) 中以 `id + 1` 等算术断言 UNIMPLEMENTED 的各处（749、999、1085、1091、1254 行附近），[timestamptz.rs](../../crates/core/tests/timestamptz.rs) 445–457 行对 `id + 1 > 2`、`-id > 0` 的 `Unsupported` 断言，[test_filter_s1.py](../../tests/differential/test_filter_s1.py) 343–344 行对 `age + 1 > 0` 的断言，[test_timestamp_filters.py](../../tests/differential/test_timestamp_filters.py) 的 `GENERAL_ARITHMETIC` 集合及其「先于语义检查」的断言，[filter.rs](../../crates/core/src/filter.rs) 的 `out_of_scope_constructs_stay_unimplemented`。
    - **文档**：0006（588、594、603 行附近的登记）、0014（267 行与已确认取舍第 3 条标注被本文取代）、0025（112、182 行的登记差异）、0026（373 行）、INVENTORY 中关于算术的条目、AGENTS 的技术栈（`num-bigint` 直接依赖）、知识索引与架构地图、README 的支持范围。
@@ -162,4 +166,4 @@ pymilvus 在客户端拒绝超过 64 位的 JSON 整数，所以经 SDK 写入�
 
 ## 验收
 
-实施后补充。
+开发验收见 [0032 验收记录](../testing/0032-arithmetic-acceptance.md)：组件真值 1798 条（Arrow 15 / 25 一致，3.x 的 MemoryError 对应资源错误，40 条登记的 hybrid 推断差异两边分别断言）、直接模糊对照约 25 万条零不一致、端到端差分 40 条（含 Delete 失败不落盘、死行改变推断与按数据源分路线）、参照 adapter 用例 4 条，以及两条 SDK 线的全量回归。

@@ -894,7 +894,11 @@ fn evaluate(
             Kind::Like { value, .. } => {
                 let value = get(*value)?;
                 if value.shape != Shape::String {
-                    return Err(kernel("no matching LIKE kernel"));
+                    // Arrow 路线上只有 ARRAY 字段能走到这里（语义类型是动态值）；文案按 pc.match_like。
+                    return Err(kernel(format!(
+                        "Function 'match_like' has no kernel matching input types ({})",
+                        column_type(value)
+                    )));
                 }
                 let pattern = tree.patterns[id].as_ref().ok_or_else(|| {
                     Failure::Fatal(EngineError::Storage("LIKE lost pattern".into()))

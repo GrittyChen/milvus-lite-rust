@@ -577,6 +577,29 @@ const REGISTERED_HYBRID_INFERENCE: &[(&str, u64, &str)] = &[
         10,
         r#"{"mask":[true,false,false,false]}"#,
     ),
+    // 空类型组合与参照测试转写的表达式落在同几组取值上。
+    ("x + f > 0", 7, r#"{"mask":[false,false,false,true]}"#),
+    ("f + x > 0", 7, r#"{"mask":[false,false,false,true]}"#),
+    ("x + i8 > -200", 7, r#"{"mask":[true,false,false,true]}"#),
+    ("x * i16 > 0", 7, r#"{"mask":[true,false,false,false]}"#),
+    ("x / 2 > 0", 7, r#"{"mask":[true,false,false,true]}"#),
+    ("i8 / x > 0", 7, r#"{"mask":[true,false,false,true]}"#),
+    ("i8 / x > 0", 10, r#"{"mask":[false,false,false,true]}"#),
+    ("x + d > 0", 7, r#"{"mask":[true,false,false,true]}"#),
+    ("x - 1.5 < 0", 7, r#"{"mask":[false,false,false,false]}"#),
+    ("x * 2 == y + y", 7, r#"{"mask":[false,false,false,false]}"#),
+    ("x + y == x + y", 7, r#"{"mask":[true,false,false,true]}"#),
+    ("x * y > x", 7, r#"{"mask":[true,true,false,true]}"#),
+    (
+        "$meta[\"x\"] * 2 > 1.0",
+        7,
+        r#"{"mask":[true,false,false,true]}"#,
+    ),
+    (
+        "$meta[\"x\"] + 0.1 >= 0.6",
+        7,
+        r#"{"mask":[true,false,false,true]}"#,
+    ),
 ];
 
 /// 0032：算术的组件真值（[generate_filter_arith_fixtures.py](../../../tests/differential/generate_filter_arith_fixtures.py)）。
@@ -617,6 +640,11 @@ fn arithmetic_matches_reference_corpus() {
         }
         let values = fixture["columns"][name].as_array().unwrap();
         let valid: Vec<bool> = values.iter().map(|v| !v.is_null()).collect();
+        // null 槽里存放的值（3.x 一侧以 mask 构造），转换检查不能看到它们。
+        let values = fixture["slots"]
+            .get(name)
+            .and_then(Value::as_array)
+            .unwrap_or(values);
         let data = match f.data_type {
             DataType::Int64 => {
                 ColumnData::Int64(values.iter().map(|v| v.as_i64().unwrap_or(0)).collect())
