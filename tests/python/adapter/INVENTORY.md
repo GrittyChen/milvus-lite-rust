@@ -751,7 +751,7 @@
 | Query / search iterator V1 | 0016 A / B 接续；V2 不增加服务端实现 |
 | 分区 RPC；写入、检索、查询指定 `_default` 以外的分区；partition key | `test_insert_m1_unsupported`、`test_search_m1_unsupported`、`test_query_m1_unsupported`、`test_pymilvus_entry_points_remaining_unsupported` |
 | 跨数据库改名（数据库 RPC 本身已由 0023 B 实现；数据库 `timezone` 属性已由 0025 实现） | 差分测试 `tests/differential/test_databases.py` 与 `test_rename.py` 的预期差异断言 |
-| schema：GEOMETRY、`ARRAY<TIMESTAMPTZ>`、nullable 稠密向量、向量默认值、JSON/嵌套 ARRAY 元素、function | `test_create_collection_remaining_unsupported`、`test_pymilvus_entry_points_remaining_unsupported` |
+| schema：`ARRAY<GEOMETRY>`（GEOMETRY 字段已由 0034 实现）、`ARRAY<TIMESTAMPTZ>`、nullable 稠密向量、向量默认值、JSON/嵌套 ARRAY 元素、function | `test_create_collection_remaining_unsupported`、`test_pymilvus_entry_points_remaining_unsupported` |
 | 写入 null 值 | `test_insert_m1_unsupported` |
 | 修改 schema | `test_pymilvus_entry_points_remaining_unsupported` |
 | rerank 的 model provider（含与 group_by 同时出现） | `test_search_m1_unsupported`、`test_pymilvus_entry_points_remaining_unsupported` |

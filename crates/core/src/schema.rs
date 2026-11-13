@@ -20,6 +20,8 @@ pub enum DataType {
     Array,
     /// UTC Unix 微秒的 int64（0025）；列沿用 `ColumnData::Int64`，类型差异只在 schema。
     Timestamptz,
+    /// 校验过的 WKT 原文（0034）；列沿用 `ColumnData::VarChar`，类型差异只在 schema。
+    Geometry,
     FloatVector,
     /// 每行是按维度排序的 `<uint32, float32>` 小端对（0030）。
     SparseFloatVector,
@@ -40,6 +42,7 @@ impl DataType {
             Self::Json => "JSON",
             Self::Array => "ARRAY",
             Self::Timestamptz => "TIMESTAMPTZ",
+            Self::Geometry => "GEOMETRY",
             Self::FloatVector => "FLOAT_VECTOR",
             Self::SparseFloatVector => "SPARSE_FLOAT_VECTOR",
         }
@@ -267,6 +270,7 @@ impl CollectionSchema {
                         | DataType::FloatVector
                         | DataType::SparseFloatVector
                         | DataType::Timestamptz
+                        | DataType::Geometry
                 ) {
                     return Err(EngineError::unsupported(
                         "ARRAY element type",
@@ -281,6 +285,16 @@ impl CollectionSchema {
                 && let Some(default) = f.default_value.as_ref().filter(|v| !v.is_null())
             {
                 crate::timestamptz::check_default(default, &timezone)?;
+            }
+            // 3.x 对默认值调用 `validate_geometry_wkt`：不是字符串或不是合法 WKT 都报同一条。
+            if f.data_type == DataType::Geometry
+                && let Some(default) = f.default_value.as_ref().filter(|v| !v.is_null())
+                && !default.as_str().is_some_and(crate::geometry::is_valid)
+            {
+                return Err(EngineError::schema(format!(
+                    "GEOMETRY field {} default_value is invalid",
+                    py_repr(&f.name)
+                )));
             }
         }
 

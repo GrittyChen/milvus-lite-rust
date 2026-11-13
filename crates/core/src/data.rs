@@ -245,7 +245,7 @@ impl ColumnData {
             DataType::Int64 | DataType::Timestamptz => Self::Int64(vec![0; n]),
             DataType::Float => Self::Float(vec![0.0; n]),
             DataType::Double => Self::Double(vec![0.0; n]),
-            DataType::VarChar => Self::VarChar(vec![String::new(); n]),
+            DataType::VarChar | DataType::Geometry => Self::VarChar(vec![String::new(); n]),
             DataType::Json => Self::Json(vec![b"null".to_vec(); n]),
             DataType::Array => Self::Array(ArrayData::empty_rows(field, n)),
             // schema 拒绝可空向量，存储层到不了这里；只有 boost 剥掉同名字段时输出占位（0026）。
@@ -302,7 +302,7 @@ impl ColumnData {
             DataType::Int64 | DataType::Timestamptz => Self::Int64(Vec::new()),
             DataType::Float => Self::Float(Vec::new()),
             DataType::Double => Self::Double(Vec::new()),
-            DataType::VarChar => Self::VarChar(Vec::new()),
+            DataType::VarChar | DataType::Geometry => Self::VarChar(Vec::new()),
             DataType::Json => Self::Json(Vec::new()),
             DataType::Array => Self::Array(ArrayData::empty_rows(field, 0)),
             DataType::FloatVector => Self::FloatVector {

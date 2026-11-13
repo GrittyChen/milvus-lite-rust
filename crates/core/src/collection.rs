@@ -5368,6 +5368,7 @@ fn check_value(field: &FieldSchema, values: &InputValues, row: usize) -> Result<
                 }
             }
             DataType::Json => true,
+            DataType::Geometry => value.as_str().is_some_and(crate::geometry::is_valid),
             DataType::Timestamptz => {
                 let micros = integer.and_then(|n| n.as_i64()).ok_or_else(|| {
                     EngineError::invalid("Python int too large to convert to C long")
@@ -5431,6 +5432,7 @@ fn check_value(field: &FieldSchema, values: &InputValues, row: usize) -> Result<
             }
             true
         }
+        (DataType::Geometry, InputValues::Str(v)) => crate::geometry::is_valid(&v[row]),
         (DataType::Json, InputValues::Json(v)) => {
             // JSON 的 null 在 3.x 中即 None。
             if parse_json(&field.name, &v[row])?.is_null() && !field.nullable {
@@ -5630,7 +5632,9 @@ fn convert_nonnull(field: &FieldSchema, values: &InputValues) -> Result<ColumnDa
                 .collect::<Result<_>>()?,
         ),
         (DataType::Double, InputValues::Float(v)) => ColumnData::Double(v.clone()),
-        (DataType::VarChar, InputValues::Str(v)) => ColumnData::VarChar(v.clone()),
+        (DataType::VarChar | DataType::Geometry, InputValues::Str(v)) => {
+            ColumnData::VarChar(v.clone())
+        }
         (DataType::Json, InputValues::Json(v)) => ColumnData::Json(v.clone()),
         (DataType::FloatVector, InputValues::FloatVector { dim, values }) => {
             ColumnData::FloatVector {

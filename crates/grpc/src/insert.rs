@@ -85,9 +85,6 @@ pub(crate) fn decode(
 
 fn scalar(name: &str, t: i32, sf: pb::ScalarField) -> Result<InputValues, EngineError> {
     use scalar_field::Data;
-    if t == 24 {
-        return Err(unsupported("GEOMETRY values"));
-    }
     // 槽位与 type 不符时，3.x 读到的是空数组，随后报行数不符。
     Ok(match (t, sf.data) {
         (22, Some(Data::ArrayData(array))) => InputValues::Array(
@@ -132,6 +129,10 @@ fn scalar(name: &str, t: i32, sf: pb::ScalarField) -> Result<InputValues, Engine
         (23, _) => InputValues::Json(Vec::new()),
         // TIMESTAMPTZ：pymilvus 发 string_data（ISO 字符串），原始 gRPC 也可发 timestamptz_data（UTC 微秒）；
         // long_data 槽 3.x 不读，视为空列。字符串在 valid_data 展开后再换算（见 `timestamps`）。
+        // GEOMETRY：3.x 先读 geometry_wkt_data，再读 string_data；WKB（geometry_data）与其余槽位视为空列。
+        (24, Some(Data::GeometryWktData(a))) => InputValues::Str(a.data),
+        (24, Some(Data::StringData(a))) => InputValues::Str(a.data),
+        (24, _) => InputValues::Str(Vec::new()),
         (26, Some(Data::TimestamptzData(a))) => InputValues::Int(a.data),
         (26, Some(Data::StringData(a))) => InputValues::Str(a.data),
         (26, _) => InputValues::Int(Vec::new()),

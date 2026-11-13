@@ -95,7 +95,8 @@ fn nullable_typed_columns_match_reference_all_routes() {
             DataType::FloatVector
             | DataType::SparseFloatVector
             | DataType::Array
-            | DataType::Timestamptz => {
+            | DataType::Timestamptz
+            | DataType::Geometry => {
                 panic!("type outside scalar fixture")
             }
         }
@@ -276,6 +277,7 @@ fn all_routes_match_reference_tree_corpus() {
                     },
                     DataType::Array => panic!("ARRAY is covered by its own truth fixture"),
                     DataType::Timestamptz => panic!("TIMESTAMPTZ has its own fixtures"),
+                    DataType::Geometry => panic!("GEOMETRY is not in this fixture"),
                     DataType::SparseFloatVector => panic!("sparse vectors are not in this fixture"),
                 }
             })

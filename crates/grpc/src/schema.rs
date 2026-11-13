@@ -26,6 +26,7 @@ fn m1_type(t: i32) -> Option<DataType> {
         21 => DataType::VarChar,
         23 => DataType::Json,
         22 => DataType::Array,
+        24 => DataType::Geometry,
         26 => DataType::Timestamptz,
         101 => DataType::FloatVector,
         104 => DataType::SparseFloatVector,
@@ -45,18 +46,11 @@ pub(crate) fn milvus_type(t: DataType) -> i32 {
         DataType::VarChar => 21,
         DataType::Json => 23,
         DataType::Array => 22,
+        DataType::Geometry => 24,
         DataType::Timestamptz => 26,
         DataType::FloatVector => 101,
         DataType::SparseFloatVector => 104,
     }
-}
-
-/// 3.x 支持、当前尚不支持的类型（GEOMETRY）。
-fn unsupported_in_m1(t: i32) -> Option<&'static str> {
-    Some(match t {
-        24 => "GEOMETRY fields",
-        _ => return None,
-    })
 }
 
 /// 3.x `translators/schema.py` 的 `_MILVUS_TYPE_NAMES`。
@@ -131,21 +125,14 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<CollectionSchema, EngineError> {
     };
     let mut fields = Vec::with_capacity(proto.fields.len());
     for f in &proto.fields {
-        let data_type = match (m1_type(f.data_type), unsupported_in_m1(f.data_type)) {
-            (Some(t), _) => Some(t),
-            (None, Some(feature)) => {
-                note(feature);
-                None
-            }
-            (None, None) => {
-                return Err(EngineError::SchemaValidation(format!(
-                    "field {} uses Milvus type {} which MilvusLite does not support. \
-                     Phase 10.2 supports: BOOL, INT8/16/32/64, FLOAT, DOUBLE, VARCHAR, JSON, ARRAY, \
-                     GEOMETRY, TIMESTAMPTZ, FLOAT_VECTOR, SPARSE_FLOAT_VECTOR.",
-                    py_repr(&f.name),
-                    type_name(f.data_type)
-                )));
-            }
+        let Some(data_type) = m1_type(f.data_type) else {
+            return Err(EngineError::SchemaValidation(format!(
+                "field {} uses Milvus type {} which MilvusLite does not support. \
+                 Phase 10.2 supports: BOOL, INT8/16/32/64, FLOAT, DOUBLE, VARCHAR, JSON, ARRAY, \
+                 GEOMETRY, TIMESTAMPTZ, FLOAT_VECTOR, SPARSE_FLOAT_VECTOR.",
+                py_repr(&f.name),
+                type_name(f.data_type)
+            )));
         };
         // 同名 key 以后出现者为准（3.x 逐个写入 dict）。
         let param = |key: &str| {
@@ -156,7 +143,7 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<CollectionSchema, EngineError> {
                 .map(|kv| kv.value.as_str())
         };
         let mut dim = None;
-        if data_type == Some(DataType::FloatVector) {
+        if data_type == DataType::FloatVector {
             let text = param("dim").filter(|s| !s.is_empty()).ok_or_else(|| {
                 EngineError::SchemaValidation(format!(
                     "FLOAT_VECTOR field {} is missing required 'dim' type_param",
@@ -172,7 +159,7 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<CollectionSchema, EngineError> {
             })?);
         }
         let mut max_length = None;
-        if data_type == Some(DataType::VarChar)
+        if data_type == DataType::VarChar
             && let Some(text) = param("max_length").filter(|s| !s.is_empty())
         {
             max_length = Some(pyint::int_str(text).ok_or_else(|| {
@@ -183,7 +170,7 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<CollectionSchema, EngineError> {
                 ))
             })?);
         }
-        let element_type = if data_type == Some(DataType::Array) {
+        let element_type = if data_type == DataType::Array {
             if matches!(f.element_type, 24 | 26 | 104) {
                 note("ARRAY element type");
             }
@@ -191,7 +178,7 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<CollectionSchema, EngineError> {
         } else {
             None
         };
-        let max_capacity = if data_type == Some(DataType::Array) {
+        let max_capacity = if data_type == DataType::Array {
             param("max_capacity").and_then(pyint::int_str)
         } else {
             None
@@ -210,7 +197,7 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<CollectionSchema, EngineError> {
                 (None, None)
             }
         };
-        if f.nullable && data_type == Some(DataType::FloatVector) {
+        if f.nullable && data_type == DataType::FloatVector {
             note("nullable vectors");
         }
         let default_value = match f.default_value.as_ref().and_then(|v| v.data.as_ref()) {
@@ -244,28 +231,26 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<CollectionSchema, EngineError> {
                 None
             }
         };
-        if default_value.is_some() && data_type == Some(DataType::FloatVector) {
+        if default_value.is_some() && data_type == DataType::FloatVector {
             note("vector default values");
         }
-        if let Some(data_type) = data_type {
-            fields.push(FieldSchema {
-                is_primary: f.is_primary_key,
-                is_partition_key: f.is_partition_key,
-                auto_id: f.auto_id,
-                dim,
-                max_length,
-                element_type,
-                max_capacity,
-                nullable: f.nullable,
-                default_value,
-                enable_analyzer: flag("enable_analyzer"),
-                enable_match: flag("enable_match"),
-                analyzer_params,
-                unsaved_analyzer_params,
-                is_function_output: f.is_function_output,
-                ..FieldSchema::new(f.name.clone(), data_type)
-            });
-        }
+        fields.push(FieldSchema {
+            is_primary: f.is_primary_key,
+            is_partition_key: f.is_partition_key,
+            auto_id: f.auto_id,
+            dim,
+            max_length,
+            element_type,
+            max_capacity,
+            nullable: f.nullable,
+            default_value,
+            enable_analyzer: flag("enable_analyzer"),
+            enable_match: flag("enable_match"),
+            analyzer_params,
+            unsaved_analyzer_params,
+            is_function_output: f.is_function_output,
+            ..FieldSchema::new(f.name.clone(), data_type)
+        });
     }
     let mut functions = Vec::with_capacity(proto.functions.len());
     for function in &proto.functions {
@@ -478,7 +463,7 @@ fn encode_default(dtype: DataType, value: &Value) -> Result<Option<pb::ValueFiel
         DataType::Timestamptz => Data::TimestamptzData(int()?),
         DataType::Float => Data::FloatData(float()? as f32),
         DataType::Double => Data::DoubleData(float()?),
-        DataType::VarChar => Data::StringData(match value {
+        DataType::VarChar | DataType::Geometry => Data::StringData(match value {
             Value::String(v) => v.clone(),
             other => milvus_lite_core::error::py_json_repr(other),
         }),

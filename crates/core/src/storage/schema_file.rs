@@ -237,6 +237,7 @@ impl SchemaFile {
                     "json" => DataType::Json,
                     "array" => DataType::Array,
                     "timestamptz" => DataType::Timestamptz,
+                    "geometry" => DataType::Geometry,
                     "float_vector" => DataType::FloatVector,
                     "sparse_float_vector" => DataType::SparseFloatVector,
                     _ => {
@@ -383,6 +384,7 @@ fn dtype_name(dtype: DataType) -> &'static str {
         DataType::Json => "json",
         DataType::Array => "array",
         DataType::Timestamptz => "timestamptz",
+        DataType::Geometry => "geometry",
         DataType::FloatVector => "float_vector",
         DataType::SparseFloatVector => "sparse_float_vector",
     }
@@ -401,6 +403,7 @@ fn core_dtype(name: &str) -> Option<DataType> {
         "json" => DataType::Json,
         "array" => DataType::Array,
         "timestamptz" => DataType::Timestamptz,
+        "geometry" => DataType::Geometry,
         "float_vector" => DataType::FloatVector,
         "sparse_float_vector" => DataType::SparseFloatVector,
         _ => return None,

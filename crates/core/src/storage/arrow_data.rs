@@ -471,7 +471,7 @@ fn user_fields(schema: &CollectionSchema) -> Result<Vec<Field>, ArrowDataError> 
                 DataType::Int64 => ArrowType::Int64,
                 DataType::Float => ArrowType::Float32,
                 DataType::Double => ArrowType::Float64,
-                DataType::VarChar | DataType::Json => ArrowType::Utf8,
+                DataType::VarChar | DataType::Json | DataType::Geometry => ArrowType::Utf8,
                 DataType::Timestamptz => timestamptz_type(),
                 DataType::Array => {
                     let element =
@@ -872,7 +872,7 @@ fn decode_column(field: &FieldSchema, array: &ArrayRef) -> Result<ColumnData, Ar
                 .values()
                 .to_vec(),
         ),
-        DataType::VarChar => {
+        DataType::VarChar | DataType::Geometry => {
             let strings = array
                 .as_any()
                 .downcast_ref::<StringArray>()

@@ -349,7 +349,7 @@ pub(crate) fn python_cell(field: &FieldSchema, value: &PyVal) -> Result<ColumnDa
         DataType::Int64 => ColumnData::Int64(vec![py_int(value)?]),
         DataType::Float => ColumnData::Float(vec![value.to_float()? as f32]),
         DataType::Double => ColumnData::Double(vec![value.to_float()?]),
-        DataType::VarChar => ColumnData::VarChar(vec![value.py_str()]),
+        DataType::VarChar | DataType::Geometry => ColumnData::VarChar(vec![value.py_str()]),
         DataType::Json => ColumnData::Json(vec![match value {
             PyVal::Str(s) => s.as_bytes().to_vec(),
             PyVal::Bool(true) => b"true".to_vec(),
@@ -435,8 +435,9 @@ pub fn float_str(s: &str) -> Option<f64> {
     t.parse::<f64>().ok()
 }
 
-/// Python `float(s)`：另外接受任意 Unicode 十进制数字。
-fn float_literal(s: &str) -> Option<f64> {
+/// Python `float(s)`：另外接受任意 Unicode 十进制数字。这是通用的 Python 取值规则，与 rerank 的语义无关；
+/// WKT 的坐标（[`crate::geometry`]，0034）也用它解析，只保留这一份实现。
+pub(crate) fn float_literal(s: &str) -> Option<f64> {
     let normalized: String = s
         .chars()
         .map(|c| {

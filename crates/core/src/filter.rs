@@ -122,7 +122,7 @@ impl RowFilter {
         let Some(ast) = &parsed.ast else {
             return Ok(None);
         };
-        if eval::out_of_scope(ast) {
+        if eval::out_of_scope(ast, schema) {
             return Err(eval::unsupported());
         }
         let pk = schema.fields.iter().position(|f| f.is_primary);

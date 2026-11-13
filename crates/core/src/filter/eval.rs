@@ -74,11 +74,17 @@ pub(super) fn unsupported() -> EngineError {
         "geometry predicates are not supported",
     )
 }
-/// 含几何谓词这类范围外构造：它们先于语义检查报 UNIMPLEMENTED（0006 第 1 项）。
-pub(super) fn out_of_scope(ast: &Ast) -> bool {
-    ast.nodes
-        .iter()
-        .any(|node| matches!(node.kind, Kind::Unsupported))
+/// 含几何谓词这类范围外构造：它们先于语义检查报 UNIMPLEMENTED（0006 第 1 项）。GEOMETRY 字段在过滤中
+/// 还没有语义类型，引用它的表达式同样在这里拒绝，不能落到按字符串列求值的路径上（0034）。
+pub(super) fn out_of_scope(ast: &Ast, schema: &CollectionSchema) -> bool {
+    ast.nodes.iter().any(|node| match &node.kind {
+        Kind::Unsupported => true,
+        Kind::Field(name) => schema
+            .fields
+            .iter()
+            .any(|f| &f.name == name && f.data_type == DataType::Geometry),
+        _ => false,
+    })
 }
 
 pub(super) fn compatible(a: &str, b: &str) -> bool {
@@ -215,7 +221,7 @@ impl Predicate {
             });
         };
         // 语法总是完整检查；范围外构造优先 UNIMPLEMENTED，不执行其语义检查（0006 第 1 项）。
-        if out_of_scope(ast) {
+        if out_of_scope(ast, schema) {
             return Err(unsupported());
         }
         if !super::tree::legacy_shape(ast, schema) {

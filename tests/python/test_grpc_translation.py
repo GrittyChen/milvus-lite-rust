@@ -1249,7 +1249,8 @@ def test_pymilvus_entry_points_remaining_unsupported(env):
                      params={"reranker": "model", "provider": "cohere", "queries": ["q"]})
     cases = [
         (with_field("n", DataType.FLOAT_VECTOR, dim=2, nullable=True), f"nullable vectors: {feature}"),
-        (with_field("g", DataType.GEOMETRY), f"GEOMETRY fields: {feature}"),
+        # GEOMETRY 字段已支持（0034）；ARRAY 的 GEOMETRY 元素仍是登记的差异。
+        (with_field("g", DataType.ARRAY, element_type=DataType.GEOMETRY, max_capacity=2), f"ARRAY element type: {feature}"),
         # pymilvus 3.0 先发 AlterCollectionSchema，收到 UNIMPLEMENTED 后回退到 AddCollectionField。
         (lambda: client.add_collection_field("q", "x", DataType.INT64, nullable=True), f"AddCollectionField: {rpc}"),
         (lambda: client.search("q", [[1, 0]], filter="st_isvalid(id)"), "filter expressions: geometry predicates are not supported"),

@@ -433,8 +433,11 @@ fn validate_scalar_request(data_type: DataType, index_type: &str) -> Result<()> 
             py_repr(index_type)
         )));
     }
-    // 参照的 INVERTED 支持这八种标量类型，JSON / ARRAY 不在其能力表中。
-    if matches!(data_type, DataType::Json | DataType::Array) {
+    // 参照的 INVERTED 支持这八种标量类型，JSON / ARRAY / GEOMETRY 不在其能力表中。
+    if matches!(
+        data_type,
+        DataType::Json | DataType::Array | DataType::Geometry
+    ) {
         return Err(EngineError::schema(format!(
             "field type {} does not support scalar index",
             data_type.name()
@@ -882,6 +885,15 @@ mod tests {
         assert_eq!(
             err(&j, req("INVERTED", None)).to_string(),
             "field type JSON does not support scalar index"
+        );
+        let g = FieldSchema::new("g", DataType::Geometry);
+        assert_eq!(
+            err(&g, req("INVERTED", None)).to_string(),
+            "field type GEOMETRY does not support scalar index"
+        );
+        assert_eq!(
+            err(&g, req("RTREE", None)).to_string(),
+            "unknown scalar index_type 'RTREE'; supported scalar index_type: INVERTED"
         );
         assert_eq!(
             build_spec(&t, req("INVERTED", None)).unwrap().metric_type,

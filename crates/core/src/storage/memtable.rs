@@ -650,7 +650,10 @@ fn validate_decoded(schema: &CollectionSchema, decoded: &DecodedData) -> Result<
                 )
                 | (DataType::Float, ColumnData::Float(_))
                 | (DataType::Double, ColumnData::Double(_))
-                | (DataType::VarChar, ColumnData::VarChar(_))
+                | (
+                    DataType::VarChar | DataType::Geometry,
+                    ColumnData::VarChar(_)
+                )
                 | (DataType::Json, ColumnData::Json(_))
                 | (DataType::Array, ColumnData::Array(_))
                 | (DataType::FloatVector, ColumnData::FloatVector { .. })

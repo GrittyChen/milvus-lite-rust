@@ -472,6 +472,9 @@ fn scalar(
         DataType::VarChar => Data::StringData(pb::StringArray {
             data: collect!(VarChar, Clone::clone),
         }),
+        DataType::Geometry => Data::GeometryWktData(pb::GeometryWktArray {
+            data: collect!(VarChar, Clone::clone),
+        }),
         DataType::Json => Data::JsonData(pb::JsonArray {
             data: parts
                 .iter()

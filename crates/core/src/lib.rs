@@ -12,6 +12,7 @@ pub mod error;
 pub mod filter;
 mod flat;
 pub mod flush_budget;
+mod geometry;
 pub mod index;
 pub mod json_text;
 pub mod lock_order;
