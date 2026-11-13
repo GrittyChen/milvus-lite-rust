@@ -114,71 +114,205 @@ fn overflow() -> EngineError {
 }
 
 fn number_float(raw: &str) -> Result<f64> {
-    let value = raw.parse::<f64>().map_err(|_| overflow())?;
-    if !raw.contains(['.', 'e', 'E']) && value.is_infinite() {
-        return Err(EngineError::invalid("int too large to convert to float"));
-    }
-    Ok(value)
+    // 合法 JSON 数字都能解析为 f64；double 列中的整数已由 infer 限制在 ±2^53 内。
+    raw.parse::<f64>()
+        .map_err(|_| EngineError::Storage(format!("invalid JSON number {raw}")))
 }
 
-// None 表示 Arrow 类型推断/安全转换会触发 hybrid 的整批 Python 路径；真实溢出仍向上传递。
-pub(super) fn infer(values: &[&Value]) -> Result<Option<Shape>> {
-    let values: Vec<_> = values.iter().copied().filter(|v| !v.is_null()).collect();
-    if values.is_empty() {
-        return Ok(Some(Shape::Null));
-    }
-    if values.iter().all(|v| v.is_number()) {
-        let float = values.iter().any(|v| {
-            v.as_number()
-                .is_some_and(|n| n.as_str().contains(['.', 'e', 'E']))
-        });
-        for value in &values {
-            let Value::Number(number) = value else {
-                return Ok(None);
-            };
-            if !float {
-                number.as_str().parse::<i64>().map_err(|_| overflow())?;
-            } else {
-                number_float(number.as_str())?;
-                if !number.as_str().contains(['.', 'e', 'E'])
-                    && (int_cmp(number.as_str(), "-9007199254740992").is_lt()
-                        || int_cmp(number.as_str(), "9007199254740992").is_gt())
-                {
-                    return Ok(None);
+fn is_float_text(raw: &str) -> bool {
+    // json.loads 把带小数点或指数的数字读成 float，其余读成 int。
+    raw.contains(['.', 'e', 'E'])
+}
+
+/// pyarrow `TypeInferrer` 对一组 JSON 取值的计数（arrow `python/inference.cc`）。
+#[derive(Default)]
+struct Inferrer<'a> {
+    total: usize,
+    nulls: usize,
+    bools: usize,
+    ints: usize,
+    floats: usize,
+    strings: usize,
+    lists: usize,
+    list: Option<Box<Inferrer<'a>>>,
+    objects: usize,
+    // 字段按首次出现顺序（Arrow 25）；index 只用于查找。
+    fields: Vec<(&'a str, Inferrer<'a>)>,
+    index: BTreeMap<&'a str, usize>,
+}
+
+/// 推断出的 Arrow 类型；嵌套只用于转换检查，不构造列。
+enum Type<'a> {
+    Null,
+    Bool,
+    Int,
+    Float,
+    String,
+    List(Box<Type<'a>>),
+    Object(Vec<(&'a str, Type<'a>)>),
+}
+
+enum Failure {
+    Fallback,
+    Overflow,
+}
+
+impl<'a> Inferrer<'a> {
+    /// 返回是否继续访问同一序列的后续元素：pyarrow 遇到 bool、float、字符串即停止。
+    fn visit(&mut self, value: &'a Value) -> bool {
+        self.total += 1;
+        match value {
+            Value::Null => self.nulls += 1,
+            Value::Bool(_) => {
+                self.bools += 1;
+                return false;
+            }
+            Value::Number(n) if is_float_text(n.as_str()) => {
+                self.floats += 1;
+                return false;
+            }
+            Value::Number(_) => self.ints += 1,
+            Value::String(_) => {
+                self.strings += 1;
+                return false;
+            }
+            Value::Array(items) => {
+                self.lists += 1;
+                self.list.get_or_insert_default().visit_sequence(items);
+            }
+            Value::Object(map) => {
+                // 3.x 写入 $meta 时 sort_keys=True，每行对象（含嵌套）的键都有序；本实现 MemTable
+                // 保留客户端键序，所以逐行先排序。跨行的字段顺序仍是首次出现顺序。
+                let mut entries: Vec<_> = map.iter().collect();
+                entries.sort_unstable_by(|a, b| a.0.cmp(b.0));
+                for (key, item) in entries {
+                    let i = *self.index.entry(key.as_str()).or_insert_with(|| {
+                        self.fields.push((key.as_str(), Inferrer::default()));
+                        self.fields.len() - 1
+                    });
+                    // 对象字段的子推断器不因 bool / float / 字符串停止访问。
+                    self.fields[i].1.visit(item);
                 }
+                self.objects += 1;
             }
         }
-        return Ok(Some(if float { Shape::Float } else { Shape::Int }));
+        true
     }
-    if values.iter().all(|v| v.is_boolean()) {
-        return Ok(Some(Shape::Bool));
-    }
-    if values.iter().all(|v| v.is_string()) {
-        return Ok(Some(Shape::String));
-    }
-    if values.iter().all(|v| v.is_array()) {
-        let inner: Vec<_> = values
-            .iter()
-            .filter_map(|v| v.as_array())
-            .flatten()
-            .collect();
-        return Ok(infer(&inner)?.map(|_| Shape::Complex));
-    }
-    if values.iter().all(|v| v.is_object()) {
-        let keys: BTreeSet<_> = values
-            .iter()
-            .filter_map(|v| v.as_object())
-            .flat_map(|v| v.keys())
-            .collect();
-        for key in keys {
-            let inner: Vec<_> = values.iter().filter_map(|v| v.get(key)).collect();
-            if infer(&inner)?.is_none() {
-                return Ok(None);
+
+    fn visit_sequence(&mut self, values: impl IntoIterator<Item = &'a Value>) {
+        for value in values {
+            if !self.visit(value) {
+                break;
             }
         }
-        return Ok(Some(Shape::Complex));
     }
-    Ok(None)
+
+    /// 校验混排并定类型；列表或对象与其他非 null 值混排时 pyarrow 报 ArrowInvalid。
+    /// `SORTED` 是 Arrow 15 的字段顺序（按键名排序），只用于核对 0033 登记的版本差异。
+    fn resolve<const SORTED: bool>(self) -> Option<Type<'a>> {
+        if self.lists > 0 {
+            if self.lists + self.nulls != self.total {
+                return None;
+            }
+            let item = self
+                .list
+                .map_or(Some(Type::Null), |list| list.resolve::<SORTED>())?;
+            return Some(Type::List(Box::new(item)));
+        }
+        if self.objects > 0 {
+            if self.objects + self.nulls != self.total {
+                return None;
+            }
+            let mut fields = self.fields;
+            if SORTED {
+                fields.sort_unstable_by(|a, b| a.0.cmp(b.0));
+            }
+            let fields = fields
+                .into_iter()
+                .map(|(key, field)| Some((key, field.resolve::<SORTED>()?)))
+                .collect::<Option<_>>()?;
+            return Some(Type::Object(fields));
+        }
+        Some(if self.floats > 0 {
+            Type::Float
+        } else if self.ints > 0 {
+            Type::Int
+        } else if self.bools > 0 {
+            Type::Bool
+        } else if self.strings > 0 {
+            Type::String
+        } else {
+            Type::Null
+        })
+    }
+}
+
+impl Type<'_> {
+    /// pyarrow 逐元素转换的成败；第一个失败的元素决定回退还是 OverflowError。
+    fn convert(&self, value: &Value) -> std::result::Result<(), Failure> {
+        let ok = match (self, value) {
+            (_, Value::Null) | (Type::Bool, Value::Bool(_)) | (Type::String, Value::String(_)) => {
+                true
+            }
+            (Type::Int, Value::Number(n)) if !is_float_text(n.as_str()) => {
+                n.as_str().parse::<i64>().map_err(|_| Failure::Overflow)?;
+                true
+            }
+            // double 接受 bool；整数先转 int64 再检查 ±2^53，两种失败都是 ArrowInvalid（回退）。
+            (Type::Float, Value::Bool(_)) => true,
+            (Type::Float, Value::Number(n)) => {
+                is_float_text(n.as_str())
+                    || n.as_str().parse::<i64>().is_ok_and(|i| {
+                        (-9_007_199_254_740_992..=9_007_199_254_740_992).contains(&i)
+                    })
+            }
+            (Type::List(item), Value::Array(items)) => {
+                for value in items {
+                    item.convert(value)?;
+                }
+                true
+            }
+            // 按类型的字段顺序逐个取键，缺键为 null，与该行对象自身的键序无关。
+            (Type::Object(fields), Value::Object(map)) => {
+                for (key, field) in fields {
+                    field.convert(map.get(*key).unwrap_or(&Value::Null))?;
+                }
+                true
+            }
+            _ => false,
+        };
+        if ok { Ok(()) } else { Err(Failure::Fallback) }
+    }
+}
+
+/// 复刻 hybrid 物化动态键时的 `pa.array(values)`：先推断类型，再按行逐个转换。`None` 表示
+/// ArrowInvalid / ArrowTypeError，整条表达式在本数据源回退 Python；超出 int64 的整数转 int64
+/// 时的 OverflowError 不在回退清单内，向上传递。规则与实测见 0033。
+pub(super) fn infer(values: &[&Value]) -> Result<Option<Shape>> {
+    infer_with::<false>(values)
+}
+
+fn infer_with<const SORTED: bool>(values: &[&Value]) -> Result<Option<Shape>> {
+    let mut inferrer = Inferrer::default();
+    inferrer.visit_sequence(values.iter().copied());
+    let Some(ty) = inferrer.resolve::<SORTED>() else {
+        return Ok(None);
+    };
+    for value in values {
+        match ty.convert(value) {
+            Ok(()) => {}
+            Err(Failure::Fallback) => return Ok(None),
+            Err(Failure::Overflow) => return Err(overflow()),
+        }
+    }
+    Ok(Some(match ty {
+        Type::Null => Shape::Null,
+        Type::Bool => Shape::Bool,
+        Type::Int => Shape::Int,
+        Type::Float => Shape::Float,
+        Type::String => Shape::String,
+        Type::List(_) | Type::Object(_) => Shape::Complex,
+    }))
 }
 
 fn meta_at<'a>(
@@ -243,6 +377,8 @@ pub(super) fn materialize(
                 .iter()
                 .map(|v| match v {
                     Some(Value::Number(n)) => number_float(n.as_str()),
+                    // pyarrow 把 double 列中的 bool 转成 1.0 / 0.0。
+                    Some(Value::Bool(b)) => Ok(f64::from(u8::from(*b))),
                     _ => Ok(0.0),
                 })
                 .collect::<Result<_>>()?,
@@ -533,6 +669,100 @@ fn evaluate_python(
 mod tests {
     use super::*;
     use crate::schema::{CollectionSchema, DataType, FieldSchema};
+
+    /// 0033：hybrid 物化动态键时 `pa.array` 的推断与转换。输入保留客户端原始键序（MemTable 的情形），
+    /// 期望来自真实 3.x 在 Arrow 25 下的结果；Arrow 15 只在对象字段顺序不同时结果不同。
+    #[test]
+    fn dynamic_inference_matches_reference_arrow_conversion() {
+        let fixture: Value = crate::json_text::value_str(include_str!(
+            "../../tests/fixtures/filter_dynamic_infer.json"
+        ))
+        .unwrap();
+        let outcome = |got: Result<Option<Shape>>, values: &[Value]| -> Value {
+            match got {
+                Err(error) => serde_json::json!({"kind":"error","message":error.to_string()}),
+                Ok(None) => serde_json::json!({"kind":"fallback"}),
+                Ok(Some(shape)) => {
+                    let name = match shape {
+                        Shape::Null => "null",
+                        Shape::Bool => "bool",
+                        Shape::Int => "int",
+                        Shape::Float => "float",
+                        Shape::String => "string",
+                        Shape::Complex => return serde_json::json!({"kind":"ok","shape":"complex"}),
+                    };
+                    let rows: Vec<Map<String, Value>> = values
+                        .iter()
+                        .map(|v| [("x".to_owned(), v.clone())].into_iter().collect())
+                        .collect();
+                    let meta: Vec<_> = rows.iter().map(Some).collect();
+                    let live = SourceBits::from_live(&vec![true; values.len()]);
+                    let (column, valid) = materialize(&meta, "x", shape, &live).unwrap();
+                    let cells: Vec<Value> = (0..values.len())
+                        .map(|row| {
+                            if !valid.get(row) {
+                                return Value::Null;
+                            }
+                            match &column {
+                                ColumnData::Bool(v) => Value::Bool(v[row]),
+                                ColumnData::Int64(v) => Value::from(v[row]),
+                                // 浮点按位比较，-0.0 与 0.0 不同。
+                                ColumnData::Double(v) => Value::from(v[row].to_bits()),
+                                ColumnData::VarChar(v) => Value::from(v[row].clone()),
+                                other => panic!("unexpected column {other:?}"),
+                            }
+                        })
+                        .collect();
+                    serde_json::json!({"kind":"ok","shape":name,"values":cells})
+                }
+            }
+        };
+        // 期望里的浮点值也换成位模式再比较。
+        let normalize = |mut expected: Value| {
+            if expected["shape"] == "float" {
+                for cell in expected["values"].as_array_mut().unwrap() {
+                    if let Value::Number(n) = cell {
+                        *cell = Value::from(n.as_str().parse::<f64>().unwrap().to_bits());
+                    }
+                }
+            }
+            expected
+        };
+        let mut failures = Vec::new();
+        let mut arrow15_cases = 0;
+        let cases = fixture["cases"].as_array().unwrap();
+        for (index, case) in cases.iter().enumerate() {
+            let values = case["values"].as_array().unwrap();
+            let refs: Vec<&Value> = values.iter().collect();
+            let arrow25 = normalize(case["arrow25"].clone());
+            let got = outcome(infer(&refs), values);
+            if got != arrow25 {
+                failures.push(format!(
+                    "case {index}: {values:?}: expected {arrow25}, got {got}"
+                ));
+            }
+            // 登记的版本差异：只把字段顺序换成按键名排序，就必须得到 Arrow 15 的实测结果。
+            let arrow15 = case.get("arrow15").cloned().map(normalize);
+            arrow15_cases += usize::from(arrow15.is_some());
+            let sorted = outcome(infer_with::<true>(&refs), values);
+            if sorted != arrow15.unwrap_or(arrow25) {
+                failures.push(format!(
+                    "case {index}: {values:?}: Arrow 15 order gives {sorted}"
+                ));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "{} divergences:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+        assert_eq!(cases.len(), 7280);
+        assert_eq!(
+            arrow15_cases, 4,
+            "Arrow 15 differs only in the registered field-order cases"
+        );
+    }
 
     #[test]
     fn dynamic_binding_uses_original_live_rows_and_does_not_change_old_masks() {

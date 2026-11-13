@@ -212,3 +212,42 @@ def test_same_expression_takes_different_routes_per_source(pair):
     diff.step("flush_all", lambda c: c.flush(name))
     assert ids(diff.step("sparse_committed", sparse)) == [1, 3, 4, 5, 6]
     assert diff.step("hybrid_committed", lambda c: c.query(name, filter=square, output_fields=["id"])) == ("ok", [{"id": 1}])
+
+
+B63 = 2**63
+
+
+@pytest.mark.parametrize("values,expression,expected", [
+    # float 之后的 bool 推断为 double，False 当 0.0：2^62 / 0.0 得 inf（Python 路线会是未知）。
+    ([1.5, 0.1, False, 0.1], "4611686018427387904 / x > 1e300", ("ok", [{"id": 3}])),
+    # 超出 int64 的整数先于字符串：物化 int64 时 OverflowError；反过来推断为 string，回退。
+    ([B63, "a"], "x + 1 > 0", "error"),
+    (["a", B63], "x == 1", ("ok", [])),
+    # 对象字段：每行先按键名排序（3.x 写入时 sort_keys），跨行按首次出现顺序（Arrow 25）。
+    ([{"b": 1}, {"a": 1}, {"a": "s", "b": B63}], "x == 1", "error"),
+    ([{"b": 1, "a": 1}, {"b": B63, "a": "s"}], "x == 1", ("ok", [])),
+    ([{"b": 1}, {"a": "s", "b": B63}], "x == 1", "error"),
+])
+def test_dynamic_inference_follows_pyarrow_order(pair, values, expression, expected):
+    # 0033：hybrid 物化动态键时复刻 pa.array 的推断与逐元素转换。MemTable 中本实现保留客户端键序，
+    # flush 后 segment 中键已排序，三个阶段都要与 3.x 一致；同时固定 3.x 自身的结果确实如此。
+    name = "dynamic_infer"
+    diff = pair.open()
+    diff.step("create", lambda c: c.create_collection(name, schema=schema(), index_params=indexes()))
+    batch = [{**SEGMENT[0], "id": i, "x": value} for i, value in enumerate(values, 1)]
+    diff.step("insert", lambda c: c.insert(name, rows(batch)))
+    for stage in ("memtable", "committed", "reopened"):
+        if stage == "committed":
+            diff.step("flush", lambda c: c.flush(name))
+        if stage == "reopened":
+            pair.close()
+            diff = pair.open()
+            diff.step("load", lambda c: c.load_collection(name))
+        error = expected == "error"
+        result = diff.step(stage + "_query", lambda c: c.query(name, filter=expression, output_fields=["id"]), error=error)
+        if error:
+            assert run(lambda c: c.query(name, filter=expression), diff.ref)[3] == "Python int too large to convert to C long"
+        else:
+            assert result == expected, stage
+        diff.step(stage + "_count", lambda c: c.query(name, filter=expression, output_fields=["count(*)"]), error=error)
+        diff.step(stage + "_search", lambda c: c.search(name, [[0.0, 0.0]], anns_field="vector", filter=expression, limit=6), error=error)

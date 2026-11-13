@@ -89,6 +89,7 @@
 | 稀疏向量与 IP：打包字节的存储与解码时机、SPARSE_INVERTED_INDEX 的定义与调参项、每个 segment 惰性倒排的缓存与作废、排序键与错误先后、带分区时先全局判版本、登记差异 | [0030](docs/decisions/0030-sparse-vectors.md) |
 | BM25 function 与全文检索：函数的校验与持久化、`analyzer_params` 原值与分词器、写入时生成输出字段、BM25 度量的换算表、k1 / b、按 segment 的统计与 NumPy 2 的 float32 打分、登记差异 | [0031](docs/decisions/0031-bm25.md)、[验收](docs/testing/0031-bm25-acceptance.md) |
 | 过滤中的算术：三条求值路线（pyarrow 的类型提升、回绕与带检查的转换；Python 的精确整数、正确舍入的真除法、字符串与列表的拼接和重复；hybrid 的整源回退）、资源上限与登记差异（资源上限、hybrid 推断、只看活行）；三步均已实施并复核通过（第 3 步为真值、模糊对照、差分、参照用例与文档） | [0032](docs/decisions/0032-arithmetic-filters.md)、[验收](docs/testing/0032-arithmetic-acceptance.md) |
+| hybrid 动态列类型推断的复刻：pyarrow `pa.array` 的推断（遇 bool / float / 字符串即停、列表与对象的子推断）与逐元素转换（报 OverflowError 还是回退的先后）、每行按键名排序与跨行首次出现的对象字段顺序、Arrow 15 / 25 的版本差异（对齐 25.0.1）；注销 0032 登记的推断差异 | [0033](docs/decisions/0033-hybrid-dynamic-inference.md) |
 | JSON 文本解析与 serde_json 数字私有键：影响面、判别规则、唯一入口与 clippy 门、已有数据能否恢复 | [修复记录](docs/testing/json-private-number-key-fix.md) |
 | 验收与调查记录引用的证据分哪几类、谁能复核（仓库内可重跑 / 公开产物 / 本地留存），以及验收与调查记录的写法约定 | [证据的存放与复核范围](docs/testing/README.md) |
 | 性能基线怎么测 / 口径 / 注意事项 | [benchmarks/baseline/README.md](benchmarks/baseline/README.md) |
@@ -185,6 +186,7 @@ pymilvus ──server_manager──▶ adapter/grpc ──▶ db（多 collectio
 | 时区换算真值核验（真实 CPython 3.12 zoneinfo；本地时间 → UTC、UTC → 各分量，含 `datetime` 范围两端） | `<参照 python> tests/differential/generate_timezone_fixtures.py --verify` |
 | 过滤算术组件真值核验（真实 3.x / `1320d26`；Arrow 15/25 各执行） | `<3.x 的 venv>/bin/python tests/differential/generate_filter_arith_fixtures.py --verify`；重新生成须用 Arrow 25 并指定 `--arrow15-python <Arrow15 的参照解释器>` |
 | 过滤算术直接模糊对照（不经服务；随机表与表达式覆盖三条路线；报告放仓库外） | `cargo build -p milvus-lite-core --example filter_arith_probe`，再 `<3.x 的 venv>/bin/python tests/differential/fuzz_arith.py --output <work_dir>/arith.json` |
+| hybrid 动态列推断组件真值核验（真实 3.x / `1320d26`；Arrow 15/25 各执行，版本分歧条目分别核对） | `<3.x 的 venv>/bin/python tests/differential/generate_dynamic_infer_fixtures.py --verify`；重新生成须用 Arrow 25 并指定 `--arrow15-python <Arrow15 的参照解释器>` |
 | S1 Unicode 分类表与小写表核验（CPython 3.12 / Unicode 15.0） | `<CPython 3.12>/bin/python tests/differential/generate_filter_unicode.py --verify` |
 | standard 分词真值核验（真实 3.x / `1320d26`） | `<3.x 的 venv>/bin/python tests/differential/generate_analyzer_fixtures.py --verify` |
 | standard 分词模糊对照（不经服务；参照环境为 CPython 3.12） | `cargo build -p milvus-lite-core --example analyzer_probe`，再 `<3.x 的 venv>/bin/python tests/differential/fuzz_analyzer.py --cases 200000 --seed 29` |

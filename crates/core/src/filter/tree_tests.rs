@@ -491,117 +491,6 @@ fn array_columns_match_reference_routes_and_masks() {
     );
 }
 
-/// 0032 登记的 hybrid 推断差异：pyarrow 按元素顺序推断类型与报错（`[2**64, 's', ...]` 在物化时报
-/// OverflowError；float 之后出现的 bool 推断为 double、按 0.0 / 1.0 参与运算），本实现对数字与其他
-/// 类型的混排一律整源回退 Python 路线。3.x 一侧的结果留在语料里，这里固定本实现一侧的结果。
-const REGISTERED_HYBRID_INFERENCE: &[(&str, u64, &str)] = &[
-    ("x + 1 > 1", 7, r#"{"mask":[true,false,false,true]}"#),
-    ("x * 2 == 2", 7, r#"{"mask":[false,false,false,false]}"#),
-    ("x / y > 0", 7, r#"{"mask":[true,false,false,true]}"#),
-    ("-x < 0", 7, r#"{"mask":[true,false,false,true]}"#),
-    ("x + age > 0", 7, r#"{"mask":[true,false,false,false]}"#),
-    ("x * x > 0", 7, r#"{"mask":[true,false,false,true]}"#),
-    (
-        "x + 1 == 'a' and age == 9223372036854775808",
-        7,
-        r#"{"mask":[false,false,false,false]}"#,
-    ),
-    (
-        "x == 'a' and age == 9223372036854775808",
-        7,
-        r#"{"mask":[false,false,false,false]}"#,
-    ),
-    (
-        "x + 1 == 2 and age == 9223372036854775808",
-        7,
-        r#"{"mask":[false,false,false,false]}"#,
-    ),
-    (
-        "x + 1 == 2 and age == 9223372036854775808",
-        9,
-        r#"{"mask":[false,false,false,false]}"#,
-    ),
-    (
-        "x + 1 == 2 and age == 9223372036854775808",
-        10,
-        r#"{"mask":[false,false,false,false]}"#,
-    ),
-    ("x * 2 == x + x", 7, r#"{"mask":[true,true,true,true]}"#),
-    ("x * y == x + x", 7, r#"{"mask":[false,true,false,false]}"#),
-    ("x + 0.5 > 1", 7, r#"{"mask":[true,false,false,true]}"#),
-    ("x - x == 0", 7, r#"{"mask":[true,false,false,true]}"#),
-    ("x == 'a'", 7, r#"{"mask":[false,false,false,false]}"#),
-    ("x > 0", 7, r#"{"mask":[true,false,false,true]}"#),
-    (
-        "4611686018427387904 / x > 0",
-        7,
-        r#"{"mask":[true,false,false,true]}"#,
-    ),
-    (
-        "4611686018427387904 / x > 0",
-        9,
-        r#"{"mask":[true,true,false,true]}"#,
-    ),
-    (
-        "4611686018427387904 / x > 0",
-        10,
-        r#"{"mask":[false,true,true,true]}"#,
-    ),
-    (
-        "x * 1180591620717411303424 > 0",
-        7,
-        r#"{"error":"cannot fit 'int' into an index-sized integer","phase":"evaluate"}"#,
-    ),
-    (
-        "x * 1180591620717411303424 > 0",
-        9,
-        r#"{"mask":[true,true,false,true]}"#,
-    ),
-    (
-        "x * 1180591620717411303424 > 0",
-        10,
-        r#"{"mask":[false,true,true,true]}"#,
-    ),
-    (
-        "(x * 1180591620717411303424) - (x * x) == 0",
-        7,
-        r#"{"error":"cannot fit 'int' into an index-sized integer","phase":"evaluate"}"#,
-    ),
-    (
-        "(x * 1180591620717411303424) - (x * x) == 0",
-        9,
-        r#"{"mask":[false,false,true,false]}"#,
-    ),
-    (
-        "(x * 1180591620717411303424) - (x * x) == 0",
-        10,
-        r#"{"mask":[true,false,false,false]}"#,
-    ),
-    // 空类型组合与参照测试转写的表达式落在同几组取值上。
-    ("x + f > 0", 7, r#"{"mask":[false,false,false,true]}"#),
-    ("f + x > 0", 7, r#"{"mask":[false,false,false,true]}"#),
-    ("x + i8 > -200", 7, r#"{"mask":[true,false,false,true]}"#),
-    ("x * i16 > 0", 7, r#"{"mask":[true,false,false,false]}"#),
-    ("x / 2 > 0", 7, r#"{"mask":[true,false,false,true]}"#),
-    ("i8 / x > 0", 7, r#"{"mask":[true,false,false,true]}"#),
-    ("i8 / x > 0", 10, r#"{"mask":[false,false,false,true]}"#),
-    ("x + d > 0", 7, r#"{"mask":[true,false,false,true]}"#),
-    ("x - 1.5 < 0", 7, r#"{"mask":[false,false,false,false]}"#),
-    ("x * 2 == y + y", 7, r#"{"mask":[false,false,false,false]}"#),
-    ("x + y == x + y", 7, r#"{"mask":[true,false,false,true]}"#),
-    ("x * y > x", 7, r#"{"mask":[true,true,false,true]}"#),
-    (
-        "$meta[\"x\"] * 2 > 1.0",
-        7,
-        r#"{"mask":[true,false,false,true]}"#,
-    ),
-    (
-        "$meta[\"x\"] + 0.1 >= 0.6",
-        7,
-        r#"{"mask":[true,false,false,true]}"#,
-    ),
-];
-
 /// 0032：算术的组件真值（[generate_filter_arith_fixtures.py](../../../tests/differential/generate_filter_arith_fixtures.py)）。
 /// 三条路线逐条对照；3.x 的 MemoryError 对应本实现的资源错误（登记的差异）。
 #[test]
@@ -746,7 +635,6 @@ fn arithmetic_matches_reference_corpus() {
         .collect();
     let mut failures = Vec::new();
     let mut evaluated = 0;
-    let mut registered = 0;
     for (index, case) in fixture["cases"].as_array().unwrap().iter().enumerate() {
         let meta = &metas[case["meta"].as_u64().unwrap() as usize];
         let rows: Vec<_> = (0..4)
@@ -788,22 +676,6 @@ fn arithmetic_matches_reference_corpus() {
             }
             Err(error) => serde_json::json!({"error":error.to_string(),"phase":phase}),
         };
-        let group = case["meta"].as_u64().unwrap();
-        if let Some((_, _, rust)) = REGISTERED_HYBRID_INFERENCE
-            .iter()
-            .find(|(e, g, _)| *e == expr && *g == group)
-        {
-            registered += 1;
-            let rust: Value = crate::json_text::value_str(rust).unwrap();
-            let reference_differs =
-                rust.get("mask") != case.get("mask") || rust.get("error") != case.get("error");
-            if actual != rust || !reference_differs {
-                failures.push(format!(
-                    "case {index}: {expr}; registered {rust}, actual={actual}, reference differs={reference_differs}"
-                ));
-            }
-            continue;
-        }
         if actual.get("mask") != case.get("mask")
             || actual.get("error") != case.get("error")
             || actual.get("phase") != case.get("phase")
@@ -815,11 +687,6 @@ fn arithmetic_matches_reference_corpus() {
         }
     }
     assert!(evaluated > 1300, "corpus lost cases: {evaluated}");
-    assert_eq!(
-        registered,
-        REGISTERED_HYBRID_INFERENCE.len(),
-        "registered cases not all visited"
-    );
     assert!(
         failures.is_empty(),
         "{} divergences:\n{}",

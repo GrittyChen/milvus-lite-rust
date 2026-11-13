@@ -5,13 +5,13 @@
 每张随机表（类型化列、JSON 列与 $meta）上生成一组表达式，覆盖 Arrow、hybrid 与 Python 三条路线；
 本实现命中的主键须与 3.x 的掩码为 True 的行相同，错误须文案相同。
 
-两类结果取决于本实现之外的条件，生成时排除，不算作一致：
-- 3.x 中字符串 / 列表重复或拼接的结果长度超过 10^6、又不至于让分配大小本身越界时，成败取决于机器内存，
+一类结果取决于本实现之外的条件，生成时排除，不算作一致：3.x 中字符串 / 列表重复或拼接的结果长度超过 10^6、又不至于让分配大小本身越界时，成败取决于机器内存，
   本实现则可能先触及 0032 的资源上限。脚本在本进程内包装 3.x 的 _ARITH_OPS，遇到这种结果放弃该表达式
   （计入 discarded），不调用原运算；分配大小超过 2^60 字节的仍交给 3.x 自己报错（OverflowError 或
   MemoryError，后者对应本实现的资源错误）。
-- 0032 登记的 hybrid 推断差异（pyarrow 按元素顺序推断：超出 int64 的整数先于其他类型、float 之后的 bool）。
-  $meta 的「混排」取值不含超出 int64 的整数，含 float 时不含 bool；这些差异由组件真值两边分别断言。
+
+$meta 的「混排」取值包含超出 int64 的整数、浮点与 bool，覆盖 0033 复刻的 pyarrow 推断与转换先后。
+取值池中的对象只有单键，不会出现 0033 登记的 Arrow 15 / 25 对象字段顺序差异，两个版本都应零不一致。
 """
 import argparse
 from collections import Counter
@@ -109,9 +109,7 @@ def meta_values(rng, rows, coverage):
         "other": OTHERS + [True, False],
     }
     if profile == "mixed":
-        floats = rng.random() < 0.5
-        pool = SMALL_INTS + [2**53 + 1, -(2**63), 2**63 - 1] + OTHERS
-        pool += FLOATS if floats else [True, False]
+        pool = SMALL_INTS + BIG_INTS + FLOATS + [True, False] + OTHERS
     else:
         pool = pools[profile]
     return [rng.choice(pool + [None, ...]) for _ in range(rows)]
