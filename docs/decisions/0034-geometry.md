@@ -1,6 +1,6 @@
 # 0034：GEOMETRY 字段与几何谓词
 
-状态：设计第二稿 2026-11-13 复审通过（第一稿未通过：大小写与 `float()` 的实现路线达不到承诺的行为、`ARRAY<GEOMETRY>` 的打开路径没有守卫、实施步骤依赖倒置）；负责人已确认决策 A–E；第 1 步（类型、解析与读写）已实施并评审通过（2026-11-13）；第 2、3 步未实施。参照版本 `1320d26`（pyarrow 25.0.1、CPython 3.12）。排序见 [0032](0032-arithmetic-filters.md)、[0033](0033-hybrid-dynamic-inference.md)：本切片排在两者之后。
+状态：设计第二稿 2026-11-13 复审通过（第一稿未通过：大小写与 `float()` 的实现路线达不到承诺的行为、`ARRAY<GEOMETRY>` 的打开路径没有守卫、实施步骤依赖倒置）；负责人已确认决策 A–E；第 1 步（类型、解析与读写）已实施并评审通过（2026-11-13）；第 2 步（谓词与过滤）已实施并评审通过（2026-11-14）；第 3 步未实施。参照版本 `1320d26`（pyarrow 25.0.1、CPython 3.12）。排序见 [0032](0032-arithmetic-filters.md)、[0033](0033-hybrid-dynamic-inference.md)：本切片排在两者之后。
 
 ## 范围
 
@@ -53,8 +53,10 @@
 - `ST_DWITHIN` 的距离只能是非负数字字面量：`-1` 与 `+5` 是解析错误，`-0`、`-0.0`、`1e400`、`1e-400` 可用；整数字面量大到 `float()` 溢出时（如 400 位）每行返回 False，`not` 之后选中全部行。本实现的解析器对 `-0`、`-0.0`、`-1`、`+5` 已与 3.x 一致（评审时用 `filter_parse_probe` 复核），其余输入在第 2 步由用例固定。
 - GEOMETRY 列在其他运算中的语义类型是 `geometry`：
   - 两个 GEOMETRY 字段之间的比较（`==`、`!=`、`<`、`>=` 等）可用，按原文的字符串比较。
+  - 与动态类型的值比较也可用（语义检查对动态类型一律放行）：动态字段、`$meta['k']`、ARRAY 或 JSON 的下标访问（`arr[0]`）。
   - `is null` / `is not null`、`text_match(geo, 'point')`（按原文分词）可用。
-  - 与字符串或数字字面量比较、`in`、`like`、算术、`exists`、`array_length`、`json_contains` 都是类型错误，文案中的类型名是 `geometry`。
+  - 与字符串或数字字面量比较、与其他静态类型的字段（VARCHAR、整数、JSON、TIMESTAMPTZ）比较、`in`、`like`、算术、`exists`、`array_length`、`json_contains` 都是类型错误（code 6），文案中的类型名是 `geometry`；与向量字段比较报的是向量字段不能用于标量过滤。
+  - 与整个 ARRAY 字段比较（`geo == arr`）通过语义检查（ARRAY 字段是动态类型），在 Arrow 路线求值时失败：code 1，`Function 'equal' has no kernel matching input types (string, list<item: …>)`（元素类型随字段而定）。
 
 **ARRAY 的 GEOMETRY 元素**
 
@@ -70,7 +72,7 @@
      - 坐标用 core 已有的 Python `float()` 实现：[pyval.rs](../../crates/core/src/rerank/pyval.rs) 的 `float_literal`（处理 Unicode 数字与下划线），把它的可见性提到 crate 内并注明 WKT 解析也在用；只有一份实现。**不改** grpc 的 [pyint.rs](../../crates/grpc/src/pyint.rs)：它对请求参数的行为是 [0004](0004-m1-scope.md) 登记过的差异，不属于本切片。
    - **谓词**：按 3.x 的运算顺序逐步移植；`hypot` 移植 CPython 3.12 的 `vector_norm`（两个参数的情形）。
 3. **写入与默认值**：写入的校验接在现有的逐字段校验处；schema 的默认值在 schema 校验中用同一个解析器检查，建表与打开数据目录两条路径都经过它。错误文案与先后按 3.x；有默认值时显式 `None` 取默认值，沿用其他类型已有的规则。
-4. **过滤**：解析器已经识别这些函数（现在产出 `Kind::Unsupported`），改为产出几何节点；语义检查加 `geometry` 语义类型（两个 GEOMETRY 字段的比较按字符串列处理，其余组合按上文报类型错误）；路线判定把几何节点标为强制 Python 路线；`python.rs` 加逐行求值。字面量在编译时解析一次，字段值逐行解析。去掉 [eval.rs](../../crates/core/src/filter/eval.rs) 里几何谓词的前置 UNIMPLEMENTED 扫描。
+4. **过滤**：解析器已经识别这些函数（现在产出 `Kind::Unsupported`），改为产出几何节点；语义检查加 `geometry` 语义类型（两个 GEOMETRY 字段的比较、与动态类型值的比较按字符串列处理，其余组合按上文报错）；路线判定把几何节点标为强制 Python 路线；`python.rs` 加逐行求值。字面量在编译时解析一次，字段值逐行解析。去掉 [eval.rs](../../crates/core/src/filter/eval.rs) 里几何谓词的前置 UNIMPLEMENTED 扫描。
 5. **gRPC**：schema 解码放开类型 24；写入按 `geometry_wkt_data` → `string_data` 的顺序取值；输出用 `geometry_wkt_data`。
 6. **`ARRAY<GEOMETRY>` 继续拒绝，建表与打开两条路径都要守住**：
    - 建表：[grpc/schema.rs](../../crates/grpc/src/schema.rs) 对 ARRAY 元素类型 24 的拒绝保留，不随顶层类型 24 的放开而消失。
@@ -153,6 +155,43 @@
 已有用例的更新：[test_grpc_translation.py](../../tests/python/test_grpc_translation.py) 里「GEOMETRY 建表返回 UNIMPLEMENTED」断言的是切片前的范围，改为断言 `ARRAY<GEOMETRY>` 建表返回 UNIMPLEMENTED；`st_isvalid(id)` 的断言留到第 2 步。
 
 没有执行：Linux 与 x86_64 上的运行（由 CI 与 Compare 覆盖）；性能测量（本步不改变已有类型的路径，不作性能声明）。
+
+## 第 2 步验收
+
+实现要点：
+
+- 解析器把五个谓词（含别名）解析成几何节点，不再有「范围外构造」这种节点；第 1 步的前置 UNIMPLEMENTED 扫描随之删除。过滤里留下的 UNIMPLEMENTED 只是各路线的防御分支，解析器产出的表达式到不了，文案改为不再提几何谓词。
+- 语义检查加 `geometry` 语义类型；几何节点按「字段引用 → 必须是 GEOMETRY 列 → 字面量是合法 WKT」的先后检查；动态集合里 schema 外的名字在几何谓词中是未知字段。
+- 含几何节点的表达式整条走 Python 路线。字面量在编译时解析一次；`ST_DWITHIN` 的整数距离按 Python `float(int)` 转换，溢出时这个谓词每行为 False。
+- `hypot` 按 CPython 3.12 的 `vector_norm` 移植（缩放、无误差的平方与求和、一次牛顿修正；次正规数先放大）。
+
+开发验收（2026-11-14，最终代码，本机 macOS arm64，串行执行）：
+
+| 项目 | 结果 |
+| --- | --- |
+| `hypot` 的批量对照（一次性，不入库） | 对 CPython 3.12.14 的 `math.hypot` 生成 301 024 组输入（含 0、次正规数、接近溢出、无穷大与 NaN 的两两组合，随机位模式，随机指数），逐位一致，零差异 |
+| 谓词的单元测试（[geometry.rs](../../crates/core/src/geometry.rs)，新增 3 条） | 40 组 `hypot` 的位模式（含与朴素 `sqrt(x²+y²)` 不同的输入）；16 个几何两两组合的 256 对，`contains`、`intersects` 与距离的位模式逐项相同，三张表由真实 3.x 的 `geometry.py` 生成；`ST_DWITHIN` 的阈值、无穷大上限与距离溢出 |
+| 引擎测试（[tests/geometry.rs](../../crates/core/tests/geometry.rs)） | 中间状态的那一条改为：18 个表达式的命中与 13 条类型错误的首行、末行文案，MemTable 与 flush 之后各一遍；期望值取自真实 3.x 在同一份数据上的结果 |
+| 端到端差分（[test_geometry.py](../../tests/differential/test_geometry.py)，共 18 条，其中本步 13 条取代中间状态的 5 条） | 16 行数据（点、凸与凹多边形、退化与溢出边界、两列各自的 NULL）上：81 个表达式（五个谓词与别名、大小写、`not` 与 NULL、`ST_DWITHIN` 的 `-0`、`-0.0`、`1e400`、`1e-400`、`--1`、400 位整数与阈值两侧、与算术混用、两个 GEOMETRY 字段的六种比较、`is null`、`text_match`、空列表的 `in`、下标访问、与 ARRAY / JSON 下标访问的比较）加动态集合上的 8 个，在 MemTable、flush、重开后追加写入、合并四个阶段逐条相同；74 条错误（非 GEOMETRY 字段、未知与保留字段、无效 WKT 字面量、距离的各种非法写法、语法、`geometry` 语义类型在比较、`in`、`like`、算术、`exists`、`array_length`、`json_contains` 中的类型错误，与 JSON、TIMESTAMPTZ、向量、整个 ARRAY 字段的比较）加动态集合上的 7 条，文案逐字相同；10 个表达式（7 个成功、3 个报错）经 Query、count、Search、boost、HybridSearch、query iterator、search iterator 在 MemTable 与 flush 后对照，Delete 在 MemTable 与 flush 之后各对照一次并核对剩余行；稀疏检索（逐条记录求值的路径）上 7 个表达式与 3 条错误在 MemTable、flush 后、segment 加 MemTable 三个阶段对照 |
+| fmt / clippy（默认与 fault-injection） | 无告警 |
+| cargo test --workspace / fault-injection | 668 / 805 通过 |
+| tests/python（pymilvus 3.0.2 / 2.6.18） | 各 653 通过 |
+| 差分（pymilvus 3.0.2 / 2.6.18，参照 Arrow 25） | 各 855 通过（会话组 404）；这是评审前的全量结果，评审后的增补见下 |
+| 互通（Arrow 15 / 25） | 311 通过 |
+| 工作流与发行工具自检（tests/release、ci、sharding、packaging） | 871 通过；差分计数 856 已同步到 compare.yml、scorecard、发行测试与分片 README |
+
+已有用例的更新（断言的都是切片前的范围）：
+
+- [test_grpc_translation.py](../../tests/python/test_grpc_translation.py)：原始 gRPC 的 Search、Query、count 上 `st_isvalid(id)` 由 UNIMPLEMENTED 改为 code 6 的类型错误；pymilvus 入口的「仍不支持」清单去掉这一条。
+- [test_filter_s1.py](../../tests/differential/test_filter_s1.py)：`geometry_contains(title, 'POINT (0 0)')` 由单边断言 UNIMPLEMENTED 改为与 3.x 对照的类型错误。
+- [filter.rs](../../crates/core/src/filter.rs) 与 [tests/geometry.rs](../../crates/core/tests/geometry.rs) 中断言 UNIMPLEMENTED 的两条改为断言 3.x 的结果与文案。
+- 解析真值不变，[parser.rs](../../crates/core/src/filter/parser.rs) 的语料测试原样通过。
+
+实测中与设计稿预想不同、已按 3.x 写进用例的三点：`ST_DWITHIN` 的距离写成 `--1` 可用（两次取负折叠成正的字面量）；`geo['x']` 这类下标访问是动态类型，不是类型错误；`geo in []` 可用。
+
+评审后的修改（评审通过，建议项）：补「与动态类型的值、与其他类型字段比较」的行为描述与用例；补稀疏检索与 MemTable 阶段 Delete 的用例（差分收集数 855 → 856，会话组不变）；`hypot` 只改注释与一处显式丢弃返回值的写法，算法不变。`test_search_m1_unsupported` 等用例没有改名：[INVENTORY.md](../../tests/python/adapter/INVENTORY.md) 按这些名字保留 M1 当时的断言分类，里面已有 0025 之后改为成功的断言，改为在清单的说明里注明 0034。改后重跑：fmt、clippy（两种）、cargo test 668 / 805、tests/python 两条线各 653、[test_geometry.py](../../tests/differential/test_geometry.py) 与 [test_filter_s1.py](../../tests/differential/test_filter_s1.py) 在两条线上各 31 通过、分片计划核对 856 / 404、工具自检 871。完整差分与互通在评审后没有重跑（产品代码只有上述不改变行为的两处）。
+
+没有执行：Linux 与 x86_64 上的运行（由 CI 与 Compare 覆盖）；性能测量（不作性能声明）；组件真值生成器、模糊对照、参照用例的复制与 README / 发行说明（第 3 步）。
 
 ## 证据
 

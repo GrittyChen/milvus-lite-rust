@@ -746,7 +746,9 @@ def test_search_m1_unsupported(env):
     _, stub, _ = env
     basic(stub)
     seed(stub)
-    unimplemented(stub.Search, search_req(dsl="st_isvalid(id)"))
+    # 几何谓词已支持（0034）：非 GEOMETRY 字段是类型错误，不再是 UNIMPLEMENTED。
+    code, _, reason = status_of(stub.Search(search_req(dsl="st_isvalid(id)")))
+    assert code == 6 and reason.startswith("ST_ISVALID requires a GEOMETRY field, got int (field 'id')"), reason
     response = stub.Search(search_req(params={"metric_type": '"L2"', "params": '{"radius": 6, "range_filter": 1}'}))
     assert status_of(response)[0] == 0
     assert list(response.results.ids.int_id.data) == [1, 2]
@@ -1083,13 +1085,16 @@ def test_query_m1_unsupported(env):
     _, stub, _ = env
     basic(stub)
     seed(stub)
-    unimplemented(stub.Query, query_req(expr="st_isvalid(id)", output_fields=["count(*)"]))
+    # 几何谓词已支持（0034）：非 GEOMETRY 字段是类型错误，不再是 UNIMPLEMENTED。
+    code, _, reason = status_of(stub.Query(query_req(expr="st_isvalid(id)", output_fields=["count(*)"])))
+    assert code == 6 and reason.startswith("ST_ISVALID requires a GEOMETRY field, got int (field 'id')"), reason
     iterator = [common_pb2.KeyValuePair(key="iterator", value="False")]
     response = stub.Query(query_req(expr="id in [3, 1]", query_params=iterator + [
         common_pb2.KeyValuePair(key="limit", value="1")]))
     assert status_of(response)[0] == 0
     assert list(response.fields_data[0].scalars.long_data.data) == [1]
-    unimplemented(stub.Query, query_req(expr="st_isvalid(id)"))
+    code, _, reason = status_of(stub.Query(query_req(expr="st_isvalid(id)")))
+    assert code == 6 and reason.startswith("ST_ISVALID requires a GEOMETRY field, got int (field 'id')"), reason
     # 时间字面量的比较已支持（0025）：恒真时命中全部行。
     constant = stub.Query(query_req(
         expr="ISO '2025-01-01T00:00:00Z' == ISO '2025-01-01T00:00:00Z'", output_fields=["count(*)"]))
@@ -1253,7 +1258,6 @@ def test_pymilvus_entry_points_remaining_unsupported(env):
         (with_field("g", DataType.ARRAY, element_type=DataType.GEOMETRY, max_capacity=2), f"ARRAY element type: {feature}"),
         # pymilvus 3.0 先发 AlterCollectionSchema，收到 UNIMPLEMENTED 后回退到 AddCollectionField。
         (lambda: client.add_collection_field("q", "x", DataType.INT64, nullable=True), f"AddCollectionField: {rpc}"),
-        (lambda: client.search("q", [[1, 0]], filter="st_isvalid(id)"), "filter expressions: geometry predicates are not supported"),
         (lambda: client.search("m", [[1, 0]], ranker=model), f"rerank model providers: {feature}"),
         # 与分组同时出现时，model 的 UNIMPLEMENTED 不能被分组路径吞掉。
         (lambda: client.search("m", [[1, 0]], ranker=model, group_by_field="id"),

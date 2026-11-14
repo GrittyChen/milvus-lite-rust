@@ -340,10 +340,9 @@ def test_filter_errors_and_full_syntax_before_unsupported(diff):
         diff.step(expr, lambda c: c.query(name, filter=expr))
     for expr in ["true and missing>1", "active and missing>1", "array_length(age) > 0"]:
         diff.step(expr, lambda c: c.query(name, filter=expr), error=True)
-    # 纯 schema 字段的算术走 Arrow 路线（0032），两边对照；几何谓词仍是范围外构造。
+    # 纯 schema 字段的算术走 Arrow 路线（0032），两边对照；几何谓词用在 VARCHAR 字段上是类型错误（0034）。
     diff.step("age + 1 > 0", lambda c: c.query(name, filter="age + 1 > 0"))
-    expr = "geometry_contains(title, 'POINT (0 0)')"
-    assert run(lambda c: c.query(name, filter=expr), diff.rust)[:2] == ("rpc", "UNIMPLEMENTED"), expr
+    diff.step("geometry on varchar", lambda c: c.query(name, filter="geometry_contains(title, 'POINT (0 0)')"), error=True)
     # 时间字面量的比较已支持（0025）：两边都求值。
     diff.step("iso_literals", lambda c: c.query(name, filter="ISO '2025-01-01T00:00:00Z' == ISO '2025-01-01T00:00:00Z'", output_fields=["id"]))
     diff.step("disabled_meta_access",lambda c:c.query(name,filter="$meta['x'] == 1"),error=True)

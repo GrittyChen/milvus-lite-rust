@@ -68,23 +68,12 @@ pub(crate) struct Predicate {
     pub(super) tree: Option<super::tree::Tree>,
 }
 
+/// 解析器产出的每种表达式都有求值路线；这个错误只留给各路线里「形状不该出现」的防御分支。
 pub(super) fn unsupported() -> EngineError {
     EngineError::unsupported(
         "filter expressions",
-        "geometry predicates are not supported",
+        "this expression form is not supported",
     )
-}
-/// 含几何谓词这类范围外构造：它们先于语义检查报 UNIMPLEMENTED（0006 第 1 项）。GEOMETRY 字段在过滤中
-/// 还没有语义类型，引用它的表达式同样在这里拒绝，不能落到按字符串列求值的路径上（0034）。
-pub(super) fn out_of_scope(ast: &Ast, schema: &CollectionSchema) -> bool {
-    ast.nodes.iter().any(|node| match &node.kind {
-        Kind::Unsupported => true,
-        Kind::Field(name) => schema
-            .fields
-            .iter()
-            .any(|f| &f.name == name && f.data_type == DataType::Geometry),
-        _ => false,
-    })
 }
 
 pub(super) fn compatible(a: &str, b: &str) -> bool {
@@ -99,6 +88,8 @@ pub(super) fn sem(dtype: DataType) -> Option<&'static str> {
         DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => Some("int"),
         DataType::Float | DataType::Double => Some("float"),
         DataType::VarChar => Some("string"),
+        // 原文按字符串存储，但语义类型独立：只能与另一个 GEOMETRY 字段比较（3.x `SEM_GEOMETRY`）。
+        DataType::Geometry => Some("geometry"),
         _ => None,
     }
 }
@@ -220,10 +211,6 @@ impl Predicate {
                 tree: None,
             });
         };
-        // 语法总是完整检查；范围外构造优先 UNIMPLEMENTED，不执行其语义检查（0006 第 1 项）。
-        if out_of_scope(ast, schema) {
-            return Err(unsupported());
-        }
         if !super::tree::legacy_shape(ast, schema) {
             let tree = super::tree::Tree::compile(parsed, schema)?;
             return Ok(Self {

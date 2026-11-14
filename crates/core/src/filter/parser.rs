@@ -90,7 +90,35 @@ pub(super) enum Kind {
         base: usize,
         parts: Vec<PathPart>,
     },
-    Unsupported,
+    /// 几何谓词。字段保留为子节点，按普通字段引用做语义检查；字面量是叶子，不参与类型推导。
+    Geometry {
+        op: GeometryOp,
+        field: usize,
+        /// WKT 字面量与它的位置；`ST_ISVALID` 没有。
+        wkt: Option<(String, usize)>,
+        /// `ST_DWITHIN` 的距离：非负的整数或浮点字面量。
+        distance: Option<Literal>,
+    },
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum GeometryOp {
+    Contains,
+    Within,
+    Intersects,
+    IsValid,
+    DWithin,
+}
+impl GeometryOp {
+    /// 3.x 类型错误文案里的名字：三个二元谓词用规范名，另外两个固定大写。
+    pub(super) fn name(self) -> &'static str {
+        match self {
+            Self::Contains => "geometry_contains",
+            Self::Within => "geometry_within",
+            Self::Intersects => "geometry_intersects",
+            Self::IsValid => "ST_ISVALID",
+            Self::DWithin => "ST_DWITHIN",
+        }
+    }
 }
 #[derive(Debug, Clone)]
 pub(super) struct Node {
@@ -918,19 +946,15 @@ impl Parser<'_> {
         } else {
             tok.text.as_str()
         };
-        let geometry = matches!(
-            name.as_str(),
-            "geometry_contains"
-                | "geometry_within"
-                | "geometry_intersects"
-                | "st_contains"
-                | "st_within"
-                | "st_intersects"
-                | "st_isvalid"
-                | "geometry_isvalid"
-                | "st_dwithin"
-                | "geometry_dwithin"
-        );
+        let geometry_op = match name.as_str() {
+            "geometry_contains" | "st_contains" => Some(GeometryOp::Contains),
+            "geometry_within" | "st_within" => Some(GeometryOp::Within),
+            "geometry_intersects" | "st_intersects" => Some(GeometryOp::Intersects),
+            "geometry_isvalid" | "st_isvalid" => Some(GeometryOp::IsValid),
+            "geometry_dwithin" | "st_dwithin" => Some(GeometryOp::DWithin),
+            _ => None,
+        };
+        let geometry = geometry_op.is_some();
         let contains = matches!(
             name.as_str(),
             "array_contains"
@@ -965,13 +989,18 @@ impl Parser<'_> {
                 value = self.node(Kind::Path { base: value, parts }, field.pos);
             }
         }
-        if name == "array_length" || matches!(name.as_str(), "st_isvalid" | "geometry_isvalid") {
+        if name == "array_length" || geometry_op == Some(GeometryOp::IsValid) {
             self.required(")", &format!("{display}: expected ')'"))?;
             return Ok(self.node(
                 if name == "array_length" {
                     Kind::Length(value)
                 } else {
-                    Kind::Unsupported
+                    Kind::Geometry {
+                        op: GeometryOp::IsValid,
+                        field: value,
+                        wkt: None,
+                        distance: None,
+                    }
                 },
                 tok.pos,
             ));
@@ -984,6 +1013,7 @@ impl Parser<'_> {
             format!("{}: expected ','", tok.text)
         };
         self.required(",", &comma)?;
+        let mut geometry_args = None;
         let targets = if contains {
             if self.has("[") {
                 Some(self.list()?)
@@ -1016,12 +1046,20 @@ impl Parser<'_> {
                     tok.pos,
                 ));
             }
-            if matches!(name.as_str(), "st_dwithin" | "geometry_dwithin") {
+            let Some(Literal::String(wkt)) = query.lit else {
+                return Err(EngineError::Storage("string token lost its value".into()));
+            };
+            let mut distance = None;
+            if geometry_op == Some(GeometryOp::DWithin) {
                 self.required(",", &format!("{}: expected ',' after WKT string", tok.text))?;
                 let d = self.unary()?;
                 match &self.nodes[d].kind {
-                    Kind::Lit(Literal::Int(v)) if !v.starts_with('-') => {}
-                    Kind::Lit(Literal::Float(v)) if *v >= 0.0 => {}
+                    Kind::Lit(literal @ Literal::Int(v)) if !v.starts_with('-') => {
+                        distance = Some(literal.clone());
+                    }
+                    Kind::Lit(literal @ Literal::Float(v)) if *v >= 0.0 => {
+                        distance = Some(literal.clone());
+                    }
                     Kind::Lit(Literal::Int(_) | Literal::Float(_)) => {
                         return Err(self.error(
                             format!("{}: distance must be non-negative", tok.text),
@@ -1040,11 +1078,19 @@ impl Parser<'_> {
                     }
                 }
             }
+            geometry_args = Some(((wkt, query.pos), distance));
             None
         };
         self.required(")", &format!("{display}: expected ')'"))?;
         Ok(self.node(
-            if let Some(targets) = targets {
+            if let (Some(op), Some((wkt, distance))) = (geometry_op, geometry_args) {
+                Kind::Geometry {
+                    op,
+                    field: value,
+                    wkt: Some(wkt),
+                    distance,
+                }
+            } else if let Some(targets) = targets {
                 Kind::Contains {
                     value,
                     targets,
@@ -1058,7 +1104,9 @@ impl Parser<'_> {
                     .into(),
                 }
             } else {
-                Kind::Unsupported
+                return Err(EngineError::Storage(
+                    "function call lost its arguments".into(),
+                ));
             },
             tok.pos,
         ))

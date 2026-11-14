@@ -2,9 +2,11 @@
 
 use super::dynamic::DynamicRow;
 use super::eval::{self, Operand};
-use super::parser::{self, Ast, Kind, Literal};
+use super::parser::{self, Ast, GeometryOp, Kind, Literal};
+use super::python_num::IntRef;
 use crate::analyzer::TextQuery;
 use crate::error::{EngineError, Result, py_repr};
+use crate::geometry::{self, Geometry};
 use crate::schema::{CollectionSchema, DataType};
 use crate::storage::visibility::SourceBits;
 
@@ -23,8 +25,58 @@ pub(super) struct Tree {
     pub(super) backend: Backend,
     pub(super) patterns: Vec<Option<super::python::LikePattern>>,
     pub(super) text_queries: Vec<Option<TextQuery>>,
+    pub(super) geometries: Vec<Option<GeometryTest>>,
     /// 算术操作数中的整数字面量，编译期解析一次供 Python 路线各行共享（0032）。
     pub(super) integers: Vec<Option<super::python_num::Integer>>,
+}
+
+/// 几何谓词编译期解析好的参数。3.x 每行重新解析字面量；解析是纯函数，结果与只解析一次相同。
+#[derive(Debug)]
+pub(super) enum GeometryTest {
+    IsValid,
+    Contains(Geometry),
+    Within(Geometry),
+    Intersects(Geometry),
+    /// 距离是 `float(字面量)`；整数字面量超出 double 时 3.x 每行 OverflowError、当作 False，记为 `None`。
+    DWithin(Geometry, Option<f64>),
+}
+
+impl GeometryTest {
+    fn new(op: GeometryOp, wkt: Option<&str>, distance: &Option<Literal>) -> Result<Self> {
+        let lost = || EngineError::Storage("geometry predicate lost its literal".into());
+        let shape = || wkt.and_then(geometry::parse).ok_or_else(lost);
+        Ok(match op {
+            GeometryOp::IsValid => Self::IsValid,
+            GeometryOp::Contains => Self::Contains(shape()?),
+            GeometryOp::Within => Self::Within(shape()?),
+            GeometryOp::Intersects => Self::Intersects(shape()?),
+            GeometryOp::DWithin => Self::DWithin(
+                shape()?,
+                match distance {
+                    Some(Literal::Float(v)) => Some(*v),
+                    Some(Literal::Int(text)) => IntRef::Text(text).to_f64().ok(),
+                    _ => return Err(lost()),
+                },
+            ),
+        })
+    }
+
+    /// 字段值为 `text` 的这一行是否命中。字段值解析不了时，三个二元谓词与 `ST_DWITHIN` 在 3.x 里是
+    /// 被吞掉的异常，`ST_ISVALID` 是它的本意，结果都是 False。
+    pub(super) fn matches(&self, text: &str) -> bool {
+        let Some(value) = geometry::parse(text) else {
+            return false;
+        };
+        match self {
+            Self::IsValid => true,
+            Self::Contains(shape) => geometry::contains(&value, shape),
+            Self::Within(shape) => geometry::contains(shape, &value),
+            Self::Intersects(shape) => geometry::intersects(&value, shape),
+            Self::DWithin(shape, limit) => {
+                limit.is_some_and(|limit| geometry::dwithin(&value, shape, limit))
+            }
+        }
+    }
 }
 
 /// 3.x `semantic.py`：任一侧动态则动态；`/` 或含 float 则 float；否则 int。
@@ -68,6 +120,7 @@ pub(super) fn legacy_shape(ast: &Ast, schema: &CollectionSchema) -> bool {
                         | DataType::FloatVector
                         | DataType::SparseFloatVector
                         | DataType::Timestamptz
+                        | DataType::Geometry
                 )
         }),
         Kind::Meta(_) => true,
@@ -151,8 +204,8 @@ impl Tree {
                         None,
                     ));
                 }
-                // 3.x 改写动态字段时跳过 TextMatchOp，schema 外的名字在动态集合里同样是未知字段。
-                if let Kind::TextMatch { field, .. } = &node.kind
+                // 3.x 改写动态字段时跳过 TextMatchOp 与几何谓词，schema 外的名字在动态集合里同样是未知字段。
+                if let Kind::TextMatch { field, .. } | Kind::Geometry { field, .. } = &node.kind
                     && let Kind::Field(name) = &ast.nodes[*field].kind
                     && !matches!(name.as_str(), "_seq" | "_partition" | "$meta")
                     && !schema.fields.iter().any(|f| &f.name == name)
@@ -187,7 +240,7 @@ impl Tree {
                     | Kind::IsNull { value, .. }
                     | Kind::Contains { value, .. } => vec![*value],
                     Kind::Path { base, .. } => vec![*base],
-                    Kind::TextMatch { field, .. } => vec![*field],
+                    Kind::TextMatch { field, .. } | Kind::Geometry { field, .. } => vec![*field],
                     _ => Vec::new(),
                 };
                 if !children.is_empty() {
@@ -370,7 +423,34 @@ impl Tree {
                     }
                     numeric_result("-", "int", t)
                 }
-                Kind::Unsupported => return Err(eval::unsupported()),
+                // 3.x 的先后：字段按普通引用检查（上面已做）→ 必须是 GEOMETRY 列 → 字面量是合法 WKT。
+                Kind::Geometry { op, field, wkt, .. } => {
+                    if types[*field] != "geometry" {
+                        return Err(parser::diagnostic(
+                            &format!(
+                                "{} requires a GEOMETRY field, got {}",
+                                op.name(),
+                                eval::describe(ast, *field, types[*field])
+                            ),
+                            source,
+                            node.pos,
+                            1,
+                            None,
+                        ));
+                    }
+                    if let Some((text, pos)) = wkt
+                        && !crate::geometry::is_valid(text)
+                    {
+                        return Err(parser::diagnostic(
+                            "geometry predicate requires a valid WKT literal",
+                            source,
+                            *pos,
+                            1,
+                            None,
+                        ));
+                    }
+                    "bool"
+                }
             };
         }
         if types[ast.root] != "bool" {
@@ -434,7 +514,10 @@ impl Tree {
                     }
                     None
                 }
-                Kind::Path { .. } | Kind::Contains { .. } | Kind::Length(_) => {
+                Kind::Path { .. }
+                | Kind::Contains { .. }
+                | Kind::Length(_)
+                | Kind::Geometry { .. } => {
                     backend = Backend::Python;
                     None
                 }
@@ -457,6 +540,17 @@ impl Tree {
                 _ => None,
             })
             .collect();
+        let geometries = ast
+            .nodes
+            .iter()
+            .map(|node| match &node.kind {
+                Kind::Geometry {
+                    op, wkt, distance, ..
+                } => GeometryTest::new(*op, wkt.as_ref().map(|(text, _)| text.as_str()), distance)
+                    .map(Some),
+                _ => Ok(None),
+            })
+            .collect::<Result<_>>()?;
         let mut integers = vec![None; ast.nodes.len()];
         for node in &ast.nodes {
             if let Kind::Arith(_, a, b) = &node.kind {
@@ -474,6 +568,7 @@ impl Tree {
             backend,
             patterns,
             text_queries,
+            geometries,
             integers,
         })
     }

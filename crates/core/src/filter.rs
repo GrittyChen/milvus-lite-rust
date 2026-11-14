@@ -109,7 +109,7 @@ pub(crate) struct RowFilter {
 }
 
 impl RowFilter {
-    /// 表达式为空时返回 None（3.x 的 `if filt:`）。范围外构造优先 UNIMPLEMENTED，与普通过滤相同。
+    /// 表达式为空时返回 None（3.x 的 `if filt:`）。
     /// `id_key_visible`：动态键 `$id` 是否在这次检索的投影内。
     pub(crate) fn compile(
         parsed: &ParsedFilter,
@@ -119,11 +119,8 @@ impl RowFilter {
         use crate::rerank::boost::ID_FIELD;
         use crate::schema::DataType;
         use eval::Operand;
-        let Some(ast) = &parsed.ast else {
+        if parsed.ast.is_none() {
             return Ok(None);
-        };
-        if eval::out_of_scope(ast, schema) {
-            return Err(eval::unsupported());
         }
         let pk = schema.fields.iter().position(|f| f.is_primary);
         let is_pk = |op: &Operand| matches!(op, Operand::Column(i) if Some(*i) == pk);
@@ -198,7 +195,7 @@ pub(crate) struct RecordFilter {
 }
 
 impl RecordFilter {
-    /// 表达式为空时返回 None。调用方已用 [`Predicate::from_parsed`] 报出编译与范围外错误。
+    /// 表达式为空时返回 None。调用方已用 [`Predicate::from_parsed`] 报出编译错误。
     pub(crate) fn compile(
         parsed: &ParsedFilter,
         schema: &crate::schema::CollectionSchema,
@@ -524,13 +521,18 @@ mod tests {
         }
 
         #[test]
-        fn out_of_scope_constructs_stay_unimplemented() {
+        fn geometry_predicates_check_the_field_type() {
             for dynamic in [false, true] {
                 let expr = "geometry_contains(name, 'POINT (0 0)')";
-                assert!(
-                    matches!(filter(expr, dynamic), Err(EngineError::Unsupported { .. })),
-                    "{expr}"
-                );
+                match filter(expr, dynamic) {
+                    Err(EngineError::SchemaValidation(message)) => assert!(
+                        message.starts_with(
+                            "geometry_contains requires a GEOMETRY field, got string (field 'name')"
+                        ),
+                        "{message}"
+                    ),
+                    other => panic!("{expr}: {:?}", other.map(|f| f.is_some())),
+                }
             }
         }
 

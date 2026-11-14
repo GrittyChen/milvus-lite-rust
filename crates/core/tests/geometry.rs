@@ -1,4 +1,4 @@
-//! GEOMETRY（0034 第 1 步）：校验过的 WKT 原文列的写入、落盘（Arrow `string`）、恢复、合并与 schema 规则。
+//! GEOMETRY（0034）：校验过的 WKT 原文列的写入、落盘（Arrow `string`）、恢复、合并与 schema 规则，以及几何谓词的过滤。
 #![allow(clippy::unwrap_used)]
 
 use std::sync::Arc;
@@ -293,55 +293,154 @@ fn schema_rules_for_the_new_type() {
     );
 }
 
-/// 第 1 步还没有 `geometry` 语义类型：引用 GEOMETRY 字段的过滤一律 UNIMPLEMENTED，不按字符串列求值，
-/// 也不报类型错误。
+/// 几何谓词、`geometry` 语义类型与它们的错误文案；期望值取自真实 3.x（1320d26）在同一份数据上的结果。
 #[test]
-fn filters_that_reference_a_geometry_field_stay_unimplemented() {
+fn geometry_predicates_and_semantic_type_follow_the_reference() {
+    const SQUARE: &str = "POLYGON((0 0, 10 0, 10 10, 0 10, 0 0))";
     let root = tempfile::tempdir().unwrap();
     let db = open(root.path());
     db.create_collection("", "c", schema()).unwrap();
-    db.insert("", "c", batch(&[1], &[Some("POINT(1 1)")], &[None]))
-        .unwrap();
+    db.insert(
+        "",
+        "c",
+        batch(
+            &[1, 2, 3, 4],
+            &[Some("POINT(1 1)"), None, Some(SQUARE), Some("POINT(13 14)")],
+            &[None, Some("POINT(1 1)"), Some(SQUARE), Some("POINT(13 14)")],
+        ),
+    )
+    .unwrap();
     let handle = db.collection("", "c").unwrap();
     handle.write().load().unwrap();
-    let snapshot = handle.read().read_snapshot();
-    for expr in [
-        "geo is null",
-        "geo is not null",
-        "geo == geo",
-        "geo == g2",
-        "geo == 1",
-        "geo == 'POINT(1 1)'",
-        "geo in ['POINT(1 1)']",
-        "geo like 'P%'",
-        "text_match(geo, 'point')",
-        "ST_ISVALID(geo)",
-        "ST_WITHIN(geo, 'POINT(1 1)')",
-        "ST_DWITHIN(g2, 'POINT(1 1)', 5)",
-        "id > 0 and geo is null",
-        "id > 0 or not (g2 == geo)",
-        "ST_ISVALID(id)",
-    ] {
-        let error = snapshot.query(expr, &[], None, 0).unwrap_err();
-        assert!(
-            matches!(
-                &error,
-                EngineError::Unsupported { feature: "filter expressions", reason }
-                    if reason == "geometry predicates are not supported"
+    let huge = "1".repeat(400);
+    let hits: Vec<(String, Vec<i64>)> = [
+        (format!("ST_WITHIN(geo, '{SQUARE}')"), vec![1, 3]),
+        // NULL 是 False 而不是未知：取反后选中 NULL 行。
+        (format!("not ST_WITHIN(geo, '{SQUARE}')"), vec![2, 4]),
+        ("geometry_contains(geo, 'POINT(1 1)')".into(), vec![1, 3]),
+        (format!("ST_INTERSECTS(g2, '{SQUARE}')"), vec![1, 2, 3]),
+        ("ST_ISVALID(geo)".into(), vec![1, 3, 4]),
+        ("not st_isvalid(geo)".into(), vec![2]),
+        ("ST_DWITHIN(geo, 'POINT(10 10)', 5)".into(), vec![3, 4]),
+        (
+            "ST_DWITHIN(geo, 'POINT(10 10)', 4.999999998)".into(),
+            vec![3],
+        ),
+        // 整数距离超出 double：每行都是 False。
+        (format!("ST_DWITHIN(geo, 'POINT(10 10)', {huge})"), vec![]),
+        (
+            format!("not ST_DWITHIN(geo, 'POINT(10 10)', {huge})"),
+            vec![1, 2, 3, 4],
+        ),
+        (
+            "ST_DWITHIN(geo, 'POINT(10 10)', 1e400)".into(),
+            vec![1, 3, 4],
+        ),
+        // 两个 GEOMETRY 字段按原文的字符串比较。
+        ("geo == g2".into(), vec![3, 4]),
+        ("geo != g2".into(), vec![1]),
+        ("geo < g2".into(), vec![1]),
+        ("geo is null".into(), vec![2]),
+        ("text_match(geo, 'point')".into(), vec![1, 4]),
+        ("id > 1 and ST_ISVALID(geo)".into(), vec![3, 4]),
+        ("ST_ISVALID(geo) or id / 0 == 1".into(), vec![1, 3, 4]),
+    ]
+    .into();
+    // MemTable 与 flush 之后各求值一遍。
+    for stage in ["memtable", "flushed"] {
+        let snapshot = handle.read().read_snapshot();
+        for (expr, want) in &hits {
+            let result = snapshot.query(expr, &[], None, 0).unwrap();
+            let mut got: Vec<i64> = result
+                .rows
+                .pks
+                .iter()
+                .map(|pk| match pk {
+                    milvus_lite_core::Pk::Int64(v) => *v,
+                    other => panic!("{other:?}"),
+                })
+                .collect();
+            got.sort_unstable();
+            assert_eq!(&got, want, "{stage}: {expr}");
+        }
+        for (expr, first, last) in [
+            (
+                "ST_ISVALID(id)",
+                "ST_ISVALID requires a GEOMETRY field, got int (field 'id') at column 1",
+                "  ^",
             ),
-            "{expr}: {error:?}"
-        );
+            (
+                "geometry_contains(id, 'POINT (0 0)')",
+                "geometry_contains requires a GEOMETRY field, got int (field 'id') at column 1",
+                "  ^",
+            ),
+            (
+                "ST_WITHIN(v, 'POINT(1 1)')",
+                "field 'v' of type float_vector cannot be used in scalar filter expressions at column 11",
+                "            ^",
+            ),
+            (
+                "ST_ISVALID(nosuch)",
+                "unknown field 'nosuch' at column 12",
+                "available fields: ['g2', 'geo', 'id', 'v']",
+            ),
+            (
+                "ST_WITHIN(geo, 'nope')",
+                "geometry predicate requires a valid WKT literal at column 16",
+                "                 ^",
+            ),
+            (
+                "geo == 1",
+                "comparison '==' between incompatible types at column 5",
+                "left side is geometry (field 'geo'), right side is int",
+            ),
+            (
+                "geo == 'POINT(1 1)'",
+                "comparison '==' between incompatible types at column 5",
+                "left side is geometry (field 'geo'), right side is string",
+            ),
+            (
+                "geo in ['POINT(1 1)']",
+                "'in' list elements (string) incompatible with field 'geo' (geometry) at column 5",
+                "      ^^",
+            ),
+            (
+                "geo like 'P%'",
+                "LIKE requires a string operand, got geometry (field 'geo') at column 5",
+                "operand is geometry (field 'geo')",
+            ),
+            (
+                "geo + 1 > 0",
+                "arithmetic '+' requires numeric operands, left side is geometry (field 'geo') at column 5",
+                "operand is geometry (field 'geo')",
+            ),
+            (
+                "exists geo",
+                "'exists' is only supported on JSON keys and dynamic fields, but 'geo' is geometry at column 8",
+                "         ^^^",
+            ),
+            (
+                "array_length(geo) > 0",
+                "array_length requires an array or dynamic value, got geometry at column 1",
+                "  ^",
+            ),
+            (
+                "json_contains(geo, 1)",
+                "array_contains requires an array or dynamic value, got geometry at column 1",
+                "  ^",
+            ),
+        ] {
+            match snapshot.query(expr, &[], None, 0) {
+                Err(EngineError::SchemaValidation(message)) => {
+                    assert_eq!(message.lines().next(), Some(first), "{stage}: {expr}");
+                    assert_eq!(message.lines().last(), Some(last), "{stage}: {expr}");
+                }
+                other => panic!("{stage}: {expr}: {:?}", other.map(|r| r.rows.pks.len())),
+            }
+        }
+        drop(snapshot);
+        db.flush_collection("", "c").unwrap();
     }
-    // 不引用 GEOMETRY 字段的过滤不受影响。
-    assert_eq!(
-        snapshot
-            .query("id > 0", &[], None, 0)
-            .unwrap()
-            .rows
-            .pks
-            .len(),
-        1
-    );
 }
 
 /// 3.x 能建出 `ARRAY<GEOMETRY>` 并经原始 gRPC 写入；这样的集合在这里打不开，但不妨碍 drop 与同目录的

@@ -880,6 +880,7 @@ pub(super) fn evaluate_tree_with(
                                 | Kind::Length(value)
                                 | Kind::IsNull { value, .. }
                                 | Kind::TextMatch { field: value, .. }
+                                | Kind::Geometry { field: value, .. }
                                 | Kind::In { field: value, .. } => tasks.push(Task::Visit(*value)),
                                 Kind::Path { base, .. } => tasks.push(Task::Visit(*base)),
                                 _ => return Err(super::eval::unsupported()),
@@ -1054,6 +1055,21 @@ pub(super) fn evaluate_tree_with(
                             let value = node_value(&mut values, *field)?;
                             Value::Bool(match value.atom()? {
                                 Atom::Text(text) => query.matches(&text),
+                                _ => false,
+                            })
+                        }
+                        Kind::Geometry { field, .. } => {
+                            let test = tree.geometries[id].as_ref().ok_or_else(|| {
+                                EngineError::Storage("geometry predicate lost its literal".into())
+                            })?;
+                            // 3.x：NULL 是 False 而不是未知；值不是合法 WKT 时谓词内部的异常也当作 False。
+                            let value = node_value(&mut values, *field)?;
+                            Value::Bool(match value.atom()? {
+                                Atom::Text(text) => text
+                                    .iter()
+                                    .map(|c| char::from_u32(*c))
+                                    .collect::<Option<String>>()
+                                    .is_some_and(|text| test.matches(&text)),
                                 _ => false,
                             })
                         }
