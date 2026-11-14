@@ -1,6 +1,6 @@
 # 0034：GEOMETRY 字段与几何谓词
 
-状态：设计第二稿 2026-11-13 复审通过（第一稿未通过：大小写与 `float()` 的实现路线达不到承诺的行为、`ARRAY<GEOMETRY>` 的打开路径没有守卫、实施步骤依赖倒置）；负责人已确认决策 A–E；第 1 步（类型、解析与读写）已实施并评审通过（2026-11-13）；第 2 步（谓词与过滤）已实施并评审通过（2026-11-14）；第 3 步未实施。参照版本 `1320d26`（pyarrow 25.0.1、CPython 3.12）。排序见 [0032](0032-arithmetic-filters.md)、[0033](0033-hybrid-dynamic-inference.md)：本切片排在两者之后。
+状态：设计第二稿 2026-11-13 复审通过（第一稿未通过：大小写与 `float()` 的实现路线达不到承诺的行为、`ARRAY<GEOMETRY>` 的打开路径没有守卫、实施步骤依赖倒置）；负责人已确认决策 A–E；第 1 步（类型、解析与读写）已实施并评审通过（2026-11-13）；第 2 步（谓词与过滤）已实施并评审通过（2026-11-14）；第 3 步（证据与文档）已实施并评审通过（2026-11-14）。参照版本 `1320d26`（pyarrow 25.0.1、CPython 3.12）。排序见 [0032](0032-arithmetic-filters.md)、[0033](0033-hybrid-dynamic-inference.md)：本切片排在两者之后。
 
 ## 范围
 
@@ -193,9 +193,43 @@
 
 没有执行：Linux 与 x86_64 上的运行（由 CI 与 Compare 覆盖）；性能测量（不作性能声明）；组件真值生成器、模糊对照、参照用例的复制与 README / 发行说明（第 3 步）。
 
+## 第 3 步验收
+
+本步不改变产品行为：`geometry` 模块改为公开（供不经服务的对照入口调用），其余是测试、工具与文档。
+
+- **组件真值**：[generate_geometry_fixtures.py](../../tests/differential/generate_geometry_fixtures.py) 直接调用 3.x 的 `geometry.py` 与 CPython 3.12 的 `math.hypot`，导出 [geometry.json](../../crates/core/tests/fixtures/geometry.json)；`--verify` 重新计算并逐字节比较。[geometry.rs](../../crates/core/src/geometry.rs) 的单元测试读这份文件，第 2 步贴在源码里的三张谓词表、`hypot` 表与关键字字母的穷举随之删除（由文件里范围更大的内容取代）。
+  - 码位穷举：31 个模板，每个把一个位置换成任意码位（代理区除外）后记录被接受的全集。覆盖 `POINT` 与 `POLYGON` 每一处空白、12 个关键字字母、坐标的开头、中间、指数与末尾、多边形的分隔符。Rust 一侧同样遍历全部码位，集合必须完全相同。
+  - 解析：253 种写法（150 种被接受），含 68 组 Unicode 十进制数字各一条；比较类型与每个坐标的位模式。
+  - 谓词：45 个几何的 2025 对，`contains`、`intersects` 与距离的位模式；2086 条 `geometry_dwithin` 在距离本身、距离减容差及其两侧相邻浮点数上的结果。几何里有落在容差内外的点、共边与相邻的多边形、凹多边形、退化多边形与乘积溢出的坐标。
+  - 参照用例：[test_geometry.py](https://github.com/milvus-io/milvus-lite/blob/1320d26/tests/search/filter/test_geometry.py) 中直接调用几何函数的 25 条断言（含凹多边形）；生成时核对 3.x 的结果与用例写的期望相同。该文件其余用例断言的是 3.x 内部的语法树与求值入口，对应的行为由解析真值与端到端差分覆盖。
+  - `hypot`：1725 组（0、次正规数、接近溢出、无穷大与 NaN 的两两组合，随机位模式，随机指数）。
+- **模糊对照**：[fuzz_geometry.py](../../tests/differential/fuzz_geometry.py) 加 [geometry_probe](../../crates/core/examples/geometry_probe.rs)，不经服务。随机 WKT 文本（合法写法加空白、大小写、数字写法与结构上的变异）比较解析结果；随机几何对（整数格点加容差量级的偏移、极角排序与随机顺序的多边形、极大坐标）比较三个谓词、距离的位模式与阈值附近的 `ST_DWITHIN`；另比较 `hypot`。3.x 一侧抛出的异常记入结果参与比较。
+- **参照用例**：[test_grpc_geometry.py](../../tests/python/adapter/test_grpc_geometry.py) 的 8 条按 adapter 规则原样复制（去掉 `importorskip` 与按 pymilvus 有无 GEOMETRY 类型跳过的 `skipif`），[INVENTORY.md](../../tests/python/adapter/INVENTORY.md) 同步；tests/python 的收集数 653 → 661。
+- **文档**：[README](../../README.md) 的范围说明去掉「几何谓词」并加一条当前源码新增的能力说明（接受范围、谓词不是 OGC 语义、登记差异、降级行为）；发行说明在准备候选时按这一条与本文「与 3.x 的差异」写，与 0032、0033 的做法相同。
+
+开发验收（2026-11-14，最终代码，本机 macOS arm64，串行执行）：
+
+| 项目 | 结果 |
+| --- | --- |
+| 组件真值核验（`--verify`，真实 3.x / CPython 3.12.14） | 逐字节相同 |
+| 几何模块的单元测试 | 9 条通过（码位穷举、解析、谓词与阈值、参照断言、`hypot` 各读取真值文件；另有手写的空白集合、点与多边形清单、`ST_DWITHIN` 阈值） |
+| 模糊对照（种子 34 与 35，每个种子三类各 20 万条） | 各 60 万条，0 不一致；3.x 一侧 0 次异常。每个种子约 5.6 万条 WKT 被接受，约 15.7 万对两侧都合法（其中相交约 6.5 万、包含约 0.95 万） |
+| fmt / clippy（默认与 fault-injection） | 无告警 |
+| cargo test --workspace / fault-injection | 670 / 807 通过（fault-injection 的日志里有两行汇总被子进程的输出冲乱，按全部汇总行相加） |
+| tests/python（pymilvus 3.0.2 / 2.6.18） | 各 661 通过 |
+| 差分（pymilvus 3.0.2 / 2.6.18，参照 Arrow 25） | 各 856 通过（差分用例本步没有增减） |
+| 互通（Arrow 15 / 25） | 311 通过 |
+| 工作流与发行工具自检（tests/release、ci、sharding、packaging、platform） | 886 通过；不含 platform 时 871，与前两步口径相同；tests/python 的计数 661 已同步到 ci.yml、scorecard、发行测试、打包 README 与 AGENTS |
+
+这次全量同时覆盖第 2 步评审后没有重跑的完整差分与互通。
+
+评审后的修改（评审通过，建议项）：真值单测对各部分的条数改为断言确切值（31 / 253 / 1725 / 45 / 2086 / 25），截断的真值文件不再能通过；`geometry` 模块标为 `#[doc(hidden)]` 并在模块头注明公开只为对照入口、不是稳定接口；AGENTS 的命令说明区分生成器与单测的耗时并写明验收用的两个种子；复制的参照用例文件头统一写 `1320d26`，并注明最后两条的宽松异常匹配是上游原样（错误码与文案由差分逐字对照，所以不改用例本体）。改后重跑：fmt、clippy（两种）、几何模块单测 9 条、复制的 8 条参照用例在两条 SDK 线上通过；产品行为与用例本体没有变化，全量没有重跑。
+
+没有执行：Linux 与 x86_64 上的运行（由 CI 与 Compare 覆盖）；性能测量（不作性能声明）；Arrow 15 参照环境下的真值核验（几何模块不经过 pyarrow）。
+
 ## 证据
 
-实测脚本与原始输出在仓库外的本地留存目录（[证据的存放与复核范围](../testing/README.md) 的「本地留存」一类），实施第 3 步时由仓库内的生成器、差分与模糊对照取代：
+设计阶段的实测脚本与原始输出在仓库外的本地留存目录（[证据的存放与复核范围](../testing/README.md) 的「本地留存」一类）；它们得出的结论现在由仓库内可重跑的生成器、差分与模糊对照覆盖：
 
 - `p1`：pymilvus 3.0.2 的建表、写入、查询、检索、删除、计数、Unicode 边角与错误文案。
 - `p2`：原始 gRPC 的主键 / partition key、默认值槽位、写入槽位、输出、400 位与 `1e-400` 的距离、`schema.json` 与 Parquet 的列类型。输出里 `describe dl`、`dl insert`、`dl query` 的报错是探针顺序造成的（`dl` 因默认值无效没有建出来），不是产品行为。

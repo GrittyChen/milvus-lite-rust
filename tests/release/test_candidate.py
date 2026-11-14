@@ -74,7 +74,7 @@ def test_matrix_shape():
     assert set(scorecard.MATRIX) == {*scorecard.PLATFORMS, "sdist"}
     for platform in scorecard.PLATFORMS:
         stages_ = scorecard.MATRIX[platform]
-        assert stages_["python-3.15-2.6.17"] == {"collected": 653, "executed": 653, "group": 0}
+        assert stages_["python-3.15-2.6.17"] == {"collected": 661, "executed": 661, "group": 0}
         assert stages_["differential-3.0.2"] == {"collected": 856, "executed": 856, "group": 404}
         assert ("pid1" in stages_) == platform.startswith("linux-")
     assert "previous-reader" in scorecard.MATRIX["linux-x86_64"] and "previous-reader" not in scorecard.MATRIX["linux-aarch64"]

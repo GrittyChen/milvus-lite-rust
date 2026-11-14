@@ -4,17 +4,20 @@
 //! 原文的判定一致，所以这里按 3.x 的匹配规则逐项复刻，而不是按 WKT 标准解析：空白是 Python `\s` 的集合，
 //! 关键字忽略大小写按 `re.IGNORECASE`，坐标按 `float()`，多边形的自交检查与各谓词沿用 3.x 的运算顺序与容差。
 //! 谓词是 3.x 自己的近似算法，不是 OGC 语义。
+//!
+//! 模块公开只是为了让不经服务的对照入口（`examples/geometry_probe.rs`）直接调用，不是稳定接口；
+//! 产品路径只经 `filter` 与写入校验使用它。
 
 use crate::rerank::pyval::float_literal;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) struct Point {
-    pub(crate) x: f64,
-    pub(crate) y: f64,
+pub struct Point {
+    pub x: f64,
+    pub y: f64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) enum Geometry {
+pub enum Geometry {
     Point(Point),
     /// 闭合的环：首尾两点相同，至少 4 个点。
     Polygon(Vec<Point>),
@@ -93,7 +96,7 @@ fn polygon_body(s: &str) -> Option<&str> {
 }
 
 /// 3.x 的 `parse_wkt`；任何不被接受的文本返回 `None`（3.x 的各个调用方都只区分成败）。
-pub(crate) fn parse(value: &str) -> Option<Geometry> {
+pub fn parse(value: &str) -> Option<Geometry> {
     // 3.x 先试 POINT：正则匹配而坐标无效时直接失败，不再试 POLYGON。
     if let Some((x, y)) = point_tokens(value) {
         return Some(Geometry::Point(Point {
@@ -211,7 +214,7 @@ fn point_in_polygon(p: Point, ring: &[Point]) -> bool {
 
 /// CPython 3.12 `math.hypot` 的两参数情形（`vector_norm`）。它不是 libm 的 `hypot`：两者在约 16% 的输入上
 /// 相差 1 ULP，`ST_DWITHIN` 落在阈值上的行要与 3.x 一致就必须用同一个算法。
-pub(crate) fn hypot(x: f64, y: f64) -> f64 {
+pub fn hypot(x: f64, y: f64) -> f64 {
     let (x, y) = (x.abs(), y.abs());
     let mut max = 0.0;
     if x > max {
@@ -346,7 +349,7 @@ fn polygons_intersect(a: &[Point], b: &[Point]) -> bool {
 }
 
 /// 3.x 的 `geometry_contains(a, b)`；`geometry_within(a, b)` 是 `contains(b, a)`。
-pub(crate) fn contains(a: &Geometry, b: &Geometry) -> bool {
+pub fn contains(a: &Geometry, b: &Geometry) -> bool {
     match (a, b) {
         (Geometry::Polygon(a), Geometry::Point(b)) => point_in_polygon(*b, a),
         (Geometry::Point(a), Geometry::Point(b)) => a == b,
@@ -356,7 +359,7 @@ pub(crate) fn contains(a: &Geometry, b: &Geometry) -> bool {
 }
 
 /// 3.x 的 `geometry_intersects`。
-pub(crate) fn intersects(a: &Geometry, b: &Geometry) -> bool {
+pub fn intersects(a: &Geometry, b: &Geometry) -> bool {
     match (a, b) {
         (Geometry::Point(a), Geometry::Point(b)) => a == b,
         (Geometry::Polygon(a), Geometry::Point(b)) => point_in_polygon(*b, a),
@@ -366,7 +369,7 @@ pub(crate) fn intersects(a: &Geometry, b: &Geometry) -> bool {
 }
 
 /// 3.x 的 `_geometry_distance`。
-fn distance(a: &Geometry, b: &Geometry) -> f64 {
+pub fn distance(a: &Geometry, b: &Geometry) -> f64 {
     if intersects(a, b) {
         return 0.0;
     }
@@ -387,7 +390,7 @@ fn distance(a: &Geometry, b: &Geometry) -> f64 {
 }
 
 /// 3.x 的 `geometry_dwithin`，`limit` 不为负（过滤的解析器保证）。
-pub(crate) fn dwithin(a: &Geometry, b: &Geometry, limit: f64) -> bool {
+pub fn dwithin(a: &Geometry, b: &Geometry, limit: f64) -> bool {
     distance(a, b) <= limit + EPS
 }
 
@@ -395,433 +398,167 @@ pub(crate) fn dwithin(a: &Geometry, b: &Geometry, limit: f64) -> bool {
 mod tests {
     use super::*;
 
-    // 以下四张表由真实 3.x（1320d26，CPython 3.12）的 `geometry.py` 与 `math.hypot` 生成：
-    // `geometry_contains(a, b)`、`geometry_intersects(a, b)`、`_geometry_distance(a, b)` 的位模式，以及
-    // `math.hypot(x, y)` 的位模式（NaN 只比较是否为 NaN）。
-    const SHAPES: [&str; 16] = [
-        "POINT(1 1)",
-        "POINT(5 5)",
-        "POINT(10 5)",
-        "POINT(13 14)",
-        "POINT(2 3)",
-        "POINT(0.3 0.1)",
-        "POINT(1e308 1e308)",
-        "POINT(-1e308 -1e308)",
-        "POLYGON((0 0, 10 0, 10 10, 0 10, 0 0))",
-        "POLYGON((2 2, 4 2, 4 4, 2 4, 2 2))",
-        "POLYGON((8 8, 12 8, 12 12, 8 12, 8 8))",
-        "POLYGON((20 20, 30 20, 30 30, 20 20))",
-        "POLYGON((0 0, 4 0, 4 4, 2 1, 0 4, 0 0))",
-        "POLYGON((0 0,0 0,0 0,0 0))",
-        "POLYGON((10 0, 20 0, 20 10, 10 10, 10 0))",
-        "POLYGON((0.1 0.2, 0.7 0.3, 0.4 0.9, 0.1 0.2))",
-    ];
-    const CONTAINS: [&str; 16] = [
-        "1000000000000000",
-        "0100000000000000",
-        "0010000000000000",
-        "0001000000000000",
-        "0000100000000000",
-        "0000010000000000",
-        "0000001000000000",
-        "0000000100000000",
-        "1110110011001101",
-        "0000100001000000",
-        "0000000000100000",
-        "0000000000010000",
-        "1000010000001101",
-        "0000000000000100",
-        "0010000000000010",
-        "0000000000000001",
-    ];
-    const INTERSECTS: [&str; 16] = [
-        "1000000010001000",
-        "0100000010000000",
-        "0010000010000010",
-        "0001000000000000",
-        "0000100011000000",
-        "0000010010001000",
-        "0000001000000000",
-        "0000000100000000",
-        "1110110011101111",
-        "0000100011001000",
-        "0000000010100010",
-        "0000000000010000",
-        "1000010011001101",
-        "0000000010001100",
-        "0010000010100010",
-        "0000000010001001",
-    ];
-    const DISTANCES: [[u64; 16]; 16] = [
-        [
-            0x0000000000000000,
-            0x4016a09e667f3bcd,
-            0x4023b29d7d635662,
-            0x4031b11a32e8d06c,
-            0x4001e3779b97f4a8,
-            0x3ff23e2896280f23,
-            0x7fe92c80954c51f5,
-            0x7fe92c80954c51f5,
-            0x0000000000000000,
-            0x3ff6a09e667f3bcd,
-            0x4023cc8a99af5453,
-            0x403adebc19b71703,
-            0x0000000000000000,
-            0x3ff6a09e667f3bcd,
-            0x4022000000000000,
-            0x3fe29aa55a232767,
-        ],
-        [
-            0x4016a09e667f3bcd,
-            0x0000000000000000,
-            0x4014000000000000,
-            0x4028154be2773526,
-            0x400cd82b446159f3,
-            0x401b28a69cf70ba8,
-            0x7fe92c80954c51f5,
-            0x7fe92c80954c51f5,
-            0x0000000000000000,
-            0x3ff6a09e667f3bcd,
-            0x4010f876ccdf6cd9,
-            0x4035369480174810,
-            0x3ff6a09e667f3bcd,
-            0x401c48c6001f0ac0,
-            0x4014000000000000,
-            0x4018a5de234b0a70,
-        ],
-        [
-            0x4023b29d7d635662,
-            0x4014000000000000,
-            0x0000000000000000,
-            0x4022f9422c23c47e,
-            0x40207e0f66afed07,
-            0x4025bc198b6835be,
-            0x7fe92c80954c51f5,
-            0x7fe92c80954c51f5,
-            0x0000000000000000,
-            0x401854bfb363dc39,
-            0x4008000000000000,
-            0x4032071b0abcd838,
-            0x401854bfb363dc39,
-            0x40265c55827df1d2,
-            0x0000000000000000,
-            0x4024d7144d9625fb,
-        ],
-        [
-            0x4031b11a32e8d06c,
-            0x4028154be2773526,
-            0x4022f9422c23c47e,
-            0x0000000000000000,
-            0x402f1cd9cceef239,
-            0x4032d402f969c6d6,
-            0x7fe92c80954c51f5,
-            0x7fe92c80954c51f5,
-            0x4014000000000000,
-            0x402ae841693db8b4,
-            0x4001e3779b97f4a8,
-            0x4022706821902e9a,
-            0x402ae841693db8b4,
-            0x40331adf859f9e5e,
-            0x4010000000000000,
-            0x40322d13c9a716ed,
-        ],
-        [
-            0x4001e3779b97f4a8,
-            0x400cd82b446159f3,
-            0x40207e0f66afed07,
-            0x402f1cd9cceef239,
-            0x0000000000000000,
-            0x400ae472e42d478a,
-            0x7fe92c80954c51f5,
-            0x7fe92c80954c51f5,
-            0x0000000000000000,
-            0x0000000000000000,
-            0x401f3db2174e7468,
-            0x4038c2432101f926,
-            0x3ff1c01aa03be896,
-            0x400cd82b446159f3,
-            0x4020000000000000,
-            0x40051ee009c8a7ca,
-        ],
-        [
-            0x3ff23e2896280f23,
-            0x401b28a69cf70ba8,
-            0x4025bc198b6835be,
-            0x4032d402f969c6d6,
-            0x400ae472e42d478a,
-            0x0000000000000000,
-            0x7fe92c80954c51f5,
-            0x7fe92c80954c51f5,
-            0x0000000000000000,
-            0x400465655f122ff6,
-            0x40261044755c0fea,
-            0x403c0075065be82b,
-            0x0000000000000000,
-            0x3fd43d136248490f,
-            0x4023666666666666,
-            0x3fc0d59eed96bc59,
-        ],
-        [
-            0x7fe92c80954c51f5,
-            0x7fe92c80954c51f5,
-            0x7fe92c80954c51f5,
-            0x7fe92c80954c51f5,
-            0x7fe92c80954c51f5,
-            0x7fe92c80954c51f5,
-            0x0000000000000000,
-            0x7ff0000000000000,
-            0x7fe92c80954c51f5,
-            0x7fe92c80954c51f5,
-            0x7fe92c80954c51f5,
-            0x7fe92c80954c51f5,
-            0x7fe92c80954c51f5,
-            0x7fe92c80954c51f5,
-            0x7fe92c80954c51f5,
-            0x7fe92c80954c51f5,
-        ],
-        [
-            0x7fe92c80954c51f5,
-            0x7fe92c80954c51f5,
-            0x7fe92c80954c51f5,
-            0x7fe92c80954c51f5,
-            0x7fe92c80954c51f5,
-            0x7fe92c80954c51f5,
-            0x7ff0000000000000,
-            0x0000000000000000,
-            0x7fe92c80954c51f5,
-            0x7fe92c80954c51f5,
-            0x7fe92c80954c51f5,
-            0x7fe92c80954c51f5,
-            0x7fe92c80954c51f5,
-            0x7fe92c80954c51f5,
-            0x7fe92c80954c51f5,
-            0x7fe92c80954c51f5,
-        ],
-        [
-            0x0000000000000000,
-            0x0000000000000000,
-            0x0000000000000000,
-            0x4014000000000000,
-            0x0000000000000000,
-            0x0000000000000000,
-            0x7fe92c80954c51f5,
-            0x7fe92c80954c51f5,
-            0x0000000000000000,
-            0x0000000000000000,
-            0x0000000000000000,
-            0x402c48c6001f0ac0,
-            0x0000000000000000,
-            0x0000000000000000,
-            0x0000000000000000,
-            0x0000000000000000,
-        ],
-        [
-            0x3ff6a09e667f3bcd,
-            0x3ff6a09e667f3bcd,
-            0x401854bfb363dc39,
-            0x402ae841693db8b4,
-            0x0000000000000000,
-            0x400465655f122ff6,
-            0x7fe92c80954c51f5,
-            0x7fe92c80954c51f5,
-            0x0000000000000000,
-            0x0000000000000000,
-            0x4016a09e667f3bcd,
-            0x4036a09e667f3bcd,
-            0x0000000000000000,
-            0x4006a09e667f3bcd,
-            0x4018000000000000,
-            0x3fff10fe50b256b1,
-        ],
-        [
-            0x4023cc8a99af5453,
-            0x4010f876ccdf6cd9,
-            0x4008000000000000,
-            0x4001e3779b97f4a8,
-            0x401f3db2174e7468,
-            0x40261044755c0fea,
-            0x7fe92c80954c51f5,
-            0x7fe92c80954c51f5,
-            0x0000000000000000,
-            0x4016a09e667f3bcd,
-            0x0000000000000000,
-            0x4026a09e667f3bcd,
-            0x4016a09e667f3bcd,
-            0x4026a09e667f3bcd,
-            0x0000000000000000,
-            0x4024cd0bd05d9866,
-        ],
-        [
-            0x403adebc19b71703,
-            0x4035369480174810,
-            0x4032071b0abcd838,
-            0x4022706821902e9a,
-            0x4038c2432101f926,
-            0x403c0075065be82b,
-            0x7fe92c80954c51f5,
-            0x7fe92c80954c51f5,
-            0x402c48c6001f0ac0,
-            0x4036a09e667f3bcd,
-            0x4026a09e667f3bcd,
-            0x0000000000000000,
-            0x4036a09e667f3bcd,
-            0x403c48c6001f0ac0,
-            0x4024000000000000,
-            0x403b5e087074e3d4,
-        ],
-        [
-            0x0000000000000000,
-            0x3ff6a09e667f3bcd,
-            0x401854bfb363dc39,
-            0x402ae841693db8b4,
-            0x3ff1c01aa03be896,
-            0x0000000000000000,
-            0x7fe92c80954c51f5,
-            0x7fe92c80954c51f5,
-            0x0000000000000000,
-            0x0000000000000000,
-            0x4016a09e667f3bcd,
-            0x4036a09e667f3bcd,
-            0x0000000000000000,
-            0x0000000000000000,
-            0x4018000000000000,
-            0x0000000000000000,
-        ],
-        [
-            0x3ff6a09e667f3bcd,
-            0x401c48c6001f0ac0,
-            0x40265c55827df1d2,
-            0x40331adf859f9e5e,
-            0x400cd82b446159f3,
-            0x3fd43d136248490f,
-            0x7fe92c80954c51f5,
-            0x7fe92c80954c51f5,
-            0x0000000000000000,
-            0x4006a09e667f3bcd,
-            0x4026a09e667f3bcd,
-            0x403c48c6001f0ac0,
-            0x0000000000000000,
-            0x0000000000000000,
-            0x4024000000000000,
-            0x3fcc9f25c5bfedda,
-        ],
-        [
-            0x4022000000000000,
-            0x4014000000000000,
-            0x0000000000000000,
-            0x4010000000000000,
-            0x4020000000000000,
-            0x4023666666666666,
-            0x7fe92c80954c51f5,
-            0x7fe92c80954c51f5,
-            0x0000000000000000,
-            0x4018000000000000,
-            0x0000000000000000,
-            0x4024000000000000,
-            0x4018000000000000,
-            0x4024000000000000,
-            0x0000000000000000,
-            0x402299999999999a,
-        ],
-        [
-            0x3fe29aa55a232767,
-            0x4018a5de234b0a70,
-            0x4024d7144d9625fb,
-            0x40322d13c9a716ed,
-            0x40051ee009c8a7ca,
-            0x3fc0d59eed96bc59,
-            0x7fe92c80954c51f5,
-            0x7fe92c80954c51f5,
-            0x0000000000000000,
-            0x3fff10fe50b256b1,
-            0x4024cd0bd05d9866,
-            0x403b5e087074e3d4,
-            0x0000000000000000,
-            0x3fcc9f25c5bfedda,
-            0x402299999999999a,
-            0x0000000000000000,
-        ],
-    ];
-    const HYPOT: [(u64, u64, u64); 40] = [
-        (0x4008000000000000, 0x4010000000000000, 0x4014000000000000),
-        (0xc008000000000000, 0x4010000000000000, 0x4014000000000000),
-        (0x0000000000000000, 0x0000000000000000, 0x0000000000000000),
-        (0x8000000000000000, 0x0000000000000000, 0x0000000000000000),
-        (0x0000000000000000, 0x0000000000000001, 0x0000000000000001),
-        (0x0000000000000001, 0x0000000000000001, 0x0000000000000001),
-        (0x00000000000007e8, 0x00000000000017b8, 0x0000000000001900),
-        (0x0011fa182c40c60d, 0x0011fa182c40c60d, 0x00196c58276b9b78),
-        (0x0010000000000000, 0x000012688b70e62b, 0x0010000a96eeeaa3),
-        (0x16687e92154ef7ac, 0x16687e92154ef7ac, 0x167151f68876f410),
-        (0x5fe7dddf6b095ff1, 0x5fe7dddf6b095ff1, 0x5ff0e0551a9edea1),
-        (0x7fefffffffffffff, 0x7fefffffffffffff, 0x7ff0000000000000),
-        (0x7fe1ccf385ebc8a0, 0x7fe1ccf385ebc8a0, 0x7fe92c80954c51f5),
-        (0x7fe55c576d815726, 0x7c9008896bcf54fa, 0x7fe55c576d815726),
-        (0x3ff0000000000000, 0x3c670ef54646d497, 0x3ff0000000000000),
-        (0x3fb999999999999a, 0x3fc999999999999a, 0x3fcc9f25c5bfedda),
-        (0x3fe6666666666666, 0x3fb999999999999a, 0x3fe6a09e667f3bcc),
-        (0x4008000000036f9c, 0x4010000000000000, 0x40140000000107e2),
-        (0x3e112e0be826d695, 0x3e112e0be826d695, 0x3e184bc6eb0aa98a),
-        (0x405edd2f1a9fbe77, 0x408472916872b021, 0x4084ceed4c854db8),
-        (0x7ff0000000000000, 0x7ff8000000000000, 0x7ff0000000000000),
-        (0x7ff8000000000000, 0xfff0000000000000, 0x7ff0000000000000),
-        (0x7ff8000000000000, 0x3ff0000000000000, 0x7ff8000000000000),
-        (0x3ff0000000000000, 0x7ff0000000000000, 0x7ff0000000000000),
-        (0x408c0d7271012352, 0xc062fb3ae5641048, 0x408c7378621fcdee),
-        (0xc0783a1e980b76e0, 0xc0895779418fe710, 0x408c168a9b173399),
-        (0x408b1c0014ad7fd2, 0x406632b4cfcc4b40, 0x408babeb966c610d),
-        (0x407116114f7806e4, 0xc07a015e3b499606, 0x407f1dbd7fdd69cc),
-        (0xc0747ca79119b9f2, 0xc076652a4c0a71bc, 0x407e5a2c3ac4a609),
-        (0x4080da0c9cb41cb6, 0x407e37cc09ff0e10, 0x4086a21b0a2e4816),
-        (0xc07bac354fd7a8c6, 0x408b20026754c302, 0x408e733d7666b5a4),
-        (0x406cae33f5a71010, 0xc07e0226957f44b4, 0x4080a11fcb796bc0),
-        (0xc0707ff96b18f796, 0x40839f895f21af7e, 0x40854970f4a54ba7),
-        (0x408e8a010e241962, 0xc086035f45222b90, 0x4092d2ad6a5dc2de),
-        (0xc087ba5d64e55278, 0xc08083594a12aac4, 0x408ce8910b898a04),
-        (0x407bb295d9ae2e94, 0x4070dceb5dcc6a7c, 0x408036ab1e6701a1),
-        (0x4021a9e083ed2a40, 0xc08cf47e6b3ed3bb, 0x408cf4d49ec09682),
-        (0xc08b54124d211b90, 0xc08908f109ed0457, 0x409287ee7d76b009),
-        (0xc0893b7ea825bae9, 0xc0530c00ade57448, 0x4089582fb9baaa3d),
-        (0x408cea7c67353b02, 0x408ebf4d5a9beb56, 0x40951aa48d2ad8d8),
-    ];
+    use serde_json::Value;
 
-    fn shapes() -> Vec<Geometry> {
-        SHAPES.iter().map(|text| parse(text).unwrap()).collect()
+    /// 真实 3.x 的组件真值，由 tests/differential/generate_geometry_fixtures.py 导出。
+    fn fixture() -> Value {
+        crate::json_text::value_str(include_str!("../tests/fixtures/geometry.json")).unwrap()
+    }
+
+    fn list<'a>(value: &'a Value, key: &str) -> &'a [Value] {
+        value[key].as_array().unwrap()
+    }
+
+    /// 位模式的十六进制；NaN 不比较位模式，统一成一个值。
+    fn float(value: &Value) -> f64 {
+        match value.as_str().unwrap() {
+            "nan" => f64::NAN,
+            hex => f64::from_bits(u64::from_str_radix(hex, 16).unwrap()),
+        }
+    }
+
+    fn same(got: f64, want: f64) -> bool {
+        got.to_bits() == want.to_bits() || (got.is_nan() && want.is_nan())
+    }
+
+    #[test]
+    fn code_point_sets_match_the_reference() {
+        // 把一个位置换成任意码位：被接受的集合与 3.x 完全相同，多一个少一个都不行。
+        let fixture = fixture();
+        let templates = list(&fixture, "templates");
+        assert_eq!(templates.len(), 31);
+        for template in templates {
+            let (before, after) = (
+                template["before"].as_str().unwrap(),
+                template["after"].as_str().unwrap(),
+            );
+            let expected: Vec<u32> = list(template, "accepted")
+                .iter()
+                .map(|c| u32::try_from(c.as_u64().unwrap()).unwrap())
+                .collect();
+            let mut text = String::new();
+            let accepted: Vec<u32> = (0..=0x10ffff_u32)
+                .filter(|&c| {
+                    char::from_u32(c).is_some_and(|c| {
+                        text.clear();
+                        text.push_str(before);
+                        text.push(c);
+                        text.push_str(after);
+                        is_valid(&text)
+                    })
+                })
+                .collect();
+            assert_eq!(accepted, expected, "{before:?} ? {after:?}");
+        }
+    }
+
+    #[test]
+    fn parse_results_match_the_reference() {
+        let fixture = fixture();
+        let cases = list(&fixture, "parse");
+        assert_eq!(cases.len(), 253);
+        for case in cases {
+            let text = case["text"].as_str().unwrap();
+            let want = (!case["result"].is_null()).then(|| {
+                let points: Vec<Point> = list(&case["result"], "points")
+                    .iter()
+                    .map(|p| Point {
+                        x: float(&p[0]),
+                        y: float(&p[1]),
+                    })
+                    .collect();
+                (case["result"]["polygon"].as_bool().unwrap(), points)
+            });
+            let got = parse(text).map(|shape| match shape {
+                Geometry::Point(p) => (false, vec![p]),
+                Geometry::Polygon(points) => (true, points),
+            });
+            // 坐标比较位模式：-0.0 与 0.0 要分得开。
+            let key = |shape: &Option<(bool, Vec<Point>)>| {
+                shape.as_ref().map(|(polygon, points)| {
+                    let bits: Vec<_> = points
+                        .iter()
+                        .map(|p| (p.x.to_bits(), p.y.to_bits()))
+                        .collect();
+                    (*polygon, bits)
+                })
+            };
+            assert_eq!(key(&got), key(&want), "{text:?}");
+        }
     }
 
     #[test]
     fn hypot_is_the_cpython_algorithm() {
-        for (x, y, want) in HYPOT {
-            let (x, y, want) = (f64::from_bits(x), f64::from_bits(y), f64::from_bits(want));
+        let fixture = fixture();
+        let cases = list(&fixture, "hypot");
+        assert_eq!(cases.len(), 1725);
+        let mut differs_from_naive = 0;
+        for case in cases {
+            let (x, y, want) = (float(&case[0]), float(&case[1]), float(&case[2]));
             let got = hypot(x, y);
             assert!(
-                got.to_bits() == want.to_bits() || (got.is_nan() && want.is_nan()),
+                same(got, want),
                 "hypot({x:?}, {y:?}) = {got:?}, want {want:?}"
             );
+            if want.is_finite() && (x * x + y * y).sqrt().to_bits() != want.to_bits() {
+                differs_from_naive += 1;
+            }
         }
         // 表里要有与朴素算法不同的输入，否则它证明不了算法。
-        assert!(HYPOT.iter().any(|&(x, y, want)| {
-            let (x, y) = (f64::from_bits(x), f64::from_bits(y));
-            (x * x + y * y).sqrt().to_bits() != want && f64::from_bits(want).is_finite()
-        }));
+        assert!(differs_from_naive > 100);
     }
 
     #[test]
     fn predicates_follow_the_reference_algorithms() {
-        let shapes = shapes();
+        let fixture = fixture();
+        let texts: Vec<&str> = list(&fixture, "shapes")
+            .iter()
+            .map(|text| text.as_str().unwrap())
+            .collect();
+        let shapes: Vec<Geometry> = texts.iter().map(|text| parse(text).unwrap()).collect();
+        assert_eq!(shapes.len(), 45);
         for (i, a) in shapes.iter().enumerate() {
             for (j, b) in shapes.iter().enumerate() {
-                let pair = format!("{} / {}", SHAPES[i], SHAPES[j]);
-                let flag = |table: &[&str]| table[i].as_bytes()[j] == b'1';
-                assert_eq!(contains(a, b), flag(&CONTAINS), "contains {pair}");
-                assert_eq!(intersects(a, b), flag(&INTERSECTS), "intersects {pair}");
-                let want = f64::from_bits(DISTANCES[i][j]);
-                let got = distance(a, b);
-                assert!(
-                    got.to_bits() == want.to_bits() || (got.is_nan() && want.is_nan()),
-                    "distance {pair}: {got:?}, want {want:?}"
-                );
+                let pair = format!("{} / {}", texts[i], texts[j]);
+                let flag = |table: &str| fixture[table][i].as_str().unwrap().as_bytes()[j] == b'1';
+                assert_eq!(contains(a, b), flag("contains"), "contains {pair}");
+                assert_eq!(intersects(a, b), flag("intersects"), "intersects {pair}");
+                let (got, want) = (distance(a, b), float(&fixture["distances"][i][j]));
+                assert!(same(got, want), "distance {pair}: {got:?}, want {want:?}");
             }
+        }
+        let limits = list(&fixture, "dwithin");
+        assert_eq!(limits.len(), 2086);
+        for case in limits {
+            let index = |at: usize| usize::try_from(case[at].as_u64().unwrap()).unwrap();
+            let (i, j, limit) = (index(0), index(1), float(&case[2]));
+            assert_eq!(
+                dwithin(&shapes[i], &shapes[j], limit),
+                case[3].as_bool().unwrap(),
+                "dwithin {} / {} / {limit:?}",
+                texts[i],
+                texts[j]
+            );
+        }
+    }
+
+    #[test]
+    fn reference_test_assertions_hold() {
+        // 参照实现 tests/search/filter/test_geometry.py 里直接调用几何函数的断言。
+        let fixture = fixture();
+        let cases = list(&fixture, "reference");
+        assert_eq!(cases.len(), 25);
+        for case in cases {
+            let shape = |key: &str| parse(case[key].as_str().unwrap()).unwrap();
+            let (left, right) = (shape("left"), shape("right"));
+            let got = match case["op"].as_str().unwrap() {
+                "contains" => contains(&left, &right),
+                "within" => contains(&right, &left),
+                "intersects" => intersects(&left, &right),
+                "dwithin" => dwithin(&left, &right, float(&case["distance"])),
+                other => panic!("unknown op {other}"),
+            };
+            assert_eq!(got, case["expected"].as_bool().unwrap(), "{case}");
         }
     }
 
@@ -867,27 +604,6 @@ mod tests {
         .collect();
         assert_eq!(spaces, expected);
         assert_eq!(spaces.len(), 29);
-    }
-
-    #[test]
-    fn keyword_letters_follow_re_ignorecase() {
-        // 每个字母位置换成任意码位，只有 ASCII 大小写与 I 的两个额外码位被接受。
-        for (word, tail) in [("POINT", "(1 1)"), ("POLYGON", "((0 0,1 0,1 1,0 0))")] {
-            for (pos, letter) in word.char_indices() {
-                let accepted: Vec<char> = (0..=0x10ffff_u32)
-                    .filter_map(char::from_u32)
-                    .filter(|c| {
-                        let text = format!("{}{c}{}{tail}", &word[..pos], &word[pos + 1..]);
-                        is_valid(&text)
-                    })
-                    .collect();
-                let mut expected = vec![letter, letter.to_ascii_lowercase()];
-                if letter == 'I' {
-                    expected.extend(['\u{130}', '\u{131}']);
-                }
-                assert_eq!(accepted, expected, "{word} position {pos}");
-            }
-        }
     }
 
     #[test]
