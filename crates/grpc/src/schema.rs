@@ -101,7 +101,8 @@ pub(crate) fn truthy(v: &Value) -> bool {
     match v {
         Value::Null => false,
         Value::Bool(b) => *b,
-        Value::Number(n) => n.as_f64().is_some_and(|f| f != 0.0),
+        // 超出 f64 范围的数字（`1e999`）在 Python 里是 inf，为真；`as_f64` 对它返回 None。
+        Value::Number(n) => n.as_f64().is_none_or(|f| f != 0.0),
         Value::String(s) => !s.is_empty(),
         Value::Array(a) => !a.is_empty(),
         Value::Object(o) => !o.is_empty(),

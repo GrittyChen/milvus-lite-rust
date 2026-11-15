@@ -636,6 +636,31 @@ mod tests {
     }
 
     #[test]
+    fn truthy_follows_python_for_json_values() {
+        // 期望值是 Python 3.12 的 `bool(json.loads(text))`。
+        for (text, want) in [
+            ("0", false),
+            ("-0", false),
+            ("0.0", false),
+            ("1e-999", false),
+            ("1", true),
+            ("1e999", true),
+            ("-1e999", true),
+            ("123456789012345678901234567890", true),
+            ("\"\"", false),
+            ("\" \"", true),
+            ("[]", false),
+            ("[0]", true),
+            ("{}", false),
+            ("null", false),
+            ("false", false),
+        ] {
+            let value = milvus_lite_core::json_text::value_str(text).unwrap();
+            assert_eq!(truthy(&value), want, "{text}");
+        }
+    }
+
+    #[test]
     fn py_round_matches_python() {
         // 期望值取自 Python 3.12 的 round。
         assert_eq!(py_round(1.250_000_036_705_515, 1), 1.3);
