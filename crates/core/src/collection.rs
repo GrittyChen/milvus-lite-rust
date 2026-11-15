@@ -104,6 +104,9 @@ pub struct Hits {
     pub public_scores: Option<Vec<f64>>,
     /// 同名字段盖掉 `$id` 时每个命中的 id。响应编码时才按主键类型做 `int()` / `str()`（错误在那里报）。
     pub id_overrides: Option<Vec<crate::rerank::pyval::PyVal>>,
+    /// 公共 function chain 结束时有命中的 `$score` 是 `None`（0035）。3.x 在响应编码处才对分数做
+    /// `round()` / `float()`，错误由那里报出；这些命中的分数此处是占位值。
+    pub null_score: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -414,6 +417,7 @@ fn run_chain(
             group_values,
             public_scores: Some(public),
             id_overrides: overridden.then(|| rows.into_iter().map(|r| r.id).collect()),
+            null_score: false,
         });
     }
     Ok(SearchResult {
@@ -620,6 +624,107 @@ impl ReadSnapshot {
         )
     }
 
+    /// 带公共 function chain 的 Search（0035）：引擎按普通检索执行（`limit`、`offset`、分组、范围都照常，
+    /// 不放大候选窗口），链作用在每个查询返回的命中上，只改变行的顺序、行数与分数；投影与不带链时相同。
+    /// 链读到的 schema 字段直接从命中所在的列取值，不依赖 `output_fields`。
+    pub fn search_chained_in(
+        &self,
+        req: SearchRequest,
+        compute: &Compute,
+        filter: BoostedFilter<'_>,
+        chain: &crate::rerank::public::ValidatedChain,
+    ) -> Result<SearchResult> {
+        use crate::rerank::chain::SCORE_FIELD;
+        use crate::rerank::public::Plan;
+        let BoostedFilter {
+            expr,
+            range,
+            group,
+            timezone,
+        } = filter;
+        let plan = Plan::new(chain, &self.schema.fields[self.pk_pos].name)?;
+        let rows_per_block = self.rows_per_block(req.anns_field.as_deref());
+        let mut ranking = self.rank_in_blocks(
+            req,
+            compute,
+            rows_per_block,
+            FilterContext {
+                expr,
+                range,
+                group: group.as_ref(),
+                timezone,
+                boost: None,
+            },
+        )?;
+        let Some(metric) = ranking.metric else {
+            return Ok(self.finish(ranking));
+        };
+        let mut chunks = Vec::with_capacity(ranking.queries.len());
+        for query in &ranking.queries {
+            let mut rows = Vec::with_capacity(query.refs.len());
+            for (i, &at) in query.refs.iter().enumerate() {
+                let chunk = &self.chunks[at.chunk];
+                let id = match pk_at(&chunk.columns[self.pk_pos], at.row) {
+                    Pk::Int64(i) => PyVal::Int(i),
+                    Pk::VarChar(s) => PyVal::Str(s),
+                };
+                // 3.x `hit_score_for_chain`：链的入口是 float64 对外分数，只有 BM25 取负；链之后不再取回。
+                let public = metric.public_f64(query.scores[i]);
+                let score = if metric == Metric::Bm25 {
+                    -public
+                } else {
+                    public
+                };
+                rows.push(plan.row(i, id, score, |name| {
+                    let pos = self
+                        .schema
+                        .fields
+                        .iter()
+                        .position(|f| f.name == name)
+                        .ok_or_else(|| {
+                            EngineError::Storage(format!(
+                                "function chain input field {name} is missing from the schema"
+                            ))
+                        })?;
+                    PyVal::from_field(&self.schema.fields[pos], &chunk.columns[pos], at.row)
+                })?);
+            }
+            chunks.push(rows);
+        }
+        let group_pos = group
+            .as_ref()
+            .map(|g| self.resolve_group_field(&g.field))
+            .transpose()?;
+        let mut null_scores = Vec::with_capacity(ranking.queries.len());
+        for (query, rows) in ranking.queries.iter_mut().zip(plan.execute(chunks)?) {
+            let mut public = Vec::with_capacity(rows.len());
+            let mut null_score = false;
+            for row in &rows {
+                // 3.x 的 `float(score)`：整数分数也转成浮点；`None` 留到响应编码处报错。
+                public.push(match row.score() {
+                    PyVal::None => {
+                        null_score = true;
+                        f64::NAN
+                    }
+                    score => score.to_float()?,
+                });
+            }
+            let refs: Vec<RowRef> = rows.iter().map(|row| query.refs[row.source]).collect();
+            query.group_values = group_pos.map(|pos| self.group_column(&refs, pos));
+            query.scores = public.iter().map(|s| *s as f32).collect();
+            query.public = Some(public);
+            query.refs = refs;
+            null_scores.push(null_score);
+        }
+        let mut result = self.finish(ranking);
+        for (hits, null_score) in result.hits.iter_mut().zip(null_scores) {
+            hits.null_score = null_score;
+            // 3.x `_project_entity` 把名为 `$id` / `$score` 的名字从 entity 里去掉（与 0026 的 L2 链相同）。
+            self.strip(&mut hits.rows, &[ID_FIELD, SCORE_FIELD]);
+        }
+        Ok(result)
+    }
+
     /// Search + L2（0026 第 6、7 节，3.x `servicer.Search` 的 `l2_func` 分支）：引擎按
     /// `window::search_l2` 取候选（offset 为 0、分组关闭；有 boost 时引擎再按 boost 放大），再执行 L2 链。
     /// `req.limit` / `req.offset` 不使用，由 `rerank` 给出；`filter.group` 交给链的 `GroupByOp`，
@@ -822,6 +927,7 @@ impl ReadSnapshot {
                     group_values: q.group_values,
                     public_scores: q.public,
                     id_overrides: q.ids,
+                    null_score: false,
                 }
             })
             .collect();

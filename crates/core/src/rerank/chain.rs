@@ -140,7 +140,7 @@ enum Merge {
 
 /// 3.x `DecayReranker` 构造好的曲线。
 #[derive(Debug)]
-struct Curve {
+pub(super) struct Curve {
     function: Function,
     origin: f64,
     scale: f64,
@@ -153,14 +153,35 @@ struct Curve {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-enum Function {
+pub(super) enum Function {
     Gauss,
     Exp,
     Linear,
 }
 
 impl Curve {
-    fn factor(&self, value: f64) -> Result<f64> {
+    /// 参数已经过 3.x `DecayReranker.__init__` 的检查并转成浮点。
+    /// `scale_sq` 是 `scale * scale` 转成浮点的值：3.x 用构造参数的原值相乘，整数是精确乘积再转换。
+    pub(super) fn new(
+        function: Function,
+        origin: f64,
+        (scale, scale_sq): (f64, f64),
+        offset: f64,
+        decay: f64,
+    ) -> Self {
+        let ln_decay = decay.ln();
+        Self {
+            function,
+            origin,
+            scale,
+            offset,
+            ln_decay,
+            sigma_sq: scale_sq / ln_decay,
+            slope: (1.0 - decay) / scale,
+        }
+    }
+
+    pub(super) fn factor(&self, value: f64) -> Result<f64> {
         // Python 的 max(0.0, nan) 返回 0.0：NaN 的比较为假，保留第一个参数。
         let raw = (value - self.origin).abs() - self.offset;
         let d = if raw > 0.0 { raw } else { 0.0 };
@@ -312,19 +333,14 @@ fn curve(params: &Map<String, Value>) -> Result<Curve> {
         )));
     }
     let decay = decay.to_float()?;
-    let scale_value = scale.to_float()?;
-    let ln_decay = decay.ln();
-    let sigma_sq = scale_value * scale_value / ln_decay;
-    let slope = (1.0 - decay) / scale_value;
-    Ok(Curve {
+    let scale = scale.to_float()?;
+    Ok(Curve::new(
         function,
-        origin: origin.to_float()?,
-        scale: scale_value,
-        offset: offset.to_float()?,
-        ln_decay,
-        sigma_sq,
-        slope,
-    })
+        origin.to_float()?,
+        (scale, scale * scale),
+        offset.to_float()?,
+        decay,
+    ))
 }
 
 const NUMERIC_TYPES: [DataType; 6] = [
@@ -1207,7 +1223,7 @@ fn small_int(value: &PyVal) -> Option<i64> {
 /// 3. 通用路径：逐项 Python 加法，整数精确、浮点不补偿。
 ///
 /// 所以宽整数相加是精确的 Python 整数（保留符号），之后再遇到浮点才转换。
-fn py_sum(values: &[PyVal]) -> Result<PyVal> {
+pub(super) fn py_sum(values: &[PyVal]) -> Result<PyVal> {
     let mut items = values.iter();
     let mut small = 0i64;
     let mut total = loop {
@@ -1260,7 +1276,7 @@ fn py_sum(values: &[PyVal]) -> Result<PyVal> {
 }
 
 /// `sum(...) / len(...)`：Python 的真除法；整数被除数按整数真除法正确舍入。
-fn py_divide(total: &PyVal, n: usize) -> Result<PyVal> {
+pub(super) fn py_divide(total: &PyVal, n: usize) -> Result<PyVal> {
     if let PyVal::Float(f) = total {
         return Ok(PyVal::Float(f / n as f64));
     }

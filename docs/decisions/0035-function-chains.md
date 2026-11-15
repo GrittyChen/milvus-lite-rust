@@ -1,6 +1,6 @@
 # 0035：公共 function chain
 
-状态：设计第一稿 2026-11-15 评审通过（0 阻断，5 项建议已并入本稿）；第 1 步（解码与校验）已实施并评审通过（2026-11-15）。动手前的调查（三轮真实 3.x 探针、2.6 线原始请求验证）经负责人复核，决策 A–F 已确认。参照版本 `1320d26`（pymilvus 3.0.2 / 2.6.18、CPython 3.12）。
+状态：设计第一稿 2026-11-15 评审通过（0 阻断，5 项建议已并入本稿）；第 1 步（解码与校验）已实施并评审通过（2026-11-15）；第 2 步（执行与结果）已实施并评审通过（2026-11-15）。动手前的调查（三轮真实 3.x 探针、2.6 线原始请求验证）经负责人复核，决策 A–F 已确认。参照版本 `1320d26`（pymilvus 3.0.2 / 2.6.18、CPython 3.12）。
 
 ## 范围
 
@@ -68,7 +68,8 @@
 
 ### 5. 结果
 
-- 分数取链结束时的 `$score`，经 Python 的 `float()` 后按 float32 返回：超出 float32 范围得 `inf`，整数分数同样处理；`$score` 是 `None` 时报 code 1 `float() argument must be a string or a real number, not 'NoneType'`。
+- 分数取链结束时的 `$score`，经 Python 的 `float()` 后按 float32 返回：超出 float32 范围得 `inf`，整数分数同样处理。
+- `$score` 是 `None` 时（例如 `round_decimal` 作用在可空字段上）在响应编码处报 code 1，先后是：search 级 `round_decimal` 的 `round()`（`type NoneType doesn't define __round__ method`）→ 请求时区的第二次校验 → `float()`（`float() argument must be a string or a real number, not 'NoneType'`）。只有链结束时还在结果里的行参与，被 `limit` 截掉的不报错。
 - 分组值随行走；`topks` 是每个查询链结束后的行数。
 - 投影见下节。
 
@@ -97,10 +98,11 @@ Search iterator 发的也是 `SearchRequest`，3.x 对带链的请求不区分�
 - 显式动态字段：`$meta` 里只有点名的键。
 - 临时列：不返回。点名一个与动态字段同名的临时列，返回的是原动态字段值。
 - 主键、重复字段名、JSON / ARRAY / 向量 / TIMESTAMPTZ 字段、分组、`time_fields`、无动态字段的 collection 上点名不存在的字段：都与不带链相同。
+- 例外（第 2 步实测，探针 `probe5` / `probe6`）：名为 `$id`、`$score` 的名字被去掉。schema 里叫这两个名字的非主键字段返回空值占位，动态字段里的这两个键不返回；不带链时照常返回。来源是 3.x `_project_entity` 跳过 `$id` / `$score`，与 [0026](0026-rerank-and-hybrid-search.md) 的 L2 链相同。本实现照做，不登记差异。
 
 含 `*` 或 `$meta` 时 3.x 有缺陷：除主键与另外显式点名的字段外，schema 字段全部返回类型默认值（`0`、`""`、JSON `null`、空数组），`$meta` 只剩显式点名的动态键（没有则为 `{}`）；只有 `limit` 的链也这样。
 
-本实现的合同（决策 A）：**带链时的投影与同一请求不带链时完全相同**，链只改变行的顺序、行数与分数。实现上不另写投影逻辑，响应沿用普通 Search 的输出路径；链需要的字段只进入内部取列（见“设计”第 3 条），不进入响应。
+本实现的合同（决策 A）：**带链时的投影与同一请求不带链时完全相同**（上面名为 `$id` / `$score` 的例外照 3.x），链只改变行的顺序、行数与分数。实现上不另写投影逻辑，响应沿用普通 Search 的输出路径；链需要的字段只进入内部取列（见“设计”第 3 条），不进入响应。
 
 ## 设计
 
@@ -108,11 +110,11 @@ Search iterator 发的也是 `SearchRequest`，3.x 对带链的请求不区分�
    - `crates/grpc` 新增 `function_chain` 模块，把 proto 解码成与协议无关的链表示（第 3 节第 4 步的错误在这里报），并解析 `order_by_fields`。
    - `crates/core` 在 `rerank` 下新增公共链模块：按 schema 校验链表示（第 3 节第 5–7 步）、得出需要取值的字段、执行。值与比较复用 `rerank::pyval`，decay 公式与 Python `round` 复用 0026 的实现，超过 int64 的整数用 [0032](0032-arithmetic-filters.md) 已引入的 num-bigint。不新增依赖。
 2. **入口**：[service.rs](../../crates/grpc/src/service.rs) 的 Search 在度量解析之后、读快照（未加载检查）之前完成链的解码、校验与 `rerank_model` 的处理，保持第 8 节的先后。现有的 `check_function_chains` 并入这一步。
-3. **取列与取值**（与 0026 的 Search + L2 同一做法，见 [collection.rs](../../crates/core/src/collection.rs) 的 `search_reranked_in`）：
+3. **取列与取值**（[collection.rs](../../crates/core/src/collection.rs) 的 `search_chained_in`）：
    - 校验产出链读到的 schema 字段清单（按首次出现的顺序，不含 `$score`、`$id`、主键名与临时列），对应 3.x 的 `required_schema_fields`。
-   - 引擎的内部取列 = 请求的 `output_fields` 并上这份清单；请求没有给 `output_fields` 时引擎本来就取全部字段。分组值照旧由分组检索的结果带出，`time_fields` 照旧在输出时处理——3.x 的公共链路径也只并入链的输入字段，不并入分组字段。
-   - 链只使用内部行；结果的行序、行数与分数回写到命中后，响应按**请求的** `output_fields` 走普通投影，所以没被点名的链输入与临时列都不返回。
-   - `$score` 的来源与 0026 的 Search + L2 相同（公共分数的 Python 值）；BM25 取负。
+   - 引擎按请求本身检索（投影就是请求的 `output_fields`），得到每个查询排好的命中（行位置与分数，还没有取列）。链的行只含 `$score`、`$id`、清单里的字段与临时列，清单里的字段直接按命中的行位置从存储列读取。3.x 的做法是把清单并进内部的 `output_fields`，再在响应里按请求的字段投影回去；两者可观察的结果相同，这里不必扩大投影。
+   - 链结束后，按结果行重排命中的行位置，回写分数，分组值按新的行位置取；然后走普通 Search 的取列与输出路径。没被点名的链输入与临时列因此都不返回。
+   - `$score` 是 float32 内部分数按 3.x 换算出的 float64 对外分数（与 0026 相同）；BM25 取负。
 4. **资源**：链在 RPC 所在的阻塞线程上执行，不进计算池；行数不超过引擎返回的命中数，整数不超过 2^1024，不需要另设上限。
 
 ## 决策
@@ -125,6 +127,7 @@ Search iterator 发的也是 `SearchRequest`，3.x 对带链的请求不区分�
 | D | 参照用例 | 28 个函数改后复制（断言不动，只换链的构造与发送），3 条不复制并写明覆盖方式，1 条已复制。见“参照用例” |
 | E | BM25 分数变号、`order_by_fields` 的判定、主键名为 `$id` / `$score` 的拒绝 | 照 3.x 复刻 |
 | F | 实施分步 | 三步，各自带测试、评审后单独提交 |
+| G | 按名为 `$score` / `$id` 的字段分组时，3.x 用分组值盖掉链里的 `$score` / `$id`（第 2 步评审补测时发现，2026-11-15 负责人确认） | 不照抄。分组值只进分组输出，分数与 id 不受影响，登记差异 |
 
 ## 实施步骤
 
@@ -144,6 +147,10 @@ Search iterator 发的也是 `SearchRequest`，3.x 对带链的请求不区分�
 
 - **`*` / `$meta` 投影**（决策 A）：带链且 `output_fields` 含 `*` 或 `$meta` 时，3.x 返回类型默认值与残缺的 `$meta`，本实现返回真实值。其余投影相同。
 - **合法的 `rerank_model`**（决策 B）：3.x 没有 key 时报 code 1 `Cohere API key is required...`，有 key 时调用外部服务；本实现返回 `UNIMPLEMENTED`。两边都发生在未加载检查之前。
+- **按名为 `$score` / `$id` 的字段分组**（决策 G）：3.x `execute_search_function_chain` 在建行时先写 `$id` / `$score`，再执行 `row[group_by_field] = hit["_group_by_value"]`，分组字段恰好叫这两个名字时，分组值盖掉了虚拟列。实测（探针 `probe8`）：
+  - 按 `$score` 分组：链的入口分数是分组值，响应分数随之变成分组值；分组值是字符串时报 code 1 `could not convert string to float`，链读 `$score` 时报 `num_combine row values must be finite numeric non-bool values`。
+  - 按 `$id` 分组：链结束后按 `$id` 找回原命中，分组值不是本查询的主键时报 code 1 `function chain runtime output chunk 0 row 0 has unknown $id value ...`；恰好等于别的行的主键时，响应的 id 换成那个主键（可出现重复 id），字段值仍是原行的。
+  - 本实现不盖：分组值照常进分组输出，分数与 id 与不按这个字段分组时相同；名为这两个名字的字段在 entity 里仍按“投影”的例外返回空值占位。不带链时两边相同。
 
 ## 测试机制
 
@@ -229,6 +236,38 @@ Search iterator 发的也是 `SearchRequest`，3.x 对带链的请求不区分�
 - 改后重跑：fmt、clippy、gRPC 单测 39、tests/python 在 3.0.2 上 665、在 2.6.18 上 [test_function_chains.py](../../tests/python/test_function_chains.py) 与 [test_grpc_translation.py](../../tests/python/test_grpc_translation.py) 共 118。
 
 实现中确定的一处细节：proto 的 map 没有顺序，一个参数表里有多个未设置的值时 3.x 报哪一个取决于它的迭代顺序；本实现按键排序后报第一个。只有一个非法值时两边相同。
+
+## 第 2 步验收
+
+本机（macOS arm64），参照 `1320d26`，pymilvus 3.0.2 / 2.6.18。
+
+改动：
+- [public.rs](../../crates/core/src/rerank/public.rs)：增加链的编译（`Plan`）与执行。三个表达式、三个算子都有；一个算子对全部查询做完才进入下一个，所以运行期错误的先后与 3.x 相同。`rerank_model` 不编译（决策 B，入口处已先返回）。`num_combine` 的 `sum` 与 `avg` 复用 0026 的 Python `sum` 与整数真除法，`fsum` 照 CPython 的 `math.fsum` 实现，decay 复用 0026 的曲线。整数 `scale` 的平方按精确乘积再转浮点，与 3.x 用参数原值相乘一致。
+- [collection.rs](../../crates/core/src/collection.rs) 的 `search_chained_in` 见“设计”第 3 条。
+- [search.rs](../../crates/grpc/src/search.rs)：带链的请求走这条路径；`$score` 为 `None` 时按第 5 节的先后报错。`py_round` 移到 `rerank::pyval`，供链与响应编码共用。
+- [service.rs](../../crates/grpc/src/service.rs)：校验通过的链交给检索，不再返回 `UNIMPLEMENTED`。
+
+| 项目 | 结果 |
+| --- | --- |
+| `cargo fmt --check`、clippy（默认与 `fault-injection`） | 通过 |
+| `cargo test --workspace` | 689 通过（新增 8：`num_combine` 六种模式、`fsum`、decay 三种函数与 TIMESTAMPTZ、`round_decimal`、`sort` 的各种列与缺失值、链的执行顺序、运行期错误的先后、`rerank_model` 不编译；期望值取自在参照环境直接调用 3.x 表达式与算子的结果） |
+| tests/python（3.0.2） | 671 通过，无跳过（评审后补一条差异用例，为 672） |
+| tests/python 中链相关的两个文件（2.6.18） | [test_function_chains.py](../../tests/python/test_function_chains.py) 与 [test_grpc_translation.py](../../tests/python/test_grpc_translation.py) 共 124 通过 |
+| 差分中涉及 Search 入口与 rerank 的三个文件（3.0.2） | 151 通过 |
+| [test_function_chains.py](../../tests/python/test_function_chains.py) 直接打真实 3.x | 11 条中 8 条通过；失败的三条恰是登记差异的用例（`*` / `$meta` 投影、合法 `rerank_model`、按名为 `$score` / `$id` 的字段分组）。期望值因此是 3.x 的真值，不是手算的 |
+| 调查探针打本实现与 3.x 逐条比对（本地留存，新增 `probe5` / `probe6` 覆盖 `None` 分数、整数与超范围分数、各模式数值、排序列种类、iterator 参数、检索参数组合、名为 `$id` / `$score` 的字段与动态键） | 387 条中 371 条相同；16 条不同都属于两项登记差异（`*` / `$meta` 投影 13 条、合法 `rerank_model` 3 条） |
+
+[test_function_chains.py](../../tests/python/test_function_chains.py) 由 4 条变为 11 条。第 1 步断言合法链返回 `UNIMPLEMENTED` 的用例换成执行结果的用例，只保留合法 `rerank_model` 的断言（决策 B）。新增的用例覆盖：投影表各格（MemTable 与 flush 后各一遍）、`*` / `$meta` 的差异、名为 `$id` / `$score` 的字段与动态键、三种 dense 度量与 BM25（含只有 `limit` 的链变号）、稀疏 IP 与稀疏字段作输入的拒绝、各表达式与可空输入、排序的各种列、`offset`、过滤、空结果、范围检索、多查询、分组（含 `group_size`）、search 级 `round_decimal`（含整数分数）、`time_fields`、两个 iterator 版本的参数、运行期错误与 `None` 分数的先后，以及决策 G 的分组。计数 `tests/python` 665 → 672，已同步 `ci.yml` 两处、`scorecard.py`、`test_candidate.py`、打包验收 README 与 AGENTS 命令表；发行与打包脚本自检 687 通过。
+
+SDK 的 `search_iterator`：签名里没有 `function_chains`，经 `**kwargs` 透传给每一页的检索。实测 3.x 与本实现都只返回第一页的重排结果，之后迭代结束，两边相同。迭代器带链的组合由原始请求那一格覆盖，不另加 SDK 用例（2.6 线也没有对应的 SDK 写法）。
+
+评审后的修改（评审通过，0 阻断，建议项）：
+- 补“按名为 `$score` / `$id` 的字段分组”一格，补测时查出 3.x 的缺陷，负责人确认不照抄，登记为决策 G，用例单列。
+- 补“`$score` 为 `None` + 非法 `time_fields` 分量”一格。3.x 先对全部命中做 `float()`，再编码字段（`time_fields` 的分量在这里校验），所以先报 `float()` 的错；带 search 级 `round_decimal` 时仍是 `round()` 最先。3.x 实跑与本实现相同，`time_fields` 本身的错误在没有 `None` 分数时照常报出。
+- 改后重跑：本文件在本实现上 11 条通过、在 3.x 上 8 条通过（失败的是三条差异用例）；在 2.6.18 上本文件通过；发行与打包脚本自检通过。
+- `search_iterator` 带 `function_chains` 的 SDK 写法在第 3 步的 SDK 冒烟里补一条可重跑的断言。
+
+没有重跑：2.6 线 tests/python 全量、完整差分与互通。改动只在带链请求的路径上；不带链的请求只多了一次空判断，以及 `py_round` 换了位置（实现不变，单测随之移动）。
 
 ## 证据
 

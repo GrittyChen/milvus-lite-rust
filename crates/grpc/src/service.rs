@@ -686,7 +686,7 @@ impl Service for MilvusService {
             // 解析（包括解码查询向量）不需要 collection 的状态，放在取读锁之前以缩短持锁时间；
             // collection 不存在的错误仍然最先报出（3.x 相同）。
             let parsed = search::parse(&req)?;
-            let snapshot = {
+            let (snapshot, chain) = {
                 let guard = handle.read();
                 // 3.x 在 load、分组与过滤之前按目标字段确定度量，无效的 anns_field 或度量最先报出。
                 guard.resolve_search_metric(
@@ -694,10 +694,10 @@ impl Service for MilvusService {
                     parsed.metric_type.as_deref(),
                 )?;
                 // 3.x 的先后：度量解析之后、load 检查之前完成链的解码与校验。
-                if parsed.chains.prepare(guard.schema())?.is_some() {
-                    return Err(crate::schema::unsupported("function chains"));
-                }
-                guard.read_search_snapshot(&req.partition_names, parsed.anns_field.as_deref())?
+                let chain = parsed.chains.prepare(guard.schema())?;
+                let snapshot = guard
+                    .read_search_snapshot(&req.partition_names, parsed.anns_field.as_deref())?;
+                (snapshot, chain)
             };
             #[cfg(test)]
             if let Some(pause) = after_snapshot {
@@ -708,6 +708,7 @@ impl Service for MilvusService {
                 db.compute(),
                 &|| db.database_timezone(&database),
                 parsed,
+                chain.as_ref(),
                 req.output_fields,
             )
         })

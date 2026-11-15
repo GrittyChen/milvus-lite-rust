@@ -7,7 +7,8 @@ use std::collections::HashMap;
 use milvus_lite_core::error::{py_json_repr, py_repr};
 use milvus_lite_core::rerank::boost::{BoostPlan, BoostSpec};
 use milvus_lite_core::rerank::chain::L2Function;
-use milvus_lite_core::rerank::pyval::PyVal;
+use milvus_lite_core::rerank::public::ValidatedChain;
+use milvus_lite_core::rerank::pyval::{PyVal, py_round};
 use milvus_lite_core::timezone::TimezoneSource;
 use milvus_lite_core::{
     BoostedFilter, Compute, EngineError, GroupBy, Metric, Pk, QueryVectors, ReadSnapshot, Rerank,
@@ -58,6 +59,7 @@ pub(crate) fn search(
     compute: &Compute,
     database_timezone: &dyn Fn() -> Result<Option<String>, EngineError>,
     parsed: Parsed,
+    chain: Option<&ValidatedChain>,
     output_fields: Vec<String>,
 ) -> Result<svc::SearchResults, EngineError> {
     c.require_loaded()?;
@@ -96,9 +98,11 @@ pub(crate) fn search(
         group: parsed.group,
         timezone: &timezone,
     };
-    let result = match (&parsed.l2, parsed.boost) {
+    let result = match (chain, &parsed.l2, parsed.boost) {
+        // 带链的请求没有 `function_score`（两者同时出现已被拒绝），引擎按普通检索执行。
+        (Some(chain), _, _) => c.search_chained_in(request, compute, filter, chain)?,
         // 3.x 的 Search + L2：候选窗口、分组与 offset 都交给 rerank 链（0026 第 6、7 节）。
-        (Some(function), boost) => c.search_reranked_in(
+        (None, Some(function), boost) => c.search_reranked_in(
             request,
             compute,
             filter,
@@ -109,7 +113,7 @@ pub(crate) fn search(
                 offset: parsed.offset,
             },
         )?,
-        (None, Some(spec)) => c.search_boosted_in(
+        (None, None, Some(spec)) => c.search_boosted_in(
             request,
             compute,
             filter,
@@ -124,7 +128,7 @@ pub(crate) fn search(
                 chained: false,
             },
         )?,
-        (None, None) => c.search_grouped_in(
+        (None, None, None) => c.search_grouped_in(
             request,
             compute,
             filter.expr,
@@ -133,10 +137,22 @@ pub(crate) fn search(
             filter.timezone,
         )?,
     };
+    // 链把 `$score` 算成 `None` 时（0035）：3.x 先做 search 级的 `round()`，再校验时区，最后才 `float()`。
+    let null_score = result.hits.iter().any(|hits| hits.null_score);
+    if null_score && parsed.round_decimal >= 0 {
+        return Err(EngineError::InvalidArgument(
+            "type NoneType doesn't define __round__ method".to_owned(),
+        ));
+    }
     // 响应编码处再校验一次请求时区（3.x 的第二个校验点）：空表达式、空结果也会在这里报错。
     timezone.next_phase();
     timezone.validate_request()?;
     let time_fields = TimeFields::new(parsed.time_fields.as_deref(), &timezone);
+    if null_score {
+        return Err(EngineError::InvalidArgument(
+            "float() argument must be a string or a real number, not 'NoneType'".to_owned(),
+        ));
+    }
 
     encode(
         c.schema(),
@@ -293,16 +309,6 @@ fn blank_null_pks(fields: &mut [pb::FieldData], pk: &str, nulls: &[bool]) {
 /// 3.x 对 float64 对外分数做 Python `round(x, ndigits)`（按十进制正确舍入、同距取偶），再存为 float32。
 fn round_score(metric: Metric, score: f32, ndigits: i64) -> f32 {
     py_round(metric.public_f64(score), ndigits) as f32
-}
-
-/// Python `float.__round__`：位数超过 323 时原样返回（float64 在十进制下的最大有效位置）。
-fn py_round(x: f64, ndigits: i64) -> f64 {
-    if !x.is_finite() || ndigits > 323 {
-        return x;
-    }
-    let digits = usize::try_from(ndigits).unwrap_or(0);
-    // Rust 的定点格式化按精确的二进制值做正确舍入、同距取偶，与 Python 的 round 相同。
-    format!("{x:.digits$}").parse().unwrap_or(x)
 }
 
 pub(crate) fn parse(req: &svc::SearchRequest) -> Result<Parsed, EngineError> {
@@ -654,20 +660,6 @@ mod tests {
             let value = milvus_lite_core::json_text::value_str(text).unwrap();
             assert_eq!(truthy(&value), want, "{text}");
         }
-    }
-
-    #[test]
-    fn py_round_matches_python() {
-        // 期望值取自 Python 3.12 的 round。
-        assert_eq!(py_round(1.250_000_036_705_515, 1), 1.3);
-        assert_eq!(py_round(1.25, 1), 1.2);
-        assert_eq!(py_round(0.125, 2), 0.12);
-        assert_eq!(py_round(0.375, 2), 0.38);
-        assert_eq!(py_round(2.5, 0), 2.0);
-        assert_eq!(py_round(-0.5, 0), -0.0);
-        assert_eq!(py_round(123.456_789, 4), 123.4568);
-        assert_eq!(py_round(1e-300, 400), 1e-300);
-        assert!(py_round(f64::NAN, 2).is_nan());
     }
 
     #[test]

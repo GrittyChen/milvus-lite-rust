@@ -449,6 +449,16 @@ pub(crate) fn float_literal(s: &str) -> Option<f64> {
     float_str(&normalized)
 }
 
+/// Python `float.__round__`：位数超过 323 时原样返回（float64 在十进制下的最大有效位置）。
+pub fn py_round(x: f64, ndigits: i64) -> f64 {
+    if !x.is_finite() || ndigits > 323 {
+        return x;
+    }
+    let digits = usize::try_from(ndigits).unwrap_or(0);
+    // Rust 的定点格式化按精确的二进制值做正确舍入、同距取偶，与 Python 的 round 相同。
+    format!("{x:.digits$}").parse().unwrap_or(x)
+}
+
 /// CPython 3.12 的 `sum()`：浮点累加带 Neumaier 补偿，结果可能与逐项相加差一个 ulp，会影响并列。
 pub(crate) fn python_sum(values: impl IntoIterator<Item = f64>) -> f64 {
     let (mut total, mut compensation) = (0.0_f64, 0.0_f64);
@@ -473,6 +483,20 @@ mod tests {
     use super::*;
 
     /// Python `repr(bytes)` 的实测值。
+    #[test]
+    fn py_round_matches_python() {
+        // 期望值取自 Python 3.12 的 round。
+        assert_eq!(py_round(1.250_000_036_705_515, 1), 1.3);
+        assert_eq!(py_round(1.25, 1), 1.2);
+        assert_eq!(py_round(0.125, 2), 0.12);
+        assert_eq!(py_round(0.375, 2), 0.38);
+        assert_eq!(py_round(2.5, 0), 2.0);
+        assert_eq!(py_round(-0.5, 0), -0.0);
+        assert_eq!(py_round(123.456_789, 4), 123.4568);
+        assert_eq!(py_round(1e-300, 400), 1e-300);
+        assert!(py_round(f64::NAN, 2).is_nan());
+    }
+
     #[test]
     fn bytes_repr_matches_python() {
         let cases: [(&[u8], &str); 5] = [

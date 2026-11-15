@@ -2,7 +2,15 @@
 //!
 //! 对应 3.x 的 `function/repr.py` 与 `function/validator.py`。校验的先后与文案逐条照 3.x：
 //! 每个算子的错误带 `function chain op[i]` 前缀，表达式内部的错误再带 `expression <名字>`。
+//!
+//! 执行（[`Plan`]）对应 3.x 的 `function/compiler.py`、`ops/` 与 `expr/`：一个算子对全部查询做完才进入
+//! 下一个算子，运行期错误的先后因此与 3.x 相同。行里的值是 Python 值，算术与比较按 Python 的规则。
 
+use std::cmp::Ordering;
+
+use super::chain::{Curve, Function as DecayFunction, py_divide, py_sum};
+use super::pyval::{PyVal, py_round};
+use super::try_sort_by;
 use crate::error::{EngineError, Result, py_repr};
 use crate::schema::{CollectionSchema, DataType};
 
@@ -516,6 +524,478 @@ pub fn validate(
         uses_rerank_model,
         repr: chain,
     })
+}
+
+const SCORE_SLOT: usize = 0;
+const ID_SLOT: usize = 1;
+
+const ROW_VALUES_ERROR: &str = "num_combine row values must be finite numeric non-bool values";
+const NON_FINITE_ERROR: &str = "num_combine produced a non-finite result";
+
+/// 校验保证不会出现的形态；出现说明校验与执行不一致，按内部错误报出而不是 panic。
+fn inconsistent(what: &str) -> EngineError {
+    EngineError::Storage(format!("validated function chain is inconsistent: {what}"))
+}
+
+/// 链执行时的一行（3.x 的行字典）：`$score`、`$id`（主键名是它的别名）、链读到的 schema 字段与临时列。
+#[derive(Debug, Clone)]
+pub(crate) struct Row {
+    /// 调用者给的命中标识，链不解释它。
+    pub(crate) source: usize,
+    values: Vec<PyVal>,
+}
+
+impl Row {
+    /// 链结束时的 `$score`。
+    pub(crate) fn score(&self) -> &PyVal {
+        &self.values[SCORE_SLOT]
+    }
+}
+
+#[derive(Debug)]
+enum Input {
+    Slot(usize),
+    Literal(PyVal),
+}
+
+#[derive(Debug)]
+enum Combine {
+    Sum,
+    Multiply,
+    Max,
+    Min,
+    Avg,
+    Weighted(Vec<f64>),
+}
+
+#[derive(Debug)]
+enum Function {
+    Combine(Combine),
+    Decay(Curve),
+    Round(i64),
+}
+
+#[derive(Debug)]
+enum Step {
+    Map {
+        function: Function,
+        inputs: Vec<Input>,
+        output: usize,
+    },
+    Sort {
+        column: usize,
+        descending: bool,
+        tie_break: Option<usize>,
+    },
+    Limit {
+        limit: usize,
+        offset: usize,
+    },
+}
+
+/// 编译好的链（3.x `compile_function_chain`）。
+#[derive(Debug)]
+pub(crate) struct Plan {
+    steps: Vec<Step>,
+    /// 行里各列的名字：`$score`、`$id`、链读到的 schema 字段，然后是临时列。
+    names: Vec<String>,
+    fields: usize,
+}
+
+fn number(params: &Params, key: &str, default: Option<Param>) -> Result<Param> {
+    match get(params, key).cloned().or(default) {
+        Some(value) if value.is_finite_numeric() => Ok(value),
+        _ => Err(inconsistent(key)),
+    }
+}
+
+fn compile_expr(expr: &Expr) -> Result<Function> {
+    Ok(match expr.name.as_str() {
+        "num_combine" => Function::Combine(match get(&expr.params, "mode") {
+            None => Combine::Sum,
+            Some(Param::Str(mode)) => match mode.as_str() {
+                "sum" => Combine::Sum,
+                "multiply" => Combine::Multiply,
+                "max" => Combine::Max,
+                "min" => Combine::Min,
+                "avg" => Combine::Avg,
+                "weighted" => Combine::Weighted(
+                    sequence(get(&expr.params, "weights"))
+                        .and_then(|weights| weights.iter().map(Param::as_f64).collect())
+                        .ok_or_else(|| inconsistent("weights"))?,
+                ),
+                _ => return Err(inconsistent("mode")),
+            },
+            Some(_) => return Err(inconsistent("mode")),
+        }),
+        "decay" => {
+            let function = match get(&expr.params, "function") {
+                Some(Param::Str(name)) if name == "gauss" => DecayFunction::Gauss,
+                Some(Param::Str(name)) if name == "exp" => DecayFunction::Exp,
+                Some(Param::Str(name)) if name == "linear" => DecayFunction::Linear,
+                _ => return Err(inconsistent("function")),
+            };
+            let float = |value: &Param| value.as_f64().ok_or_else(|| inconsistent("decay"));
+            let scale = number(&expr.params, "scale", None)?;
+            // 3.x 用参数原值算 `scale * scale`：整数是精确乘积，再转成浮点。
+            let scale_sq = match scale {
+                Param::Int(i) => (i128::from(i) * i128::from(i)) as f64,
+                _ => float(&scale)? * float(&scale)?,
+            };
+            Function::Decay(Curve::new(
+                function,
+                float(&number(&expr.params, "origin", None)?)?,
+                (float(&scale)?, scale_sq),
+                float(&number(&expr.params, "offset", Some(Param::Int(0)))?)?,
+                float(&number(&expr.params, "decay", Some(Param::Float(0.5)))?)?,
+            ))
+        }
+        "round_decimal" => match get(&expr.params, "decimal") {
+            Some(Param::Int(decimal)) => Function::Round(*decimal),
+            _ => return Err(inconsistent("decimal")),
+        },
+        // 0035 决策 B：`rerank_model` 只校验，不执行。
+        "rerank_model" => {
+            return Err(EngineError::Unsupported {
+                feature: "function chains: rerank_model",
+                reason: "not supported in this build of milvus-lite-rust yet".to_owned(),
+            });
+        }
+        _ => return Err(inconsistent("expression")),
+    })
+}
+
+impl Plan {
+    pub(crate) fn new(chain: &ValidatedChain, pk_name: &str) -> Result<Self> {
+        let mut names = vec![SCORE_FIELD.to_owned(), ID_FIELD.to_owned()];
+        names.extend(chain.required_fields.iter().cloned());
+        let fields = names.len();
+        let find = |names: &[String], name: &str| {
+            if name == pk_name {
+                Some(ID_SLOT)
+            } else {
+                names.iter().position(|n| n == name)
+            }
+        };
+        let read = |names: &[String], name: &str| {
+            find(names, name).ok_or_else(|| inconsistent("input column"))
+        };
+        let mut steps = Vec::with_capacity(chain.repr.ops.len());
+        for op in &chain.repr.ops {
+            steps.push(match op.op.as_str() {
+                "map" => {
+                    let expr = op.expr.as_ref().ok_or_else(|| inconsistent("map"))?;
+                    let mut inputs = Vec::with_capacity(expr.args.len());
+                    for arg in &expr.args {
+                        inputs.push(match arg {
+                            Arg::Column(name) => Input::Slot(read(&names, name)?),
+                            Arg::Literal(Param::Bool(b)) => Input::Literal(PyVal::Bool(*b)),
+                            Arg::Literal(Param::Int(i)) => Input::Literal(PyVal::Int(*i)),
+                            Arg::Literal(Param::Float(f)) => Input::Literal(PyVal::Float(*f)),
+                            Arg::Literal(Param::Str(s)) => Input::Literal(PyVal::Str(s.clone())),
+                            Arg::Literal(_) => return Err(inconsistent("literal")),
+                        });
+                    }
+                    let function = compile_expr(expr)?;
+                    let name = op.outputs.first().ok_or_else(|| inconsistent("output"))?;
+                    let output = match find(&names, name) {
+                        Some(slot) => slot,
+                        None => {
+                            names.push(name.clone());
+                            names.len() - 1
+                        }
+                    };
+                    Step::Map {
+                        function,
+                        inputs,
+                        output,
+                    }
+                }
+                "sort" => Step::Sort {
+                    column: match get(&op.params, "column") {
+                        Some(Param::Str(name)) => read(&names, name)?,
+                        _ => return Err(inconsistent("sort column")),
+                    },
+                    descending: !matches!(get(&op.params, "desc"), Some(Param::Bool(false))),
+                    tie_break: match get(&op.params, "tie_break_col") {
+                        None => None,
+                        Some(Param::Str(name)) => Some(read(&names, name)?),
+                        Some(_) => return Err(inconsistent("sort tie_break_col")),
+                    },
+                },
+                "limit" => {
+                    let count = |key: &str, default: Option<i64>| {
+                        match get(&op.params, key) {
+                            Some(Param::Int(n)) => Some(*n),
+                            None => default,
+                            Some(_) => None,
+                        }
+                        .and_then(|n| usize::try_from(n).ok())
+                        .ok_or_else(|| inconsistent("limit"))
+                    };
+                    Step::Limit {
+                        limit: count("limit", None)?,
+                        offset: count("offset", Some(0))?,
+                    }
+                }
+                _ => return Err(inconsistent("operator")),
+            });
+        }
+        Ok(Self {
+            steps,
+            names,
+            fields,
+        })
+    }
+
+    /// 一个命中的行。`score` 是链入口的分数（BM25 已取负），`field(name)` 给出链读到的 schema 字段的值。
+    pub(crate) fn row(
+        &self,
+        source: usize,
+        id: PyVal,
+        score: f64,
+        mut field: impl FnMut(&str) -> Result<PyVal>,
+    ) -> Result<Row> {
+        let mut values = Vec::with_capacity(self.names.len());
+        values.push(PyVal::Float(score));
+        values.push(id);
+        for name in &self.names[2..self.fields] {
+            values.push(field(name)?);
+        }
+        values.resize(self.names.len(), PyVal::None);
+        Ok(Row { source, values })
+    }
+
+    /// 执行整条链；`chunks[q]` 是第 q 个查询的命中，按引擎返回的顺序。
+    pub(crate) fn execute(&self, mut chunks: Vec<Vec<Row>>) -> Result<Vec<Vec<Row>>> {
+        for step in &self.steps {
+            match step {
+                Step::Map {
+                    function,
+                    inputs,
+                    output,
+                } => {
+                    for chunk in &mut chunks {
+                        // 先算出整列再写回：输出列可以同时是输入列。
+                        let mut column = Vec::with_capacity(chunk.len());
+                        for row in chunk.iter() {
+                            let args: Vec<&PyVal> = inputs
+                                .iter()
+                                .map(|input| match input {
+                                    Input::Slot(slot) => &row.values[*slot],
+                                    Input::Literal(value) => value,
+                                })
+                                .collect();
+                            column.push(function.apply(&args)?);
+                        }
+                        for (row, value) in chunk.iter_mut().zip(column) {
+                            row.values[*output] = value;
+                        }
+                    }
+                }
+                Step::Sort {
+                    column,
+                    descending,
+                    tie_break,
+                } => {
+                    for chunk in &mut chunks {
+                        *chunk = try_sort_by(std::mem::take(chunk), &mut |a, b| {
+                            compare(a, b, *column, *descending, *tie_break)
+                        })?;
+                    }
+                }
+                Step::Limit { limit, offset } => {
+                    for chunk in &mut chunks {
+                        let start = (*offset).min(chunk.len());
+                        chunk.truncate(start.saturating_add(*limit).min(chunk.len()));
+                        chunk.drain(..start);
+                    }
+                }
+            }
+        }
+        Ok(chunks)
+    }
+}
+
+/// 3.x `SortOp`：`None` 与 NaN 不论升降序都在最后；主列相等时按平局列升序，没有平局列时保持原顺序。
+fn compare(
+    a: &Row,
+    b: &Row,
+    column: usize,
+    descending: bool,
+    tie_break: Option<usize>,
+) -> Result<Ordering> {
+    let tie = || -> Result<Ordering> {
+        let Some(slot) = tie_break else {
+            return Ok(Ordering::Equal);
+        };
+        let (x, y) = (&a.values[slot], &b.values[slot]);
+        match (x.is_missing(), y.is_missing()) {
+            (true, true) => Ok(Ordering::Equal),
+            (true, false) => Ok(Ordering::Greater),
+            (false, true) => Ok(Ordering::Less),
+            (false, false) => x.py_order(y),
+        }
+    };
+    let (x, y) = (&a.values[column], &b.values[column]);
+    match (x.is_missing(), y.is_missing()) {
+        (true, true) => tie(),
+        (true, false) => Ok(Ordering::Greater),
+        (false, true) => Ok(Ordering::Less),
+        (false, false) if x.py_eq(y) => tie(),
+        (false, false) if descending => y.py_order(x),
+        (false, false) => x.py_order(y),
+    }
+}
+
+impl Function {
+    fn apply(&self, args: &[&PyVal]) -> Result<PyVal> {
+        match self {
+            Self::Combine(mode) => mode.apply(args),
+            Self::Decay(curve) => {
+                let value = match args.first() {
+                    Some(PyVal::None) => return Ok(PyVal::Float(0.0)),
+                    // `datetime.timestamp()`：UTC 微秒整数除以 10⁶ 的正确舍入结果。
+                    Some(PyVal::DateTime(micros)) => {
+                        py_divide(&PyVal::Int(*micros), 1_000_000)?.to_float()?
+                    }
+                    Some(value) => value.to_float()?,
+                    None => return Err(inconsistent("decay argument")),
+                };
+                curve.factor(value).map(PyVal::Float)
+            }
+            Self::Round(decimal) => Ok(match args.first() {
+                Some(PyVal::Float(f)) => PyVal::Float(py_round(*f, *decimal)),
+                // `None` 保持 `None`；整数的 `round(i, n >= 0)` 是它自己。
+                Some(value) => (*value).clone(),
+                None => return Err(inconsistent("round_decimal argument")),
+            }),
+        }
+    }
+}
+
+/// Python 的 `isinstance(v, Real) and not bool` 且 `math.isfinite(v)`（整数转不成浮点时为假）。
+fn finite_number(value: &PyVal) -> bool {
+    match value {
+        PyVal::Int(_) => true,
+        PyVal::BigInt(_) => value.to_float().is_ok(),
+        PyVal::Float(f) => f.is_finite(),
+        _ => false,
+    }
+}
+
+impl Combine {
+    /// 3.x `NumCombineExpr.execute` 的一行。算术里的 OverflowError 都报成非有限结果。
+    fn apply(&self, values: &[&PyVal]) -> Result<PyVal> {
+        if values.iter().any(|v| **v == PyVal::None) {
+            return Ok(PyVal::Float(0.0));
+        }
+        if !values.iter().all(|v| finite_number(v)) {
+            return Err(EngineError::invalid(ROW_VALUES_ERROR));
+        }
+        let non_finite = || EngineError::invalid(NON_FINITE_ERROR);
+        let float = |value: &PyVal| value.to_float().map_err(|_| non_finite());
+        let owned = || values.iter().map(|v| (*v).clone()).collect::<Vec<_>>();
+        let result = match self {
+            Self::Multiply => {
+                let mut product = 1.0_f64;
+                for value in values {
+                    product *= float(value)?;
+                }
+                PyVal::Float(product)
+            }
+            Self::Sum => py_sum(&owned()).map_err(|_| non_finite())?,
+            // Python 的 `max` / `min`：后面的元素严格更大（更小）才替换，返回元素本身。
+            Self::Max | Self::Min => {
+                let wanted = if matches!(self, Self::Max) {
+                    Ordering::Greater
+                } else {
+                    Ordering::Less
+                };
+                let mut best = values[0];
+                for value in &values[1..] {
+                    if value.py_order(best)? == wanted {
+                        best = value;
+                    }
+                }
+                best.clone()
+            }
+            Self::Avg => {
+                let mut terms = Vec::with_capacity(values.len());
+                for value in values {
+                    let term = py_divide(value, values.len()).map_err(|_| non_finite())?;
+                    terms.push(float(&term)?);
+                }
+                PyVal::Float(fsum(&terms).ok_or_else(non_finite)?)
+            }
+            Self::Weighted(weights) => {
+                let mut products = Vec::with_capacity(values.len());
+                for (value, weight) in values.iter().zip(weights) {
+                    products.push(PyVal::Float(float(value)? * weight));
+                }
+                py_sum(&products).map_err(|_| non_finite())?
+            }
+        };
+        if finite_number(&result) {
+            Ok(result)
+        } else {
+            Err(non_finite())
+        }
+    }
+}
+
+/// CPython `math.fsum`（Shewchuk 的精确部分和，结果正确舍入）。输入都是有限数；中间结果溢出时 CPython 报
+/// OverflowError，这里返回 None。
+fn fsum(values: &[f64]) -> Option<f64> {
+    let mut partials: Vec<f64> = Vec::new();
+    for &value in values {
+        let mut x = value;
+        let mut kept = 0;
+        for j in 0..partials.len() {
+            let mut y = partials[j];
+            if x.abs() < y.abs() {
+                std::mem::swap(&mut x, &mut y);
+            }
+            let hi = x + y;
+            let lo = y - (hi - x);
+            if lo != 0.0 {
+                partials[kept] = lo;
+                kept += 1;
+            }
+            x = hi;
+        }
+        partials.truncate(kept);
+        if x != 0.0 {
+            if !x.is_finite() {
+                return None;
+            }
+            partials.push(x);
+        }
+    }
+    let mut hi = match partials.pop() {
+        Some(top) => top,
+        None => return Some(0.0),
+    };
+    let mut lo = 0.0;
+    while let Some(y) = partials.pop() {
+        let x = hi;
+        hi = x + y;
+        lo = y - (hi - x);
+        if lo != 0.0 {
+            break;
+        }
+    }
+    // 舍入到偶数时再看下一个部分和：它与余项同号说明真值越过了中点。
+    if let Some(&next) = partials.last()
+        && ((lo < 0.0 && next < 0.0) || (lo > 0.0 && next > 0.0))
+    {
+        let y = lo * 2.0;
+        let x = hi + y;
+        if y == x - hi {
+            hi = x;
+        }
+    }
+    Some(hi)
 }
 
 #[cfg(test)]
@@ -1219,5 +1699,657 @@ mod tests {
             ),
             Err("unsupported rerank_model parameter 'aa'".to_owned())
         );
+    }
+
+    // ---- 执行。期望值取自真实 3.x（`1320d26`，CPython 3.12）的 NumCombineExpr / DecayExpr /
+    // RoundDecimalExpr / SortOp 对同样输入的结果（`repr`）。
+
+    const MAX: i64 = i64::MAX;
+
+    fn pow2(exponent: u32) -> num_bigint::BigInt {
+        num_bigint::BigInt::from(1) << exponent
+    }
+
+    fn big(value: num_bigint::BigInt) -> PyVal {
+        PyVal::BigInt(value.to_string())
+    }
+
+    fn float(value: f64) -> PyVal {
+        PyVal::Float(value)
+    }
+
+    fn outcome(result: Result<PyVal>) -> String {
+        match result {
+            Ok(value) => value.repr(),
+            Err(EngineError::InvalidArgument(message)) => format!("ERR {message}"),
+            Err(other) => panic!("unexpected error {other:?}"),
+        }
+    }
+
+    fn combine_rows() -> Vec<[PyVal; 3]> {
+        let int = PyVal::Int;
+        vec![
+            [int(1), int(2), int(3)],
+            [int(MAX), int(MAX), int(1)],
+            [int(MAX), int(MAX), float(0.5)],
+            [float(0.1), float(0.2), float(0.3)],
+            [float(1e16), float(1.0), float(-1e16)],
+            [PyVal::None, int(1), int(2)],
+            [int(1), float(2.5), int(-7)],
+            [int(3), float(3.0), int(2)],
+            [float(-0.0), int(0), float(-0.0)],
+            [float(1e308), float(1e308), int(1)],
+            [big(pow2(1023)), big(pow2(1023)), int(1)],
+            [float(f64::NAN), int(1), int(2)],
+            [float(f64::INFINITY), int(1), int(2)],
+            [float(1e308), float(1e308), float(-1e308)],
+            [big(pow2(1023)), big(pow2(1023) - pow2(970)), int(0)],
+            [int(5), int(7), float(0.1)],
+        ]
+    }
+
+    fn combined(mode: &Combine, rows: &[[PyVal; 3]]) -> Vec<String> {
+        rows.iter()
+            .map(|row| outcome(mode.apply(&row.iter().collect::<Vec<_>>())))
+            .collect()
+    }
+
+    const NON_FINITE: &str = "ERR num_combine produced a non-finite result";
+    const ROW_VALUES: &str = "ERR num_combine row values must be finite numeric non-bool values";
+
+    #[test]
+    fn num_combine_follows_python_arithmetic() {
+        let rows = combine_rows();
+        let huge = pow2(1023).to_string();
+        assert_eq!(
+            combined(&Combine::Sum, &rows),
+            [
+                "6",
+                "18446744073709551615",
+                "1.8446744073709552e+19",
+                "0.6",
+                "1.0",
+                "0.0",
+                "-3.5",
+                "8.0",
+                "0.0",
+                NON_FINITE,
+                NON_FINITE,
+                ROW_VALUES,
+                ROW_VALUES,
+                NON_FINITE,
+                NON_FINITE,
+                "12.1",
+            ]
+        );
+        assert_eq!(
+            combined(&Combine::Multiply, &rows),
+            [
+                "6.0",
+                "8.507059173023462e+37",
+                "4.253529586511731e+37",
+                "0.006000000000000001",
+                "-1e+32",
+                "0.0",
+                "-17.5",
+                "18.0",
+                "0.0",
+                NON_FINITE,
+                NON_FINITE,
+                ROW_VALUES,
+                ROW_VALUES,
+                NON_FINITE,
+                NON_FINITE,
+                "3.5",
+            ]
+        );
+        assert_eq!(
+            combined(&Combine::Max, &rows),
+            [
+                "3",
+                "9223372036854775807",
+                "9223372036854775807",
+                "0.3",
+                "1e+16",
+                "0.0",
+                "2.5",
+                "3",
+                "-0.0",
+                "1e+308",
+                huge.as_str(),
+                ROW_VALUES,
+                ROW_VALUES,
+                "1e+308",
+                huge.as_str(),
+                "7",
+            ]
+        );
+        assert_eq!(
+            combined(&Combine::Min, &rows),
+            [
+                "1", "1", "0.5", "0.1", "-1e+16", "0.0", "-7", "2", "-0.0", "1", "1", ROW_VALUES,
+                ROW_VALUES, "-1e+308", "0", "0.1",
+            ]
+        );
+        assert_eq!(
+            combined(&Combine::Avg, &rows),
+            [
+                "2.0",
+                "6.148914691236517e+18",
+                "6.148914691236517e+18",
+                "0.19999999999999998",
+                "0.3333333333333333",
+                "0.0",
+                "-1.1666666666666667",
+                "2.6666666666666665",
+                "0.0",
+                "6.666666666666666e+307",
+                "5.992310449541053e+307",
+                ROW_VALUES,
+                ROW_VALUES,
+                "3.333333333333333e+307",
+                "5.992310449541053e+307",
+                "4.033333333333333",
+            ]
+        );
+        assert_eq!(
+            combined(&Combine::Weighted(vec![0.1, 0.2, 0.7]), &rows),
+            [
+                "2.5999999999999996",
+                "2.767011611056433e+18",
+                "2.767011611056433e+18",
+                "0.26",
+                "-6000000000000000.0",
+                "0.0",
+                "-4.3",
+                "2.3",
+                "0.0",
+                "3.0000000000000003e+307",
+                "2.6965397022934743e+307",
+                ROW_VALUES,
+                ROW_VALUES,
+                "-3.999999999999999e+307",
+                "2.696539702293474e+307",
+                "1.9700000000000002",
+            ]
+        );
+        let int = PyVal::Int;
+        assert_eq!(
+            combined(
+                &Combine::Weighted(vec![10.0, 10.0, -1.0]),
+                &[
+                    [float(1e308), float(1e308), int(1)],
+                    [int(MAX), int(1), int(1)],
+                    [int(3), int(4), int(5)],
+                ]
+            ),
+            [NON_FINITE, "9.223372036854776e+19", "65.0"]
+        );
+        // 布尔、字符串不是数值（校验已排除，执行时仍按 3.x 报错）。
+        let row = [PyVal::Bool(true), int(1)];
+        assert_eq!(
+            outcome(Combine::Sum.apply(&row.iter().collect::<Vec<_>>())),
+            ROW_VALUES
+        );
+    }
+
+    #[test]
+    fn fsum_is_correctly_rounded_and_reports_overflow() {
+        assert_eq!(fsum(&[]), Some(0.0));
+        assert_eq!(fsum(&[0.1; 10]), Some(1.0));
+        assert_eq!(fsum(&[1e16, 1.0, -1e16]), Some(1.0));
+        // CPython 的例子：中点之上的余项让结果进位。
+        assert_eq!(fsum(&[1e16, 1.0, 1e-16]), Some(1.000_000_000_000_000_2e16));
+        assert_eq!(fsum(&[1e308, 1e308, -1e308]), None);
+        assert_eq!(fsum(&[-0.0, -0.0]), Some(0.0));
+    }
+
+    fn decay(items: &[(&'static str, Param)]) -> Function {
+        compile_expr(&expr("decay", vec![col("ts")], items)).unwrap()
+    }
+
+    #[test]
+    fn decay_follows_the_3x_curves() {
+        let values = [
+            PyVal::None,
+            PyVal::Int(0),
+            PyVal::Int(10),
+            PyVal::Int(25),
+            float(30.5),
+            float(f64::NAN),
+            float(f64::INFINITY),
+            float(-1e300),
+            big(pow2(70)),
+            PyVal::DateTime(1_767_225_600_000_000),
+            PyVal::DateTime(1_767_225_600_000_001),
+            PyVal::DateTime(-1),
+            PyVal::DateTime(9_007_199_254_740_993),
+        ];
+        let run = |function: Function| -> Vec<String> {
+            values
+                .iter()
+                .map(|value| outcome(function.apply(&[value])))
+                .collect()
+        };
+        let name = |function: &str| ("function", text(function));
+        assert_eq!(
+            run(decay(&[
+                name("gauss"),
+                ("origin", Param::Int(20)),
+                ("scale", Param::Int(10))
+            ])),
+            [
+                "0.0",
+                "0.0625",
+                "0.5",
+                "0.8408964152537145",
+                "0.46570878431485163",
+                "1.0",
+                "0.0",
+                "0.0",
+                "0.0",
+                "0.0",
+                "0.0",
+                "0.062499982671322445",
+                "0.0",
+            ]
+        );
+        assert_eq!(
+            run(decay(&[
+                name("exp"),
+                ("origin", Param::Int(20)),
+                ("scale", Param::Int(10)),
+                ("offset", Param::Int(2)),
+                ("decay", Param::Float(0.3)),
+            ])),
+            [
+                "0.0",
+                "0.11450336728854528",
+                "0.3816778909618176",
+                "0.6968453019359488",
+                "0.35937930668721074",
+                "1.0",
+                "0.0",
+                "0.0",
+                "0.0",
+                "0.0",
+                "0.0",
+                "0.11450335350265202",
+                "0.0",
+            ]
+        );
+        assert_eq!(
+            run(decay(&[
+                name("linear"),
+                ("origin", Param::Float(20.5)),
+                ("scale", Param::Int(4)),
+                ("offset", Param::Float(0.5)),
+                ("decay", Param::Float(0.25)),
+            ])),
+            [
+                "0.0", "0.0", "0.0", "0.25", "0.0", "1.0", "0.0", "0.0", "0.0", "0.0", "0.0",
+                "0.0", "0.0",
+            ]
+        );
+        // 整数 scale 的平方是精确乘积再转浮点；TIMESTAMPTZ 取 epoch 秒（微秒整数的正确舍入商）。
+        assert_eq!(
+            run(decay(&[
+                name("gauss"),
+                ("origin", Param::Int(0)),
+                ("scale", Param::Int(9_007_199_254_740_993)),
+                ("decay", Param::Float(0.5)),
+            ])),
+            [
+                "0.0",
+                "1.0",
+                "1.0",
+                "1.0",
+                "1.0",
+                "1.0",
+                "0.0",
+                "0.0",
+                "0.0",
+                "0.9999999999999734",
+                "0.9999999999999734",
+                "1.0",
+                "0.9999999999993069",
+            ]
+        );
+        assert_eq!(
+            run(decay(&[
+                name("linear"),
+                ("origin", Param::Int(1_767_225_600)),
+                ("scale", Param::Int(86400)),
+            ])),
+            [
+                "0.0",
+                "0.0",
+                "0.0",
+                "0.0",
+                "0.0",
+                "1.0",
+                "0.0",
+                "0.0",
+                "0.0",
+                "1.0",
+                "0.9999999999944811",
+                "0.0",
+                "0.0",
+            ]
+        );
+        let zero = "ERR float division by zero";
+        assert_eq!(
+            run(decay(&[
+                name("gauss"),
+                ("origin", Param::Int(0)),
+                ("scale", Param::Float(1e-200)),
+            ])),
+            [
+                "0.0", "1.0", zero, zero, zero, "1.0", zero, zero, zero, zero, zero, zero, zero
+            ]
+        );
+    }
+
+    #[test]
+    fn round_decimal_keeps_none_and_integers() {
+        let values = [
+            PyVal::None,
+            PyVal::Int(5),
+            big(pow2(63)),
+            float(2.5),
+            float(0.125),
+            float(1.005),
+            float(-0.5),
+            float(2.675),
+            float(f64::NAN),
+            float(f64::INFINITY),
+            float(1e300),
+            float(123_456.789_123_4),
+        ];
+        let run = |decimal: i64| -> Vec<String> {
+            values
+                .iter()
+                .map(|value| outcome(Function::Round(decimal).apply(&[value])))
+                .collect()
+        };
+        let fixed = ["None", "5", "9223372036854775808"];
+        let tail = ["nan", "inf", "1e+300"];
+        assert_eq!(
+            run(0),
+            [
+                &fixed[..],
+                &["2.0", "0.0", "1.0", "-0.0", "3.0"],
+                &tail[..],
+                &["123457.0"]
+            ]
+            .concat()
+        );
+        assert_eq!(
+            run(2),
+            [
+                &fixed[..],
+                &["2.5", "0.12", "1.0", "-0.5", "2.67"],
+                &tail[..],
+                &["123456.79"]
+            ]
+            .concat()
+        );
+        assert_eq!(
+            run(6),
+            [
+                &fixed[..],
+                &["2.5", "0.125", "1.005", "-0.5", "2.675"],
+                &tail[..],
+                &["123456.789123"]
+            ]
+            .concat()
+        );
+    }
+
+    /// 排序后各行原来的下标。`values` 是主列，`ties` 是平局列。
+    fn sorted(values: &[PyVal], descending: bool, ties: Option<&[PyVal]>) -> Vec<usize> {
+        let rows: Vec<Row> = values
+            .iter()
+            .enumerate()
+            .map(|(i, value)| Row {
+                source: i,
+                values: vec![
+                    value.clone(),
+                    ties.map_or(PyVal::None, |ties| ties[i].clone()),
+                ],
+            })
+            .collect();
+        try_sort_by(rows, &mut |a, b| {
+            compare(a, b, 0, descending, ties.map(|_| 1))
+        })
+        .unwrap()
+        .iter()
+        .map(|row| row.source)
+        .collect()
+    }
+
+    #[test]
+    fn sort_puts_missing_values_last_and_breaks_ties_ascending() {
+        let int = PyVal::Int;
+        let nan = float(f64::NAN);
+        let values = [
+            int(3),
+            PyVal::None,
+            float(1.5),
+            nan.clone(),
+            float(3.0),
+            int(MAX),
+            big(pow2(63)),
+            int(-2),
+            PyVal::None,
+            float(1.5),
+        ];
+        assert_eq!(sorted(&values, true, None), [6, 5, 0, 4, 2, 9, 7, 1, 3, 8]);
+        assert_eq!(sorted(&values, false, None), [7, 2, 9, 0, 4, 5, 6, 1, 3, 8]);
+        let ties = [
+            int(5),
+            int(1),
+            PyVal::None,
+            int(2),
+            int(1),
+            int(0),
+            int(0),
+            nan,
+            int(0),
+            int(2),
+        ];
+        assert_eq!(
+            sorted(&values, true, Some(&ties)),
+            [6, 5, 4, 0, 9, 2, 7, 8, 1, 3]
+        );
+        assert_eq!(
+            sorted(&values, false, Some(&ties)),
+            [7, 9, 2, 4, 0, 5, 6, 8, 1, 3]
+        );
+
+        let s = |value: &str| PyVal::Str(value.to_owned());
+        let strings = [
+            s("b"),
+            s("a"),
+            PyVal::None,
+            s("é"),
+            s("Z"),
+            s("a"),
+            s(""),
+            s("ab"),
+        ];
+        assert_eq!(sorted(&strings, false, None), [6, 4, 1, 5, 7, 0, 3, 2]);
+        let ties: Vec<PyVal> = [3, 2, 1, 0, 9, 1, 0, 0].into_iter().map(int).collect();
+        assert_eq!(
+            sorted(&strings, true, Some(&ties)),
+            [3, 0, 7, 5, 1, 4, 6, 2]
+        );
+
+        let bools = [
+            PyVal::Bool(true),
+            PyVal::Bool(false),
+            PyVal::None,
+            PyVal::Bool(true),
+            PyVal::Bool(false),
+        ];
+        assert_eq!(sorted(&bools, true, None), [0, 3, 1, 4, 2]);
+        assert_eq!(sorted(&bools, false, None), [1, 4, 0, 3, 2]);
+
+        let times = [
+            PyVal::DateTime(5),
+            PyVal::DateTime(-3),
+            PyVal::None,
+            PyVal::DateTime(5),
+            PyVal::DateTime(0),
+        ];
+        assert_eq!(sorted(&times, true, None), [0, 3, 4, 1, 2]);
+        assert_eq!(sorted(&times, false, None), [1, 4, 0, 3, 2]);
+    }
+
+    fn plan(ops: Vec<Op>) -> Plan {
+        Plan::new(&check(ops).unwrap(), "id").unwrap()
+    }
+
+    /// 每行是（id, 分数, ts）；`ts` 为 None 表示空值。
+    fn chunk(plan: &Plan, rows: &[(i64, f64, Option<i64>)]) -> Vec<Row> {
+        rows.iter()
+            .enumerate()
+            .map(|(i, (id, score, ts))| {
+                plan.row(i, PyVal::Int(*id), *score, |name| {
+                    assert_eq!(name, "ts");
+                    Ok(ts.map_or(PyVal::None, PyVal::Int))
+                })
+                .unwrap()
+            })
+            .collect()
+    }
+
+    fn summary(chunks: &[Vec<Row>]) -> Vec<Vec<(usize, String)>> {
+        chunks
+            .iter()
+            .map(|rows| {
+                rows.iter()
+                    .map(|row| (row.source, row.score().repr()))
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn pairs(items: &[(usize, &str)]) -> Vec<(usize, String)> {
+        items.iter().map(|(i, s)| (*i, (*s).to_owned())).collect()
+    }
+
+    #[test]
+    fn plan_runs_ops_in_order_on_each_chunk() {
+        // 临时列、主键名作 `$id` 的别名、输出列同时是输入列、每个查询各自排序与截断。
+        let plan = plan(vec![
+            map(
+                "t",
+                nc(vec![col("ts"), col("id")], &[("mode", text("multiply"))]),
+            ),
+            map("$score", nc(vec![col("$score"), col("t")], &[])),
+            map(
+                "$score",
+                expr(
+                    "round_decimal",
+                    vec![col("$score")],
+                    &[("decimal", Param::Int(1))],
+                ),
+            ),
+            sort(
+                &["$score", "$id"],
+                &[("column", text("$score")), ("tie_break_col", text("$id"))],
+            ),
+            limit(&[("limit", Param::Int(2)), ("offset", Param::Int(1))]),
+        ]);
+        assert_eq!(plan.names, ["$score", "$id", "ts", "t"]);
+        let chunks = vec![
+            chunk(
+                &plan,
+                &[
+                    (1, 0.25, Some(10)),
+                    (2, 0.26, Some(5)),
+                    (3, 0.5, None),
+                    (4, 0.0, Some(5)),
+                ],
+            ),
+            chunk(&plan, &[(7, 1.0, Some(1))]),
+            chunk(&plan, &[]),
+        ];
+        assert_eq!(
+            summary(&plan.execute(chunks).unwrap()),
+            [pairs(&[(1, "10.3"), (0, "10.2")]), Vec::new(), Vec::new()]
+        );
+
+        // 只有 limit 的链不改分数；offset 超出行数时为空。
+        let only_limit = super::Plan::new(
+            &check(vec![limit(&[
+                ("limit", Param::Int(5)),
+                ("offset", Param::Int(1)),
+            ])])
+            .unwrap(),
+            "id",
+        )
+        .unwrap();
+        let rows = chunk(&only_limit, &[(1, 0.5, None), (2, 0.25, None)]);
+        assert_eq!(
+            summary(&only_limit.execute(vec![rows, Vec::new()]).unwrap()),
+            [pairs(&[(1, "0.25")]), Vec::new()]
+        );
+    }
+
+    #[test]
+    fn runtime_errors_follow_operator_order_across_chunks() {
+        // 第一个算子在第二个查询上出错，第二个算子在第一个查询上出错：3.x 一个算子做完全部查询才进入下一个。
+        let plan = plan(vec![
+            map(
+                "t",
+                nc(vec![col("$score"), Arg::Literal(Param::Int(1))], &[]),
+            ),
+            map(
+                "$score",
+                nc(
+                    vec![col("t"), Arg::Literal(Param::Float(1e308))],
+                    &[("mode", text("multiply"))],
+                ),
+            ),
+        ]);
+        let chunks = vec![
+            chunk(&plan, &[(1, 1e10, None)]),
+            chunk(&plan, &[(2, f64::NAN, None)]),
+        ];
+        assert_eq!(
+            outcome(plan.execute(chunks).map(|_| PyVal::None)),
+            ROW_VALUES
+        );
+        let chunks = vec![chunk(&plan, &[(1, 1e10, None)])];
+        assert_eq!(
+            outcome(plan.execute(chunks).map(|_| PyVal::None)),
+            NON_FINITE
+        );
+    }
+
+    #[test]
+    fn rerank_model_is_never_compiled() {
+        let chain = check_with(
+            vec![map(
+                "$score",
+                expr(
+                    "rerank_model",
+                    vec![col("s")],
+                    &[
+                        ("provider", text("cohere")),
+                        ("queries", Param::Array(vec![text("q")])),
+                    ],
+                ),
+            )],
+            &schema(),
+            1,
+        )
+        .unwrap();
+        assert!(matches!(
+            Plan::new(&chain, "id"),
+            Err(EngineError::Unsupported { .. })
+        ));
     }
 }
