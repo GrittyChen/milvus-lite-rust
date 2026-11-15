@@ -91,6 +91,7 @@
 | 过滤中的算术：三条求值路线（pyarrow 的类型提升、回绕与带检查的转换；Python 的精确整数、正确舍入的真除法、字符串与列表的拼接和重复；hybrid 的整源回退）、资源上限与登记差异（资源上限、hybrid 推断、只看活行）；三步均已实施并复核通过（第 3 步为真值、模糊对照、差分、参照用例与文档） | [0032](docs/decisions/0032-arithmetic-filters.md)、[验收](docs/testing/0032-arithmetic-acceptance.md) |
 | hybrid 动态列类型推断的复刻：pyarrow `pa.array` 的推断（遇 bool / float / 字符串即停、列表与对象的子推断）与逐元素转换（报 OverflowError 还是回退的先后）、每行按键名排序与跨行首次出现的对象字段顺序、Arrow 15 / 25 的版本差异（对齐 25.0.1）；注销 0032 登记的推断差异 | [0033](docs/decisions/0033-hybrid-dynamic-inference.md) |
 | GEOMETRY 字段与几何谓词：3.x 的 WKT 接受范围（两个正则加 `float()`，含 Unicode 空白、`re.IGNORECASE` 与 Unicode 数字的边角）、原文存储与协议槽位、谓词的求值语义、`ARRAY<GEOMETRY>` 等登记差异；设计复审通过，第 1 步（类型、解析与读写）已实施并评审通过；第 2 步（五个谓词、`geometry` 语义类型、整条走 Python 路线的逐行求值、CPython 3.12 的 `math.hypot`）已实施并评审通过；第 3 步（组件真值、模糊对照、参照用例与文档）已实施并评审通过 | [0034](docs/decisions/0034-geometry.md) |
+| 公共 function chain（Search 的 `function_chains`）：3.x 的执行位置、名字与种类、解码与校验的先后、`num_combine` / `decay` / `round_decimal` / `sort` / `limit` 的求值、BM25 分数变号、`order_by_fields` 的冲突判定、投影合同（与不带链相同）、两项登记差异（`*` / `$meta` 投影、合法 `rerank_model`）、2.6 线的测试机制与“改后复制”的边界；设计评审通过，尚未实施 | [0035](docs/decisions/0035-function-chains.md) |
 | JSON 文本解析与 serde_json 数字私有键：影响面、判别规则、唯一入口与 clippy 门、已有数据能否恢复 | [修复记录](docs/testing/json-private-number-key-fix.md) |
 | 验收与调查记录引用的证据分哪几类、谁能复核（仓库内可重跑 / 公开产物 / 本地留存），以及验收与调查记录的写法约定 | [证据的存放与复核范围](docs/testing/README.md) |
 | 性能基线怎么测 / 口径 / 注意事项 | [benchmarks/baseline/README.md](benchmarks/baseline/README.md) |
