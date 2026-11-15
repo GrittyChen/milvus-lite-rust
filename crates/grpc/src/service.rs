@@ -693,7 +693,10 @@ impl Service for MilvusService {
                     parsed.anns_field.as_deref(),
                     parsed.metric_type.as_deref(),
                 )?;
-                parsed.check_function_chains()?;
+                // 3.x 的先后：度量解析之后、load 检查之前完成链的解码与校验。
+                if parsed.chains.prepare(guard.schema())?.is_some() {
+                    return Err(crate::schema::unsupported("function chains"));
+                }
                 guard.read_search_snapshot(&req.partition_names, parsed.anns_field.as_deref())?
             };
             #[cfg(test)]

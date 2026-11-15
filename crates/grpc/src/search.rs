@@ -22,7 +22,7 @@ use crate::pb::schema as pb;
 use crate::pb::service as svc;
 use crate::pyint::{self, PyError};
 use crate::schema::{truthy, unsupported};
-use crate::{function_score, insert, status};
+use crate::{function_chain, function_score, insert, status};
 
 const PLACEHOLDER_FLOAT_VECTOR: i32 = 101;
 const PLACEHOLDER_SPARSE_FLOAT_VECTOR: i32 = 104;
@@ -39,7 +39,8 @@ pub(crate) struct Parsed {
     range: Option<SearchRange>,
     group: Option<GroupBy>,
     pub(crate) unsupported: Option<&'static str>,
-    function_chains_conflict: bool,
+    /// 公共 function chain 的请求部分（0035）；HybridSearch 的子请求不带。
+    pub(crate) chains: function_chain::Request,
     pub(crate) expr: String,
     pub(crate) boost: Option<BoostSpec>,
     l2: Option<L2Function>,
@@ -48,18 +49,6 @@ pub(crate) struct Parsed {
     pub(crate) time_fields: Option<String>,
     /// 3.x 的引擎检索参数：`params` 为对象时取它，否则为空（稀疏检索按它校验调参项）。
     pub(crate) params: serde_json::Map<String, Value>,
-}
-
-impl Parsed {
-    /// 3.x 在 `prepare_search_function_chain` 中检查，晚于度量解析、早于 load。
-    pub(crate) fn check_function_chains(&self) -> Result<(), EngineError> {
-        if self.function_chains_conflict {
-            return Err(EngineError::SchemaValidation(
-                "function_score and function_chains cannot be used together".to_owned(),
-            ));
-        }
-        Ok(())
-    }
 }
 
 /// `parsed` 由 [`parse`] 在取 collection 读锁之前得到。
@@ -440,11 +429,18 @@ fn parse_request(req: &svc::SearchRequest, route: bool) -> Result<Parsed, Engine
         }
     };
 
-    let function_chains_conflict =
-        !route && !req.function_chains.is_empty() && req.function_score.is_some();
-    if !route && !req.function_chains.is_empty() && !function_chains_conflict {
-        note("function chains");
-    }
+    let num_queries = match &vectors {
+        QueryVectors::Dense(v) => v.len(),
+        QueryVectors::Sparse(v) => v.len(),
+        QueryVectors::Text(v) => v.len(),
+    };
+    let chains = function_chain::Request::new(
+        if route { &[] } else { &req.function_chains },
+        req.function_score.is_some(),
+        // 3.x 的 Search 只用 `order_by_fields` 判断与链的冲突。
+        raw.get("order_by_fields").is_some_and(truthy),
+        num_queries,
+    );
     Ok(Parsed {
         vectors,
         top_k,
@@ -453,7 +449,7 @@ fn parse_request(req: &svc::SearchRequest, route: bool) -> Result<Parsed, Engine
         offset,
         round_decimal,
         range: (range.radius.is_some() || range.range_filter.is_some()).then_some(range),
-        function_chains_conflict,
+        chains,
         group,
         unsupported: unsupported_feature,
         expr: req.dsl.clone(),

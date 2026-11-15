@@ -1,6 +1,6 @@
 # 0035：公共 function chain
 
-状态：设计第一稿 2026-11-15 评审通过（0 阻断，5 项建议已并入本稿），尚未实施。动手前的调查（三轮真实 3.x 探针、2.6 线原始请求验证）经负责人复核，决策 A–F 已确认。参照版本 `1320d26`（pymilvus 3.0.2 / 2.6.18、CPython 3.12）。
+状态：设计第一稿 2026-11-15 评审通过（0 阻断，5 项建议已并入本稿）；第 1 步（解码与校验）已实施并评审通过（2026-11-15）。动手前的调查（三轮真实 3.x 探针、2.6 线原始请求验证）经负责人复核，决策 A–F 已确认。参照版本 `1320d26`（pymilvus 3.0.2 / 2.6.18、CPython 3.12）。
 
 ## 范围
 
@@ -204,6 +204,31 @@ Search iterator 发的也是 `SearchRequest`，3.x 对带链的请求不区分�
   - MemTable 与 flush 后各一遍（链的取值经过两种数据源）。
 - **参照用例**：上节的 28 个函数，加一条 SDK 冒烟。
 - **已有用例的更新**（都属于“测试断言的是切片前的范围”，提交说明写明）：断言 Search 的 `function_chains` 返回 `UNIMPLEMENTED` 的用例；0026 文档与 README 中“公共 `function_chains` 不纳入”的表述。
+
+## 第 1 步验收
+
+本机（macOS arm64），参照 `1320d26`，pymilvus 3.0.2 / 2.6.18。
+
+改动：[public.rs](../../crates/core/src/rerank/public.rs)（链表示与按 schema 的校验）、[function_chain.rs](../../crates/grpc/src/function_chain.rs)（proto 解码、冲突判定与入口）；[search.rs](../../crates/grpc/src/search.rs) 摘出链的请求部分并解析 `order_by_fields`，[service.rs](../../crates/grpc/src/service.rs) 在度量解析之后、读快照之前调用。原先在未加载检查之后才报的 `UNIMPLEMENTED` 前移到这里。
+
+| 项目 | 结果 |
+| --- | --- |
+| `cargo fmt --check`、clippy（默认与 `fault-injection`） | 通过 |
+| `cargo test --workspace` | 681 通过（新增 11：校验 8、解码 2、JSON 真值 1） |
+| tests/python（3.0.2 / 2.6.18） | 各 665 通过，无跳过（新增 [test_function_chains.py](../../tests/python/test_function_chains.py) 4 条） |
+| 差分中涉及 Search 入口与 rerank 的三个文件（两条线） | 各 151 通过 |
+| 调查探针改为打本实现后与 3.x 的输出逐条比对（本地留存） | 3.x 的 118 条错误，码与文案全部相同；3.x 成功的 158 条带链请求在本实现为 `UNIMPLEMENTED`；其余 13 条不同都是本步的中间状态（见下） |
+
+中间状态（第 2 步放开）：通过全部校验的链返回 `UNIMPLEMENTED`，因此 3.x 在运行期才报的错误（`num_combine produced a non-finite result` 等 8 条）、“未加载 + 合法链”的 101、“过滤语法错误 + 合法链”的 6 在本步都是 `UNIMPLEMENTED`。合法的 `rerank_model`（3 条）是决策 B 的登记差异，不随第 2 步改变。
+
+计数：`tests/python` 661 → 665，已同步 `ci.yml` 两处、`scorecard.py`、`test_candidate.py`、打包验收 README 与 AGENTS 命令表。完整差分与互通本步没有重跑：改动只在 Search 入口对带链请求的处理，不带链的请求路径只多了一次空判断。
+
+评审后的修改（评审通过，建议项）：
+- 补 `order_by_fields` 的 `NaN` 与 `1e999` 两个取值。后者查出一个缺陷：[schema.rs](../../crates/grpc/src/schema.rs) 的 `truthy`（Python 对 `json.loads` 结果的真值判断）把超出 f64 范围的数字当成假，3.x 里它是 `inf`、为真。已在这个共享函数里修正并加单测；它的其他调用点（`strict_group_size`、`function_score` 的 `provider`、建表属性）同样按 Python 的真值取值，一并更正。
+- 补 `function_score`、`order_by_fields` 与两条链同时出现的先后断言。
+- 改后重跑：fmt、clippy、gRPC 单测 39、tests/python 在 3.0.2 上 665、在 2.6.18 上 [test_function_chains.py](../../tests/python/test_function_chains.py) 与 [test_grpc_translation.py](../../tests/python/test_grpc_translation.py) 共 118。
+
+实现中确定的一处细节：proto 的 map 没有顺序，一个参数表里有多个未设置的值时 3.x 报哪一个取决于它的迭代顺序；本实现按键排序后报第一个。只有一个非法值时两边相同。
 
 ## 证据
 

@@ -5,6 +5,7 @@
 
 pub mod boost;
 pub mod chain;
+pub mod public;
 pub mod pyval;
 pub mod window;
 
