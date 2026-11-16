@@ -2331,6 +2331,9 @@ mod tests {
 
     /// 真实 3.x 的组件真值，由 tests/differential/generate_function_chain_fixtures.py 导出：3.x 解码出的链表示、
     /// 各查询的输入行，以及 3.x 编译、执行后每行的 `$id`、`$score` 与临时列的 `repr`，或运行期错误的文案。
+    /// 经过 decay 的浮点值允许的差（按位相邻的个数），见 `execution_matches_the_reference_fixture`。
+    const DECAY_ULPS: u64 = 4;
+
     #[test]
     fn execution_matches_the_reference_fixture() {
         use serde_json::Value;
@@ -2458,6 +2461,10 @@ mod tests {
                 stage: chain["stage"].as_str().unwrap().to_owned(),
                 ops,
             };
+            let uses_decay = repr
+                .ops
+                .iter()
+                .any(|op| op.expr.as_ref().is_some_and(|expr| expr.name == "decay"));
             let rows = case["rows"].as_array().unwrap();
             let validated = validate(repr, &schema, rows.len()).unwrap();
             let plan = Plan::new(&validated, &pk).unwrap();
@@ -2506,7 +2513,28 @@ mod tests {
                         .iter()
                         .map(|chunk| chunk.as_array().unwrap().iter().map(strings).collect())
                         .collect();
-                    assert_eq!(got, expected, "{what}");
+                    if uses_decay {
+                        // decay 的曲线经过 `exp` / `ln`：3.x 的 `math.exp` 与本实现的 `f64::exp` 都调用平台 libm，
+                        // 真值在 macOS 上生成，glibc 在少数输入上差最后一位。这类用例的浮点值允许几个 ULP，
+                        // 其余单元格（id、整数、None、错误）与其他用例仍逐位比较。
+                        let close = |a: &str, b: &str| {
+                            a == b
+                                || matches!((a.parse::<f64>(), b.parse::<f64>()), (Ok(x), Ok(y))
+                                    if x.is_finite() && y.is_finite() && x.signum() == y.signum()
+                                        && x.to_bits().abs_diff(y.to_bits()) <= DECAY_ULPS)
+                        };
+                        let same = got.len() == expected.len()
+                            && got.iter().zip(&expected).all(|(g, e)| {
+                                g.len() == e.len()
+                                    && g.iter().zip(e).all(|(gr, er)| {
+                                        gr.len() == er.len()
+                                            && gr.iter().zip(er).all(|(a, b)| close(a, b))
+                                    })
+                            });
+                        assert!(same, "{what}\n got {got:?}\n expected {expected:?}");
+                    } else {
+                        assert_eq!(got, expected, "{what}");
+                    }
                 }
                 (got, expected) => panic!("{what}: got {got:?}, expected {expected:?}"),
             }
