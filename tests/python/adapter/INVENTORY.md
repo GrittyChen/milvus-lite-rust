@@ -7,15 +7,15 @@
 | 状态 | 含义 | 条数 |
 | --- | --- | --- |
 | 已复制 | 原样复制到本目录 | 325 |
-| 改后复制 | 仅按 0004「验收」第 2 项与 0006 第 25 项授权的条件替换，逐条说明改动 | 0 |
-| 范围外 | 用到当前切片不支持的功能，或断言 3.x 自身也不满足的上游契约，不复制；未实现能力的代表性入口见「范围外功能的 `UNIMPLEMENTED` 断言」 | 47 |
+| 改后复制 | 仅按 0004「验收」第 2 项、0006 第 25 项与 0035 决策 D 授权的条件替换，逐条说明改动 | 19 |
+| 范围外 | 用到当前切片不支持的功能，或断言 3.x 自身也不满足的上游契约，不复制；未实现能力的代表性入口见「范围外功能的 `UNIMPLEMENTED` 断言」 | 32 |
 | 待复用 | 原功能阻断已解除，尚未复制到本地默认套件；0015 的条目已通过固定外部套件验收 | 53 |
-| 依赖内部模块 | 导入或使用 3.x 的内部模块、内部对象，换成本实现后无法运行 | 52 |
+| 依赖内部模块 | 导入或使用 3.x 的内部模块、内部对象，换成本实现后无法运行 | 48 |
 | 不运行 | 上游被同名定义覆盖，上游自己也不运行 | 1 |
 
 以上是逐条列出的 36 个文件中的 478 条（含 0027 从 `1320d26` 盘点的 3 条、0030 盘点的 18 条、0031 按 `1320d26` 逐条列出的 4 个文件 35 条，0032 从 test_milvus_compat_v2.py 拆出的 4 条，以及 0034 复制的 test_grpc_geometry.py 8 条），其余 14 个文件的 187 条整个文件记一行原因，见「整个文件不复用的文件」（test_milvus_compat_v2.py 拆出 4 条后其余 20 条仍记在那里，所以它在两处都出现）。
 
-「已复制」与「改后复制」共 325 个用例函数，参数化展开后 391 条（0034 新增 8 个函数、8 条：GEOMETRY 字段与几何谓词；0032 新增 4 个函数、4 条：过滤中的算术；0031 新增 39 个函数、46 条：BM25 / 全文检索的 4 个文件 30 个函数、HybridSearch 中依赖 BM25 的 9 个函数，均取自 `1320d26`；0030 新增 15 个函数、27 条：稀疏向量的上游 Milvus 场景；0029 新增 4 个函数、4 条：`text_match`；0028 新增 1 个函数、1 条：多向量字段；0027 新增 2 个函数、6 条，取自 `1320d26`：Search 的主键投影与带分区的 count(*)；上游同批新增的 `test_hybrid_search_honors_primary_key_projection` 依赖 BM25，随 0031 复制；0026 第 3 步新增 4 个函数、4 条：HybridSearch 的顶层 decay、TIMESTAMPTZ 时区与 `time_fields`、顶层 boost，以及动态字段 `["*"]` 随 Hybrid 分组返回；0026 第 2 步新增 1 个函数、1 条：Search 的 decay；0026 第 1 步新增 8 个函数、10 条：Search 的 boost 7 个函数 9 条，动态字段 `["*"]` 随 boost 返回 1 条；0025 新增 22 个函数、22 条：TIMESTAMPTZ 的 16 个与数据库 `timezone` 属性的 6 个；0024 新增 6 个函数、6 条：分组检索 5 个与动态字段 `["*"]` 随分组返回 1 个；0023 B 新增 19 个函数、31 条：数据库用例 17 个函数 29 条，加两个按数据库隔离的用例）。S1 恢复 [test_grpc_crud.py](test_grpc_crud.py) 中的原过滤表达式，并纳入除 LIKE 外的全部 19 条；它们在本实现与真实 3.x 上的两条客户端线均作为 S1 验收。随后迁移全部 40 条待复用用例，恢复此前为绕过过滤限制而替换的原表达式；顶层动态字段切片另加入原样的 TestDynamicField 用例。0014 已恢复原 HNSW 定义，并新增创建 HNSW、DropIndex 和 describe 参数的原用例；检索仍按 FLAT 执行。
+「已复制」与「改后复制」共 344 个用例函数，参数化展开后 412 条（0035 新增 19 个函数、21 条：公共 function chain，全部为改后复制；0034 新增 8 个函数、8 条：GEOMETRY 字段与几何谓词；0032 新增 4 个函数、4 条：过滤中的算术；0031 新增 39 个函数、46 条：BM25 / 全文检索的 4 个文件 30 个函数、HybridSearch 中依赖 BM25 的 9 个函数，均取自 `1320d26`；0030 新增 15 个函数、27 条：稀疏向量的上游 Milvus 场景；0029 新增 4 个函数、4 条：`text_match`；0028 新增 1 个函数、1 条：多向量字段；0027 新增 2 个函数、6 条，取自 `1320d26`：Search 的主键投影与带分区的 count(*)；上游同批新增的 `test_hybrid_search_honors_primary_key_projection` 依赖 BM25，随 0031 复制；0026 第 3 步新增 4 个函数、4 条：HybridSearch 的顶层 decay、TIMESTAMPTZ 时区与 `time_fields`、顶层 boost，以及动态字段 `["*"]` 随 Hybrid 分组返回；0026 第 2 步新增 1 个函数、1 条：Search 的 decay；0026 第 1 步新增 8 个函数、10 条：Search 的 boost 7 个函数 9 条，动态字段 `["*"]` 随 boost 返回 1 条；0025 新增 22 个函数、22 条：TIMESTAMPTZ 的 16 个与数据库 `timezone` 属性的 6 个；0024 新增 6 个函数、6 条：分组检索 5 个与动态字段 `["*"]` 随分组返回 1 个；0023 B 新增 19 个函数、31 条：数据库用例 17 个函数 29 条，加两个按数据库隔离的用例）。S1 恢复 [test_grpc_crud.py](test_grpc_crud.py) 中的原过滤表达式，并纳入除 LIKE 外的全部 19 条；它们在本实现与真实 3.x 上的两条客户端线均作为 S1 验收。随后迁移全部 40 条待复用用例，恢复此前为绕过过滤限制而替换的原表达式；顶层动态字段切片另加入原样的 TestDynamicField 用例。0014 已恢复原 HNSW 定义，并新增创建 HNSW、DropIndex 和 describe 参数的原用例；检索仍按 FLAT 执行。
 
 历史的 HNSW→FLAT 授权替换按 0014 恢复原定义；`== N` 换成 `in [N]` 的条件见 0004「验收」第 2 项及 0006 第 25 项。已接通 S1 的 CRUD 副本不再替换表达式或读回方式。其余副本只删去随范围外用例一起不再使用的 import、helper 与空的分节标题；上游用于跳过的 `importorskip` 改为直接导入（本仓不允许因缺依赖静默跳过），上游因 HNSW 需要 faiss 而加的 `skipif` 随 HNSW 一起去掉。起服务的 fixture 与清理见 [conftest.py](conftest.py)。
 
@@ -203,30 +203,33 @@
 
 ### [test_function_chain.py](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_function_chain.py)
 
-22 条：已复制 1，范围外 15，依赖内部模块 6。
+
+22 条：改后复制 19，已复制 1，依赖内部模块 2。`1320d26` 与 v3.2.1 相同。
+
+公共 function chain 由 0035 纳入，按 0035 决策 D「改后复制」：链用 [chainwire.py](../chainwire.py) 里与 pymilvus 3.0 `FunctionChain` / `FunctionChainStage` / `col` / `fn` 同名的写法构造（pymilvus 2.6 没有这些类；与 SDK `to_proto()` 的等价由 [组件真值生成器](../../differential/generate_function_chain_fixtures.py) 逐条核对），经 `sending`（SDK 发出的 Search）或 `attach`（原始请求）发送；断言不变，只有注明替换点的四条换成等价的可观察断言。
 
 | 用例 | 状态 | 说明 |
 | --- | --- | --- |
-| [`test_search_function_chain_reranks_by_hidden_field_and_serializes_score`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_function_chain.py#L188) | 范围外 | rerank、function chain |
-| [`test_search_function_chain_preserves_explicit_dynamic_output_field`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_function_chain.py#L214) | 范围外 | function chain |
-| [`test_search_function_chain_preserves_default_dynamic_output_fields`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_function_chain.py#L237) | 范围外 | function chain |
-| [`test_search_function_chain_preserves_explicit_dynamic_field_on_temp_collision`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_function_chain.py#L259) | 范围外 | function chain |
-| [`test_search_function_chain_preserves_default_dynamic_field_on_temp_collision`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_function_chain.py#L281) | 范围外 | function chain |
-| [`test_search_function_chain_uses_primary_field_name_as_id_alias`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_function_chain.py#L302) | 依赖内部模块 | 导入内部模块（[L307](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_function_chain.py#L307)） |
-| [`test_search_function_chain_limit_changes_each_query_chunk`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_function_chain.py#L348) | 范围外 | function chain |
-| [`test_search_function_chain_keeps_query_chunks_independent`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_function_chain.py#L372) | 范围外 | function chain |
-| [`test_search_function_chain_without_sort_preserves_ann_order`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_function_chain.py#L397) | 范围外 | function chain |
-| [`test_search_function_chain_explicit_id_tie_break`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_function_chain.py#L416) | 范围外 | function chain |
-| [`test_search_function_chain_rewrites_metric_scores`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_function_chain.py#L446) | 范围外 | function chain |
-| [`test_public_chain_keeps_requested_candidate_budget`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_function_chain.py#L479) | 依赖内部模块 | 导入内部模块（[L483](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_function_chain.py#L483)） |
-| [`test_public_chain_preserves_group_by_response_metadata`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_function_chain.py#L518) | 范围外 | group_by、function chain |
-| [`test_raw_search_rejects_function_score_function_chain_conflict`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_function_chain.py#L544) | 范围外 | function chain |
-| [`test_raw_search_rejects_order_by_function_chain_conflict_before_ann`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_function_chain.py#L567) | 依赖内部模块 | 导入内部模块（[L572](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_function_chain.py#L572)） |
-| [`test_raw_search_rejects_unknown_rerank_provider_as_illegal_argument`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_function_chain.py#L601) | 范围外 | function chain、rerank |
-| [`test_raw_search_rejects_request_rerank_endpoint_as_illegal_argument`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_function_chain.py#L629) | 范围外 | function chain、rerank |
-| [`test_raw_search_rejects_unsupported_rerank_param_before_ann`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_function_chain.py#L658) | 依赖内部模块 | 导入内部模块（[L663](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_function_chain.py#L663)） |
-| [`test_raw_search_rejects_primary_name_conflicting_with_system_column`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_function_chain.py#L696) | 依赖内部模块 | 导入内部模块（[L701](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_function_chain.py#L701)、[L702](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_function_chain.py#L702)、[L705](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_function_chain.py#L705)、[L706](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_function_chain.py#L706)） |
-| [`test_raw_hybrid_search_rejects_function_chains`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_function_chain.py#L751) | 范围外 | 用 pymilvus 3.0 的 `FunctionChain` 构造公共 function chain（0026 不纳入；2.6 线没有这个类）；HybridSearch 对 `function_chains` 的拒绝由 [test_grpc_translation.py](../test_grpc_translation.py) 的 `test_hybrid_search_rank_params_and_function_score` 断言 |
+| [`test_search_function_chain_reranks_by_hidden_field_and_serializes_score`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_function_chain.py#L188) | 改后复制 | 链经 `sending` 写进 SDK 发出的 Search |
+| [`test_search_function_chain_preserves_explicit_dynamic_output_field`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_function_chain.py#L214) | 改后复制 | 链经 `sending` 写进 SDK 发出的 Search |
+| [`test_search_function_chain_preserves_default_dynamic_output_fields`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_function_chain.py#L237) | 改后复制 | 链经 `sending` 写进 SDK 发出的 Search |
+| [`test_search_function_chain_preserves_explicit_dynamic_field_on_temp_collision`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_function_chain.py#L259) | 改后复制 | 链经 `sending` 写进 SDK 发出的 Search |
+| [`test_search_function_chain_preserves_default_dynamic_field_on_temp_collision`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_function_chain.py#L281) | 改后复制 | 链经 `sending` 写进 SDK 发出的 Search |
+| [`test_search_function_chain_uses_primary_field_name_as_id_alias`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_function_chain.py#L302) | 改后复制 | 链经 `sending` 写进 SDK 发出的 Search与原始请求；替换点：去掉对参照 `Collection.search` 入参的观察（[L307](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_function_chain.py#L307)–318、L330），保留结果、分数与响应 `output_fields == ["title"]` 的断言 |
+| [`test_search_function_chain_limit_changes_each_query_chunk`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_function_chain.py#L348) | 改后复制 | 链经 `sending` 写进 SDK 发出的 Search |
+| [`test_search_function_chain_keeps_query_chunks_independent`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_function_chain.py#L372) | 改后复制 | 链经 `sending` 写进 SDK 发出的 Search |
+| [`test_search_function_chain_without_sort_preserves_ann_order`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_function_chain.py#L397) | 改后复制 | 链经 `sending` 写进 SDK 发出的 Search |
+| [`test_search_function_chain_explicit_id_tie_break`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_function_chain.py#L416) | 改后复制 | 链经 `sending` 写进 SDK 发出的 Search |
+| [`test_search_function_chain_rewrites_metric_scores`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_function_chain.py#L446) | 改后复制 | 链经 `sending` 写进 SDK 发出的 Search；参数化 3 条 |
+| [`test_public_chain_keeps_requested_candidate_budget`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_function_chain.py#L479) | 依赖内部模块 | 不复制：断言的是参照 `Collection.search` 的入参（[L483](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_function_chain.py#L483)）。“不放大候选窗口”由 [差分](../../differential/test_function_chains.py) 与 [test_function_chains.py](../test_function_chains.py) 的 `limit` / `offset` / 分组格子覆盖 |
+| [`test_public_chain_preserves_group_by_response_metadata`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_function_chain.py#L518) | 改后复制 | 链经 `attach` 写进原始 SearchRequest |
+| [`test_raw_search_rejects_function_score_function_chain_conflict`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_function_chain.py#L544) | 改后复制 | 链经 `attach` 写进原始 SearchRequest |
+| [`test_raw_search_rejects_order_by_function_chain_conflict_before_ann`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_function_chain.py#L567) | 改后复制 | 链经 `attach` 写进原始 SearchRequest；替换点：参照用 monkeypatch 让 `Collection.search` 直接失败（[L572](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_function_chain.py#L572)–580），改为在未加载的 collection 上发同一请求（冲突检查若晚于检索会先报 101） |
+| [`test_raw_search_rejects_unknown_rerank_provider_as_illegal_argument`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_function_chain.py#L601) | 改后复制 | 链经 `attach` 写进原始 SearchRequest |
+| [`test_raw_search_rejects_request_rerank_endpoint_as_illegal_argument`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_function_chain.py#L629) | 改后复制 | 链经 `attach` 写进原始 SearchRequest |
+| [`test_raw_search_rejects_unsupported_rerank_param_before_ann`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_function_chain.py#L658) | 改后复制 | 链经 `attach` 写进原始 SearchRequest；替换点同上（[L663](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_function_chain.py#L663)、L669–672） |
+| [`test_raw_search_rejects_primary_name_conflicting_with_system_column`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_function_chain.py#L696) | 改后复制 | 链经 `attach` 写进原始 SearchRequest；替换点：参照用 monkeypatch 把普通 collection 的 schema 换成主键名为 `$score` 的 schema 并让检索失败（[L701](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_function_chain.py#L701)–731），改为经公开接口直接建这样的 collection |
+| [`test_raw_hybrid_search_rejects_function_chains`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_function_chain.py#L751) | 改后复制 | 链经 `attach(..., field=15)` 写进原始 HybridSearchRequest |
 | [`test_search_without_function_chain_preserves_legacy_behavior`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_function_chain.py#L770) | 已复制 |  |
 | [`test_parse_search_request_accepts_legacy_shape_without_new_messages`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_function_chain.py#L794) | 依赖内部模块 | 调用 [L13](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/adapter/test_function_chain.py#L13) 顶层导入的 `parse_search_request` |
 
@@ -799,6 +802,23 @@
 ## tests/compatibility
 
 [tests/compatibility/](https://github.com/milvus-io/milvus-lite/tree/v3.2.1/tests/compatibility) 的 9 个文件共 239 条用例，M1 不复用：它们以范围外的功能为主（过滤、分区与 partition key、多数据库、function、delete / upsert），而且每个文件各自用 `start_server_in_thread` 定义起服务的 fixture。某个文件涉及的功能全部进入范围后，替换 fixture 整文件运行（0004「验收」第 2 项）。
+
+### [test_function_chain_l2.py](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/compatibility/test_function_chain_l2.py)
+
+10 条：改后复制 9，不复制 1（0035）；`1320d26` 与 v3.2.1 相同。整文件复制到 [tests/python/compatibility/test_function_chain_l2.py](../compatibility/test_function_chain_l2.py)：起服务的 `server` fixture 换成本包的 server_manager；上游在 pymilvus 没有 Function Chain API 时整模块跳过（[L11](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/compatibility/test_function_chain_l2.py#L11)–34），本仓两条 SDK 线都运行，去掉这两处跳过，链的构造与发送同上节 test_function_chain.py；断言不变。不计入上文 tests/adapter 的统计。
+
+| 用例 | 状态 | 说明 |
+| --- | --- | --- |
+| [`test_search_with_l2_function_chain_sdk_reranks_by_scalar_field`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/compatibility/test_function_chain_l2.py#L156) | 改后复制 | 链经 `sending` 写进 SDK 发出的 Search |
+| [`test_search_with_l2_function_chain_sdk_uses_hidden_input_field`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/compatibility/test_function_chain_l2.py#L173) | 改后复制 | 链经 `sending` 写进 SDK 发出的 Search |
+| [`test_search_with_l2_function_chain_sdk_temp_column_not_returned`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/compatibility/test_function_chain_l2.py#L191) | 改后复制 | 链经 `sending` 写进 SDK 发出的 Search |
+| [`test_search_with_l2_function_chain_sdk_limit_op`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/compatibility/test_function_chain_l2.py#L222) | 改后复制 | 链经 `sending` 写进 SDK 发出的 Search |
+| [`test_search_rejects_l2_function_chain_write_readonly_system_column`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/compatibility/test_function_chain_l2.py#L241) | 改后复制 | 链经 `sending` 写进 SDK 发出的 Search |
+| [`test_search_rejects_l2_function_chain_reserved_temp_output`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/compatibility/test_function_chain_l2.py#L259) | 改后复制 | 链经 `sending` 写进 SDK 发出的 Search |
+| [`test_search_rejects_l2_function_chain_read_internal_system_input`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/compatibility/test_function_chain_l2.py#L277) | 改后复制 | 链经 `sending` 写进 SDK 发出的 Search |
+| [`test_search_rejects_l2_function_chain_read_unknown_system_input`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/compatibility/test_function_chain_l2.py#L295) | 改后复制 | 链经 `sending` 写进 SDK 发出的 Search |
+| [`test_search_rejects_l2_function_chain_with_function_score`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/compatibility/test_function_chain_l2.py#L313) | 不复制 | 断言的是 pymilvus 3.0 客户端在发出请求前抛出的 `ParamError`，请求到不了服务端；服务端的冲突由 adapter 的 `test_raw_search_rejects_function_score_function_chain_conflict` 覆盖 |
+| [`test_search_rejects_l2_function_chain_with_order_by`](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/tests/compatibility/test_function_chain_l2.py#L333) | 改后复制 | 链经 `sending` 写进 SDK 发出的 Search；`order_by_fields` 照常经 SDK 参数发出（两条 SDK 线写法相同） |
 
 ## CLI 入口用例（独立来源）
 

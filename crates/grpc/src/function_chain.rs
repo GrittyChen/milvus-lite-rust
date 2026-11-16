@@ -317,6 +317,96 @@ mod tests {
         assert_eq!(error(bad), "unknown function chain stage value: 99");
     }
 
+    /// 真实 3.x 的组件真值，由 tests/differential/generate_function_chain_fixtures.py 导出：
+    /// 每条链的线格式字节经本实现解码与校验，结果与 3.x `function_chain_to_repr` + `validate_function_chain` 相同。
+    #[test]
+    fn validation_matches_the_reference_fixture() {
+        use milvus_lite_core::{DataType, FieldSchema};
+        use prost::Message;
+        use serde_json::Value;
+
+        let fixture = milvus_lite_core::json_text::value_str(include_str!(
+            "../tests/fixtures/function_chain_validation.json"
+        ))
+        .unwrap();
+        let types = [
+            DataType::Bool,
+            DataType::Int8,
+            DataType::Int16,
+            DataType::Int32,
+            DataType::Int64,
+            DataType::Float,
+            DataType::Double,
+            DataType::VarChar,
+            DataType::Json,
+            DataType::Array,
+            DataType::Timestamptz,
+            DataType::Geometry,
+            DataType::FloatVector,
+            DataType::SparseFloatVector,
+        ];
+        let schemas: HashMap<&str, CollectionSchema> = fixture["schemas"]
+            .as_object()
+            .unwrap()
+            .iter()
+            .map(|(key, fields)| {
+                let fields = fields
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|field| {
+                        let name = field[1].as_str().unwrap();
+                        let data_type = *types.iter().find(|t| t.name() == name).unwrap();
+                        let mut field_schema =
+                            FieldSchema::new(field[0].as_str().unwrap(), data_type);
+                        field_schema.is_primary = field[2].as_bool().unwrap();
+                        field_schema
+                    })
+                    .collect();
+                let schema = CollectionSchema {
+                    fields,
+                    enable_dynamic_field: true,
+                    properties: Vec::new(),
+                    functions: Vec::new(),
+                };
+                (key.as_str(), schema)
+            })
+            .collect();
+        let cases = fixture["cases"].as_array().unwrap();
+        assert_eq!(cases.len(), 280);
+        for case in cases {
+            let hex = case["wire"].as_str().unwrap();
+            let bytes: Vec<u8> = (0..hex.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+                .collect();
+            let chain = pb::FunctionChain::decode(bytes.as_slice()).unwrap();
+            let schema = &schemas[case["schema"].as_str().unwrap()];
+            let nq = case["nq"].as_u64().unwrap() as usize;
+            let got = decode(&chain).and_then(|repr| public::validate(repr, schema, nq));
+            match (got, case.get("error").and_then(Value::as_str)) {
+                (Err(EngineError::SchemaValidation(message)), Some(expected)) => {
+                    assert_eq!(message, expected, "{hex}")
+                }
+                (Ok(validated), None) => {
+                    let required: Vec<&str> = case["required"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|v| v.as_str().unwrap())
+                        .collect();
+                    assert_eq!(validated.required_fields, required, "{hex}");
+                    assert_eq!(
+                        validated.uses_rerank_model,
+                        case["rerank_model"].as_bool().unwrap(),
+                        "{hex}"
+                    );
+                }
+                (got, expected) => panic!("{hex}: got {got:?}, expected {expected:?}"),
+            }
+        }
+    }
+
     #[test]
     fn decoded_values_keep_their_types() {
         let mut expr = num_combine(vec![

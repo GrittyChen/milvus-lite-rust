@@ -91,7 +91,7 @@
 | 过滤中的算术：三条求值路线（pyarrow 的类型提升、回绕与带检查的转换；Python 的精确整数、正确舍入的真除法、字符串与列表的拼接和重复；hybrid 的整源回退）、资源上限与登记差异（资源上限、hybrid 推断、只看活行）；三步均已实施并复核通过（第 3 步为真值、模糊对照、差分、参照用例与文档） | [0032](docs/decisions/0032-arithmetic-filters.md)、[验收](docs/testing/0032-arithmetic-acceptance.md) |
 | hybrid 动态列类型推断的复刻：pyarrow `pa.array` 的推断（遇 bool / float / 字符串即停、列表与对象的子推断）与逐元素转换（报 OverflowError 还是回退的先后）、每行按键名排序与跨行首次出现的对象字段顺序、Arrow 15 / 25 的版本差异（对齐 25.0.1）；注销 0032 登记的推断差异 | [0033](docs/decisions/0033-hybrid-dynamic-inference.md) |
 | GEOMETRY 字段与几何谓词：3.x 的 WKT 接受范围（两个正则加 `float()`，含 Unicode 空白、`re.IGNORECASE` 与 Unicode 数字的边角）、原文存储与协议槽位、谓词的求值语义、`ARRAY<GEOMETRY>` 等登记差异；设计复审通过，第 1 步（类型、解析与读写）已实施并评审通过；第 2 步（五个谓词、`geometry` 语义类型、整条走 Python 路线的逐行求值、CPython 3.12 的 `math.hypot`）已实施并评审通过；第 3 步（组件真值、模糊对照、参照用例与文档）已实施并评审通过 | [0034](docs/decisions/0034-geometry.md) |
-| 公共 function chain（Search 的 `function_chains`）：3.x 的执行位置、名字与种类、解码与校验的先后、`num_combine` / `decay` / `round_decimal` / `sort` / `limit` 的求值、BM25 分数变号、`order_by_fields` 的冲突判定、投影合同（与不带链相同）、三项登记差异（`*` / `$meta` 投影、合法 `rerank_model`、按名为 `$score` / `$id` 的字段分组）、2.6 线的测试机制与“改后复制”的边界；设计评审通过；第 1 步（解码与校验）已实施并评审通过；第 2 步（执行与结果：三个表达式与三个算子、BM25 变号、`None` 分数的报错先后、名为 `$id` / `$score` 的名字不返回、按这两个名字分组时不照抄 3.x 的覆盖）已实施并评审通过 | [0035](docs/decisions/0035-function-chains.md) |
+| 公共 function chain（Search 的 `function_chains`）：3.x 的执行位置、名字与种类、解码与校验的先后、`num_combine` / `decay` / `round_decimal` / `sort` / `limit` 的求值、BM25 分数变号、`order_by_fields` 的冲突判定、投影合同（与不带链相同）、三项登记差异（`*` / `$meta` 投影、合法 `rerank_model`、按名为 `$score` / `$id` 的字段分组）、2.6 线的测试机制与“改后复制”的边界；设计评审通过；第 1 步（解码与校验）已实施并评审通过；第 2 步（执行与结果：三个表达式与三个算子、BM25 变号、`None` 分数的报错先后、名为 `$id` / `$score` 的名字不返回、按这两个名字分组时不照抄 3.x 的覆盖）已实施并评审通过；第 3 步（组件真值、端到端差分、参照用例的改后复制、SDK 冒烟与文档）已实施并评审通过 | [0035](docs/decisions/0035-function-chains.md) |
 | JSON 文本解析与 serde_json 数字私有键：影响面、判别规则、唯一入口与 clippy 门、已有数据能否恢复 | [修复记录](docs/testing/json-private-number-key-fix.md) |
 | 验收与调查记录引用的证据分哪几类、谁能复核（仓库内可重跑 / 公开产物 / 本地留存），以及验收与调查记录的写法约定 | [证据的存放与复核范围](docs/testing/README.md) |
 | 性能基线怎么测 / 口径 / 注意事项 | [benchmarks/baseline/README.md](benchmarks/baseline/README.md) |
@@ -194,7 +194,8 @@ pymilvus ──server_manager──▶ adapter/grpc ──▶ db（多 collectio
 | standard 分词模糊对照（不经服务；参照环境为 CPython 3.12） | `cargo build -p milvus-lite-core --example analyzer_probe`，再 `<3.x 的 venv>/bin/python tests/differential/fuzz_analyzer.py --cases 200000 --seed 29` |
 | GEOMETRY 组件真值核验（真实 3.x / `1320d26`，CPython 3.12；生成器的码位穷举约半分钟，读取它的 Rust 单测在 debug 下约 45 秒） | `<3.x 的 venv>/bin/python tests/differential/generate_geometry_fixtures.py --verify` |
 | GEOMETRY 直接模糊对照（不经服务；WKT 解析、五个谓词与 `hypot`；参照环境为 CPython 3.12，报告放仓库外；验收用种子 34 与 35 各跑一次） | `cargo build -p milvus-lite-core --example geometry_probe`，再 `<3.x 的 venv>/bin/python tests/differential/fuzz_geometry.py --cases 200000 --seed 34 --output <work_dir>/geometry.json` |
-| 端到端测试（真实 pymilvus；含 [tests/python/adapter/](tests/python/adapter/) 中复制自参照实现的用例，逐条状态见其 INVENTORY.md） | `.venv/bin/python -m pytest tests/python` |
+| 公共 function chain 组件真值核验（真实 3.x / `1320d26` 与 pymilvus 3.0.2，CPython 3.12；解码、校验与执行的结果，以及测试用的线格式编码与 SDK `to_proto()` 的等价） | `<3.x 的 venv>/bin/python tests/differential/generate_function_chain_fixtures.py --verify` |
+| 端到端测试（真实 pymilvus；含 [tests/python/adapter/](tests/python/adapter/) 与 [tests/python/compatibility/](tests/python/compatibility/) 中复制自参照实现的用例，逐条状态见 adapter 的 INVENTORY.md） | `.venv/bin/python -m pytest tests/python` |
 | 与 3.x 的差分测试（3.x 的 venv 按 [互通 README](tests/storage_interop/README.md) 建 Arrow 25 参照环境；`benchmarks/baseline/setup.sh` 建出的环境不固定 pyarrow，arm64 上会被 S1 用例拒绝；不设环境变量时报错，不跳过；上一行的命令不包含它） | `MILVUS_LITE_3X_PYTHON=<3.x 的 venv>/bin/python .venv/bin/python -m pytest tests/differential` |
 | ARRAY 元素转换、schema/default 与三路线组件真值（真实 3.x / `1320d26`，Arrow 15/25 各执行） | `<参照解释器> tests/differential/generate_array_fixtures.py --verify`；重新生成用 Arrow 25，随后以 Arrow 15 核验 |
 | 固定兼容样本统计、nullable 反事实与 schema 真值（离线、显式执行，不进入默认测试） | [统计工具与命令](tests/compatibility_audit/README.md)；`<参照解释器> tests/compatibility_audit/schema_truth.py --reference references/milvus-lite --kind filters --output <仓库外报告> --verify-nullable-filter-fixture` 核验空值过滤组件 |
@@ -202,7 +203,7 @@ pymilvus ──server_manager──▶ adapter/grpc ──▶ db（多 collectio
 | 独立 CLI server | `.venv/bin/milvus-lite server --data-dir <data_dir> --host 127.0.0.1 --port 19530 --max-workers 10`；也可 `python -m milvus_lite server ...`，合同见 0012 |
 | 构建 wheel / sdist | `.venv/bin/maturin build --release -m crates/py/Cargo.toml` / `.venv/bin/maturin sdist -m crates/py/Cargo.toml` |
 | 核对依赖图中没有 C++ 构建与 protoc | `cargo tree --workspace -e all` |
-| 发行物与安装验收（本地诊断，候选以发行工作流为准；根配置；工作目录在仓库外） | `.venv/bin/python tests/packaging/run_acceptance.py --work-dir <work_dir> --constraints <constraints.txt> --suite --suite-expect 672`；约束文件与完整步骤见 [打包验收](tests/packaging/README.md) |
+| 发行物与安装验收（本地诊断，候选以发行工作流为准；根配置；工作目录在仓库外） | `.venv/bin/python tests/packaging/run_acceptance.py --work-dir <work_dir> --constraints <constraints.txt> --suite --suite-expect 703`；约束文件与完整步骤见 [打包验收](tests/packaging/README.md) |
 | 发行物/平台脚本自检 | `.venv/bin/python -m pytest tests/packaging tests/platform` |
 | CI 纯文档分类与汇总判定自检 | `.venv/bin/python -m pytest tests/ci` |
 | 发行工作流：演练 / 正式运行（0021；从以冻结提交为最新提交的已推送分支触发，正式运行引用同一提交含 PID 1 的成功演练） | `gh workflow run release.yml --repo <owner/repo> --ref <冻结分支> -f commit=<完整 SHA> -f version=<版本> -f dry_run=true`；正式运行改为 `-f dry_run=false -f pid1_dry_run=<演练运行 ID>.<attempt>` |

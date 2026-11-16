@@ -20,7 +20,7 @@
 | --- | --- | --- |
 | `HybridSearchRequest.rank_params`（pymilvus 的 `RRFRanker` / `WeightedRanker`） | `parse_rank_params` → `build_hybrid_rerank_chain` → `MergeOp` | **纳入** |
 | `SearchRequest.function_score` / `HybridSearchRequest.function_score`（pymilvus 的 `Function` / `FunctionScore`） | `decode_hybrid_function_score`：boost 为 L0，另允许最多一个 L2（rrf / weighted / decay / model） | **纳入 boost + rrf / weighted / decay；model 除外** |
-| `SearchRequest.function_chains`（公共 L2 算子语言） | `prepare_search_function_chain` | **不纳入**，保持 `UNIMPLEMENTED` |
+| `SearchRequest.function_chains`（公共 L2 算子语言） | `prepare_search_function_chain` | **不纳入**，保持 `UNIMPLEMENTED`（之后由 [0035](0035-function-chains.md) 实现） |
 | `HybridSearchRequest.function_chains` | 3.x 自己报 `SchemaValidationError("function_chains is not supported for hybrid search yet")` | **按 3.x 拒绝**（code 6，同文案），不是 `UNIMPLEMENTED` |
 
 两个容易搞错的点：
@@ -30,7 +30,7 @@
 
 ### 不纳入
 
-- 公共 `function_chains`（9 条参照用例），另做 L2 算子切片。
+- 公共 `function_chains`（9 条参照用例），另做 L2 算子切片（[0035](0035-function-chains.md) 已实现，参照用例按其盘点为 adapter 19 个函数 / 21 条与 compatibility 9 条）。
 - model rerank（外部 provider）：Search 与 HybridSearch 顶层的合法 model 通过全部校验后返回带明确说明的 `UNIMPLEMENTED`，登记差异；HybridSearch 子请求里的 model 与其他子请求 L2 一样只解码、被忽略，与 3.x 一样成功（第 10 节）。
 - `random_score`：候选行真正用到时（该函数的过滤命中）同样返回 `UNIMPLEMENTED` 并登记（3.x 用 sha256 派生随机数，纳入要新增 sha2 依赖）；没有候选行时与 3.x 一样成功（第 10 节）。
 - 多向量字段（schema 仍拒绝，另立切片）、BM25 / sparse / text analyzer（全文检索切片）。因此建表用了 BM25 的 Hybrid 用例仍会被 text analyzer 挡住，**不能用“Hybrid 全绿”作验收口径**。
@@ -45,7 +45,7 @@
 | Search L2 decay | 1 | 是 |
 | Search 动态字段 `["*"]` + rerank | 1 | 是 |
 | HybridSearch | 7 | 是 |
-| 公共 `function_chains` | 9 | 否 |
+| 公共 `function_chains` | 9 | 否（0035 已实现） |
 | 多向量字段 | 1 | 否 |
 
 本切片的首个阻断目标是 **18 条**，逐条 ID（取自 0025 收口后固定统计的 junit 结果，验收按 ID 记账）：
@@ -351,7 +351,7 @@ Search：collection 不存在（100）→ 解码 `function_score`（boost 参数
 
 - Search 与 HybridSearch 顶层的合法 model（`cohere`）通过全部校验后：`UNIMPLEMENTED`，3.x 是 code 1（缺 key）或调用外部服务。HybridSearch 子请求里的 model 被忽略，两边都成功，不是差异。
 - 候选行真正用到的 `random_score`：`UNIMPLEMENTED`，3.x 成功。
-- 公共 `function_chains`（Search）：`UNIMPLEMENTED`。
+- 公共 `function_chains`（Search）：`UNIMPLEMENTED`（之后由 [0035](0035-function-chains.md) 实现）。
 - ~~boost 过滤中的算术表达式：`UNIMPLEMENTED`（3.x 可用；等待过滤范围切片）~~：已由 [0032](0032-arithmetic-filters.md) 实现，转为两边对照。`text_match` 已由 [0029](0029-text-match.md) 接入。
 - 路由查询向量维度或度量非法：沿用 [0004](0004-m1-scope.md#决策) 的严格校验文案（已登记），3.x 是 numpy 原始报错。
 - 引擎分组（普通 Search 与 Search + boost）的两个 3.x 缺陷：沿用 [0024](0024-group-by-search.md) 已登记的“不复制”。主键名不是 `id` 时按主键分组变成单个空值组；可空字段叫 `distance` / `id` 时取错值（探针还看到 `id` 字段配 VARCHAR 主键时 3.x 报 `invalid literal for int()`）。**链式分组按 3.x**：主键（除与虚拟列同名）不在候选行，是单个空值组，不是差异；只有非主键字段名为 `id` / `distance` 的引擎错值在链式路径不存在。

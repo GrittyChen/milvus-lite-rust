@@ -1,6 +1,6 @@
 # 0035：公共 function chain
 
-状态：设计第一稿 2026-11-15 评审通过（0 阻断，5 项建议已并入本稿）；第 1 步（解码与校验）已实施并评审通过（2026-11-15）；第 2 步（执行与结果）已实施并评审通过（2026-11-15）。动手前的调查（三轮真实 3.x 探针、2.6 线原始请求验证）经负责人复核，决策 A–F 已确认。参照版本 `1320d26`（pymilvus 3.0.2 / 2.6.18、CPython 3.12）。
+状态：设计第一稿 2026-11-15 评审通过（0 阻断，5 项建议已并入本稿）；第 1 步（解码与校验）已实施并评审通过（2026-11-15）；第 2 步（执行与结果）已实施并评审通过（2026-11-15）；第 3 步（证据与文档）已实施并评审通过（2026-11-16）。动手前的调查（三轮真实 3.x 探针、2.6 线原始请求验证）经负责人复核，决策 A–F 已确认。参照版本 `1320d26`（pymilvus 3.0.2 / 2.6.18、CPython 3.12）。
 
 ## 范围
 
@@ -100,7 +100,7 @@ Search iterator 发的也是 `SearchRequest`，3.x 对带链的请求不区分�
 - 主键、重复字段名、JSON / ARRAY / 向量 / TIMESTAMPTZ 字段、分组、`time_fields`、无动态字段的 collection 上点名不存在的字段：都与不带链相同。
 - 例外（第 2 步实测，探针 `probe5` / `probe6`）：名为 `$id`、`$score` 的名字被去掉。schema 里叫这两个名字的非主键字段返回空值占位，动态字段里的这两个键不返回；不带链时照常返回。来源是 3.x `_project_entity` 跳过 `$id` / `$score`，与 [0026](0026-rerank-and-hybrid-search.md) 的 L2 链相同。本实现照做，不登记差异。
 
-含 `*` 或 `$meta` 时 3.x 有缺陷：除主键与另外显式点名的字段外，schema 字段全部返回类型默认值（`0`、`""`、JSON `null`、空数组），`$meta` 只剩显式点名的动态键（没有则为 `{}`）；只有 `limit` 的链也这样。
+含 `*` 或 `$meta` 时 3.x 有缺陷：除主键与另外显式点名的字段外，schema 字段全部返回类型默认值（`0`、`""`、JSON `null`、空数组、零向量），并把 `valid_data` 全标为假（SDK 读成 `None`，非 nullable 字段也一样），`$meta` 只剩显式点名的动态键（没有则为 `{}`）；只有 `limit` 的链也这样。
 
 本实现的合同（决策 A）：**带链时的投影与同一请求不带链时完全相同**（上面名为 `$id` / `$score` 的例外照 3.x），链只改变行的顺序、行数与分数。实现上不另写投影逻辑，响应沿用普通 Search 的输出路径；链需要的字段只进入内部取列（见“设计”第 3 条），不进入响应。
 
@@ -145,7 +145,7 @@ Search iterator 发的也是 `SearchRequest`，3.x 对带链的请求不区分�
 
 ## 与 3.x 的差异
 
-- **`*` / `$meta` 投影**（决策 A）：带链且 `output_fields` 含 `*` 或 `$meta` 时，3.x 返回类型默认值与残缺的 `$meta`，本实现返回真实值。其余投影相同。
+- **`*` / `$meta` 投影**（决策 A）：带链且 `output_fields` 含 `*` 或 `$meta` 时，3.x 返回类型默认值（`valid_data` 全为假）与残缺的 `$meta`，本实现返回真实值。其余投影相同。
 - **合法的 `rerank_model`**（决策 B）：3.x 没有 key 时报 code 1 `Cohere API key is required...`，有 key 时调用外部服务；本实现返回 `UNIMPLEMENTED`。两边都发生在未加载检查之前。
 - **按名为 `$score` / `$id` 的字段分组**（决策 G）：3.x `execute_search_function_chain` 在建行时先写 `$id` / `$score`，再执行 `row[group_by_field] = hit["_group_by_value"]`，分组字段恰好叫这两个名字时，分组值盖掉了虚拟列。实测（探针 `probe8`）：
   - 按 `$score` 分组：链的入口分数是分组值，响应分数随之变成分组值；分组值是字符串时报 code 1 `could not convert string to float`，链读 `$score` 时报 `num_combine row values must be finite numeric non-bool values`。
@@ -166,7 +166,7 @@ Search iterator 发的也是 `SearchRequest`，3.x 对带链的请求不区分�
 两份参照文件的链全部用 pymilvus 3.0 的 `FunctionChain` / `col` / `fn` 构造（标着“原始请求”的用例也是 `.to_proto()` 后放进请求），没有一条能在 2.6 线原样运行。因此本切片对“测试体原样复制”的规则做一处范围明确的偏离，称为**改后复制**：
 
 - 可观察行为的断言不变：ids、分数、顺序、字段、错误码与文案保持参照原样。
-- 链的构造与请求的发送换成上节的机制。
+- 链的构造与请求的发送换成上节的机制：[chainwire.py](../../tests/python/chainwire.py) 提供与 pymilvus 3.0 `FunctionChain` / `FunctionChainStage` / `col` / `fn` 同名同参的写法，用例体里构造链的代码因此不变；`client.search(function_chains=chain)` 改为在 `with sending(client, chain):` 里发出同一个 search（SDK 照常解析响应），原始请求的 `function_chains.append(chain.to_proto())` 改为 `attach(request, chain)`。
 - 依赖参照内部对象或调用顺序的断言（monkeypatch），替换为等价的可观察断言；只有下表点名的四条有这种替换，替换点逐条写明。
 - 不因 2.6 的写法放宽断言，也不把 2.6 特有的行为写成通过。
 - [INVENTORY.md](../../tests/python/adapter/INVENTORY.md) 逐条标“改后复制”，写明链的构造与发送方式；有断言替换的四条另注明替换点。
@@ -190,7 +190,7 @@ Search iterator 发的也是 `SearchRequest`，3.x 对带链的请求不区分�
 | `sdk_reranks_by_scalar_field`、`sdk_uses_hidden_input_field`、`sdk_temp_column_not_returned`、`sdk_limit_op`、`rejects_write_readonly_system_column`、`rejects_reserved_temp_output`、`rejects_read_internal_system_input`、`rejects_read_unknown_system_input`、`rejects_with_order_by` | 改后复制 |
 | `rejects_with_function_score` | 不复制：断言的是 pymilvus 3.0 客户端的 `ParamError`，请求不发出；服务端的冲突由上表的 `rejects_function_score_function_chain_conflict` 覆盖 |
 
-合计改后复制 28 个函数（30 条）、不复制 3、已复制 1。
+合计改后复制 28 个函数（30 条）、不复制 3、已复制 1。compatibility 文件整体复制到 [tests/python/compatibility/](../../tests/python/compatibility/test_function_chain_l2.py)，起服务的 fixture 换成本包的 server_manager，并去掉上游在 pymilvus 没有 Function Chain API 时的整模块跳过。
 
 ## 测试矩阵
 
@@ -255,7 +255,7 @@ Search iterator 发的也是 `SearchRequest`，3.x 对带链的请求不区分�
 | tests/python 中链相关的两个文件（2.6.18） | [test_function_chains.py](../../tests/python/test_function_chains.py) 与 [test_grpc_translation.py](../../tests/python/test_grpc_translation.py) 共 124 通过 |
 | 差分中涉及 Search 入口与 rerank 的三个文件（3.0.2） | 151 通过 |
 | [test_function_chains.py](../../tests/python/test_function_chains.py) 直接打真实 3.x | 11 条中 8 条通过；失败的三条恰是登记差异的用例（`*` / `$meta` 投影、合法 `rerank_model`、按名为 `$score` / `$id` 的字段分组）。期望值因此是 3.x 的真值，不是手算的 |
-| 调查探针打本实现与 3.x 逐条比对（本地留存，新增 `probe5` / `probe6` 覆盖 `None` 分数、整数与超范围分数、各模式数值、排序列种类、iterator 参数、检索参数组合、名为 `$id` / `$score` 的字段与动态键） | 387 条中 371 条相同；16 条不同都属于两项登记差异（`*` / `$meta` 投影 13 条、合法 `rerank_model` 3 条） |
+| 调查探针打本实现与 3.x 逐条比对（本地留存，新增 `probe5` / `probe6` 覆盖 `None` 分数、整数与超范围分数、各模式数值、排序列种类、iterator 参数、检索参数组合、名为 `$id` / `$score` 的字段与动态键） | 387 条中 371 条相同；16 条不同都属于两项登记差异（`*` / `$meta` 投影 13 条、合法 `rerank_model` 3 条）；差异 G 是评审补测时发现的，不在这 387 条内，由 `probe8` 与第 3 步的差分覆盖 |
 
 [test_function_chains.py](../../tests/python/test_function_chains.py) 由 4 条变为 11 条。第 1 步断言合法链返回 `UNIMPLEMENTED` 的用例换成执行结果的用例，只保留合法 `rerank_model` 的断言（决策 B）。新增的用例覆盖：投影表各格（MemTable 与 flush 后各一遍）、`*` / `$meta` 的差异、名为 `$id` / `$score` 的字段与动态键、三种 dense 度量与 BM25（含只有 `limit` 的链变号）、稀疏 IP 与稀疏字段作输入的拒绝、各表达式与可空输入、排序的各种列、`offset`、过滤、空结果、范围检索、多查询、分组（含 `group_size`）、search 级 `round_decimal`（含整数分数）、`time_fields`、两个 iterator 版本的参数、运行期错误与 `None` 分数的先后，以及决策 G 的分组。计数 `tests/python` 665 → 672，已同步 `ci.yml` 两处、`scorecard.py`、`test_candidate.py`、打包验收 README 与 AGENTS 命令表；发行与打包脚本自检 687 通过。
 
@@ -269,6 +269,39 @@ SDK 的 `search_iterator`：签名里没有 `function_chains`，经 `**kwargs` �
 
 没有重跑：2.6 线 tests/python 全量、完整差分与互通。改动只在带链请求的路径上；不带链的请求只多了一次空判断，以及 `py_round` 换了位置（实现不变，单测随之移动）。
 
+## 第 3 步验收
+
+本机（macOS arm64），参照 `1320d26`，pymilvus 3.0.2 / 2.6.18。本步没有改产品行为：产品源码里只在 `#[cfg(test)]` 中增加两个读取真值的测试。
+
+改动：
+- **组件真值**：[generate_function_chain_fixtures.py](../../tests/differential/generate_function_chain_fixtures.py) 在参照环境直接调用 3.x 的 `function_chain_to_repr`、`validate_function_chain`、`compile_function_chain` 与链的执行，写两个文件：
+  - [function_chain_validation.json](../../crates/grpc/tests/fixtures/function_chain_validation.json)，280 条：第 3 节每一类解码与校验错误（含后面算子的解码错误先于前面算子的校验错误、各种阶段值、四种 schema 包括主键名为 `$score` / `$id` 与 VARCHAR 主键），以及通过校验的链读到的字段与是否用了 `rerank_model`。[function_chain.rs](../../crates/grpc/src/function_chain.rs) 的单测把每条链的线格式字节解码后校验。
+  - [function_chain_execution.json](../../crates/core/tests/fixtures/function_chain_execution.json)，688 条：`num_combine` 六种模式在随机输入与边界值上的结果；从 int64 一路累加到 float 上限附近的整数，以及越过上限时的报错；`fsum` 的抵消；decay 三种函数配八组参数（含整数 `scale` 的精确平方、下溢为 0 的 `sigma²`）与七种输入列（含 TIMESTAMPTZ 与主键）；`round_decimal` 0–6 位；`sort` 在各种列种类、空值、NaN、平局、平局列与字符串主键上的顺序；`limit`；运行期错误的先后；120 条固定种子的随机链。[public.rs](../../crates/core/src/rerank/public.rs) 的单测执行同样的链与输入行，逐行比较 `$id`、`$score` 与临时列的 Python `repr`。
+  - 编码的核对在生成时完成、不写进文件：953 条链另用 SDK `to_proto()` 构造，与 chainwire 的字节解析结果相同；SDK 构造不出的（未设置的值、空名字、空键）逐字段还原核对；复制用例与 SDK 冒烟里的 24 种 SDK 写法同时交给 chainwire 的同名写法与 `pymilvus.function_chain`，结果相同。
+- **端到端差分**：[test_function_chains.py](../../tests/differential/test_function_chains.py) 4 条，共 654 次比较（481 次有结果行，其余是 code 1 / 6 / 100 / 101 的错误）。覆盖“测试矩阵”的各格：投影表 × 6 种链（MemTable 与 flush 后各一遍，同时断言与不带链时字段相同）、16 个表达式、12 种排序、17 组检索参数（过滤、分区、`offset`、范围检索、多查询、分组含 `group_size` / `strict_group_size`、search 级 `round_decimal`、`timezone` / `time_fields`、两个 iterator 版本）；三种 dense 度量、BM25 与稀疏 IP（含只有 `limit` 的链、`round_decimal`、稀疏字段作输入的拒绝）；26 条非法链在已加载与未加载的 collection 上；冲突与 `order_by_fields` 的 15 个取值；14 种错误情形各配非法链、合法链、运行期出错的链与 `None` 分数的链；运行期错误与 `None` 分数的各种组合；HybridSearch 的拒绝。三项登记差异单列一条，两边各自断言（A 断言 3.x 的默认值与 `valid_data`、B 要求环境里没有 `COHERE_API_KEY` 以免 3.x 调用外部服务、G 断言 3.x 的覆盖与报错文案）。
+- **参照用例**：按“参照用例”一节改后复制 adapter 19 个函数（21 条）与 compatibility 9 条，[INVENTORY.md](../../tests/python/adapter/INVENTORY.md) 逐条标注。[chainwire.py](../../tests/python/chainwire.py) 增加与 SDK 同名的写法、`sending` 与 `attach` 的字段号参数。
+- **SDK 冒烟**：[test_function_chains.py](../../tests/python/test_function_chains.py) 的 `test_sdk_and_wire_chains_give_the_same_results`。3.0 线用 SDK 的 `search(function_chains=...)` 与 `search_iterator(..., function_chains=...)` 各发一次，再用手写编码各发一次；2.6 线只发手写编码；期望相同。实测 3.x 与本实现、两条 SDK 线四种组合的结果都一样：带链检索按链重排；带链的 `search_iterator` 只返回第一页的重排结果就结束（手写编码在 2.6 线上同样如此）。
+- **文档**：README 增加“公共 function chain（当前源码新增，`0.5.0rc1` 不含）”一条，HybridSearch 一条里 Search 的 `function_chains` 改为“`0.5.0rc1` 中为 UNIMPLEMENTED，当前源码已支持”；[0026](0026-rerank-and-hybrid-search.md) 的“不纳入”两处注明之后由本切片实现；AGENTS 的索引、端到端测试与组件真值命令。差异 A 的描述补上 3.x 把 `valid_data` 全标为假（差分实测）。
+
+| 项目 | 结果 |
+| --- | --- |
+| `cargo fmt --check`、clippy（默认与 `fault-injection`） | 通过 |
+| `cargo test --workspace` | 691 通过（新增 2：校验真值、执行真值） |
+| 组件真值 `--verify` | 通过；把真值文件改一个字后两个单测与 `--verify` 都报错 |
+| tests/python（3.0.2） | 703 通过，无跳过 |
+| tests/python 中本步新增与改动的三个文件（2.6.18） | 43 通过 |
+| 改后复制的 31 条与 [test_function_chains.py](../../tests/python/test_function_chains.py) 直接打真实 3.x | 31 条全部通过；test_function_chains.py 12 条中 9 条通过，失败的仍是三条差异用例 |
+| 差分新文件（3.0.2 / 2.6.18） | 各 4 通过 |
+| 完整差分（3.0.2，4 片） | 860 通过，无跳过 |
+| 发行、打包、平台、CI 与分片脚本自检 | 886 通过 |
+| 分片计划核对 | tests/python 703 / 0，差分 860 / 404 |
+
+计数：`tests/python` 672 → 703（改后复制 30、SDK 冒烟 1），已同步 [ci.yml](../../.github/workflows/ci.yml) 两处、[scorecard.py](../../tests/release/scorecard.py)、[test_candidate.py](../../tests/release/test_candidate.py)、[打包验收 README](../../tests/packaging/README.md) 与 AGENTS 命令表；差分 856 → 860，会话组 404 不变（新文件用自己的 `pair`），已同步 [compare.yml](../../.github/workflows/compare.yml) 两处、`scorecard.py`、`test_candidate.py` 与[分片 README](../../tests/sharding/README.md)。
+
+README 全文不能出现 `$` 与花括号（[发行物检查](../../tests/packaging/check_artifacts.py)防止拼接安装命令），新的一条因此用“分数”“主键”“整个动态字段”代替 `$score`、`$id`、`$meta`。
+
+没有重跑：2.6 线 tests/python 全量与完整差分、存储互通。产品行为自第 2 步提交后没有变化，这几项沿用此前的证据；本步改的是测试、真值文件、计数与文档，2.6 线跑了全部新增与改动的用例。
+
 ## 证据
 
-动手前的调查留存在本地（探针脚本、原始输出、调查记录与 2.6 线验证），属于[证据分类](../testing/README.md)里的本地留存；合同中引用的每个 3.x 行为都会在第 3 步由仓库内可重跑的组件真值或差分用例覆盖。
+动手前的调查留存在本地（探针脚本、原始输出、调查记录与 2.6 线验证），属于[证据分类](../testing/README.md)里的本地留存；合同中引用的 3.x 行为已由仓库内可重跑的组件真值（`--verify`）与差分用例覆盖（第 3 步验收）。

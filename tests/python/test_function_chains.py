@@ -645,6 +645,59 @@ def test_chain_runtime_errors_and_their_order(env):
     assert status(search(stub, "c", none_score, limit=2, data=[[0.0, 0.0], [0.0, 0.0]])) == float_none
 
 
+def test_sdk_and_wire_chains_give_the_same_results(env):
+    """SDK 冒烟（0035「测试机制」）：pymilvus 3.0 线用 `search(function_chains=...)` 与手写编码各发一次，2.6 线
+    （没有 SDK 写法）只发手写编码，结果都等于期望。`search_iterator` 带链时只返回第一页的重排结果就结束
+    （3.x 在两条 SDK 线上同样如此）。"""
+    client, _ = env
+    schema = client.create_schema(auto_id=False, enable_dynamic_field=True)
+    schema.add_field("id", DataType.INT64, is_primary=True)
+    schema.add_field("ts", DataType.INT64)
+    schema.add_field("vector", DataType.FLOAT_VECTOR, dim=2)
+    index = client.prepare_index_params()
+    index.add_index(field_name="vector", index_type="FLAT", metric_type="L2", params={})
+    client.create_collection("smoke", schema=schema, index_params=index)
+    client.insert("smoke", [{"id": i, "ts": ts, "vector": [0.01 * i, 0.0]}
+                            for i, ts in zip(range(1, 7), [10, 20, 30, 20, 50, 5])])
+    client.load_collection("smoke")
+
+    def build(api):
+        return (api.FunctionChain(api.FunctionChainStage.L2_RERANK)
+                .map("$score", api.fn.num_combine(api.col("$score"), api.col("ts"), mode="sum"))
+                .sort(api.col("$score"), desc=True, tie_break_col=api.col("$id"))
+                .limit(3))
+
+    try:
+        from pymilvus import function_chain as sdk
+    except ImportError:  # pymilvus 2.6
+        sdk = None
+    kwargs = dict(collection_name="smoke", data=[[0.0, 0.0]], anns_field="vector",
+                  search_params={"metric_type": "L2", "params": {}}, output_fields=["ts"])
+
+    def hits(result):
+        return [[(hit["id"], hit["distance"], hit["entity"]["ts"]) for hit in query] for query in result]
+
+    def pages(iterator):
+        out = []
+        while page := iterator.next():
+            out.append([(hit["id"], hit["distance"]) for hit in page])
+        iterator.close()
+        return out
+
+    expected = [[(5, pytest.approx(50.0025, rel=1e-6), 50), (3, pytest.approx(30.0009, rel=1e-6), 30),
+                 (4, pytest.approx(20.0016, rel=1e-6), 20)]]
+    expected_pages = [[(2, pytest.approx(20.0004, rel=1e-6)), (1, pytest.approx(10.0001, rel=1e-6))]]
+    with w.sending(client, build(w)):
+        assert hits(client.search(limit=5, **kwargs)) == expected
+        assert pages(client.search_iterator(batch_size=2, **kwargs)) == expected_pages
+    if sdk is not None:
+        assert hits(client.search(limit=5, function_chains=build(sdk), **kwargs)) == expected
+        assert pages(client.search_iterator(batch_size=2, function_chains=build(sdk), **kwargs)) == expected_pages
+    # 不带链的迭代照常翻页。
+    assert [[i for i, _ in page] for page in pages(client.search_iterator(batch_size=2, **kwargs))] == [
+        [1, 2], [3, 4], [5, 6]]
+
+
 def test_valid_rerank_model_is_unimplemented(env):
     """登记的差异（0035 决策 B）：通过全部校验的 `rerank_model` 返回 UNIMPLEMENTED，位置在 load 检查之前
     （3.x 在同一位置创建 provider）。"""

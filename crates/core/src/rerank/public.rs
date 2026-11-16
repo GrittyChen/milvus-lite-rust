@@ -2329,6 +2329,190 @@ mod tests {
         );
     }
 
+    /// 真实 3.x 的组件真值，由 tests/differential/generate_function_chain_fixtures.py 导出：3.x 解码出的链表示、
+    /// 各查询的输入行，以及 3.x 编译、执行后每行的 `$id`、`$score` 与临时列的 `repr`，或运行期错误的文案。
+    #[test]
+    fn execution_matches_the_reference_fixture() {
+        use serde_json::Value;
+
+        fn float(value: &Value) -> Option<f64> {
+            let hex = value.get("f")?.as_str()?;
+            Some(f64::from_bits(u64::from_str_radix(hex, 16).ok()?))
+        }
+        fn param(value: &Value) -> Param {
+            match value {
+                Value::Bool(b) => Param::Bool(*b),
+                Value::Number(n) => Param::Int(n.as_i64().unwrap()),
+                Value::String(s) => Param::Str(s.clone()),
+                _ => {
+                    if let Some(f) = float(value) {
+                        Param::Float(f)
+                    } else if let Some(items) = value.get("a") {
+                        Param::Array(items.as_array().unwrap().iter().map(param).collect())
+                    } else if let Some(hex) = value.get("y").and_then(Value::as_str) {
+                        Param::Bytes(
+                            (0..hex.len())
+                                .step_by(2)
+                                .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+                                .collect(),
+                        )
+                    } else {
+                        Param::Object(params_of(&value["o"]))
+                    }
+                }
+            }
+        }
+        fn params_of(value: &Value) -> Params {
+            value
+                .as_object()
+                .unwrap()
+                .iter()
+                .map(|(k, v)| (k.clone(), param(v)))
+                .collect()
+        }
+        fn strings(value: &Value) -> Vec<String> {
+            value
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap().to_owned())
+                .collect()
+        }
+        fn value_of(value: &Value) -> PyVal {
+            match value {
+                Value::Null => PyVal::None,
+                Value::Bool(b) => PyVal::Bool(*b),
+                Value::Number(n) => PyVal::Int(n.as_i64().unwrap()),
+                Value::String(s) => PyVal::Str(s.clone()),
+                _ => match float(value) {
+                    Some(f) => PyVal::Float(f),
+                    None => PyVal::DateTime(value["t"].as_i64().unwrap()),
+                },
+            }
+        }
+        let types = [
+            DataType::Bool,
+            DataType::Int8,
+            DataType::Int16,
+            DataType::Int32,
+            DataType::Int64,
+            DataType::Float,
+            DataType::Double,
+            DataType::VarChar,
+            DataType::Timestamptz,
+        ];
+
+        let fixture = crate::json_text::value_str(include_str!(
+            "../../tests/fixtures/function_chain_execution.json"
+        ))
+        .unwrap();
+        let cases = fixture["cases"].as_array().unwrap();
+        assert_eq!(cases.len(), 688);
+        for (index, case) in cases.iter().enumerate() {
+            let what = format!("case {index} ({})", case["label"].as_str().unwrap());
+            let fields: Vec<FieldSchema> = fixture["schemas"][case["schema"].as_str().unwrap()]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|field| {
+                    let name = field[1].as_str().unwrap();
+                    let data_type = *types.iter().find(|t| t.name() == name).unwrap();
+                    let mut schema = FieldSchema::new(field[0].as_str().unwrap(), data_type);
+                    schema.is_primary = field[2].as_bool().unwrap();
+                    schema
+                })
+                .collect();
+            let pk = fields[0].name.clone();
+            let schema = CollectionSchema {
+                fields,
+                enable_dynamic_field: true,
+                properties: Vec::new(),
+                functions: Vec::new(),
+            };
+            let chain = &case["chain"];
+            let ops = chain["ops"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|op| Op {
+                    op: op["op"].as_str().unwrap().to_owned(),
+                    expr: (!op["expr"].is_null()).then(|| Expr {
+                        name: op["expr"]["name"].as_str().unwrap().to_owned(),
+                        args: op["expr"]["args"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .map(|arg| match arg.get("column") {
+                                Some(name) => Arg::Column(name.as_str().unwrap().to_owned()),
+                                None => Arg::Literal(param(&arg["literal"])),
+                            })
+                            .collect(),
+                        params: params_of(&op["expr"]["params"]),
+                    }),
+                    inputs: strings(&op["inputs"]),
+                    outputs: strings(&op["outputs"]),
+                    params: params_of(&op["params"]),
+                })
+                .collect();
+            let repr = ChainRepr {
+                stage: chain["stage"].as_str().unwrap().to_owned(),
+                ops,
+            };
+            let rows = case["rows"].as_array().unwrap();
+            let validated = validate(repr, &schema, rows.len()).unwrap();
+            let plan = Plan::new(&validated, &pk).unwrap();
+            let temps = strings(&case["temps"]);
+            assert_eq!(plan.names[plan.fields..], temps, "{what}");
+            let chunks = rows
+                .iter()
+                .map(|chunk| {
+                    chunk
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .enumerate()
+                        .map(|(i, row)| {
+                            let score = float(&row[1]).unwrap();
+                            plan.row(i, value_of(&row[0]), score, |name| {
+                                Ok(value_of(&row[2][name]))
+                            })
+                            .unwrap()
+                        })
+                        .collect()
+                })
+                .collect();
+            match (plan.execute(chunks), case.get("error")) {
+                (Err(EngineError::InvalidArgument(message)), Some(expected)) => {
+                    assert_eq!(message, expected.as_str().unwrap(), "{what}")
+                }
+                (Ok(output), None) => {
+                    let got: Vec<Vec<Vec<String>>> = output
+                        .iter()
+                        .map(|chunk| {
+                            chunk
+                                .iter()
+                                .map(|row| {
+                                    let mut cells =
+                                        vec![row.values[ID_SLOT].repr(), row.score().repr()];
+                                    cells.extend(row.values[plan.fields..].iter().map(PyVal::repr));
+                                    cells
+                                })
+                                .collect()
+                        })
+                        .collect();
+                    let expected: Vec<Vec<Vec<String>>> = case["output"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|chunk| chunk.as_array().unwrap().iter().map(strings).collect())
+                        .collect();
+                    assert_eq!(got, expected, "{what}");
+                }
+                (got, expected) => panic!("{what}: got {got:?}, expected {expected:?}"),
+            }
+        }
+    }
+
     #[test]
     fn rerank_model_is_never_compiled() {
         let chain = check_with(
