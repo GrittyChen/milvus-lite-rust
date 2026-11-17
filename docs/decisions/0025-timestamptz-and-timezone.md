@@ -1,6 +1,6 @@
 # 0025 TIMESTAMPTZ 与 timezone 属性
 
-- 状态：设计评审通过（r2）；第 1 步（类型与存储）、第 2 步（过滤）、第 3 步（时区与属性 RPC）已实施并提交（本地），第 4 步（差分、参照用例、文档与验收）已实施待评审；验收见 [0025 验收](../testing/0025-timestamptz-acceptance.md)
+- 状态：设计评审通过（r2）；第 1 步（类型与存储）、第 2 步（过滤）、第 3 步（时区与属性 RPC）与第 4 步（差分、参照用例、文档与验收）已实施并评审通过；2026-11-03 合入 main（`b9a64ee`），随 `0.4.0rc1` 发布；验收见 [0025 验收](../testing/0025-timestamptz-acceptance.md)
 - 日期：2026-11-02
 - 参照：milvus-lite v3.2.1 / `43d1257774e629bc9f66873977ab7c320d5bf5a7`；pymilvus 3.0.2 实测，2.6.17 经源码核对（`timezone`、`time_fields` 参数与 `DataType.TIMESTAMPTZ` 同样存在，实施阶段补测）
 - 前置：[0014](0014-index-definitions-and-filter-expressions.md)（过滤语法与 ISO / INTERVAL 字面量的语法校验）、[0015](0015-nullable-defaults-and-array.md)（nullable 与默认值）、[0023](0023-aliases-rename-truncate-databases.md)（集合与数据库属性；其取舍 1 把 `timezone` 留给本切片）、[0024](0024-group-by-search.md)

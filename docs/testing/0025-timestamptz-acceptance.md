@@ -1,6 +1,6 @@
 # 0025：TIMESTAMPTZ 与 timezone 实施验收
 
-- 状态：设计评审通过；第 1 步（类型与存储）、第 2 步（过滤）、第 3 步（时区与属性 RPC）各自评审通过并提交到本地；本记录随第 4 步（差分、参照用例、文档与验收）提交。**未推送、未发布**。
+- 状态：设计评审通过；第 1 步（类型与存储）、第 2 步（过滤）、第 3 步（时区与属性 RPC）各自评审通过并提交到本地；本记录随第 4 步（差分、参照用例、文档与验收）提交，提交时未推送、未发布。其后第 4 步评审通过，临时分支上 CI 41644787327 与 Compare 41644787330 全部通过，2026-11-03 快进合入 main（`4bfd87e..b9a64ee`），main CI 41648904583 通过；随 `0.4.0rc1` 发布。
 - 日期：2026-11-03
 - 合同与设计：[0025](../decisions/0025-timestamptz-and-timezone.md)，继承 0004、0006、0014（过滤语法）、0015（nullable 与默认值）、0023（集合与数据库属性）。
 - 仓库基线：分组检索合入后的 `4bfd87e`；本地提交依次为 `d8bdfd5`（第 1 步）、`229bb9d`（第 2 步）、`abb1f15`（第 3 步）。
@@ -101,4 +101,4 @@ wheel 由 `abb1f15` 之上带第 4 步产品代码改动的工作区构建（`cr
 
 ## 证据类别
 
-仓库内可重跑：上述测试命令、差分用例与场景表（`tests/differential/test_timezone.py`、`test_timestamptz.py`、`test_timestamp_filters.py`、`timestamp_filter_cases.py`）、时区 fixture 及其 `--verify`、核心与翻译层测试、`scorecard.py` 与工作流中的预期计数。本地留存：探针脚本与 3.x 原始输出（655 场景）、统计的原始输出与环境、开发 wheel、2.6.17 线的运行环境、各步骤评审时冻结的 diff。以上结果均未推送，第三方在推送之前无法核对本记录所指的提交。
+仓库内可重跑：上述测试命令、差分用例与场景表（`tests/differential/test_timezone.py`、`test_timestamptz.py`、`test_timestamp_filters.py`、`timestamp_filter_cases.py`）、时区 fixture 及其 `--verify`、核心与翻译层测试、`scorecard.py` 与工作流中的预期计数。本地留存：探针脚本与 3.x 原始输出（655 场景）、统计的原始输出与环境、开发 wheel、2.6.17 线的运行环境、各步骤评审时冻结的 diff。提交时以上结果均未推送，第三方当时无法核对本记录所指的提交。
