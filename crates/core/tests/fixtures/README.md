@@ -21,3 +21,5 @@
 - `filter_dynamic.json`：顶层动态字段过滤在各类取值上的掩码与错误。由 [generate_dynamic_filter_fixtures.py](../../../../tests/differential/generate_dynamic_filter_fixtures.py) 生成。
 
 两个生成脚本都要求可编辑安装的参照 checkout，加 `--verify` 时只核对、不覆盖；完整命令见 [AGENTS 常用命令](../../../../AGENTS.md#常用命令)。
+
+jieba 分词的真值不来自参照实现的 checkout：`jieba.json` 由装了 jieba 0.42.1 的 3.x 参照解释器经 [generate_jieba_fixtures.py](../../../../tests/differential/generate_jieba_fixtures.py) 导出。内容包括：jieba 自带 `test/test.py` 的测试句（jieba 按 MIT 许可发布）与固定种子的随机串上的切分；3.x `create_analyzer` 的分词结果；以及每组用户词在新建 `Tokenizer` 上的结果（0036）。

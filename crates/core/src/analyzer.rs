@@ -3,6 +3,9 @@
 //! 分词结果要与 3.x 逐位一致（0002 约束 8），所以大小写和 `\w` 都用固定的 CPython 3.12 表，
 //! 不用 Rust 标准库的大小写表：后者随工具链的 Unicode 版本变化。输入按码位处理，
 //! 孤立代理（只可能来自解码后的 JSON 值）既没有大小写，也不是词字符。
+//!
+//! BM25 function 另可用 jieba 分词（0036）：切分在 [`crate::jieba`]，之后的 `strip` / `lower` / 停用词在这里，
+//! 与 3.x `JiebaAnalyzer` 相同。
 
 use crate::filter::unicode;
 use std::collections::HashSet;
@@ -92,11 +95,71 @@ fn term_id(term: &str) -> u32 {
     })
 }
 
-/// BM25 function 的分词器（3.x `create_analyzer`）：standard 切词加停用词。只在 BM25 输入字段上构造，
-/// `text_match` 仍不读 `analyzer_params`（0029）。
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+/// BM25 function 的分词器（3.x `create_analyzer`）：standard 或 jieba 切词，加停用词。只在 BM25 输入字段上
+/// 构造，`text_match` 仍不读 `analyzer_params`（0029）。
+#[derive(Debug, Clone, Default)]
 pub(crate) struct Bm25Analyzer {
+    tokenizer: Tokenizer,
     stop_words: HashSet<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+enum Tokenizer {
+    #[default]
+    Standard,
+    /// 3.x `JiebaAnalyzer`（0036）。
+    Jieba(crate::jieba::Segmenter),
+}
+
+/// 3.x `JiebaAnalyzer.tokenize`：`[t.strip().lower() for t in raw if t.strip()]`。`lower` 只看词项本身，
+/// 词尾 sigma 的规则不越过词项的边界。
+fn jieba_tokens(segmenter: &crate::jieba::Segmenter, text: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    for raw in segmenter.cut(text) {
+        let stripped = raw.trim_matches(unicode::space);
+        if stripped.is_empty() {
+            continue;
+        }
+        let points: Vec<u32> = stripped.chars().map(u32::from).collect();
+        let mut token = String::with_capacity(stripped.len());
+        for at in 0..points.len() {
+            let (first, second) = lower(&points, at);
+            token.extend(scalar(first));
+            token.extend(second.and_then(scalar));
+        }
+        tokens.push(token);
+    }
+    tokens
+}
+
+/// 3.x `JiebaAnalyzer` 的 `user_dict_words`：为真值时逐项 `jieba.add_word(word)`。字符串逐字符、对象按键迭代；
+/// 其余真值不可迭代，列表里的非字符串在 `strdecode` 上抛 AttributeError。先检查完整个列表再加词：3.x 在
+/// 出错之前加入的词只留在它的全局状态里，本实现没有这种副作用，所以报错只取决于第一个非字符串元素。
+fn jieba_user_words(value: Option<&serde_json::Value>) -> crate::error::Result<Vec<String>> {
+    use crate::error::EngineError;
+    use crate::pyjson::{python_truthy, python_type_name};
+    use serde_json::Value;
+    let Some(value) = value.filter(|value| python_truthy(value)) else {
+        return Ok(Vec::new());
+    };
+    match value {
+        Value::String(text) => Ok(text.chars().map(String::from).collect()),
+        Value::Object(entries) => Ok(entries.keys().cloned().collect()),
+        Value::Array(items) => items
+            .iter()
+            .map(|item| match item {
+                Value::String(word) => Ok(word.clone()),
+                other => Err(EngineError::invalid(format!(
+                    "'{}' object has no attribute 'decode'",
+                    python_type_name(other)
+                ))),
+            })
+            .collect(),
+        other => Err(EngineError::invalid(format!(
+            "'{}' object is not iterable",
+            python_type_name(other)
+        ))),
+    }
 }
 
 impl Bm25Analyzer {
@@ -124,9 +187,9 @@ impl Bm25Analyzer {
             .or_else(|| params.get("type"))
             .unwrap_or(&fallback);
         let stop_words = stop_words(params);
-        let name = match tokenizer {
-            Value::String(_) => tokenizer,
-            Value::Object(options) => options.get("type").unwrap_or(&fallback),
+        let (name, options) = match tokenizer {
+            Value::String(_) => (tokenizer, None),
+            Value::Object(options) => (options.get("type").unwrap_or(&fallback), Some(options)),
             other => {
                 return Err(EngineError::schema(format!(
                     "analyzer_params 'tokenizer' must be a string or dict, got {}",
@@ -135,11 +198,22 @@ impl Bm25Analyzer {
             }
         };
         match name.as_str() {
-            Some("standard") => Ok(Self { stop_words }),
-            Some("jieba") => Err(EngineError::unsupported(
-                "jieba tokenizer",
-                "the jieba tokenizer is not supported in this build of milvus-lite-rust",
-            )),
+            Some("standard") => Ok(Self {
+                tokenizer: Tokenizer::Standard,
+                stop_words,
+            }),
+            Some("jieba") => {
+                let option = |key| options.and_then(|options| options.get(key));
+                // `mode or "search"`，之后只有等于 "search" 才用 `cut_for_search`。
+                let search = option("mode")
+                    .filter(|mode| python_truthy(mode))
+                    .is_none_or(|mode| mode.as_str() == Some("search"));
+                let words = jieba_user_words(option("dict"))?;
+                Ok(Self {
+                    tokenizer: Tokenizer::Jieba(crate::jieba::Segmenter::new(search, words)?),
+                    stop_words,
+                })
+            }
             _ => Err(EngineError::schema(format!(
                 "unknown tokenizer type: {} (supported: 'standard', 'jieba')",
                 py_json_repr(name)
@@ -152,7 +226,11 @@ impl Bm25Analyzer {
     pub(crate) fn term_frequencies(&self, text: &str) -> Vec<(u32, f32)> {
         let mut counts: Vec<(u32, u64)> = Vec::new();
         let mut positions: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
-        for token in tokenize(text) {
+        let tokens = match &self.tokenizer {
+            Tokenizer::Standard => tokenize(text),
+            Tokenizer::Jieba(segmenter) => jieba_tokens(segmenter, text),
+        };
+        for token in tokens {
             if self.stop_words.contains(&token) {
                 continue;
             }
@@ -174,7 +252,8 @@ impl Bm25Analyzer {
 }
 
 /// 3.x `_extract_stop_words`：`filter` 列表里 `type == "stop"` 的对象，其 `stop_words` 为列表时逐项 `str()`。
-/// 词已转小写且只含 `\w`：`True` / `False` / `None` 与浮点、列表、对象转成的文本都不可能命中，不收进集合。
+/// jieba 的词项可以是 `1.5`、标点等，所以浮点等也按 `str()` 收进集合（0036）；standard 的词项只含 `\w`，
+/// 这些项对它不会命中，结果不变。
 fn stop_words(params: &serde_json::Map<String, serde_json::Value>) -> HashSet<String> {
     use serde_json::Value;
     let mut words = HashSet::new();
@@ -192,15 +271,10 @@ fn stop_words(params: &serde_json::Map<String, serde_json::Value>) -> HashSet<St
             continue;
         };
         for word in list {
-            match word {
-                Value::String(word) => {
-                    words.insert(word.clone());
-                }
-                Value::Number(n) if !n.as_str().contains(['.', 'e', 'E']) => {
-                    words.insert(crate::error::py_json_repr(word));
-                }
-                _ => {}
-            }
+            words.insert(match word {
+                Value::String(word) => word.clone(),
+                other => crate::error::py_json_repr(other),
+            });
         }
     }
     words
@@ -349,10 +423,92 @@ mod tests {
             message(r#"{"tokenizer": {"type": {"a": [1, "b"]}}}"#),
             "unknown tokenizer type: {'a': [1, 'b']} (supported: 'standard', 'jieba')"
         );
-        assert!(matches!(
-            analyzer(r#"{"type": "jieba"}"#),
-            Err(crate::error::EngineError::Unsupported { .. })
-        ));
+    }
+
+    /// 期望值取自 3.x `create_analyzer`（jieba 0.42.1）。
+    #[test]
+    fn jieba_params_follow_create_analyzer() {
+        let tokens = |params: &str, text: &str| {
+            let a = analyzer(params).unwrap();
+            let Tokenizer::Jieba(segmenter) = &a.tokenizer else {
+                panic!("{params} is not jieba");
+            };
+            jieba_tokens(segmenter, text)
+                .into_iter()
+                .filter(|t| !a.stop_words.contains(t))
+                .collect::<Vec<_>>()
+        };
+        let text = "价格1.5元，折扣0.5%，Ａ1 ǅ İ ΑΣ";
+        let all = [
+            "价格", "1.5", "元", "，", "折扣", "0.5%", "，", "ａ", "1", "ǆ", "i̇", "α", "σ",
+        ];
+        for search in [
+            r#"{"tokenizer": "jieba"}"#,
+            r#"{"type": "jieba"}"#,
+            r#"{"tokenizer": {}, "type": "jieba"}"#,
+            r#"{"tokenizer": {"type": "jieba", "mode": null, "hmm": false}}"#,
+            r#"{"tokenizer": {"type": "jieba", "mode": 0, "dict": []}}"#,
+        ] {
+            assert_eq!(tokens(search, text), all, "{search}");
+            assert_eq!(
+                tokens(search, "中国科学院"),
+                ["中国", "科学", "学院", "科学院", "中国科学院"]
+            );
+        }
+        for exact in [
+            r#"{"tokenizer": {"type": "jieba", "mode": "exact"}}"#,
+            r#"{"tokenizer": {"type": "jieba", "mode": "SEARCH"}}"#,
+            r#"{"tokenizer": {"type": "jieba", "mode": ["x"]}}"#,
+        ] {
+            assert_eq!(tokens(exact, "中国科学院"), ["中国科学院"], "{exact}");
+        }
+        assert_eq!(
+            tokens(
+                r#"{"tokenizer": "jieba", "filter": [{"type": "stop", "stop_words": [1.5, true, "，"]}]}"#,
+                text
+            ),
+            ["价格", "元", "折扣", "0.5%", "ａ", "1", "ǆ", "i̇", "α", "σ"]
+        );
+        for (dict, error) in [
+            ("5", "'int' object is not iterable"),
+            ("true", "'bool' object is not iterable"),
+            ("1.5", "'float' object is not iterable"),
+            (r#"["a", 5]"#, "'int' object has no attribute 'decode'"),
+            ("[null]", "'NoneType' object has no attribute 'decode'"),
+            ("[[\"a\"]]", "'list' object has no attribute 'decode'"),
+        ] {
+            let params = format!(r#"{{"tokenizer": {{"type": "jieba", "dict": {dict}}}}}"#);
+            assert_eq!(message(&params), error, "{params}");
+        }
+        assert_eq!(
+            message(r#"{"type": {"type": "jieba", "dict": [5]}}"#),
+            "'int' object has no attribute 'decode'"
+        );
+        // 字符串逐字符、对象按键加词（`total` 的增量取自 jieba 0.42.1 的新 `Tokenizer`）。
+        let total = |params: &str| {
+            let a = analyzer(params).unwrap();
+            let Tokenizer::Jieba(segmenter) = &a.tokenizer else {
+                panic!("{params} is not jieba");
+            };
+            segmenter.total() - 60_101_967
+        };
+        assert_eq!(
+            total(r#"{"tokenizer": {"type": "jieba", "dict": "米尔"}}"#),
+            38926
+        );
+        assert_eq!(
+            total(r#"{"tokenizer": {"type": "jieba", "dict": {"米尔维斯": 1, "a": 2}}}"#),
+            3
+        );
+        assert_eq!(
+            tokens(
+                r#"{"tokenizer": {"type": "jieba", "mode": "exact", "dict": {"米尔维斯": 1}}}"#,
+                "我爱米尔维斯"
+            ),
+            ["我", "爱", "米尔维斯"]
+        );
+        // 不是 jieba 时不读 `dict`。
+        assert!(analyzer(r#"{"tokenizer": {"type": "standard", "dict": 5}}"#).is_ok());
     }
 
     #[test]
@@ -363,13 +519,54 @@ mod tests {
         )
         .unwrap();
         let words: HashSet<&str> = a.stop_words.iter().map(String::as_str).collect();
-        assert_eq!(words, HashSet::from(["fox", "1", "The"]));
+        assert_eq!(
+            words,
+            HashSet::from(["fox", "1", "True", "None", "1.5", "The"])
+        );
         assert_eq!(
             a.term_frequencies("The fox the DOG 1 dog"),
             vec![(term_id("the"), 2.0), (term_id("dog"), 2.0)]
         );
         assert!(a.term_frequencies("fox 1").is_empty());
+        // `str(1e999)` 是 "inf"，standard 的词项 inf 也会命中（3.x 实测 `tokenize("inf x")` 为 `['x']`）。
+        let inf = analyzer(r#"{"filter": [{"type": "stop", "stop_words": [1e999]}]}"#).unwrap();
+        assert_eq!(inf.term_frequencies("inf x"), vec![(term_id("x"), 1.0)]);
         assert!(Bm25Analyzer::default().term_frequencies("").is_empty());
+    }
+
+    /// 3.x 真实 `create_analyzer(params).tokenize(text)`，由 tests/differential/generate_jieba_fixtures.py 导出。
+    #[test]
+    fn jieba_matches_create_analyzer_on_the_exported_corpus() {
+        #[derive(serde::Deserialize)]
+        struct Segments {
+            text: String,
+        }
+        #[derive(serde::Deserialize)]
+        struct Case {
+            params: serde_json::Value,
+            tokens: Vec<Vec<String>>,
+        }
+        #[derive(serde::Deserialize)]
+        struct Fixture {
+            segments: Vec<Segments>,
+            analyzer: Vec<Case>,
+        }
+        let fixture: Fixture =
+            crate::json_text::parse_str(include_str!("../tests/fixtures/jieba.json")).unwrap();
+        assert!(fixture.analyzer.len() >= 7);
+        for case in fixture.analyzer {
+            let a = Bm25Analyzer::from_params(Some(&case.params)).unwrap();
+            let Tokenizer::Jieba(segmenter) = &a.tokenizer else {
+                panic!("{} is not jieba", case.params);
+            };
+            for (text, want) in fixture.segments.iter().zip(&case.tokens) {
+                let got: Vec<String> = jieba_tokens(segmenter, &text.text)
+                    .into_iter()
+                    .filter(|t| !a.stop_words.contains(t))
+                    .collect();
+                assert_eq!(&got, want, "{} {:?}", case.params, text.text);
+            }
+        }
     }
 
     #[test]

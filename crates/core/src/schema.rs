@@ -142,7 +142,7 @@ pub struct Function {
 }
 
 /// 一个 BM25 function 的输入、输出位置与分词器。
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub(crate) struct Bm25Function {
     pub(crate) input: usize,
     pub(crate) output: usize,

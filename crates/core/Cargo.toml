@@ -12,6 +12,7 @@ fault-injection = []
 
 [dependencies]
 jiff.workspace = true
+jieba-rs.workspace = true
 libc.workspace = true
 md5.workspace = true
 num-bigint.workspace = true

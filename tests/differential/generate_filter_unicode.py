@@ -36,7 +36,7 @@ lower = {point: chr(point).lower() for point in range(0x110000)
 assert {p: v for p, v in lower.items() if len(v) != 1} == {0x130: 'i\u0307'}
 del lower[0x130]
 
-parts = ['//! CPython 3.12 / Unicode 15.0 的 isalpha、isalnum、isdigit、isprintable、十进制数字表，\n'
+parts = ['//! CPython 3.12 / Unicode 15.0 的 isalpha、isalnum、isdigit、isprintable、isspace、十进制数字表，\n'
          '//! 以及 str.lower() 的映射和词尾 sigma 用到的两个属性。\n'
          '//! 由 tests/differential/generate_filter_unicode.py 生成，避免 Rust Alphabetic 属性包含组合标记，\n'
          '//! 也避免 Rust 标准库的大小写表随工具链的 Unicode 版本变化。\n'
@@ -45,7 +45,7 @@ parts = ['//! CPython 3.12 / Unicode 15.0 的 isalpha、isalnum、isdigit、ispr
          '    let index = ranges.partition_point(|(_,end)| *end < c);\n'
          '    ranges.get(index).is_some_and(|(start,_)| *start <= c)\n}\n']
 for name, predicate in [('alpha', str.isalpha), ('alnum', str.isalnum), ('digit', str.isdigit), ('printable', str.isprintable),
-                        ('cased', cased), ('case_ignorable', case_ignorable)]:
+                        ('space', str.isspace), ('cased', cased), ('case_ignorable', case_ignorable)]:
     entries = ranges(predicate)
     parts.append(f'pub(crate) fn {name}(c: char) -> bool {{ contains(c, {name.upper()}) }}\n')
     parts.append(f'const {name.upper()}: &[(u32,u32)] = &[\n')

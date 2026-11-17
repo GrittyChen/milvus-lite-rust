@@ -81,7 +81,11 @@ fn pack(pairs: &[(u32, f32)]) -> Vec<u8> {
 
 /// 每个主键的（文本，输出字节）。
 fn stored(db: &Db) -> Vec<(i64, Option<String>, Vec<u8>)> {
-    let handle = db.collection("", "c").unwrap();
+    stored_in(db, "c")
+}
+
+fn stored_in(db: &Db, name: &str) -> Vec<(i64, Option<String>, Vec<u8>)> {
+    let handle = db.collection("", name).unwrap();
     let rows = handle
         .read()
         .read_snapshot()
@@ -254,11 +258,104 @@ fn analyzer_params_are_checked_after_functions_with_raw_values() {
         error(basic(Some(json!({"tokenizer": "english"})))),
         "unknown tokenizer type: 'english' (supported: 'standard', 'jieba')"
     );
-    assert!(matches!(
-        Collection::new("c", basic(Some(json!({"tokenizer": "jieba"})))),
-        Err(EngineError::Unsupported { .. })
-    ));
+    assert!(Collection::new("c", basic(Some(json!({"tokenizer": "jieba"})))).is_ok());
+    // jieba 的用户词在构造分词器时检查（0036）。
+    assert_eq!(
+        error(basic(Some(
+            json!({"tokenizer": {"type": "jieba", "dict": ["a", 5]}})
+        ))),
+        "'int' object has no attribute 'decode'"
+    );
     assert!(Collection::new("c", basic(Some(json!({"tokenizer": []})))).is_ok());
+}
+
+/// 0036：jieba 分词生成的稀疏向量与 3.x `create_analyzer(...).tokenize` 的词项计数相同（期望的词项取自 3.x，
+/// jieba 0.42.1），经 flush 与重开不变；没有用户词的集合共用一个分词器实例，带用户词的各用一份，并发写入与检索互不影响。
+#[test]
+fn jieba_outputs_survive_reopen_and_collections_are_independent() {
+    let root = tempfile::tempdir().unwrap();
+    let db = open(root.path());
+    db.create_collection("", "plain", basic(Some(json!({"tokenizer": "jieba"}))))
+        .unwrap();
+    db.create_collection(
+        "",
+        "user",
+        basic(Some(
+            json!({"tokenizer": {"type": "jieba", "mode": "exact", "dict": ["米尔维斯"]}}),
+        )),
+    )
+    .unwrap();
+    let plain_text = "我爱北京天安门，我爱Python和C++。 ΑΣ";
+    let user_text = "我爱米尔维斯，米尔维斯";
+    let threads: Vec<_> = (0..4)
+        .map(|i| {
+            let db = Arc::clone(&db);
+            std::thread::spawn(move || {
+                for round in 0..5 {
+                    let id = i * 10 + round;
+                    db.insert("", "plain", texts(&[id], &[Some(plain_text)]))
+                        .unwrap();
+                    db.insert("", "user", texts(&[id], &[Some(user_text)]))
+                        .unwrap();
+                }
+            })
+        })
+        .collect();
+    for thread in threads {
+        thread.join().unwrap();
+    }
+    // user 已经加过用户词；plain 共用的默认实例不受影响，「米尔维斯」仍按默认词典切分。
+    db.insert("", "plain", texts(&[99], &[Some("米尔维斯")]))
+        .unwrap();
+    let counts = |pairs: &[(&str, f32)]| {
+        let mut packed: Vec<(u32, f32)> = pairs.iter().map(|(t, c)| (fnv(t), *c)).collect();
+        packed.sort_by_key(|p| p.0);
+        pack(&packed)
+    };
+    let plain = counts(&[
+        ("我", 2.0),
+        ("爱", 2.0),
+        ("北京", 1.0),
+        ("天安", 1.0),
+        ("天安门", 1.0),
+        ("，", 1.0),
+        ("python", 1.0),
+        ("和", 1.0),
+        ("c++", 1.0),
+        ("。", 1.0),
+        ("α", 1.0),
+        ("σ", 1.0),
+    ]);
+    let user = counts(&[("我", 1.0), ("爱", 1.0), ("米尔维斯", 2.0), ("，", 1.0)]);
+    // 3.x `create_analyzer({"tokenizer": "jieba"}).tokenize("米尔维斯")`。
+    let default_cut = counts(&[("米尔", 1.0), ("米尔维", 1.0), ("斯", 1.0)]);
+    let check = |db: &Db| {
+        for (name, expected) in [("plain", &plain), ("user", &user)] {
+            let rows: Vec<_> = stored_in(db, name)
+                .into_iter()
+                .filter(|r| r.0 != 99)
+                .collect();
+            assert_eq!(rows.len(), 20, "{name}");
+            assert!(rows.iter().all(|(_, _, sp)| sp == expected), "{name}");
+        }
+        let extra = stored_in(db, "plain")
+            .into_iter()
+            .find(|r| r.0 == 99)
+            .unwrap();
+        assert_eq!(extra.2, default_cut);
+        // 用户词只属于自己的集合：user 的查询词是「米尔维斯」，plain 的是「米尔」「米尔维」「斯」。
+        assert_eq!(text_search(db, "user", &["米尔维斯"], "")[0].len(), 10);
+        let plain_hits = text_search(db, "plain", &["米尔维斯"], "");
+        assert_eq!(plain_hits[0].iter().map(|h| h.0).collect::<Vec<_>>(), [99]);
+        assert_eq!(text_search(db, "plain", &["天安门"], "")[0].len(), 10);
+    };
+    check(&db);
+    db.flush_collection("", "plain").unwrap();
+    db.close();
+    drop(db);
+    let db = open(root.path());
+    check(&db);
+    db.close();
 }
 
 /// 写入时生成：小写、停用词、按词项哈希计数并按维度排序；null 与缺失的文本生成空向量，

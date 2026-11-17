@@ -15,6 +15,8 @@ pub mod flush_budget;
 #[doc(hidden)]
 pub mod geometry;
 pub mod index;
+#[doc(hidden)]
+pub mod jieba;
 pub mod json_text;
 pub mod lock_order;
 mod maintenance;

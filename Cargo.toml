@@ -13,6 +13,9 @@ publish = false
 [workspace.dependencies]
 # 内置 tzdata（0025）：不依赖运行平台的时区数据；版本写死，升级须重跑时区 fixture。
 jiff = { version = "=0.2.38", default-features = false, features = ["std", "tzdb-bundle-always"] }
+# jieba 分词（0036）：关闭 default-dict，避开 include-flate 引入的 zstd-sys（C）；词典与全精度模型由本仓提供。
+# 版本写死，升级须重跑 jieba 的对照工具。
+jieba-rs = { version = "=0.11.0", default-features = false }
 libc = "0.2"
 md5 = "0.8.1"
 arrow-array = "~60.0"

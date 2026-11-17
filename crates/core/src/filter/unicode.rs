@@ -1,4 +1,4 @@
-//! CPython 3.12 / Unicode 15.0 的 isalpha、isalnum、isdigit、isprintable、十进制数字表，
+//! CPython 3.12 / Unicode 15.0 的 isalpha、isalnum、isdigit、isprintable、isspace、十进制数字表，
 //! 以及 str.lower() 的映射和词尾 sigma 用到的两个属性。
 //! 由 tests/differential/generate_filter_unicode.py 生成，避免 Rust Alphabetic 属性包含组合标记，
 //! 也避免 Rust 标准库的大小写表随工具链的 Unicode 版本变化。
@@ -2226,6 +2226,21 @@ const PRINTABLE: &[(u32, u32)] = &[
     (0x30000, 0x3134a),
     (0x31350, 0x323af),
     (0xe0100, 0xe01ef),
+];
+pub(crate) fn space(c: char) -> bool {
+    contains(c, SPACE)
+}
+const SPACE: &[(u32, u32)] = &[
+    (0x9, 0xd),
+    (0x1c, 0x20),
+    (0x85, 0x85),
+    (0xa0, 0xa0),
+    (0x1680, 0x1680),
+    (0x2000, 0x200a),
+    (0x2028, 0x2029),
+    (0x202f, 0x202f),
+    (0x205f, 0x205f),
+    (0x3000, 0x3000),
 ];
 pub(crate) fn cased(c: char) -> bool {
     contains(c, CASED)
