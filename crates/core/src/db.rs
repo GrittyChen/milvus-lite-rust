@@ -3054,6 +3054,14 @@ impl Db {
         Ok(handle)
     }
 
+    /// 3.x 的 `has_collection`：先确认数据库、再解析别名，之后只看目录与 `schema.json`，不打开集合，
+    /// 因此打不开或含范围外内容的集合也算存在。目录的判定与别名目标、[`Db::collection`] 相同：名字含路径分隔符、
+    /// 只差大小写、符号链接目录或 `schema.json` 不是文件时不存在（3.x 按拼出的路径判断，见 0006 差异表）。
+    pub fn has_collection(&self, database: &str, name: &str) -> Result<bool> {
+        let key = self.resolve(self.key(database, name)?)?;
+        self.alias_target_exists(&*self.database(&key.database)?, &key.name)
+    }
+
     /// 全部 collection 的名字与 load 状态。先在表读锁内取出句柄，放开表锁后再读各自的状态：
     /// 等待 collection 锁时若仍持有表锁，排队的写者会让所有 RPC 都停在表锁上。
     /// 取出之后被并发 drop 的 collection 仍会列出，不会报错。
@@ -4212,7 +4220,7 @@ impl Db {
         }
     }
 
-    /// 别名目标按精确名字且带 `schema.json` 判定（0023 名字与文件系统）；非法名字视为不存在。
+    /// 别名目标与 HasCollection 按精确名字且带 `schema.json` 判定（0023 名字与文件系统）；非法名字视为不存在。
     fn alias_target_exists(&self, state: &DatabaseState, name: &str) -> Result<bool> {
         if validate_filesystem_name(name, "collection").is_err() {
             return Ok(false);

@@ -168,6 +168,18 @@ impl Service for MilvusService {
         }))
     }
 
+    async fn check_health(
+        &self,
+        _request: Request<svc::CheckHealthRequest>,
+    ) -> Result<Response<svc::CheckHealthResponse>, Status> {
+        // 3.x 的 servicer.CheckHealth 总是报告健康，不访问引擎（嵌入式单进程没有部分失败的状态）。
+        Ok(Response::new(svc::CheckHealthResponse {
+            status: Some(success()),
+            is_healthy: true,
+            ..Default::default()
+        }))
+    }
+
     async fn create_collection(
         &self,
         request: Request<svc::CreateCollectionRequest>,
@@ -193,6 +205,22 @@ impl Service for MilvusService {
         self.run(Branch::Engine, move |db| {
             db.drop_collection(&database, &req.collection_name)?;
             Ok(success())
+        })
+        .await
+    }
+
+    async fn has_collection(
+        &self,
+        request: Request<svc::HasCollectionRequest>,
+    ) -> Result<Response<svc::BoolResponse>, Status> {
+        let database = database(&request, |r| &r.db_name);
+        let req = request.into_inner();
+        // 3.x 的 HasCollection 只有 `except Exception` 分支；`time_stamp` 不读。
+        self.run(Branch::Generic, move |db| {
+            Ok(svc::BoolResponse {
+                status: Some(success()),
+                value: db.has_collection(&database, &req.collection_name)?,
+            })
         })
         .await
     }

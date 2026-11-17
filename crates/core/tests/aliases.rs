@@ -471,3 +471,82 @@ fn process_exit_around_the_alias_replace_reopens_before_or_after() {
         );
     }
 }
+
+/// 3.x 的 `has_collection`：数据库 → 别名 → 目录与 `schema.json`，不打开集合。
+#[test]
+fn has_collection_resolves_aliases_and_checks_the_directory_without_opening() {
+    let root = tempfile::tempdir().unwrap();
+    let db = open(root.path());
+    db.create_collection("", "c1", schema()).unwrap();
+    db.create_alias("", "c1", "a1").unwrap();
+    let collections = root.path().join("collections");
+    std::fs::create_dir_all(collections.join("residue")).unwrap();
+    std::fs::create_dir_all(collections.join("broken")).unwrap();
+    std::fs::write(collections.join("broken/schema.json"), "{").unwrap();
+    std::fs::write(collections.join("plain"), "x").unwrap();
+    std::fs::create_dir_all(collections.join("dirschema/schema.json")).unwrap();
+    std::fs::create_dir_all(collections.join("outer/inner")).unwrap();
+    std::fs::write(collections.join("outer/inner/schema.json"), "{}").unwrap();
+
+    assert!(db.has_collection("", "c1").unwrap());
+    assert!(db.has_collection("default", "a1").unwrap());
+    // 无法解析的 schema 也算存在：只看文件，不打开（打开时报错）。
+    assert!(db.has_collection("", "broken").unwrap());
+    assert!(db.collection("", "broken").is_err());
+    for missing in [
+        "nope",
+        "residue",
+        "plain",
+        "dirschema",
+        "outer/inner",
+        "c1/",
+        "",
+        ".",
+        "..",
+        "a/b",
+        "x\0y",
+        "C1",
+    ] {
+        assert!(!db.has_collection("", missing).unwrap(), "{missing:?}");
+    }
+
+    // 悬空别名：目标被手工删除后不存在。
+    std::fs::rename(collections.join("c1"), root.path().join("moved")).unwrap();
+    assert!(!db.has_collection("", "a1").unwrap());
+    std::fs::rename(root.path().join("moved"), collections.join("c1")).unwrap();
+
+    db.drop_collection("", "c1").unwrap();
+    assert!(!db.has_collection("", "c1").unwrap());
+    assert!(!db.has_collection("", "a1").unwrap());
+
+    assert!(matches!(
+        db.has_collection("nodb", "c1").unwrap_err(),
+        EngineError::DatabaseNotFound(_)
+    ));
+    assert_eq!(
+        db.has_collection("a/b", "c1").unwrap_err().to_string(),
+        "invalid database name: 'a/b'"
+    );
+    std::fs::write(root.path().join("aliases.json"), "{").unwrap();
+    let fresh = {
+        drop(db);
+        open(root.path())
+    };
+    assert!(fresh.has_collection("", "broken").is_err());
+}
+
+/// 3.x 的 `os.path.exists` 跟随符号链接；本实现与打开集合时一样只认真实目录（0006 差异表）。
+#[cfg(unix)]
+#[test]
+fn has_collection_does_not_follow_a_symlinked_collection_directory() {
+    let root = tempfile::tempdir().unwrap();
+    let db = open(root.path());
+    db.create_collection("", "c1", schema()).unwrap();
+    std::os::unix::fs::symlink(
+        root.path().join("collections/c1"),
+        root.path().join("collections/link"),
+    )
+    .unwrap();
+    assert!(!db.has_collection("", "link").unwrap());
+    assert!(db.collection("", "link").is_err());
+}

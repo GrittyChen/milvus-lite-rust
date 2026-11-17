@@ -13,8 +13,10 @@ const MILVUS_SERVICE: &str = "MilvusService";
 const IMPLEMENTED_METHODS: &[&str] = &[
     "Connect",
     "GetVersion",
+    "CheckHealth",
     "CreateCollection",
     "DropCollection",
+    "HasCollection",
     "DescribeCollection",
     "ShowCollections",
     "AlterCollection",
