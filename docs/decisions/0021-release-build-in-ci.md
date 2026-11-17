@@ -63,7 +63,12 @@
     - 在独立 job 中分别针对 Linux x86_64 与 arm64，于固定摘要的 manylinux_2_28 镜像内用 CPython 3.15 构建；该 job 没有 `id-token`、`attestations` 或任何写权限；
     - 固定并记录 orjson sdist 的版本与 SHA256、maturin、Rust 工具链及其他构建依赖，以及生成 wheel 的 SHA256、ELF 架构与最高 GLIBC 依赖；
     - 同一平台两条 SDK 的环境安装同一份已构建的 orjson wheel，不在各环境中重复编译，结果写入该平台的环境与阶段证据。
-    orjson 是被测试的客户端依赖，不进入正式附件。其他组合的依赖缺少目标平台 wheel 时，单独解析该解释器的依赖集合（例如 Python 3.15 不复用 3.10 的集合），不以现场编译补齐。
+    orjson 是被测试的客户端依赖，不进入正式附件。
+    第二个例外是参照环境的 jieba 0.42.1（[0036](0036-jieba.md) 决策 G，2026-11-17 起）：3.x 的 jieba 分词器依赖它，它在 PyPI 上只有 sdist（纯 Python）。约束：
+    - 只允许 `jieba==0.42.1` 从 sdist（SHA256 `055ca12f62674fafed09427f176506079bc135638a14e23e25be909131928db2`）构建，构建后端 setuptools 由 `requirements/build.txt` 固定；
+    - 在独立 job（`jieba`，固定摘要的 manylinux_2_28 x86_64 镜像，CPython 3.12）中构建一次，该 job 没有 `id-token`、`attestations` 或任何写权限；纯 Python 的 wheel 由各平台差分与互通的两套参照环境共用；
+    - 构建记录（sdist 与 wheel 的 SHA256、构建后端版本、wheel 内 `jieba/dict.txt` 的 SHA256）随 `jieba` 附件保存；测试 job 安装前核对 wheel 的哈希，安装后核对实际导入的版本与词典，输出写入 job 日志。
+    jieba 只装在参照侧，不进入正式附件，也不是被测试的客户端依赖，所以与参照侧的 pyarrow、NumPy 一样不写入阶段的环境键。代价是候选结果中没有 jieba 的身份：`jieba` 附件只保留 30 天，也不在 0022 的保全范围内，事后只能凭 job 日志里 `check-installed` 的输出复核。其他组合的依赖缺少目标平台 wheel 时，单独解析该解释器的依赖集合（例如 Python 3.15 不复用 3.10 的集合），不以现场编译补齐。
 
 ### 候选结果与正式来源证明
 

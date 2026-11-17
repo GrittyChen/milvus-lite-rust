@@ -29,6 +29,8 @@ env:
   UV_VERSION: "0.12.23"
   UV_CACHE_DIR: ${{ github.workspace }}-uv-cache
   REFERENCE_COMMIT: 1320d26ec3d88b23b525e774df6e3c8e7c208f81
+  # 参照环境的 jieba 只有 sdist：固定哈希后在 jieba job 中构建一次（0036 决策 G，哈希在 .github/ci/jieba_wheel.py）。
+  JIEBA_SDIST_URL: https://files.pythonhosted.org/packages/source/j/jieba/jieba-0.42.1.tar.gz
 
 jobs:
   changes:
@@ -52,9 +54,37 @@ jobs:
           PR_BASE: ${{ github.event.pull_request.base.sha }}
         run: python3 .github/ci/changes.py
 
+  jieba:
+    # 0036 决策 G：从固定哈希的 sdist 构建 jieba 的 wheel，构建后端由 requirements/build.txt 固定；纯 Python，
+    # 三个平台的测试 job 安装同一份。0020 与 0021 第 11 条登记的例外，其余依赖仍只用 wheel。
+    needs: changes
+    if: needs.changes.outputs.docs_only == 'false'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: 构建
+        run: |
+          bash .github/ci/install_uv.sh python3.12
+          sha=$(python3 -c 'import sys; sys.path.insert(0, ".github/ci"); import jieba_wheel; print(jieba_wheel.SDIST_SHA256)')
+          python3 .github/ci/fetch.py file --url "$JIEBA_SDIST_URL" --sha256 "$sha" --out "$RUNNER_TEMP/jieba-0.42.1.tar.gz"
+          python3 .github/ci/jieba_wheel.py build --sdist "$RUNNER_TEMP/jieba-0.42.1.tar.gz" --uv "$(command -v uv)" \
+            --python python3.12 --out "$RUNNER_TEMP/jieba"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: jieba
+          path: ${{ runner.temp }}/jieba
+          if-no-files-found: error
+          retention-days: 14
+
   compare:
     name: ${{ matrix.suite }} (${{ matrix.os }})
-    needs: changes
+    needs: [changes, jieba]
     # 与 'false' 比较而不是与 'true' 比较：分类输出缺失时测试 job 跳过，汇总因形态不符而失败。
     if: needs.changes.outputs.docs_only == 'false'
     strategy:
@@ -98,6 +128,10 @@ jobs:
             ~/.cargo/git/db
             ${{ env.UV_CACHE_DIR }}
           key: compare-${{ runner.os }}-${{ runner.arch }}-uv${{ env.UV_VERSION }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', '.github/ci/requirements/*.txt') }}
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: jieba
+          path: ${{ runner.temp }}/jieba
       - name: 套件守卫
         # 以下各步按套件名执行；名字拼错或新增套件漏写步骤时，job 会一个用例都不跑而显示成功。
         run: |
@@ -121,6 +155,12 @@ jobs:
             uv pip install --python "$RUNNER_TEMP/ref$arrow/bin/python" --no-deps --build-constraint $req/build.txt -e references/milvus-lite
           done
           dirty=$(git -C references/milvus-lite status --porcelain); test -z "$dirty"
+          wheel="$RUNNER_TEMP/jieba/jieba-0.42.1-py3-none-any.whl"
+          for env in "$RUNNER_TEMP/ref25" "$RUNNER_TEMP/ref15"; do
+            uv pip install --python "$env/bin/python" --no-deps --no-index "$wheel"
+          done
+          .venv/bin/python .github/ci/jieba_wheel.py check-installed --record "$RUNNER_TEMP/jieba/record.json" --wheel "$wheel" \
+            --python "$RUNNER_TEMP/ref25/bin/python" "$RUNNER_TEMP/ref15/bin/python"
           for env in "$RUNNER_TEMP/ref25" "$RUNNER_TEMP/ref15"; do uv pip freeze --python "$env/bin/python"; done
       - name: 构建扩展
         run: |
@@ -140,7 +180,7 @@ jobs:
           . .github/ci/crash_capture.sh
           .venv/bin/python tests/sharding/shard.py plan --python .venv/bin/python --suite tests/differential \
             --out "$RUNNER_TEMP/plan" --shards ${{ matrix.shards }} \
-            --group-fixture diff --group-fixture rust_uri --group-fixture ref_uri --expect 862 --expect-group 404
+            --group-fixture diff --group-fixture rust_uri --group-fixture ref_uri --expect 867 --expect-group 405
           .venv/bin/python tests/sharding/shard.py run --plan "$RUNNER_TEMP/plan/plan.json" --out "$RUNNER_TEMP/run"
       - name: 差分（pymilvus 2.6.17，安装 wheel，仓库外运行）
         if: matrix.suite == 'diff-2.6.17'
@@ -151,7 +191,7 @@ jobs:
           mkdir "$RUNNER_TEMP/outside"
           .venv/bin/python tests/sharding/shard.py plan --python "$RUNNER_TEMP/v26/bin/python" --suite "$PWD/tests/differential" \
             --cwd "$RUNNER_TEMP/outside" --out "$RUNNER_TEMP/plan" --shards ${{ matrix.shards }} \
-            --group-fixture diff --group-fixture rust_uri --group-fixture ref_uri --expect 862 --expect-group 404
+            --group-fixture diff --group-fixture rust_uri --group-fixture ref_uri --expect 867 --expect-group 405
           .venv/bin/python tests/sharding/shard.py run --plan "$RUNNER_TEMP/plan/plan.json" --out "$RUNNER_TEMP/run"
       - name: 存储互通
         if: matrix.suite == 'interop'
@@ -176,7 +216,7 @@ jobs:
             python3 .github/ci/cargo_fresh.py "$RUNNER_TEMP/fresh-$i.json"
           done
           .venv/bin/python tests/sharding/shard.py plan --python .venv/bin/python --suite tests/storage_interop \
-            --out "$RUNNER_TEMP/plan" --shards ${{ matrix.shards }} --expect 311 --expect-group 0
+            --out "$RUNNER_TEMP/plan" --shards ${{ matrix.shards }} --expect 321 --expect-group 0
           .venv/bin/python tests/sharding/shard.py run --plan "$RUNNER_TEMP/plan/plan.json" --out "$RUNNER_TEMP/run"
       - name: 固定真值核验
         # 在互通之后串行执行，不与互通的分片同时运行。
@@ -193,6 +233,8 @@ jobs:
               --output "$RUNNER_TEMP/schema-$(basename "$(dirname "$(dirname "$ref")")").json" --verify-nullable-filter-fixture
           done
           .venv/bin/python tests/differential/generate_filter_unicode.py --verify
+          "$ref25" tests/differential/generate_jieba_data.py --verify
+          "$ref25" tests/differential/generate_jieba_fixtures.py --jieba-test "$RUNNER_TEMP/jieba/test.py" --verify
           cargo build -p milvus-lite-core --release --example partition_visibility_probe --locked
           target/release/examples/partition_visibility_probe verify-core tests/compatibility_audit/fixtures/partition_visibility_v321.json
       - name: 锁文件与参照未变
@@ -223,7 +265,7 @@ jobs:
   compare-pass:
     # 与 CI 的汇总 job 相同：总是运行，只接受全量时全部成功、纯文档时测试 job 全部跳过两种形态。
     if: always()
-    needs: [changes, compare]
+    needs: [changes, jieba, compare]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:

@@ -451,6 +451,61 @@ def partitions(c, rec):
                                                                     partition_names=parts)))
 
 
+JIEBA_DOCS = ["我是一个学生", "中华人民共和国", "今天的天气是很好的", "深度学习是人工智能的子领域", "machine learning",
+              "价格1.5元，折扣0.5%", "T.S.Eliot 和 C++、AT&T 的 a-b_c", "B超 b超 ΣΑΣ Σ İstanbul", "a\r\nb\u3000c\u0085d\u200b",
+              "", "。。。！", "米尔维斯向量数据库", "鿖鿿㐀\U00020000汉字", "我爱北京天安门，天安门上太阳升",
+              "1e+16 与 100.0 和 1e+300 以及 1.5元"]
+# 会话共用的 3.x 进程里不加用户词：3.x 的用户词写进进程全局的词典，影响同一进程里之后的所有 jieba 集合（0036
+# 决策 C）。这里只用不会加词的 `dict`：假值，以及在第一项上就报错的列表。
+JIEBA_PARAMS = [
+    {"tokenizer": "jieba"}, {"type": "jieba"}, {"tokenizer": {"type": "jieba"}}, {"tokenizer": {}, "type": "jieba"},
+    {"tokenizer": {"type": "jieba", "mode": "exact"}}, {"tokenizer": {"type": "jieba", "mode": "SEARCH"}},
+    {"tokenizer": {"type": "jieba", "mode": None}}, {"tokenizer": {"type": "jieba", "mode": ""}},
+    {"tokenizer": {"type": "jieba", "mode": 0}}, {"tokenizer": {"type": "jieba", "mode": 1}},
+    {"tokenizer": {"type": "jieba", "mode": ["x"]}}, {"tokenizer": {"type": "jieba", "hmm": False}},
+    {"type": {"type": "jieba", "mode": "exact"}}, {"tokenizer": {}, "type": {"type": "jieba", "mode": "exact"}},
+    {"tokenizer": "Jieba"}, {"tokenizer": {"type": "JIEBA"}},
+    *({"tokenizer": {"type": "jieba", "dict": d}} for d in (None, [], {}, 0, 0.0, False, "", 5, True, -1, 1.5, [5],
+                                                           [None, "x"], [1.5], [["a"]], [{"a": 1}], [True])),
+    {"type": {"type": "jieba", "dict": 5}},
+    {"tokenizer": "jieba", "filter": [{"type": "stop", "stop_words": ["的", "，", 1.5, True, None, "了", 0.5, "%"]}]},
+    {"tokenizer": {"type": "jieba", "mode": "exact"},
+     "filter": ["lowercase", {"type": "stop", "stop_words": ["中国", "learning", "σ"]}]},
+    # 原文给出。停用词按 Python 的 `str()` 得到 `1e+300`、`1e+16`、`100.0`、`100.0`：`100.0` 命中词项，`1e+16` 被切成三段、
+    # 不命中。`1e999` 属于 0029 登记的非严格 JSON，不在此列。
+    '{"tokenizer": "jieba", "filter": [{"type": "stop", "stop_words": [1e300, 1e16, 100.0, 1E2, "1.5元"]}]}',
+]
+
+
+@scenario
+def jieba(c, rec):
+    """0036：jieba 分词器的参数形状与错误、写入时生成的稀疏向量、读回与检索打分（MemTable 与 segment 各一次）。"""
+    for i, params in enumerate(JIEBA_PARAMS):
+        name, value = f"j{i}", params if isinstance(params, str) else json.dumps(params, ensure_ascii=False)
+        extra = {"analyzer_params": value, "max_length": "500"}
+        rec(f"create/{value}", lambda: create(c, name, base(text_field(extra=extra)), [fn()]))
+        if not c.has_collection(name):
+            continue
+        rec(f"write/{value}", lambda: c.insert(name, [{"id": i, "text": t} for i, t in enumerate(JIEBA_DOCS)])["insert_count"])
+        rec(f"read/{value}", lambda: c.query(name, "id >= 0", output_fields=["sp"]))
+    s = MilvusClient.create_schema(auto_id=False)
+    s.add_field("id", DataType.INT64, is_primary=True)
+    s.add_field("text", DataType.VARCHAR, max_length=500, enable_analyzer=True,
+                analyzer_params={"tokenizer": {"type": "jieba", "mode": "search"},
+                                 "filter": [{"type": "stop", "stop_words": ["的", "，"]}]})
+    s.add_field("sp", DataType.SPARSE_FLOAT_VECTOR)
+    s.add_function(Function(name="bm", function_type=FunctionType.BM25, input_field_names=["text"], output_field_names=["sp"]))
+    rec("search/create", lambda: c.create_collection("js", schema=s))
+    rec("search/insert", lambda: c.insert("js", [{"id": i, "text": t} for i, t in enumerate(JIEBA_DOCS)])["insert_count"])
+    queries = ["深度学习", "天安门", "人民共和国 学生", "的", "1.5 0.5%", "C++ AT&T", "米尔维斯"]
+    rec("search/memtable", lambda: hits(c.search("js", data=queries, anns_field="sp", limit=5)))
+    rec("search/flush", lambda: c.flush("js"))
+    rec("search/insert_after_flush", lambda: c.insert("js", [{"id": 100 + i, "text": t}
+                                                             for i, t in enumerate(JIEBA_DOCS[:7])])["insert_count"])
+    rec("search/segments", lambda: hits(c.search("js", data=queries, anns_field="sp", limit=8)))
+    rec("search/query", lambda: c.query("js", "id >= 100", output_fields=["text", "sp"]))
+
+
 REOPEN_DOCS = ["fox dog", "fox", "dog dog cat", "the quick brown fox", "lazy dog", "cat cat fox"]
 
 
@@ -480,15 +535,11 @@ def before_reopen(c, rec):
                                                       filter="g == 1")))
 
 
-# 0031「与 3.x 的差异」：jieba 分词器；0029 已登记的非严格 JSON 同样适用于函数参数。两边的结果都逐项断言。
+# 0031「与 3.x 的差异」：0029 已登记的非严格 JSON 同样适用于函数参数。两边的结果都逐项断言。
+# jieba 用户词的差异（0036）只出现在新进程的用例里，见 test_bm25.py。
 _UNREPRESENTABLE = ("rpc", "UNIMPLEMENTED", "MilvusLite does not support function params that strict JSON cannot "
                     "represent: not supported in this build of milvus-lite-rust yet")
 REGISTERED = {
-    ("analyzer_params", 'create/{"tokenizer": "jieba"}'): {
-        "rust": ("rpc", "UNIMPLEMENTED", "MilvusLite does not support jieba tokenizer: the jieba tokenizer is not "
-                 "supported in this build of milvus-lite-rust"),
-        "ref": ("ok", [1, "JiebaAnalyzer requires the 'jieba' package. Install it with: pip install jieba", False]),
-    },
     **{("function_params", f"create/{name}"): {"rust": _UNREPRESENTABLE, "ref": ("ok", [0, "", True])}
        for name in ("nan", "inf", "huge")},
     **{("before_reopen", f"params/create/{name}"): {"rust": _UNREPRESENTABLE, "ref": ("ok", [0, "", True])}

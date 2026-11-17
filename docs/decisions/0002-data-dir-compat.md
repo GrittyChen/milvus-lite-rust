@@ -88,9 +88,10 @@
    - 稀疏向量在写入时由 BM25 function 计算，存入 WAL 与 Parquet；查询时再对查询文本分词、求 term ID。要让「3.x 写入、Rust 查询」得到相同结果，分词和 term hash 都必须一致。
    - 3.x 的 standard 分词器是 Python `re` 的 `\w+`，作用在 `str.lower()` 之后（[standard.py](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/milvus_lite/analyzer/standard.py#L26)），**不是** Lucene 的 standard。它的 Unicode 语义与 Rust `regex` 不同。实测：分解形式的 `"cafe\u0301"`（e 加组合重音符），Python 得到 `cafe`，Rust `regex` 得到 `cafe\u0301`；`"İstanbul"`，Python 得到 `i`、`stanbul` 两个词，Rust 得到一个词；`"x²y"`，Python 得到一个词，Rust 得到 `x`、`y`。而且 Python 各版本的 Unicode 表不同，3.x 支持 Python ≥ 3.10。
    - term hash 是 UTF-8 字节上的 32 位 FNV-1a（[hash.py](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/milvus_lite/analyzer/hash.py)）。
-   - 逐位一致的范围还包括 `analyzer_params` 的 filter：`{type: "stop", stop_words}` 在 lower 之后过滤 token，其他 filter 类型被静默忽略（[factory.py:92](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/milvus_lite/analyzer/factory.py#L92)）。jieba 分词器对每个 token 做 `strip().lower()`，jieba 本身的等价性另议。
+   - 逐位一致的范围还包括 `analyzer_params` 的 filter：`{type: "stop", stop_words}` 在 lower 之后过滤 token，其他 filter 类型被静默忽略（[factory.py:92](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/milvus_lite/analyzer/factory.py#L92)）。jieba 分词器对每个 token 做 `strip().lower()`；jieba 切分本身的一致范围按 [0036](0036-jieba.md) 的决策 B、C 放宽，见本条末尾。
    - BM25 的 IDF 是检索时按 segment 现算的，不落盘（[collection.py:884](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/milvus_lite/engine/collection.py#L884) 的 TODO）。打分一致属于行为层（规则 2），不属于格式层。
    - [0031](0031-bm25.md) 已实现：分词、停用词与 FNV-1a 生成的稀疏值与 3.x 逐字节相同（含普通稀疏值不允许的维度 `2^32-1`），带 BM25 function 的 `schema.json` 双向读写；打分按 segment 统计，与 NumPy 2 环境中的 3.x 逐位一致，倒排与统计只在内存中，不写索引文件。
+   - jieba（[0036](0036-jieba.md) 决策 E）：逐位一致的要求放宽为 0036 的口径。没有用户词时，以 jieba 0.42.1 为真值，在验证范围内逐词相同（决策 B）；用户词每个集合一份，每一项加一次，不复制 3.x 的进程全局状态（决策 C）。3.x 带用户词或受污染的进程写出的集合照常打开，新写入与查询按本实现的切法（决策 D）。
 9. **Parquet 写入参数。**
    - 必须写入 `ARROW:schema` 元数据（pyarrow 的 `store_schema` 默认开启）。缺少时，3.x 把定长向量列读成变长 list，打开 collection 直接失败。
    - 压缩与 3.x 默认一致，用 snappy。3.x 调 `pq.write_table` 时没有指定压缩，用的是 pyarrow 的默认值。

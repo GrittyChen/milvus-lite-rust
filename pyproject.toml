@@ -6,7 +6,7 @@ build-backend = "maturin"
 name = "milvus-lite-rust"
 dynamic = ["version"]
 readme = "README.md"
-license-files = ["LICENSE", "crates/grpc/proto/LICENSE"]
+license-files = ["LICENSE", "crates/grpc/proto/LICENSE", "crates/core/data/jieba/LICENSE"]
 description = "Unofficial Rust implementation of milvus-lite; not affiliated with Milvus or Zilliz."
 requires-python = ">=3.10"
 license = "Apache-2.0"

@@ -1,6 +1,6 @@
 # 0036：jieba 分词
 
-状态：设计已通过（2026-11-17，经一轮独立评审并按评审修改），第 1 步已实施，经一轮独立评审并按评审修改，待提交；第 2 步未开始。动手前的调查已完成（见「调查结论」）。负责人确认的方向：
+状态：设计已通过（2026-11-17，经一轮独立评审并按评审修改）；第 1 步已实施并提交（经一轮独立评审并按评审修改）；第 2 步已实施，待评审，CI 与 Compare 尚未运行。动手前的调查已完成（见「调查结论」）。负责人确认的方向：
 - 以 jieba-rs 为依赖，不追求在全部输入上与 Python 版 jieba 逐位一致，差异显式登记；
 - 3.x 建的 jieba 集合照常打开；
 - 用户词按每个集合各自的词典处理，列表中的每一项按 Python `add_word` 的语义各执行一次。
@@ -133,7 +133,7 @@
   - 前缀条目频率为 0 的规则，由按字典序排序的词表做前缀查询实现，这张表只在带用户词时构造。
   - jieba-rs 的 `add_word` 对已有词会先减去旧频率；`total` 的差额用占位词补齐，使每一步之后的 `total` 都与 Python 相同。
   - 含 `re_han_default` 字符集之外字符的用户词（空格、标点、空串等），在 `cut` 里永远匹配不到，也不参与二字、三字子串。它们只通过 `total`、前缀条目和“同词再加”影响结果，因此只记在包装层的覆盖表里，不进 jieba-rs 的 trie，也就不会与占位词冲突。
-- **用户词上限**：两个上限的取值见「实施前核实的结果」。建表、打开时按列表顺序检查：会进入 trie 的用户词，码位数之和不超过 100 万；每加一个用户词后，`total` 不超过 `u64::MAX`。超出时报错，不让 jieba-rs 的 `assert!` 或整数溢出到达 RPC。3.x 没有前一个上限，后一个在 3.x 中要到 `total` 超过 2^1024 时才报 OverflowError，两者都登记为差异。
+- **用户词上限**：两个上限的取值见「实施前核实的结果」。建表、打开时按列表顺序检查：会进入 trie 的用户词，码位数之和不超过 100 万（按列表的每一项累加，重复项与默认词典里已有的词也计入）；每加一个用户词后，`total` 不超过 `u64::MAX`。超出时报错，不让 jieba-rs 的 `assert!` 或整数溢出到达 RPC。3.x 没有前一个上限，后一个在 3.x 中要到 `total` 超过 2^1024 时才报 OverflowError，两者都登记为差异。
 - **停用词**：jieba 路径按 Python 的 `str()` 收集每一项。
   - 浮点数用 Python `repr` 的格式，例如 `1.0`、`1e+20`；
   - 布尔值与 `null` 分别为 `True` / `False` / `None`；
@@ -181,7 +181,7 @@
 | 没装 jieba | 建表、打开报 code 1 | 内置，照常可用 | 分词在服务端，内置是本实现的常态（决策 F） | BM25 + jieba 的差分在参照侧必须装 jieba；`bm25_cases.py` 原有的 jieba 登记项重写 |
 | `dict` 用户词 | 进程全局，每次构造都累加，结果取决于打开顺序与次数 | 每个集合独立，每一项加一次 | 3.x 的行为不可复现（决策 C） | 带用户词的差分与互通，两边分别断言 |
 | 无用户词的集合受同进程其他集合的用户词影响 | 受影响 | 不受影响 | 同上 | 同上；多集合用例在参照侧用新进程 |
-| 用户词规模 | 无上限 | 会进入 trie 的用户词，码位数之和超过 100 万即报错 | jieba-rs 在节点数达到 `1 << 24` 时 panic；每个带用户词的集合各持有一份内存 | 用户词上限的边界用例 |
+| 用户词规模 | 无上限 | 会进入 trie 的用户词，码位数之和超过 100 万即报错；按列表的每一项累加，重复项也计入，所以 3.x 能接受的大量重复词，本实现可能拒绝 | jieba-rs 在节点数达到 `1 << 24` 时 panic；每个带用户词的集合各持有一份内存 | 用户词上限的边界用例 |
 | `total` 的范围 | Python 整数，超过 2^1024 时报 OverflowError | 超过 `u64::MAX` 即报错 | jieba-rs 的 `total` 是 `usize`；只有几十个空串才能触发 | 空串重复的边界用例 |
 | 验证范围之外的切分 | Python jieba 0.42.1 | jieba-rs 加包装层 | 只有对照过的输入保证相同（决策 B） | 无固定用例；由模糊对照覆盖 |
 | 3.x 建的、带用户词或受污染的 jieba 集合 | 按 3.x 当时的进程状态写入 | 查询按本实现切分，部分词项匹配不上 | 决策 D | 3.x 写、本实现读的互通用例 |
@@ -247,7 +247,7 @@
   - 之后要抬高单字的频率，只能重复加这些字，每加一次频率只加一，`total` 却增长得更快；而 `total` 越大，单字路径越不利。
 
   实现时曾改为“看不开 HMM 的切分里同一位置上是不是这个词”。评审的变异实验表明，任何输入都区分不出两种写法，而且那种写法在长文本上是二次复杂度，于是撤回。
-- **停用词**：standard 与 jieba 共用同一个收集函数，统一按 Python 的 `str()` 收集。对 standard，唯一的变化是 `str()` 为 `inf` 的项（JSON 里的 `1e999`）会命中词项 `inf`：此前本实现丢掉了这类项，3.x 会命中，现在与 3.x 一致，已有单测固定。其他项都含 `\w` 之外的字符，不会命中。
+- **停用词**：standard 与 jieba 共用同一个收集函数，统一按 Python 的 `str()` 收集。对 standard，唯一的变化是 `str()` 为 `inf` 的项（JSON 里的 `1e999`）会命中词项 `inf`：此前本实现丢掉了这类项，3.x 会命中，现在与 3.x 一致，已有单测固定。这类项只能来自 JSON 里的 `1e999`，而含溢出数的 `analyzer_params` 建表时按 0029 返回 UNIMPLEMENTED，3.x 写出的这类 `schema.json` 也打不开，所以经服务观察不到这一变化。其他项都含 `\w` 之外的字符，不会命中。
 - **构造次数**：建表与打开时，分词器构造两次：一次在 schema 校验，一次在建立集合对象，与 3.x 相同。带用户词时，每次都复制一份默认词典再加词。
 
 **验证**（macOS arm64）：
@@ -265,6 +265,77 @@
 **接受的残余风险**：
 - 用户词的个数不设上限。不进 trie 的用户词（空格、标点等）不计入码位上限，只给 `total` 加 1 或 2；大量这类词按单个约 150 B 占用内存，200 万个约 333 MB。3.x 同样没有上限，`analyzer_params` 的 JSON 本身也已占用同量级的内存。
 - 两个上限只约束内存与整数范围，不约束 CPU。同一个字重复成的长用户词，会让 trie 遍历在每个位置都走到底：Python 的 `get_DAG` 也是这样，3.x 同样会长时间占用 CPU。这类输入可能让建表或写入长时间占用一个工作线程，与 0032 登记的 CPU 残余风险同类，不另设上限。
+
+## 第 2 步的实施结果（2026-11-17）
+
+**差分**（[bm25_cases.py](../../tests/differential/bm25_cases.py) 与 [test_bm25.py](../../tests/differential/test_bm25.py)）：
+- `REGISTERED` 中原有的 jieba 项删除：参照侧装了 jieba 之后，`{"tokenizer": "jieba"}` 两边都建表成功，写入与读回逐项相同。
+- 新增 `jieba` 场景，在会话共用的 3.x 进程里运行：
+  - 37 组 `analyzer_params`，覆盖三种写法、`mode` 的真值规则、`hmm`、大小写不同的名字，以及会报错的 `dict` 形状；
+  - 停用词含浮点：`1.5` 与 `100.0` 命中；
+  - 每组都写入 15 条文本并读回稀疏值，文本包括扩展区汉字、`鿖` 以上的字、`\r\n` 与 Unicode 空白、`T.S.Eliot`、`a-b_c`、小数与百分号；
+  - 一个集合在 MemTable 与 segment 上各检索一次，比较分数与次序。
+
+  这个进程里只用不会加词的 `dict`：假值，以及第一项就报错的列表。原因是 3.x 的用户词进入进程全局的词典，会影响之后的所有 jieba 集合。
+- 带用户词的用例 `test_jieba_user_words_are_per_collection`：
+  - 用户词有列表（含重复项）、字符串、对象、词典字符集之外的词四种形状，每种起一对新进程，进程里只有一个带用户词的集合；
+  - 这些用户词是不在词典里的新造词、它们的单字（字符串形状逐字符加词）与词典字符集之外的词，加一次与加多次的切分相同，所以写入、读回与检索两边逐项比较，重开后再比较一次；字符串 `"米尔维斯"` 逐字符加词与整词加词的切分不同，这一组能区分两种语义；
+  - 在列表这一组里，同一进程再建一个没有用户词的集合，两边分别断言（决策 C）：3.x 把“我爱米尔维斯”切出“米尔维斯”，本实现切成“米尔 / 米尔维 / 斯”。
+- 两处前置检查都核对参照解释器的 jieba 是 0.42.1：差分的 `conftest.py` 与互通的 `interpreters`。缺少 jieba 时直接报错，不会以不一致的形式失败。
+
+**互通**（[test_jieba.py](../../tests/storage_interop/test_jieba.py)）：
+- 三个实现各自写出只有 WAL、已 flush、经过合并三种状态的目录，每个目录有两个集合：一个用 search 模式加停用词，一个用 exact 模式加用户词。
+- 三方读出的行与 `analyzer_params` 逐项相同；检索结果在本实现与 Arrow 25 之间逐位相同。
+- 再由对方写入、partial upsert 之后，三方重读一次。
+- 受污染的 3.x 目录（决策 D）：本实现原样读出已存的稀疏值，新写入的行按本实现的切法生成。
+
+**参照用例**：参照测试中的 jieba 断言改写为 [tests/python/test_jieba.py](../../tests/python/test_jieba.py)，经 gRPC 读出 BM25 输出字段，检查其中有没有对应词项的 FNV-1a。同一文件还固定了两个上限的错误码与文案：
+- 码位上限：恰好 100 万个码位可以建表，再多 4 个就报 code 1；同一个词重复 250001 次同样报错（重复项计入）；
+- `total` 上限：64 个空串报 code 1。
+
+[INVENTORY.md](../../tests/python/adapter/INVENTORY.md) 中的两条 jieba 用例注明了改写位置。
+
+**CI**（决策 G）：
+- 新工具 [jieba_wheel.py](../../.github/ci/jieba_wheel.py)：
+  - 先核对 sdist 的哈希，再用 `uv build` 构建，构建后端是 `build.txt` 固定的 setuptools 84.0.0；
+  - 核对 wheel 内 `jieba/dict.txt` 的哈希，与 `crates/core/data/jieba/dict.txt` 相同；
+  - 取出 sdist 的 `test/test.py`，供 fixture 核验使用；
+  - 测试 job 安装后，核对 wheel 的哈希、实际导入的版本与词典。
+- 对照层与发行工作流各增加一个 `jieba` job。两套参照环境以 `--no-deps --no-index` 安装这份 wheel；对照层的固定真值核验增加 jieba 数据与 fixture 两项 `--verify`。
+- 例外已登记进 0020 第 3 项、0021 第 11 条与 [.github/ci/README.md](../../.github/ci/README.md)。与 orjson 不同，jieba 只装在参照侧，不写入阶段的环境键。
+- `build` 断言 wheel 的构建后端就是 `build.txt` 固定的 setuptools 版本：约束失效时 uv 会静默换用最新版本。
+- 本地两次构建的 wheel 内容相同，哈希不同（时间戳），所以在 job 之间按记录的哈希核对，不在源码里固定 wheel 的哈希。
+
+**发行物**：
+- 许可文件：sdist 原本已带 `crates/core/data/jieba/` 与许可文本，wheel 原本只把数据嵌在原生模块里、没带许可；现在把 `crates/core/data/jieba/LICENSE` 加进 `license-files`，并同步 [check_artifacts.py](../../tests/packaging/check_artifacts.py) 与 0013。
+- 体积（macOS arm64 release，与第 1 步之前的 `4bb4fc4` 比较）：wheel 从 5.9 MB 增到 8.4 MB，原生模块从 18.6 MB 增到 25.2 MB。
+
+**资源**（macOS arm64，经 pymilvus 的进程内服务实测，不作性能声明）：
+- 首个 jieba 集合：建表约 0.09 s，含默认实例的加载；RSS 增加约 47 MB。之后不带用户词的集合共用这个实例，建表约 0.03 s，RSS 不再增加。
+- 带用户词的集合：建表 0.02–0.14 s，RSS 依次增加约 37、24、17、16 MB。增量小于一个完整实例，因为分配器复用了构造期间释放的内存。
+- 并发写入：6 个集合（2 个不带用户词、4 个带用户词）由 12 个线程写入 24000 行，峰值 RSS 约 492–496 MB。同样负载换成 standard 分词的 6 个集合，峰值约 338–343 MB。
+  - 两者的差距约等于建表后 jieba 实例的常驻（约 150 MB）。写入期间 jieba 没有额外的增长，jieba-rs 的线程临时缓冲在这一负载下看不出来。
+
+**验证**（macOS arm64，本地；参照解释器为仓库外新建的环境，装了 jieba 0.42.1）：CI 与 Compare 尚未运行，Linux 两个平台上 libm 是否一致由 Compare 回答。
+
+| 套件 | 结果 |
+| --- | --- |
+| 差分（pymilvus 3.0.2 / 2.6.17，参照 Arrow 25） | 各 867 通过（会话组 405） |
+| 互通（Arrow 15 / 25） | 321 通过 |
+| tests/python（3.0.2 / 2.6.17） | 各 706 通过 |
+| 工具自检（tests/release、tests/ci、tests/packaging） | 828 通过 |
+| 发行物静态检查（本地构建的 wheel 与 sdist） | 通过，wheel 带三份许可文本 |
+| 工作流 | YAML 解析与 `needs` 引用核对通过；actionlint 1.7.12 未运行 |
+
+Rust 代码本步没有改动，workspace 测试沿用第 1 步的 703 项。
+
+**计数**：以下固定点已同步：
+- tests/python 703 → 706：[ci.yml](../../.github/workflows/ci.yml) 两处、[scorecard.py](../../tests/release/scorecard.py)、[test_candidate.py](../../tests/release/test_candidate.py)、[打包验收 README](../../tests/packaging/README.md) 与 AGENTS 命令表；
+- 差分 862 → 867，会话组 404 → 405：[compare.yml](../../.github/workflows/compare.yml) 两处、`scorecard.py`、`test_candidate.py` 与[分片 README](../../tests/sharding/README.md)；
+- 互通 311 → 321：`compare.yml`、`scorecard.py`、`test_candidate.py`、[test_stage_and_sdist.py](../../tests/release/test_stage_and_sdist.py) 与分片 README；
+- tests/ci 132 → 141：`ci.yml`。
+
+**文档**：0002 约束 8 增加 jieba 的放宽，0006、0029、0031 的 jieba 表述改为指向本文，README 的 BM25 段落补上范围、差异、体积与内存，AGENTS 的命令表注明参照环境须装 jieba。
 
 ## 实施步骤
 

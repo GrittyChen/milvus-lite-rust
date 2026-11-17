@@ -232,8 +232,9 @@ def interpreters():
             python, "-c",
             "import json; from pathlib import Path; from importlib.metadata import version; "
             "import milvus_lite, numpy; from milvus_lite.db import MilvusLite; "
+            "from importlib.util import find_spec; jieba = find_spec('jieba') and __import__('jieba'); "
             "print(json.dumps({'path': str(Path(milvus_lite.__file__).resolve()), "
-            "'version': version('milvus-lite'), 'numpy': numpy.__version__}))",
+            "'version': version('milvus-lite'), 'numpy': numpy.__version__, 'jieba': jieba and jieba.__version__}))",
         ], cwd=REPO, text=True, capture_output=True, check=False)
         if probe.returncode != 0:
             raise pytest.UsageError(
@@ -247,6 +248,10 @@ def interpreters():
         )
         if name == PYTHONS[1]:
             assert info["numpy"] == "1.26.4", f"{name} has NumPy {info['numpy']}, expected 1.26.4"
+        # jieba 的互通要求参照侧装 jieba 0.42.1（0036 决策 F、G）。
+        assert info["jieba"] == "0.42.1", (
+            f"{name} has jieba {info['jieba']}, expected 0.42.1; install it as described in tests/storage_interop/README.md"
+        )
     return result
 
 

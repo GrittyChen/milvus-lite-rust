@@ -157,7 +157,7 @@ FI trace 的两种期望明确分开：
 
 最小可行方案是将**唯一** pyproject.toml 从 crates/py 迁移到仓库根，使发行项目与权威 README/LICENSE 同根：
 
-- project.readme=README.md；project.license-files 包括 LICENSE、crates/grpc/proto/LICENSE。
+- project.readme=README.md；project.license-files 包括 LICENSE、crates/grpc/proto/LICENSE，以及 crates/core/data/jieba/LICENSE（编译期嵌入的 jieba 0.42.1 数据，MIT，见 0036）。
 - tool.maturin.manifest-path=crates/py/Cargo.toml；python-source=crates/py/python；原模块/console script/动态版本不变。
 - 删除旧位置配置，复核现有 -m 命令与根 PEP 517 入口；同步构建身份脚本覆盖根 pyproject.toml。
 - 使用根文件本身，不复制维护第二份，不使用 checkout 在 Windows 上可能失效的符号链接，也不用含 .. 的 license/include glob。

@@ -31,6 +31,11 @@ def pytest_configure(config):
     major = numpy.stdout.strip().split(".")[0]
     if numpy.returncode != 0 or not major.isdigit() or int(major) < 2:
         raise pytest.UsageError(f"{ENV} must have NumPy 2 for BM25 scores (0031), got {numpy.stdout.strip() or numpy.stderr.strip()}")
+    # jieba 的差分要求参照侧装 jieba 0.42.1（0036 决策 G）；没装时 3.x 建表报 code 1，用例会以不一致的形式失败。
+    jieba = subprocess.run([os.environ[ENV], "-W", "ignore", "-c", "import jieba; print(jieba.__version__)"],
+                           capture_output=True, text=True, check=False)
+    if jieba.returncode != 0 or jieba.stdout.strip() != "0.42.1":
+        raise pytest.UsageError(f"{ENV} must have jieba 0.42.1 (0036), got {jieba.stdout.strip() or jieba.stderr.strip()}")
 
 
 @pytest.fixture(scope="session")

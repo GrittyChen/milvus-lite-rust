@@ -9,9 +9,13 @@ uv venv -p 3.12 <work_dir>/v3
 uv pip install -p <work_dir>/v3/bin/python -e references/milvus-lite 'pymilvus==3.0.2' 'pyarrow==25.0.1' pytest
 uv venv -p 3.12 <work_dir>/arrow15
 uv pip install -p <work_dir>/arrow15/bin/python -e references/milvus-lite 'pymilvus==3.0.2' 'pyarrow==15.0.0' 'numpy==1.26.4'
+# jieba 0.42.1 只有 sdist：下载后按固定哈希构建一次 wheel，装进两套环境（0036 决策 G，与 CI 相同）
+curl -sSfL -o <work_dir>/jieba-0.42.1.tar.gz https://files.pythonhosted.org/packages/source/j/jieba/jieba-0.42.1.tar.gz
+python3 .github/ci/jieba_wheel.py build --sdist <work_dir>/jieba-0.42.1.tar.gz --uv "$(command -v uv)" --python 3.12 --out <work_dir>/jieba
+for env in v3 arrow15; do uv pip install -p <work_dir>/$env/bin/python --no-deps --no-index <work_dir>/jieba/jieba-0.42.1-py3-none-any.whl; done
 ```
 
-前置检查要求所有参照解释器都能导入 `milvus_lite.db.MilvusLite`，并从本地固定 checkout 导入；Arrow 15 环境的 NumPy 为 1.26.4。缺失引擎依赖时直接报告对应环境变量和准备文档，不跳过用例。这两套环境与安装 Rust wheel 的测试解释器分开，不能同时安装两个提供 `milvus_lite` 的发行包。
+前置检查要求所有参照解释器都能导入 `milvus_lite.db.MilvusLite`，并从本地固定 checkout 导入；Arrow 15 环境的 NumPy 为 1.26.4；两套环境都装了 jieba 0.42.1。差分测试的参照解释器同样要求 jieba 0.42.1。缺失引擎依赖时直接报告对应环境变量和准备文档，不跳过用例。这两套环境与安装 Rust wheel 的测试解释器分开，不能同时安装两个提供 `milvus_lite` 的发行包。
 
 运行（从仓库根目录）：
 
@@ -40,5 +44,7 @@ WAL 故障矩阵另覆盖 data/delta 多批流的每个字节截断位置、中�
 `test_management_crashes.py` 把进程退出的位置交给本实现的故障注入子进程：它构建并运行 `crates/core/tests/truncate.rs` 与 `rename.rs` 的测试二进制（`--features fault-injection`，需要 Rust 工具链），由环境变量选择退出点，不复制故障注入逻辑。清空在提交点之前的 6 个退出点由 3.x 打开并继续写入，本实现随后只删除意图；清空已提交、清理未完成的 4 个退出点，3.x 只写 WAL 就被强杀，本实现补做清理并回放；改名的 10 个退出点由 3.x 按目录名打开，本实现随后收尾到改名前或改名后；从未 flush 的 partition key 集合（没有 manifest）清空后，两边的分区、路由与读取一致，并互相可读；改名前后 auto_id 序列在两边延续。这些二进制属于互通用例另行调用的源码级组件，工作流在分片前预构建并核对 `fresh`（见 [0019](../../docs/decisions/0019-test-sharding.md)）。
 
 0023 B 的数据库互通在 `test_cross_implementation.py` 的 `test_databases_created_by_one_implementation_open_and_change_in_the_other`：两个实现（两个先手方向）轮流创建数据库并带属性、在默认库与 `d1` 内建同名集合与别名、经别名读写、修改与删除属性、创建后再由对方删除空库，最后核对 `databases/<db>/database_properties.json` 与 `aliases.json` 的字节、库列表与 staging 为空。库生命周期的进程退出（创建、删除、属性替换以及非默认库内的改名、清空、别名写入）由 `crates/core/tests/databases.rs` 的子进程用例覆盖，重开后只有「操作前」或「操作后」；3.x 打开这些退出点留下的目录依赖同一个目录布局，由上面的交替用例与差分测试 `tests/differential/test_databases.py` 的逐字节比较提供证据。
+
+0036 的 jieba 互通在 `test_jieba.py`：本实现与 Arrow 15 / 25 的 3.x 各自写出只有 WAL、已 flush 与经过合并的两个 jieba 集合（search 模式加停用词、exact 模式加用户词），三方读出的行与 `analyzer_params` 逐项相同，BM25 检索在本实现与 Arrow 25 之间逐位相同；再由对方写入与 partial upsert 后三方重读。另有受污染的 3.x 目录：3.x 进程里先建带用户词的集合，之后没有用户词的集合按全局词典切分，本实现打开后原样读出已存的稀疏值，新写入的行按本实现的切法生成。
 
 0030 的稀疏向量互通在 `test_sparse_vectors.py`：本实现与 Arrow 15 / 25 的 3.x 各自写出只有 WAL、已 flush 与经过合并的稀疏集合（带 SPARSE_INVERTED_INDEX 与稠密字段），三方读出的行、索引定义、稀疏检索与 HybridSearch 逐项相同；再由对方 partial upsert（继承稀疏值）、删除与写入后三方重读。另由 3.x 引擎 API 写出 nullable 稀疏行（segment 与只在 WAL 中的行）、稀疏默认值集合，改写 parquet 得到的 8 种历史坏行与分区 p1 中的坏行（删除 p1 全部行后按分区检索），以及改写 WAL（Arrow IPC stream）得到的只在 MemTable 中的坏行；同一目录复制两份，本实现与 3.x 各执行 load、count、query、get、检索（含过滤排除坏行、稠密检索输出稀疏字段、HybridSearch）、删除或覆盖坏行后再检索、partial upsert 继承坏行与空值，除 0030 登记的 nullable 输出与默认值集合外逐项一致。

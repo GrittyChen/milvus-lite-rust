@@ -1,3 +1,5 @@
 hatchling
 # hatchling 做可编辑安装时额外请求的构建依赖
 editables
+# 从固定哈希的 sdist 构建 jieba 0.42.1 的 wheel（0036 决策 G）：它只有 setup.py，构建后端是 setuptools
+setuptools

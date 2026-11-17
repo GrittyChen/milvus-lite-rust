@@ -10,6 +10,8 @@ pathspec==1.1.1
     # via hatchling
 pluggy==1.6.0
     # via hatchling
+setuptools==84.0.0
+    # via -r .github/ci/requirements/build.in
 tomlkit==0.15.1
     # via hatchling
 trove-classifiers==2026.9.21.13

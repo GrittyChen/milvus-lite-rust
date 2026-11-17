@@ -121,6 +121,10 @@ def check_description(body, expected, version=VERSION):
     check_install_commands(body, version)
 
 
+# 发行物附带的许可文本：本项目、proto 源（milvus-proto），以及编译期嵌入的 jieba 0.42.1 数据（MIT，0036）。
+LICENSE_FILES = ["LICENSE", "crates/grpc/proto/LICENSE", "crates/core/data/jieba/LICENSE"]
+
+
 def check_metadata(raw, readme, version):
     metadata = Parser().parsestr(raw.decode("utf-8"))
     require(metadata["Name"] == "milvus-lite-rust", "wrong distribution name")
@@ -128,7 +132,7 @@ def check_metadata(raw, readme, version):
     require(metadata["Requires-Python"] == ">=3.10", "unexpected Python bound")
     require(metadata["License-Expression"] == "Apache-2.0", "wrong license expression")
     require((metadata["Description-Content-Type"] or "").split(";", 1)[0].strip() == "text/markdown", "missing markdown description")
-    require(set(metadata.get_all("License-File", [])) == {"LICENSE", "crates/grpc/proto/LICENSE"}, "missing license declaration")
+    require(set(metadata.get_all("License-File", [])) == set(LICENSE_FILES), "missing license declaration")
     require(set(metadata.get_all("Project-URL", [])) == PROJECT_URLS and len(metadata.get_all("Project-URL", [])) == len(PROJECT_URLS) and not metadata.get_all("Home-page"), "unconfirmed project address in metadata")
     check_description(metadata.get_payload(), readme, version)
 
@@ -160,7 +164,7 @@ def check_binary(wheel, tags):
 def check(wheel, sdist, repo, version=VERSION, kind="formal"):
     repo = Path(repo)
     readme = (repo / "README.md").read_text()
-    licenses = {p: (repo / p).read_bytes() for p in ["LICENSE", "crates/grpc/proto/LICENSE"]}
+    licenses = {p: (repo / p).read_bytes() for p in LICENSE_FILES}
     with zipfile.ZipFile(wheel) as archive:
         names = archive.namelist()
         safe_names(names)

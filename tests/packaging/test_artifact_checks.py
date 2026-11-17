@@ -6,18 +6,18 @@ import tarfile
 import zipfile
 
 import pytest
-from check_artifacts import VERSION, check, check_binary
+from check_artifacts import LICENSE_FILES, VERSION, check, check_binary
 
 
 @pytest.fixture
 def artifacts(tmp_path):
     repo = Path(__file__).resolve().parents[2]
     root = tmp_path / "source"
-    for name in ["README.md", "LICENSE", "crates/grpc/proto/LICENSE"]:
+    for name in ["README.md", *LICENSE_FILES]:
         path = root / name
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes((repo / name).read_bytes())
-    metadata = ("Metadata-Version: 2.4\nName: milvus-lite-rust\nVersion: 0.6.0rc1\nRequires-Python: >=3.10\nLicense-Expression: Apache-2.0\nLicense-File: LICENSE\nLicense-File: crates/grpc/proto/LICENSE\nProject-URL: Repository, https://github.com/GrittyChen/milvus-lite-rust\nProject-URL: Issues, https://github.com/GrittyChen/milvus-lite-rust/issues\nDescription-Content-Type: text/markdown; charset=UTF-8\n\n" + (root / "README.md").read_text()).encode()
+    metadata = ("Metadata-Version: 2.4\nName: milvus-lite-rust\nVersion: 0.6.0rc1\nRequires-Python: >=3.10\nLicense-Expression: Apache-2.0\nLicense-File: LICENSE\nLicense-File: crates/grpc/proto/LICENSE\nLicense-File: crates/core/data/jieba/LICENSE\nProject-URL: Repository, https://github.com/GrittyChen/milvus-lite-rust\nProject-URL: Issues, https://github.com/GrittyChen/milvus-lite-rust/issues\nDescription-Content-Type: text/markdown; charset=UTF-8\n\n" + (root / "README.md").read_text()).encode()
     info = "milvus_lite_rust-0.6.0rc1.dist-info"
     wheel_files = {
         info + "/METADATA": metadata,
@@ -25,12 +25,12 @@ def artifacts(tmp_path):
         info + "/entry_points.txt": b"[console_scripts]\nmilvus-lite = milvus_lite.cmdline:main\n",
         "milvus_lite/_native.abi3.so": b"not loaded by content inspector",
     }
-    for name in ["LICENSE", "crates/grpc/proto/LICENSE"]:
+    for name in LICENSE_FILES:
         wheel_files[info + "/licenses/" + name] = (root / name).read_bytes()
     for name in ["__init__.py", "cmdline.py", "__main__.py", "server_manager.py"]:
         wheel_files["milvus_lite/" + name] = b"# module\n"
     source_files = {"PKG-INFO": metadata}
-    for name in ["README.md", "LICENSE", "crates/grpc/proto/LICENSE"]:
+    for name in ["README.md", *LICENSE_FILES]:
         source_files[name] = (root / name).read_bytes()
     for name in ["Cargo.toml", "Cargo.lock", "pyproject.toml", "crates/core/Cargo.toml", "crates/grpc/Cargo.toml", "crates/py/Cargo.toml", "crates/py/build.rs", "crates/py/python/milvus_lite/cmdline.py"]:
         source_files[name] = b"source\n"

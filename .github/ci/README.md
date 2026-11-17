@@ -13,9 +13,11 @@
 | `sdk26-py315` | CPython 3.15 | 发行工作流中 3.15 的 pymilvus 2.6.17 线；`sdk26` 选中的 numpy 2.4.6 没有 cp315 wheel，因此单独解析，不复用 3.10 的集合 |
 | `sdk30` | CPython 3.10–3.15 | 发行工作流中各解释器的 pymilvus 3.0.2 线（3.10 / 3.15 全套与 3.11–3.14 冒烟）；逐解释器、逐平台核对过 wheel |
 | `ref25` / `ref15` | CPython 3.12 | 参照实现（`compare.yml` 的 `REFERENCE_COMMIT`）的 Arrow 25 / Arrow 15 环境；参照实现的依赖取自其 `pyproject.toml`，checkout 另以 `--no-deps -e` 安装 |
-| `build` | — | 可编辑安装参照时的构建依赖（hatchling 及其可编辑安装额外请求的 editables），经 `--build-constraint` 使用 |
+| `build` | — | 可编辑安装参照时的构建依赖（hatchling 及其可编辑安装额外请求的 editables），以及从 sdist 构建 jieba 的 setuptools，经 `--build-constraint` 使用 |
 
 Linux 上的 CPython 3.15 例外：`orjson==3.13.0` 的 cp315 Linux wheel 只有 `manylinux_2_39`，无法在 glibc 2.28 的测试环境安装，按 [0021](../../docs/decisions/0021-release-build-in-ci.md) 第 11 条只允许它从 sdist（SHA256 `d1de5eb04485110c5da4c657e49168995d55e076b1ce60f1a042e254f4186c4f`）在独立 job 中构建一次，其余依赖仍只用 wheel。
+
+参照环境的 jieba 例外：3.x 的 jieba 分词器依赖 `jieba==0.42.1`，它在 PyPI 上只有 sdist。按 [0021](../../docs/decisions/0021-release-build-in-ci.md) 第 11 条，对照层与发行工作流各有一个独立的 `jieba` job，用 [jieba_wheel.py](jieba_wheel.py) 从 sdist（SHA256 `055ca12f62674fafed09427f176506079bc135638a14e23e25be909131928db2`）构建一次纯 Python wheel，构建后端 setuptools 由 `build.txt` 固定，并取出 sdist 中的 `test/test.py` 供 jieba 固定真值核验使用；测试 job 把这份 wheel 以 `--no-deps --no-index` 装入两套参照环境，再以 `check-installed` 核对 wheel 的哈希、实际导入的版本与词典（[0036](../../docs/decisions/0036-jieba.md) 决策 G）。本地准备参照环境的等价命令见[互通 README](../../tests/storage_interop/README.md)。
 
 更新任一 `.in` 或参照版本后，在仓库根目录按各 `.txt` 文件头记录的命令重新生成，并随同一提交评审。生成使用 CI 固定的 uv 版本，并以 `--exclude-newer` 截止到生成日前两周，避免刚发布的版本进入环境；`--universal` 使同一份结果在三个平台通用，但不保证每个平台都有 wheel：例如参照环境的 faiss-cpu 1.15.1 在三个平台都有 wheel，但 macOS arm64 的最低目标是 macOS 14，更换托管机器或依赖版本时须重新核对。
 
@@ -31,7 +33,7 @@ uv 不经 PyPI 索引安装：索引响应可能被截断，而 pip 不重试响
 
 按 0021 第 11 条，判定层不重试；传输层只对内容固定或只读的操作有限重试，间隔 5 / 15 / 45 秒，每次输出 `transport-retry` 警告注解，用尽即失败：
 
-- [fetch.py](fetch.py) `file`：内容由 sha256 固定的下载（uv wheel、orjson sdist、上一版本 wheel），任何下载失败都重试，哈希不符立即失败；
+- [fetch.py](fetch.py) `file`：内容由 sha256 固定的下载（uv wheel、orjson sdist、jieba sdist、上一版本 wheel），任何下载失败都重试，哈希不符立即失败；
 - [tests/release/runs.py](../../tests/release/runs.py) 的 `Gh(retry=True)`：只读 GET 只在暂时性传输错误（连接失败、超时、HTTP 500/502/503/504、HTTP/2 stream 错误如 `stream CANCEL`）或成功响应的 JSON 无法解析时重试，任何 HTTP 4xx 原样失败（429 也不重试：gh api 的错误输出不含 `Retry-After`）；前置检查、签发前复核、演练的证明 404 检查与 `release_set.py --prepare` 使用它，0022 的保全路径（门闩与 save；verify 不访问接口）使用默认的不重试实例；
 - [Dockerfile.pid1](../../tests/platform/Dockerfile.pid1) 的 SDK 安装：完整 constraints 固定版本、只用 wheel，失败时整体重试；镜像构建输出不进入 job 日志，由 [linux_pid1_probe.py](../../tests/platform/linux_pid1_probe.py) 检索重试行后转发为注解，次数写入 `identity.json`。
 
@@ -45,8 +47,9 @@ uv、cargo、rustup 与 `gh attestation verify` 自带的网络重试保持默�
 - [cargo_fresh.py](cargo_fresh.py)：互通预构建后复跑的全部产物须为 fresh。
 - [changes.py](changes.py)：两个工作流的分类 job 判定是否为纯文档，以待合入的全部差异为准，任何异常按全量执行（0020 公共约定 9）。
 - [summary.py](summary.py)：`ci-pass` 与 `compare-pass` 的判定，只接受全量全部成功或纯文档时测试 job 全部跳过两种形态。
+- [jieba_wheel.py](jieba_wheel.py)：参照环境 jieba 的受控构建与安装核对（见上文「固定依赖」），自检在 [tests/ci](../../tests/ci/test_jieba_wheel.py)。
 
-两者的自检在 [tests/ci](../../tests/ci/test_ci_scripts.py)，随快速层工具自检运行。
+changes.py 与 summary.py 的自检在 [tests/ci](../../tests/ci/test_ci_scripts.py)，随快速层工具自检运行。
 - [crash_capture.sh](crash_capture.sh)：测试步骤开头以 source 执行，Linux 打开 core dump 并写到 `$RUNNER_TEMP/cores`、提供恢复 core 限制的 `CRASH_SUDO` 供 root 用例使用，macOS 与发行工作流的容器 job（设置 `CRASH_CORE_DIR`）只留时间标记。
 - [crash_report.py](crash_report.py)：job 失败时打出崩溃进程的原生调用栈（Linux 用 gdb 读 core，先完整打印收到信号的线程；容器 job 从只读挂入的宿主机 systemd-coredump 目录取 core 并解压；macOS 读本 job 内的 ReportCrash 诊断报告，等到报告都可解析且 20 秒内没有新增或改写再读，先后写出的多份报告都收集，总等待仍不超过 90 秒），只用于诊断，不改变 job 结论；容器分支与 macOS 等待的自检在 [tests/ci](../../tests/ci/test_crash_report.py)。
 - [collect_records.sh](collect_records.sh)：发行工作流的 job 失败时把运行记录复制到 `$RUNNER_TEMP/failure-records`，上传步骤只给这一个路径：容器 job 中 upload-artifact 的多行 path 只有第一行会换算成容器内路径，其余行找不到文件；[tests/ci](../../tests/ci/test_workflow_paths.py) 检查容器 job 的 artifact 步骤只用单行路径。

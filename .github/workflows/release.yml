@@ -51,6 +51,8 @@ env:
   PREVIOUS_WHEEL: milvus_lite_rust-0.5.0rc1-cp310-abi3-manylinux_2_28_x86_64.whl
   PREVIOUS_WHEEL_SHA256: de3371887b6bd6df0aac7dae797d180090b0e67b86a72f8ee26c78ae2f61800d
   ORJSON_SDIST_URL: https://files.pythonhosted.org/packages/source/o/orjson/orjson-3.13.0.tar.gz
+  # 参照环境的 jieba 只有 sdist：固定哈希后在 jieba job 中构建一次（0036 决策 G，哈希在 .github/ci/jieba_wheel.py）。
+  JIEBA_SDIST_URL: https://files.pythonhosted.org/packages/source/j/jieba/jieba-0.42.1.tar.gz
 
 jobs:
   precheck:
@@ -143,6 +145,34 @@ jobs:
         with:
           name: orjson-${{ matrix.arch }}
           path: ${{ runner.temp }}/orjson
+          if-no-files-found: error
+          retention-days: 30
+
+  jieba:
+    # 参照环境的 jieba（0036 决策 G；0021 第 11 条登记的例外）：从固定哈希的 sdist 构建一次 wheel，构建后端由
+    # requirements/build.txt 固定；纯 Python，各平台差分与互通的参照环境安装同一份。只用于参照侧，不进入正式附件。
+    needs: identity
+    runs-on: ubuntu-24.04
+    container: quay.io/pypa/manylinux_2_28_x86_64@sha256:4131ddd7acb9c6c966af02fe7e71edc51e078c2d41f475966697676430bfa2ae
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: 环境
+        env:
+          RELEASE_PYTHONS: "12"
+        run: bash .github/ci/release_env.sh
+      - name: 构建
+        run: |
+          sha=$("$DEV_PY" -c 'import sys; sys.path.insert(0, ".github/ci"); import jieba_wheel; print(jieba_wheel.SDIST_SHA256)')
+          "$DEV_PY" .github/ci/fetch.py file --url "$JIEBA_SDIST_URL" --sha256 "$sha" --out "$RUNNER_TEMP/jieba-0.42.1.tar.gz"
+          "$DEV_PY" .github/ci/jieba_wheel.py build --sdist "$RUNNER_TEMP/jieba-0.42.1.tar.gz" --uv "$(command -v uv)" \
+            --python "$PY312" --out "$RUNNER_TEMP/jieba"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: jieba
+          path: ${{ runner.temp }}/jieba
           if-no-files-found: error
           retention-days: 30
 
@@ -297,7 +327,7 @@ jobs:
   tests:
     # 第 9 条在四个标准层的门槛；Linux 在固定 manylinux_2_28 镜像中以非 root（UID 1001，托管机器工作区属主）运行，
     # 只在 root 下执行的权限用例属源码级门槛，由 CI 快速层在宿主机上以 root 覆盖。
-    needs: [assemble, orjson]
+    needs: [assemble, orjson, jieba]
     name: tests (${{ matrix.platform.scope }}, ${{ matrix.part }})
     strategy:
       fail-fast: false
@@ -371,6 +401,11 @@ jobs:
         with:
           name: orjson-${{ matrix.platform.arch }}
           path: ${{ runner.temp }}/orjson
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        if: startsWith(matrix.part, 'diff-') || matrix.part == 'interop'
+        with:
+          name: jieba
+          path: ${{ runner.temp }}/jieba
       - name: 环境
         # 差分本身不调用 cargo，但阶段文件按环境键记录 rustc（stage.py）；装上工具链，差分阶段记录实际版本而不是 absent。
         env:
@@ -452,7 +487,10 @@ jobs:
             uv venv -q -p "$PY312" "$RUNNER_TEMP/ref$arrow"
             uv pip install -q --python "$RUNNER_TEMP/ref$arrow/bin/python" --no-build -r "$req/ref$arrow.txt"
             uv pip install -q --python "$RUNNER_TEMP/ref$arrow/bin/python" --no-deps --build-constraint "$req/build.txt" -e references/milvus-lite
+            uv pip install -q --python "$RUNNER_TEMP/ref$arrow/bin/python" --no-deps --no-index "$RUNNER_TEMP/jieba/jieba-0.42.1-py3-none-any.whl"
           done
+          "$DEV_PY" .github/ci/jieba_wheel.py check-installed --record "$RUNNER_TEMP/jieba/record.json" \
+            --wheel "$RUNNER_TEMP/jieba/jieba-0.42.1-py3-none-any.whl" --python "$RUNNER_TEMP/ref25/bin/python" "$RUNNER_TEMP/ref15/bin/python"
           case "${{ matrix.part }}" in
             diff-3.0.2|interop) sdk=3.0.2 ;;
             diff-2.6.17) sdk=2.6.17 ;;
@@ -550,7 +588,7 @@ jobs:
     # 与 tests 相同的步骤，只是 macOS 两层：12 个 job 争 5 个 macOS 并发位，不限流时由 GitHub 决定谁先领到执行机，
     # 最长的 Intel 差分可能排到最后。max-parallel 等于该上限，使排队留在矩阵内部，以期按矩阵顺序（part 在外层、
     # 大致按 Intel 上的时长从长到短，同一 part 内 Intel 在前）放行；GitHub 文档未写明放行顺序。
-    needs: [assemble, orjson]
+    needs: [assemble, orjson, jieba]
     name: tests (${{ matrix.platform.scope }}, ${{ matrix.part }})
     strategy:
       fail-fast: false
@@ -863,7 +901,7 @@ jobs:
   candidate:
     # 只接受全部前序 job 为 success；随后生成候选结果与最终 SHA256SUMS（0021 第 12 条）。
     if: always()
-    needs: [precheck, identity, orjson, build, assemble, tests, tests-mac, linux-system, pid1, sdist, previous-reader]
+    needs: [precheck, identity, orjson, jieba, build, assemble, tests, tests-mac, linux-system, pid1, sdist, previous-reader]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:

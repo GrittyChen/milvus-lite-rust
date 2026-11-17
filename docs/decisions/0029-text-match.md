@@ -8,7 +8,7 @@
 - 建表属性 `enable_analyzer`、`enable_match`、`analyzer_params`：接受、持久化、回显，与 3.x 数据目录互通。
 - standard 分词（不带停用词）。
 
-不包含：停用词与 FNV term hash（只有 BM25 用得到，属于全文检索切片）；BM25 function（本切片当时继续拒绝）；Jieba；与算术混用的 `text_match`（算术过滤切片之前继续返回 `UNIMPLEMENTED`）。其中停用词、FNV term hash 与 BM25 function 现已由 [0031](0031-bm25.md) 实现，BM25 输入字段的 `analyzer_params` 按原值构造分词器。
+不包含：停用词与 FNV term hash（只有 BM25 用得到，属于全文检索切片）；BM25 function（本切片当时继续拒绝）；Jieba；与算术混用的 `text_match`（算术过滤切片之前继续返回 `UNIMPLEMENTED`）。其中停用词、FNV term hash 与 BM25 function 现已由 [0031](0031-bm25.md) 实现，BM25 输入字段的 `analyzer_params` 按原值构造分词器；BM25 的 Jieba 分词器由 [0036](0036-jieba.md) 实现，`text_match` 仍固定用 standard 分词，与 3.x 相同。
 
 ## 3.x 的行为
 
