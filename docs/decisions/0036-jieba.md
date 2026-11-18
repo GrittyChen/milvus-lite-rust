@@ -330,7 +330,7 @@
 | tests/python（3.0.2 / 2.6.17） | 各 706 通过 |
 | 工具自检（tests/release、tests/ci、tests/packaging） | 828 通过 |
 | 发行物静态检查（本地构建的 wheel 与 sdist） | 通过，wheel 带三份许可文本 |
-| 工作流 | YAML 解析与 `needs` 引用核对通过；actionlint 1.7.12 未运行 |
+| 工作流 | YAML 解析与 `needs` 引用核对通过；actionlint 1.7.12（含 shellcheck）在合入后的 `048db7b` 上零告警 |
 
 Rust 代码本步没有改动，workspace 测试沿用第 1 步的 703 项。
 

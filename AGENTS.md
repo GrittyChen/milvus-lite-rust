@@ -14,7 +14,7 @@
 
 重构基线已定：**以 3.x 为基础，不以 2.5.1（C++）为基础**。3.x 的性能损失主要来自 Python 实现，架构内只有一处需要修正的设计；2.5.1 反而有冷启动全量重放、索引不落盘等架构级瓶颈；决策、数据与由此得出的实现约束见 [0001-重构基线选择](docs/decisions/0001-refactor-baseline.md)。
 
-仓库结构：README / LICENSE（Apache-2.0）、设计决策（[docs/decisions/](docs/decisions/)）、验收与调查记录（[docs/testing/](docs/testing/)）、发行文档（[docs/releases/](docs/releases/)）与基准（[benchmarks/](benchmarks/)）。各切片的进展以对应决策文档开头的「状态」与验收记录为准，各版本以[版本台账](docs/releases/consumed-versions.json)与候选及发布验收记录为准，本文不记录进展。已发布的版本都是 GitHub Release 预发布，未发布到 PyPI，未声明生产可用。新增 module、依赖或命令时同步更新本文的[架构地图](#架构地图跨文件心智)、[技术栈](#技术栈)与[常用命令](#常用命令)；这几节中标注「待定」的内容不得当作事实引用。
+仓库结构：README / LICENSE（Apache-2.0）、文档（[docs/](docs/)：设计决策、验收与调查记录、发行文档，入口为 [docs/README.md](docs/README.md)）、代码（[crates/](crates/)）、测试（[tests/](tests/)）与基准（[benchmarks/](benchmarks/)）。各切片的进展以对应决策文档开头的「状态」与验收记录为准，各版本以[版本台账](docs/releases/consumed-versions.json)与候选及发布验收记录为准，本文不记录进展。已发布的版本都是 GitHub Release 预发布，未发布到 PyPI，未声明生产可用。新增设计决策时在 [docs/README.md](docs/README.md) 的索引加一行；新增 module、依赖或常用命令时同步更新本文的[架构地图](#架构地图跨文件心智)、[技术栈](#技术栈)与[常用命令](#常用命令)；专项命令写进所在目录的 README。
 
 ## 核心业务术语
 
@@ -39,56 +39,12 @@
 | --- | --- |
 | 对外功能面 / 已知限制 / 支持的类型、索引、度量 | 参照实现 [README.md](references/milvus-lite/README.md)（«Supported Features» / «Known Limitations»） |
 | 逐文件架构 / **架构不变量全表** | 参照实现 [docs/modules.md](references/milvus-lite/docs/modules.md)（«Architecture Invariants»） |
-| WAL 格式、flush、recovery、崩溃点 | 参照实现 [docs/wal-design.md](references/milvus-lite/docs/wal-design.md) |
-| 向量 / 标量 / 稀疏索引 | 参照实现 [docs/index-design.md](references/milvus-lite/docs/index-design.md) |
-| 过滤表达式 | 参照实现 [docs/filter-design.md](references/milvus-lite/docs/filter-design.md) |
-| gRPC 兼容面与 RPC 映射 | 参照实现 [docs/grpc-adapter-design.md](references/milvus-lite/docs/grpc-adapter-design.md) |
-| 全文检索 / BM25 | 参照实现 [docs/fts-design.md](references/milvus-lite/docs/fts-design.md) |
-| function chain / rerank | 参照实现 [docs/funcchain-design.md](references/milvus-lite/docs/funcchain-design.md) |
-| search / query iterator | 参照实现 [docs/search-iterator-design.md](references/milvus-lite/docs/search-iterator-design.md) |
+| 专题设计：WAL 与 flush / recovery、索引、过滤表达式、gRPC 兼容面与 RPC 映射、全文检索与 BM25、function chain 与 rerank、search / query iterator | 参照实现 docs/ 下对应的 [wal](references/milvus-lite/docs/wal-design.md)、[index](references/milvus-lite/docs/index-design.md)、[filter](references/milvus-lite/docs/filter-design.md)、[grpc-adapter](references/milvus-lite/docs/grpc-adapter-design.md)、[fts](references/milvus-lite/docs/fts-design.md)、[funcchain](references/milvus-lite/docs/funcchain-design.md)、[search-iterator](references/milvus-lite/docs/search-iterator-design.md) 各一份 `*-design.md` |
 | 近期兼容性改动的设计与计划 | 参照实现 [docs/superpowers/](references/milvus-lite/docs/superpowers/) |
 | 参照实现的演进顺序（可借鉴的垂直切片划分） | 参照实现 [docs/roadmap.md](references/milvus-lite/docs/roadmap.md) |
 | 某行为的真值 / 边界用例 | 参照实现 [tests/](references/milvus-lite/tests/)。`adapter/` 与 `compatibility/` 经 pymilvus 走 gRPC，是复用价值最高的一批，但它们用 `milvus_lite.adapter.grpc.server.start_server_in_thread` 在进程内起服务、部分用例还直接引用参照实现内部模块，**复用时须替换起服务的 fixture，不能直接指向本实现** |
 | 上游 Milvus client 用例子集 | 参照实现 [tools/run_upstream_milvus_client_supported.sh](references/milvus-lite/tools/run_upstream_milvus_client_supported.sh)（依赖 Milvus 源码中的 `tests/python_client`，路径由 `MILVUS_CLIENT_TEST_DIR` 指定） |
-| 为什么以 3.x 而非 2.5.1 为基础 / 两代架构对比 / 3.x 的耗时归属 / Rust 实现的性能约束 | [docs/decisions/0001-refactor-baseline.md](docs/decisions/0001-refactor-baseline.md) |
-| 数据目录与 3.x 互通的范围 / 共享文件的约束 / 索引文件共存规则 / 跨实现验证矩阵 | [docs/decisions/0002-data-dir-compat.md](docs/decisions/0002-data-dir-compat.md) |
-| 进程内服务的生命周期：同路径复用 / 进程退出时的停止与持久化 / fork 后的处理 / 与 3.x 在这些点上的差异 | [docs/decisions/0003-in-process-server-lifecycle.md](docs/decisions/0003-in-process-server-lifecycle.md) |
-| 第一个里程碑（M1）做什么、不做什么 / 阶段性对外差异 / 验收标准 | [docs/decisions/0004-m1-scope.md](docs/decisions/0004-m1-scope.md) |
-| 检索的线程模型：RPC 与计算池的分工、计算任务的约束、锁的边界、停服与 fork 下的计算池 | [docs/decisions/0005-search-thread-model.md](docs/decisions/0005-search-thread-model.md) |
-| 第二个里程碑（M2）做什么、不做什么 / 3.x 存储层的实测事实与缺陷 / 与 3.x 的差异 / 持久化保证 / 验收 | [docs/decisions/0006-m2-scope.md](docs/decisions/0006-m2-scope.md)、[验收记录](docs/testing/m2-acceptance.md) |
-| M2 存储引擎的结构 / 取锁顺序 / 快照与有效位图 / WAL、flush、drop 与关闭的提交和失败协议 | [docs/decisions/0007-m2-storage-engine.md](docs/decisions/0007-m2-storage-engine.md) |
-| 首发 compaction、正常关闭排空、GC 与独立已提交删除状态 | [0010](docs/decisions/0010-compaction-and-tombstone-gc.md)、[0011](docs/decisions/0011-committed-delete-state.md) |
-| CLI server 参数、工作者、信号与停服错误 | [0012](docs/decisions/0012-cli-server.md) |
-| 首发平台、PID 1、发行物验收与候选阶段决策（RC 只发 GitHub Release、公开地址；候选执行见 0021，Intel Mac 为标准层） | [0013](docs/decisions/0013-first-release-platform-and-packaging.md) |
-| 索引定义、DropIndex 与过滤表达式切片；删除意图和实施验收矩阵 | [0014](docs/decisions/0014-index-definitions-and-filter-expressions.md) |
-| 标量 nullable、默认值与 ARRAY；向量 nullable 延后、真值矩阵与前后兼容 | [0015](docs/decisions/0015-nullable-defaults-and-array.md)、[调查记录](docs/testing/0015-schema-investigation.md)、[A 验收](docs/testing/0015-scalar-nullable-acceptance.md)、[修复记录](docs/testing/0015-scalar-nullable-review-fixes.md)、[JSON 写入专项](docs/testing/0015-json-write-regression.md)、[B 验收](docs/testing/0015-array-acceptance.md) |
-| Query iterator / range search、分区调查结论及冻结边界 | [0016](docs/decisions/0016-query-iteration-and-range-search.md) |
-| 显式分区 A：目录安全、按选择集可见性、Drop 保留全局删除；partition key 见下一行 | [0017](docs/decisions/0017-partitions.md)、[原始 RPC / Linux 边界与转存原型](docs/testing/0017-partition-design-investigation.md)、[可见性组件与资源诊断](docs/testing/0017-visibility-component.md)、[A 实施验收](docs/testing/0017-partition-acceptance.md)、[实施评审修复](docs/testing/0017-partition-review-fixes.md) |
-| partition key B：调查、合同、验收与性能，三项差异与证据单列 | [B 调查](docs/testing/0017-partition-key-investigation.md)、[B 合同](docs/decisions/0017-partitions.md#b-合同设计已通过)、[B 验收](docs/testing/0017-partition-key-acceptance.md)、[B 性能](docs/testing/0017-partition-key-performance.md) |
-| 非 key 同批重复主键 Upsert：撤销累计合并差异，按请求前状态独立合并 | [修复记录](docs/testing/0017-non-key-upsert-fix.md) |
-| 0017 整体跨平台开发验收（与最终发布矩阵分开） | [跨平台收口](docs/testing/0017-cross-platform-acceptance.md) |
-| 候选测试的并行编排与确定性分片：实测耗时依据、不损失测试效果的定义、P0 编排并行、P1 分片工具、门槛与试点 | [0019](docs/decisions/0019-test-sharding.md)、[试点验收](docs/testing/0019-pilot-acceptance.md) |
-| 0015／0016 冻结提交的跨平台开发验收、平台证据边界与 SDK 临时端口复用的缓存隔离 | [跨平台验收](docs/testing/0015-0016-cross-platform-acceptance.md) |
-| 0018 JSON 写入优化：调查、合同、诊断工具与实施验收 | [合同](docs/decisions/0018-json-write-normalization.md)、[调查与证据](docs/testing/0018-json-write-investigation.md)、[实施验收](docs/testing/0018-json-write-acceptance.md)、[诊断工具](benchmarks/json-write/diagnostics/README.md) |
-| 持续集成：快速层与对照层的范围、零跳过与汇总判定、必须通过检查（`ci-pass` / `compare-pass`）与推送方式、不纳入 CI 的候选内容；「不加 retry」指判定层，传输层按 0021 第 11 条；停服路径段错误的风险接受、适用范围与停止条件见停服段错误调查 | [0020](docs/decisions/0020-continuous-integration.md)、[试点记录](docs/testing/0020-ci-pilot.md)、[工作流与固定依赖](.github/ci/README.md)、[停服段错误调查](docs/testing/shutdown-segfault-investigation.md) |
-| 在 CI 中构建与验收发行物：前置继承、冻结身份、正式附件上的差分与互通、候选结果、版本消费与最后一道多主体来源证明、签发后禁止重跑、演练与平台调整、编排拆分与传输层有限重试；0013 的本地流程只作诊断 | [0021](docs/decisions/0021-release-build-in-ci.md)、[试点记录](docs/testing/0021-release-pilot.md) |
-| 签发前的候选保全门闩：环境审批、本地保全与机器核对的保全回执、目录布局与崩溃恢复、失败语义（并入 0021 第 3、13、19、20 条，以 0021 为准） | [0022](docs/decisions/0022-pre-signing-preservation-gate.md)、[试点记录](docs/testing/0022-gate-pilot.md) |
-| 各预发布版本的交付范围、发行说明、候选方案与候选及发布验收（0.3.0rc3 起每个版本号的结局以[版本台账](docs/releases/consumed-versions.json)为准） | 0.1.0rc1–rc3 [验收](docs/testing/first-release-acceptance.md)；0.2.0rc1 [说明](docs/releases/0.2.0rc1.md)、[验收](docs/testing/0.2.0rc1-acceptance.md)；0.3.0rc1 [说明](docs/releases/0.3.0rc1.md)、[方案](docs/releases/next-candidate-plan.md)、[验收](docs/testing/0.3.0rc1-acceptance.md)；0.3.0rc2 [说明](docs/releases/0.3.0rc2.md)、[方案](docs/releases/0.3.0rc2-candidate-plan.md)、[准备核验](docs/testing/0.3.0rc2-preparation.md)、[验收](docs/testing/0.3.0rc2-acceptance.md)；0.3.0rc3 [说明](docs/releases/0.3.0rc3.md)、[方案](docs/releases/0.3.0rc3-candidate-plan.md)、[验收](docs/testing/0.3.0rc3-acceptance.md)；0.4.0rc1 [说明](docs/releases/0.4.0rc1.md)、[方案](docs/releases/0.4.0rc1-candidate-plan.md)、[验收](docs/testing/0.4.0rc1-acceptance.md)；0.5.0rc1 [说明](docs/releases/0.5.0rc1.md)、[方案](docs/releases/0.5.0rc1-candidate-plan.md)、[验收](docs/testing/0.5.0rc1-acceptance.md)；0.6.0rc1 [说明](docs/releases/0.6.0rc1.md)、[方案](docs/releases/0.6.0rc1-candidate-plan.md)、[验收](docs/testing/0.6.0rc1-acceptance.md) |
-| 别名、改名、清空与集合属性（A）与多数据库（B：数据库注册表、五个数据库 RPC、`db_name` 路由、属性、各库隔离）：参照实测、必须保留的行为、已登记差异、清空与改名的私有意图与提交协议、锁与测试矩阵；跨数据库改名返回 UNIMPLEMENTED | [0023](docs/decisions/0023-aliases-rename-truncate-databases.md)、[A 验收](docs/testing/0023-a-acceptance.md)、[B 验收](docs/testing/0023-b-acceptance.md) |
-| 分组检索（`group_by_field` / `group_size` / `strict_group_size`）：3.x 实测的候选窗口、展平后的 offset 切片、空值组与参数真值；主键非 `id`、可空 `distance` / `id` 字段两个 3.x 缺陷不复制并登记 | [0024](docs/decisions/0024-group-by-search.md) |
-| TIMESTAMPTZ 与 `timezone` 属性：3.x 实测的 UTC 微秒值、ISO 解析与输出、请求 / 集合 / 数据库时区的优先级与 `fold=0` 换算、`time_fields`、请求时区的两个校验点与错误先后、毒化整数的处理、采用内置 tzdata（jiff）的取舍 | [0025](docs/decisions/0025-timestamptz-and-timezone.md)、[验收](docs/testing/0025-timestamptz-acceptance.md) |
-| HybridSearch 与 rerank（`rank_params` 的 RRF / Weighted，`function_score` 的 boost 与 rrf / weighted / decay）：三个协议表面、两空间分数契约、链式候选行的扁平模型与存在性表、`GroupByOp` 组键、三条路径的 `limit` / `offset` / `group_size`、候选窗口、错误先后 | [0026](docs/decisions/0026-rerank-and-hybrid-search.md)、[验收](docs/testing/0026-rerank-hybrid-acceptance.md) |
-| 参照从 v3.2.1 升级到 `1320d26`：对外行为差异、Search 主键投影、按目标字段解析度量与错误先后、带分区的 count(*)、flush 字节预算 | [0027](docs/decisions/0027-reference-3.2.2-upgrade.md) |
-| 多向量字段：按字段的内存范数、其余向量字段的写入检查、三项登记差异、WAL 中 null 行不按截断处理 | [0028](docs/decisions/0028-multi-vector-fields.md) |
-| standard 分词与 `text_match`：固定 Unicode 表、hybrid 回退路线、`analyzer_params` 的判定与持久化、登记差异 | [0029](docs/decisions/0029-text-match.md) |
-| 稀疏向量与 IP：打包字节的存储与解码时机、SPARSE_INVERTED_INDEX 的定义与调参项、每个 segment 惰性倒排的缓存与作废、排序键与错误先后、带分区时先全局判版本、登记差异 | [0030](docs/decisions/0030-sparse-vectors.md) |
-| BM25 function 与全文检索：函数的校验与持久化、`analyzer_params` 原值与分词器、写入时生成输出字段、BM25 度量的换算表、k1 / b、按 segment 的统计与 NumPy 2 的 float32 打分、登记差异 | [0031](docs/decisions/0031-bm25.md)、[验收](docs/testing/0031-bm25-acceptance.md) |
-| 过滤中的算术：三条求值路线（pyarrow 的类型提升、回绕与带检查的转换；Python 的精确整数、正确舍入的真除法、字符串与列表的拼接和重复；hybrid 的整源回退）、资源上限与登记差异 | [0032](docs/decisions/0032-arithmetic-filters.md)、[验收](docs/testing/0032-arithmetic-acceptance.md) |
-| hybrid 动态列类型推断的复刻：pyarrow `pa.array` 的推断（遇 bool / float / 字符串即停、列表与对象的子推断）与逐元素转换（报 OverflowError 还是回退的先后）、每行按键名排序与跨行首次出现的对象字段顺序、Arrow 15 / 25 的版本差异（对齐 25.0.1）；注销 0032 登记的推断差异 | [0033](docs/decisions/0033-hybrid-dynamic-inference.md) |
-| GEOMETRY 字段与几何谓词：3.x 的 WKT 接受范围（两个正则加 `float()`，含 Unicode 空白、`re.IGNORECASE` 与 Unicode 数字的边角）、原文存储与协议槽位、五个谓词的求值语义与 CPython 3.12 的 `math.hypot`、`ARRAY<GEOMETRY>` 等登记差异 | [0034](docs/decisions/0034-geometry.md) |
-| 公共 function chain（Search 的 `function_chains`）：3.x 的执行位置、名字与种类、解码与校验的先后、`num_combine` / `decay` / `round_decimal` / `sort` / `limit` 的求值、BM25 分数变号、`order_by_fields` 的冲突判定、投影合同、三项登记差异（`*` / `$meta` 投影、合法 `rerank_model`、按名为 `$score` / `$id` 的字段分组）、2.6 线的测试机制与“改后复制”的边界 | [0035](docs/decisions/0035-function-chains.md) |
-| jieba 分词（BM25 输入字段）：3.x 的 `mode` / `dict` 规则与进程全局的用户词、jieba-rs 与 jieba 0.42.1 的四处差异及包装层修正、用户词每个集合一份与两个上限、3.x 目录的打开口径、参照环境中 jieba 的受控构建（只有 sdist 的例外）、登记差异 | [0036](docs/decisions/0036-jieba.md) |
-| JSON 文本解析与 serde_json 数字私有键：影响面、判别规则、唯一入口与 clippy 门、已有数据能否恢复 | [修复记录](docs/testing/json-private-number-key-fix.md) |
+| 本仓的设计决策（0001 起按编号）、验收与调查记录、各版本的发行说明与候选方案、发行流程命令 | [docs/README.md](docs/README.md)：按编号列出每份决策「查什么时看」及其验收记录，先看它再打开具体文档，不必枚举目录 |
 | 验收与调查记录引用的证据分哪几类、谁能复核（仓库内可重跑 / 公开产物 / 本地留存），以及验收与调查记录的写法约定 | [证据的存放与复核范围](docs/testing/README.md) |
 | 性能基线怎么测 / 口径 / 注意事项 | [benchmarks/baseline/README.md](benchmarks/baseline/README.md) |
 | 代码审查 / 修复复审（冻结合同、完整调用链、同类全域清扫、分级与证据门槛、二三阶影响矩阵） | [code-review-rules](.agents/skills/code-review-rules/SKILL.md)（Claude Code 经 `.claude/skills` 软链读取同一份） |
@@ -107,20 +63,21 @@ pymilvus ──server_manager──▶ adapter/grpc ──▶ db（多 collectio
                                                                                   └─ schema/   类型系统 · 校验 · 持久化
 ```
 
-本实现沿用这套**职责边界**，按 cargo workspace 拆成三个 crate（crate 内的 module 随实现补在这里）：
+本实现沿用这套**职责边界**，按 cargo workspace 拆成三个 crate。每个 module 的职责写在它自己的 `//!` 文档注释里，下表只列分组；新增 module 时写好 `//!` 注释，并把名字补进对应分组。
 
-| crate | 对应参照实现 | 职责 |
+| crate | 对应参照实现 | 职责与 module |
 | --- | --- | --- |
-| `crates/core` | [db.py](references/milvus-lite/milvus_lite/db.py) 及其下各层 | 引擎：多 collection 生命周期、LOCK、存储、检索、索引、schema。不依赖 protobuf 与 Python。module：`lock_order`（五层锁与查表叶子锁的 debug 顺序检查；同层只允许改名按名字字节序持有两把名字锁）、`maintenance`（每 Db 单线程、按句柄计数的后台维护与正常关闭排空；见 0010）、`db`（数据库与 collection 生命周期、写入许可、显式分区 Create/Drop 的独占许可、按名字懒打开与失败判定缓存、关闭闸门）、`alias`（每个数据库 `aliases.json` 的缓存、解析与原子写入；别名 RPC 与各集合入口的解析在 `db`，见 0023）、`database_properties`（每个数据库 `database_properties.json` 的缓存加载、合并与原子写入；数据库注册表、Create / Drop / Alter / Describe / List 在 `db`，见 0023 B）、`timestamptz`（TIMESTAMPTZ 的 UTC 微秒值：取值范围、带偏移或按有效时区换算的 ISO 字符串解析、`Z` 结尾的 ISO 输出格式与默认值校验；过滤中的 ISO / INTERVAL 求值在 `filter`，见 0025）、`timezone`（时区名解析与校验、`fold=0` 的本地时间换算、`time_fields` 的分量、请求 / 集合 / 数据库时区的优先级与数据库属性的按需读取 `TimezoneSource`，内置 tzdata 来自 jiff，见 0025）、`geometry`（GEOMETRY 的 WKT 解析与校验：按 3.x 的两个正则与 Python `float()` 逐项复刻，空白与关键字的大小写用固定的 CPython 3.12 规则；五个几何谓词按 3.x 的运算顺序与容差移植，距离用 CPython 3.12 的 `math.hypot` 算法；过滤里的节点、语义类型与逐行求值在 `filter`，见 0034）、`analyzer`（standard 分词与 `text_match` 查询词，大小写和 `\w` 用固定的 CPython 3.12 表，见 0029；BM25 的停用词、FNV-1a 词项哈希与按首次出现顺序的词频，见 0031；jieba 切分后的 strip / lower / 停用词，见 0036）、`jieba`（jieba-rs 加包装层：按 Python `re_han_default` 预切块、`dict.txt` 与占位词补齐 `total`、全精度 HMM 模型、ASCII 连接符按 finalseg `re_skip` 重切、自实现 `cut_for_search`；用户词按 Python `add_word` 的语义逐项加入、每个集合一份，两个上限防止 jieba-rs panic 与溢出；数据在 `crates/core/data/jieba/`，见 0036）、`partition_key`（固定 16 桶的 MD5 路由与逻辑注册）、`collection::partition_key`（请求前合并、全桶预构造与自动 ID 碰撞保护）、`collection`（不可变列式读快照、稳定块引用与源映射、小块合并、主键读取准备、写入校验、get / count / 检索、load 状态）、`compute`（服务的计算池，rayon-core 只在这里调用）、`schema`、`data`（列式数据、仅实际空值时物化的列有效位与私有的按类型主键表 `PkMap`；`data::array` 保存 ARRAY offsets、有类型子列、父/元素有效位和 Arrow 转换口径；`data::sparse` 保存稀疏向量的原始打包字节，按 3.x 的 dict 语义解码、规范化与编码，见 0030）、`sparse_index`（稀疏 IP 倒排：按维度的 CSR 列表、segment 构建时的逐行校验与按 3.x 累加顺序的 double 打分，缓存与作废在 `collection`；BM25 的 tf 倒排、按块的 doc_len 与总长度、按数据源汇总的统计与按 NumPy 2 逐步舍入的 float32 打分，见 0031）、`index`（索引定义、度量与统一的 3.x 侧车文件名解析）、`projection`（output_fields 展开）、`rerank`（0026：`pyval` 是候选行里的 Python 值与它的转换、比较和异常文案，`boost` 是内部距离上的变换、排序与转回对外分数，`window` 是三条路径各自的候选窗口，`chain` 是 L2 rerank 链：rrf / weighted / decay 的合并（`function_score` 路径已校验；HybridSearch 的 `rank_params` 路径保留原始 JSON 值、按 Python 算术报错，整数精确运算）、`GroupByOp` 与 Python 切片语义；`collection` 里的 `rank_route` / `hybrid_merge` 是 HybridSearch 的逐路排名与合并，与 Search + L2 共用链执行与取列；`public` 是公共 function chain 的链表示、按 schema 的校验与执行（`collection` 的 `search_chained_in` 在普通检索的命中上执行它），见 0035）、`filter`（`parser` / `temporal` / `unicode` 负责完整语法与诊断，`eval` 保留 S1 绑定与列式快路径，`tree` 负责扩展节点绑定与静态路线，`columns` 负责布尔树的列式求值，`dynamic` 负责整源动态列绑定，`python` / `python_json` 实现共享的 Python 值规则与平面 JSON 解码，`python_num` 是 Python 路线算术的精确整数、正确舍入的转换与真除法及资源预算，主键 in 保留快路径；范围见 0006 / 0009 / 0014，时间戳过滤见 0025，算术见 0032）、`flush_budget`（自动 flush 的字节预算与进程级配置，见 0027）、`flat`（暴力检索的距离）、`data_dir`（LOCK 与数据库 staging 残留清理）、`storage::wal`（3.x Arrow IPC stream WAL 的读写与已校验前缀恢复）、`storage::manifest` / `schema_file`（3.x JSON 格式的解析与编码）、`storage::parquet_file` / `arrow_data`（3.x Parquet 与列式值的转换）、`storage::memtable` / `visibility`（位次、tombstone、跨数据源 `_seq`、有效位图及读快照；`visibility::partitions` 用真实 PkMap、本地位图及稀疏遮挡支持先选分区再判版本）、`storage::partition_paths`（安全名称、物理目录身份及仅内存的分区 ID）、`storage::partition_drop`（保留全局 delta 的同次 manifest 提交准备）、`storage::fs_commit` / `flush`（schema、manifest 与冻结代的提交和 WAL 清理，以及 `aliases.json`、`schema.json` 等共享 JSON 文件的整体替换与其崩溃残留的打开时清扫，见 0007）、`storage::snapshot`（读取 3.x snapshot 元数据、钉住集合与各自的 manifest 副本）、`storage::index_files`（索引目录链、侧车匹配与钉住定义预检）、`storage::index_intent`（私有删除意图、跨重开封锁与安全清理）、`storage::rename_intent`（数据库根目录的私有改名意图；当前实例重试与重开时把改名收尾到改名前或改名后，见 0023）、`storage::truncate_intent`（集合目录的私有清空意图与清理：旧 / 候选 manifest、待删 snapshot 与侧车；当前实例的清理重试与重开时把清空收尾到未清空或已清空，见 0023）、`storage::index_platform`（Unix 删除权限、可信启动来源与缓存边界）、`storage::recovery`（加载已提交 segment、delta 与 WAL 并建位图）、`storage::compaction`（单分区已提交文件的有界选择、物理行映射、临时输出与全分区阈值的 delta GC）、`storage::runtime`（按逻辑批次冻结及一次提交的多分区输出、WAL 代、同步、独立已提交删除表与故障状态）、`error`（与 3.x 异常一一对应的错误及 Python repr 格式化）、`pyjson`（按 Python `json.dumps` 的格式输出 JSON）、`json_text`（JSON 文本解析的唯一入口：不把首键为 serde_json 数字私有键的用户对象当作数字；类型化结构的 `Value` 字段用它的 `deserialize_with`，clippy 禁止直接调用 `serde_json::from_*`） |
-| `crates/grpc` | [adapter/grpc/](references/milvus-lite/milvus_lite/adapter/grpc/) | proto 代码生成（protox）、协议翻译与错误映射；作为服务宿主，负责服务实例（runtime、计算池、引擎、端口）的启动与停止，计算池交给引擎。module：`service`（各 RPC 的实现）、`schema` / `insert` / `search` / `query` / `index` / `output`（请求解码与响应编码）、`function_score`（`function_score` 的解码与校验，见 0026）、`hybrid`（HybridSearch：`rank_params` 解析、逐路执行与合并，见 0026）、`function_chain`（公共 function chain 的 proto 解码、与 `function_score` / `order_by_fields` 的冲突判定，见 0035）、`status`（错误映射）、`pyint`（按 Python `int()` / `float()` 解析参数；默认值描述单独拒绝 protobuf 整数越界并复用固定 Unicode 数字分类）、`guard`（未实现的 RPC 与超限请求）、`server`（服务宿主）。RPC 的处理体在 tokio 的阻塞线程池中执行，检索在其中经计算池并行（[0005](docs/decisions/0005-search-thread-model.md)） |
-| `crates/py` | [server_manager.py](references/milvus-lite/milvus_lite/server_manager.py) | PyO3 扩展，加上 Python 包 `milvus_lite`：`server_manager.py` 维护路径表，导入时检测官方发行包。`cmdline.py` / `__main__.py` 解析独立 CLI、信号与关闭；合同见 [0012](docs/decisions/0012-cli-server.md)。根 [pyproject.toml](pyproject.toml) 是唯一发行配置；[build.rs](crates/py/build.rs) 校验目标平台与解释器，门槛见 [0013](docs/decisions/0013-first-release-platform-and-packaging.md) |
+| `crates/core` | [db.py](references/milvus-lite/milvus_lite/db.py) 及其下各层 | 引擎，不依赖 protobuf 与 Python。生命周期与并发：`db`（数据库与 collection 生命周期、写入许可、关闭闸门）、`lock_order`、`maintenance`、`compute`、`data_dir`、`alias`、`database_properties`。集合与数据：`collection`、`data`、`schema`、`projection`、`partition_key`、`flush_budget`。存储：`storage::*`（WAL、manifest、Parquet、memtable 与可见性、提交与 flush、恢复、compaction、snapshot、分区目录、索引文件与各类私有意图）。检索：`filter`、`flat`、`index`、`sparse_index`、`rerank`。类型与文本：`timestamptz`、`timezone`、`geometry`、`analyzer`、`jieba`。通用：`error`（与 3.x 异常一一对应）、`pyjson`、`json_text` |
+| `crates/grpc` | [adapter/grpc/](references/milvus-lite/milvus_lite/adapter/grpc/) | proto 代码生成（protox）、协议翻译与错误映射；作为服务宿主，负责服务实例（runtime、计算池、引擎、端口）的启停。module：`service`、`server`、`guard`、`status`、请求解码与响应编码（`schema` / `insert` / `search` / `query` / `index` / `output` / `function_score` / `hybrid` / `function_chain`）、`pyint`。RPC 的处理体在 tokio 的阻塞线程池中执行，检索在其中经计算池并行（[0005](docs/decisions/0005-search-thread-model.md)） |
+| `crates/py` | [server_manager.py](references/milvus-lite/milvus_lite/server_manager.py) | PyO3 扩展，加上 Python 包 `milvus_lite`：`server_manager.py` 维护路径表，导入时检测官方发行包；`cmdline.py` / `__main__.py` 是独立 CLI（[0012](docs/decisions/0012-cli-server.md)）。根 [pyproject.toml](pyproject.toml) 是唯一发行配置；[build.rs](crates/py/build.rs) 校验目标平台与解释器（[0013](docs/decisions/0013-first-release-platform-and-packaging.md)） |
 
 服务实例的所有权、同路径复用、进程退出与 fork 的处理见 [0003](docs/decisions/0003-in-process-server-lifecycle.md)。跨文件的隐含约定：
 
 - **已实现 RPC 的唯一清单**在 [crates/grpc/build.rs](crates/grpc/build.rs) 的 `IMPLEMENTED_METHODS`：只为清单中的方法生成 trait 方法（编译器保证都有实现），其余 RPC 与其他 service 由 [guard.rs](crates/grpc/src/guard.rs) 统一返回 `UNIMPLEMENTED`。新增 RPC 只改这份清单。
 - **引擎的每次使用都经过关闭闸门**：[service.rs](crates/grpc/src/service.rs) 中每个使用引擎的 RPC 处理体先调用 `Db::enter`，[Server](crates/grpc/src/server.rs) 停止时 `Db::close` 等所有在途任务结束才释放 LOCK（0003「进程退出」）。绕过它直接使用引擎，停止时 LOCK 可能先于引擎任务释放。
-- **持久化写入只经 Db 入口**：insert、Flush、CreateIndex / DropIndex、CreatePartition / DropPartition 与 create/drop 从 [db.rs](crates/core/src/db.rs) 取得写入许可；持久化 collection 的直接 `Collection::insert` / `create_index` 会拒绝调用。完整的锁序、读快照与按名字并行打开见 [0007](docs/decisions/0007-m2-storage-engine.md#取锁顺序)。
-- **检索的计算任务不拿锁、不阻塞**：[compute.rs](crates/core/src/compute.rs) 的 `Compute::for_each` 只能从计算池之外的线程（RPC 所在的阻塞线程）调用，叶子任务只写自己独占的数据；rayon-core 其余提交任务的接口由 [clippy.toml](clippy.toml) 禁止。违反时会死锁或优先级反转（[0005](docs/decisions/0005-search-thread-model.md)）。
+- **持久化写入只经 Db 入口**：insert、Flush、CreateIndex / DropIndex、CreatePartition / DropPartition 与 create/drop 从 [db.rs](crates/core/src/db.rs) 取得写入许可；持久化 collection 的直接 `Collection::insert` / `create_index` 会拒绝调用。完整的锁序、读快照与按名字并行打开见 [0007](docs/decisions/0007-m2-storage-engine.md#取锁顺序)；debug 构建由 `lock_order` 检查锁序。
+- **检索的计算任务不拿锁、不阻塞**：[compute.rs](crates/core/src/compute.rs) 的 `Compute::for_each` 只能从计算池之外的线程（RPC 所在的阻塞线程）调用，叶子任务只写自己独占的数据；rayon-core 只在 `compute` 中调用，其余提交任务的接口由 [clippy.toml](clippy.toml) 禁止。违反时会死锁或优先级反转（[0005](docs/decisions/0005-search-thread-model.md)）。
+- **JSON 文本解析只经 [json_text.rs](crates/core/src/json_text.rs)**：serde_json 开了 `arbitrary_precision`，自带的 `Value` 反序列化会把首键为 `$serde_json::private::Number` 的用户对象当作数字；类型化结构的 `Value` 字段用它的 `deserialize_with`，clippy 禁止直接调用 `serde_json::from_*`（[修复记录](docs/testing/json-private-number-key-fix.md)）。
 - **fork 安全由两层共同保证**：[server_manager.py](crates/py/python/milvus_lite/server_manager.py) 按进程号跳过继承来的服务；Rust 的 [Server](crates/grpc/src/server.rs) 在非创建者进程中拒绝 `stop`、析构时直接泄漏。
 
 已确定的边界约束：
@@ -134,29 +91,26 @@ pymilvus ──server_manager──▶ adapter/grpc ──▶ db（多 collectio
 方向已定，具体依赖的版本在首次引入时补在这里，并说明理由；确切版本以 [Cargo.toml](Cargo.toml) 与 [Cargo.lock](Cargo.lock) 为准。
 
 - **依赖边界：不引入 C++、CMake 或系统库依赖**（不绑定 FAISS 等），允许经 `cc` crate 编译、不需要额外安装任何东西的纯 C 代码，优先选纯 Rust。官方 3.x 删除了整套 C++ 构建（见 [0001](docs/decisions/0001-refactor-baseline.md)），本项目同样避免这类构建与分发负担：wheel 与 sdist 必须能在各目标平台只靠 cargo 构建。引入依赖时用 `cargo tree --workspace -e all` 核对完整依赖图（`-e build` 只列出根 crate 的直接构建依赖，看不到依赖自身的构建脚本）。
-- **gRPC / protobuf**：用 tonic + prost。prost-build 默认依赖系统 `protoc`（C++ 程序），因此改用纯 Rust 的 protox 解析 proto，再经 `compile_fds` 交给 prost / tonic 生成代码。proto 源取与 pymilvus 3.0.2 对应的 milvus-proto commit（3.0 的 `MilvusService` 是 2.6 的超集，2.6 的消息与字段在 3.0 中都保留），随仓库固定（离线构建与 sdist 都需要），引入时记录 commit 并核对其许可、注明来源；生成物不入库。参照实现运行期直接用 `pymilvus.grpc_gen`，CI 也不钉 pymilvus 版本，Rust 侧没有这条捷径。背景：3.0 在 2.6 的 117 个 RPC 之上只增不改地新增 27 个（snapshot、namespace、`AlterCollectionSchema` 等），另新增独立的 `ClientTelemetryService`（4 个 RPC）；3.0 客户端的 `add_collection_field` 会先调 `AlterCollectionSchema`，失败再回退旧 RPC。
+- **gRPC / protobuf**：用 tonic + prost。prost-build 默认依赖系统 `protoc`（C++ 程序），因此改用纯 Rust 的 protox 解析 proto，再经 `compile_fds` 交给 prost / tonic 生成代码。proto 源取与 pymilvus 3.0.2 对应的 milvus-proto commit（3.0 的 `MilvusService` 是 2.6 的超集，2.6 的消息与字段在 3.0 中都保留），随仓库固定（离线构建与 sdist 都需要），来源与许可见 [crates/grpc/proto/README.md](crates/grpc/proto/README.md)；生成物不入库。3.0 客户端的 `add_collection_field` 会先调 `AlterCollectionSchema`，失败再回退旧 RPC。
 - **支持的 pymilvus 版本**：2.6.x 与 3.0.x 两条线都支持，兼容测试各跑一个最新版。
-- **Python 打包**：PyO3 + maturin，产出 abi3 wheel，Python 下限与 3.x 一致（`abi3-py310`）。abi3 wheel 不能在 free-threaded 版 CPython 上加载，这一点作为已知限制。服务端在 Python 进程内的后台线程上运行多线程 tokio runtime，CPU 密集的检索交给专用线程池，调用时释放 GIL，形态与 3.x 相同（进程内服务、返回 `http://127.0.0.1:<port>`）。同路径复用、atexit 时的停止顺序与持久化语义、fork 后子进程中 runtime 的处理见 [0003](docs/decisions/0003-in-process-server-lifecycle.md)；WAL 与 flush 的 fsync 时机及持久化保证见 [0006](docs/decisions/0006-m2-scope.md) 第 19 项。PyPI 元数据与 README 都要声明非官方、与 Milvus / Zilliz 无隶属关系。发行包名为 `milvus-lite-rust`，包内提供 `milvus_lite` 模块（见 [pymilvus 接入点](#核心业务术语)）。首发平台与证据层级按 [0013](docs/decisions/0013-first-release-platform-and-packaging.md)：Linux / macOS，Windows 延后；首发 Python 包在构建期明确拒绝 Windows 目标；候选执行按 0013 / [0021](docs/decisions/0021-release-build-in-ci.md) 将 Intel Mac 视为标准层。参照 3.x 的 CI 仍包括 Windows，这一首发差异见 [0008](docs/decisions/0008-first-release-scope.md)。
+- **Python 打包**：PyO3 + maturin 产出 abi3 wheel（`abi3-py310`，与 3.x 的下限一致；不能在 free-threaded CPython 上加载，作为已知限制）。服务以进程内后台线程上的 tokio runtime 运行，形态与 3.x 相同（[0003](docs/decisions/0003-in-process-server-lifecycle.md)）。PyPI 元数据与 README 都要声明非官方、与 Milvus / Zilliz 无隶属关系。首发 Linux / macOS，构建期拒绝 Windows（[0013](docs/decisions/0013-first-release-platform-and-packaging.md)，与 3.x 的差异见 [0008](docs/decisions/0008-first-release-scope.md)）。
 - **持久化格式**：数据文件与 3.x **双向互通**，索引文件各自独立。范围、约束与验证方式见 [0002](docs/decisions/0002-data-dir-compat.md)。
-- **向量索引**：第一阶段只做 SIMD 优化的暴力检索（FLAT），同时作为召回与距离口径的正确性基准；HNSW 等 ANN 索引后期补齐，优先纯 Rust（依赖边界见上），届时再定具体方案。第一阶段对各类索引定义的处理见 [0002 «结论»](docs/decisions/0002-data-dir-compat.md#结论)，索引定义的创建、DropIndex 与删除意图协议见 [0014](docs/decisions/0014-index-definitions-and-filter-expressions.md)。
-- **分词与 BM25**：因为数据目录互通，必须与 3.x 逐位一致（范围与约束见 [0002](docs/decisions/0002-data-dir-compat.md#共享状态的语义约束) 约束 8）。standard 分词与 `text_match` 见 [0029](docs/decisions/0029-text-match.md)，BM25 见 [0031](docs/decisions/0031-bm25.md)：自行实现，不引入依赖。jieba 见 [0036](docs/decisions/0036-jieba.md)：以 jieba-rs 为依赖加包装层，约束 8 对 jieba 放宽为 0036 的口径。
-- **CLI**：先提供 `milvus-lite server`，参数与 3.x 一致（见 [CLI](#核心业务术语)）；`dump` 后续再做。
-- **已引入的依赖**：
-  - jieba-rs 0.11.0（`default-features = false`；传递依赖 jieba-macros 0.11.0（proc-macro）、bytecount 0.6、rustc-hash 2）：jieba 分词（[0036](docs/decisions/0036-jieba.md)）。纯 Rust、无构建脚本、无 C 代码，MIT / Apache-2.0。默认的 `default-dict` 经 include-flate 引入 zstd-sys（C），不开；词典与全精度模型由本仓提供（jieba 0.42.1，MIT，许可随数据放在 `crates/core/data/jieba/`）。版本写死，升级须重跑 jieba 的对照工具。
-  - jiff 0.2.38（`default-features = false`，只开 `std` 与 `tzdb-bundle-always`；传递依赖 jiff-core / jiff-tzdb 0.1.9）：TIMESTAMPTZ 的时区换算，内置 tzdata（约 276 KB），不依赖运行平台的时区数据；纯 Rust、无构建脚本、无 C 代码，MIT / Unlicense。版本写死，升级须重跑 [时区 fixture](tests/differential/generate_timezone_fixtures.py)（名字大小写不敏感是当前行为而非文档保证，由 `timezone::resolve` 的单元测试固定）。
-  - md5 0.8.1：partition key 的 3.x 固定哈希；纯 Rust、无传递依赖、无构建脚本，Apache-2.0 / MIT。只用于路由，不用于安全校验。
-  - num-bigint 0.5.1（`default-features = false`，只开 `std`）：过滤 Python 路线算术的精确整数（[0032](docs/decisions/0032-arithmetic-filters.md)）；已经随 arrow-buffer 出现在依赖图中，不新增 crate、构建脚本或 C 代码，MIT / Apache-2.0。Arrow 与 hybrid 快路径不使用。
-  - tonic 0.14（含 tonic-prost、tonic-prost-build）、prost / prost-types 0.14、protox 0.9：gRPC 与 proto 代码生成，全部纯 Rust（见上）。
-  - tokio 1：tonic 的运行时，每个服务实例独占一个 runtime（[0003](docs/decisions/0003-in-process-server-lifecycle.md)）。
-  - pyo3 0.29（`abi3-py310`）：Python 绑定。
-  - thiserror 2：错误类型。tempfile 3：仅用于测试。
-  - libc 0.2：索引变更的 Unix 权限预检、文件系统类型与内核启动标识查询；FFI 局限在 `storage::index_platform`，不引入额外系统库，合同见 [0014](docs/decisions/0014-index-definitions-and-filter-expressions.md#实施设计)。
-  - serde_json 1：JSON 字段与动态字段的校验与存储，以及 gRPC 层解析 search_params、索引参数等 JSON 文本；开启 `float_roundtrip`、`preserve_order` 与 `arbitrary_precision`，JSON 字段保留键序与宽整数，`$meta` 由 [pyjson.rs](crates/core/src/pyjson.rs) 显式按嵌套 key 排序后输出。`arbitrary_precision` 让 serde_json 自带的 `Value` 反序列化把首键为 `$serde_json::private::Number` 的对象当作数字，因此文本解析一律经 [json_text.rs](crates/core/src/json_text.rs)（[修复记录](docs/testing/json-private-number-key-fix.md)）。
-  - parking_lot 0.12：collection 表、每个 collection 的读写锁，以及数据库写入闸门、目录互斥、名字锁、失败判定缓存、flush 锁与关闭等待。它的锁没有中毒语义；debug 锁序检查与当前别名维护的串行边界见 [0007](docs/decisions/0007-m2-storage-engine.md#取锁顺序)。
-  - rayon-core 1.13：服务的计算池（[0005](docs/decisions/0005-search-thread-model.md)）。只用线程池部分，不引入 rayon 的并行迭代器；依赖只有 crossbeam-deque / epoch / utils，都是纯 Rust，构建脚本只做 cfg 探测（`cargo tree --workspace -e all` 核对）。可以使用的接口由 [clippy.toml](clippy.toml) 的 `disallowed-methods` 限定。
-  - arrow-array / arrow-schema / arrow-ipc 与 parquet 60.0（Parquet 只开 `arrow`、`snap`）、serde 1：M2 与 3.x 的 Arrow IPC WAL、Parquet 和 JSON 持久化格式。macOS 上经 chrono 的 `clock` feature 链接系统自带的 CoreFoundation 框架，无需额外安装。版本及依赖图评估见 [0006 第 24 项](docs/decisions/0006-m2-scope.md#五工程)；实际引入后用完整 `cargo tree --workspace -e all` 核对。
-  - LOCK 用 std 的 `File::try_lock`：它在 Unix 上用 flock、在 Windows 上用覆盖第 0 字节的 LockFileEx，满足 [0002](docs/decisions/0002-data-dir-compat.md) 约束 10，因此不引入 fs2 一类依赖，`rust-version` 相应定为 1.89。
-  - 构建工具 maturin 1.15，用 uv 装在开发 venv 中，不是运行依赖。根 `pyproject.toml` 声明 PEP 517 后端与发行元数据；`rust-toolchain.toml` 固定开发/候选构建 Rust 1.98.1，sdist 用户使用自己的 Rust（MSRV 1.89）。`pyo3-build-config` 0.29.2 为 py crate 的直接构建依赖，用于拒绝 free-threaded、非 CPython 与 Windows 目标。
+- **向量索引**：检索为 SIMD 优化的暴力检索（FLAT），同时是召回与距离口径的正确性基准；ANN 索引（HNSW 等）的实现未定，优先纯 Rust（依赖边界见上）。各类索引定义的处理见 [0002 «结论»](docs/decisions/0002-data-dir-compat.md#结论) 与 [0014](docs/decisions/0014-index-definitions-and-filter-expressions.md)。
+- **分词与 BM25**：因为数据目录互通，必须与 3.x 逐位一致（[0002](docs/decisions/0002-data-dir-compat.md#共享状态的语义约束) 约束 8）。standard 分词（[0029](docs/decisions/0029-text-match.md)）与 BM25（[0031](docs/decisions/0031-bm25.md)）自行实现，不引入依赖；jieba 以 jieba-rs 为依赖加包装层，约束 8 对它放宽为 [0036](docs/decisions/0036-jieba.md) 的口径。
+- **已引入的依赖**（引入理由与评估见括号中的决策；标「版本写死」的升级前须重跑对应的对照）：
+  - tonic / prost 0.14 与 protox 0.9（gRPC 与 proto 代码生成）；tokio 1（每个服务实例独占一个 runtime，[0003](docs/decisions/0003-in-process-server-lifecycle.md)）；thiserror 2；md5 0.8.1（partition key 的 3.x 固定哈希，只用于路由）；tempfile 3（仅测试）。
+  - pyo3 0.29（`abi3-py310`）：Python 绑定；`pyo3-build-config` 0.29.2 为 py crate 的直接构建依赖，用于拒绝 free-threaded、非 CPython 与 Windows 目标。
+  - rayon-core 1.13：服务的计算池，只用线程池部分，可用接口由 [clippy.toml](clippy.toml) 的 `disallowed-methods` 限定（[0005](docs/decisions/0005-search-thread-model.md)）。
+  - parking_lot 0.12：collection 表与各类锁，没有中毒语义（[0007](docs/decisions/0007-m2-storage-engine.md#取锁顺序)）。
+  - arrow-array / arrow-schema / arrow-ipc 与 parquet 60.0（Parquet 只开 `arrow`、`snap`）、serde 1：3.x 的 Arrow IPC WAL、Parquet 和 JSON 持久化格式；macOS 上经 chrono 链接系统自带的 CoreFoundation，无需额外安装（[0006 第 24 项](docs/decisions/0006-m2-scope.md#五工程)）。
+  - serde_json 1：开启 `float_roundtrip`、`preserve_order` 与 `arbitrary_precision`，JSON 字段保留键序与宽整数，`$meta` 由 [pyjson.rs](crates/core/src/pyjson.rs) 按嵌套 key 排序后输出；文本解析的约定见[架构地图](#架构地图跨文件心智)。
+  - libc 0.2：索引变更的 Unix 权限预检、文件系统类型与内核启动标识查询；FFI 局限在 `storage::index_platform`（[0014](docs/decisions/0014-index-definitions-and-filter-expressions.md#实施设计)）。
+  - num-bigint 0.5.1（只开 `std`）：过滤 Python 路线算术的精确整数，已随 arrow-buffer 在依赖图中（[0032](docs/decisions/0032-arithmetic-filters.md)）。
+  - jiff 0.2.38（只开 `std` 与 `tzdb-bundle-always`）：TIMESTAMPTZ 的时区换算，内置 tzdata；版本写死，升级须重跑[时区 fixture](tests/differential/generate_timezone_fixtures.py)（[0025](docs/decisions/0025-timestamptz-and-timezone.md)）。
+  - jieba-rs 0.11.0（`default-features = false`，不开会引入 zstd-sys 的 `default-dict`）：jieba 分词，词典与全精度模型由本仓提供（[crates/core/data/jieba/](crates/core/data/jieba/)）；版本写死，升级须重跑 jieba 的对照工具（[0036](docs/decisions/0036-jieba.md)）。
+  - LOCK 用 std 的 `File::try_lock`（Unix flock、Windows 覆盖第 0 字节的 LockFileEx，满足 [0002](docs/decisions/0002-data-dir-compat.md) 约束 10），不引入 fs2 一类依赖，`rust-version` 因此为 1.89。
+  - 以上依赖都不编译 C / C++ 代码，新增时须核对完整依赖图与许可。
+  - 构建工具 maturin 1.15，用 uv 装在开发 venv 中，不是运行依赖。`rust-toolchain.toml` 固定开发与候选构建的 Rust 1.98.1，sdist 用户使用自己的 Rust（MSRV 1.89）。
 
 ## 常用命令
 
@@ -170,50 +124,19 @@ pymilvus ──server_manager──▶ adapter/grpc ──▶ db（多 collectio
 | lint | `cargo clippy --workspace --all-targets -- -D warnings` |
 | Rust 单测 | `cargo test --workspace` |
 | M2 持久化点故障注入单测（feature 默认关闭） | `cargo test -p milvus-lite-core --features fault-injection` |
-| 子进程与关闭重开测试的隔离 / 默认并行 30 轮复验 | [进程内测试隔离记录与命令](docs/testing/process-test-isolation.md) |
-| S1 语法真值核验（参照实现须可编辑安装、HEAD 为 `1320d26`） | `<3.x 的 venv>/bin/python tests/differential/generate_filter_parse_fixtures.py --verify` |
-| 顶层动态过滤组件真值核验（真实 3.x / `1320d26`） | `<3.x 的 venv>/bin/python tests/differential/generate_dynamic_filter_fixtures.py --verify` |
-| 完整布尔树三路线组件真值核验（真实 3.x / `1320d26`；Arrow 15/25 各执行） | `<3.x 的 venv>/bin/python tests/differential/generate_filter_tree_fixtures.py --verify`；重新生成须用 Arrow 25 并指定 `--arrow15-python <Arrow15 的参照解释器>` |
-| 分区 / Query iterator 参照真值（仓库外生成、--verify 不覆盖） | 环境与命令见 [调查工具 README](tests/compatibility_audit/README.md#分区与-query-iterator-调查) |
-| 0017 分区目录边界补测与 delta 转存数据原型（非产品验收） | [环境、文件系统变体与命令](tests/compatibility_audit/README.md#0017-分区边界补测)；工具自检：`python tests/compatibility_audit/selfcheck.py` |
-| 0017 B key 单/多桶写入、Upsert、读取与峰值专项（仓库外新路径；顺序轮换） | [专项合同与命令](benchmarks/partition-key/README.md) |
-| 0017 B partition key 参照真值（显式执行；非产品验收） | [环境与命令](tests/compatibility_audit/README.md#0017-b-partition-key-参照调查)；工具自检仍用 `python tests/compatibility_audit/selfcheck.py` |
-| 0017 实际可见性组件 / 列式引擎资源 | [真实组件、26/35 组压力与冷重开命令](benchmarks/partition-visibility/README.md#实际组件与列式引擎)；`target/release/examples/partition_visibility_probe verify-core tests/compatibility_audit/fixtures/partition_visibility_v321.json` |
-| 0017 产品分区目录边界、0.2.0rc1 回退、默认路径及分区读取性能 | [产品调查命令](tests/compatibility_audit/README.md#0017-产品边界与回退)、[读取/写入专项](benchmarks/partitions/README.md)；常规 Python 与差分套件仍分别运行，不能合为同一 pytest 进程 |
-| 分区可见性隔离组件对照（不接入产品；含冻结代、快照与稀疏关系资源诊断） | `cargo test -p milvus-lite-core --example partition_visibility_probe`；构建、真值核验及 RSS 采样见 [组件 README](benchmarks/partition-visibility/README.md) |
-| ISO 时间组件直接模糊对照（不经服务；参照环境为 CPython 3.12，报告放仓库外） | `cargo build -p milvus-lite-core --example filter_parse_probe`，再 `<3.x 的 venv>/bin/python tests/differential/fuzz_temporal.py --cases 200000 --seed 29 --output <work_dir>/temporal.json` |
-| 时区换算真值核验（真实 CPython 3.12 zoneinfo；本地时间 → UTC、UTC → 各分量，含 `datetime` 范围两端） | `<参照 python> tests/differential/generate_timezone_fixtures.py --verify` |
-| 过滤算术组件真值核验（真实 3.x / `1320d26`；Arrow 15/25 各执行） | `<3.x 的 venv>/bin/python tests/differential/generate_filter_arith_fixtures.py --verify`；重新生成须用 Arrow 25 并指定 `--arrow15-python <Arrow15 的参照解释器>` |
-| 过滤算术直接模糊对照（不经服务；随机表与表达式覆盖三条路线；报告放仓库外） | `cargo build -p milvus-lite-core --example filter_arith_probe`，再 `<3.x 的 venv>/bin/python tests/differential/fuzz_arith.py --output <work_dir>/arith.json` |
-| hybrid 动态列推断组件真值核验（真实 3.x / `1320d26`；Arrow 15/25 各执行，版本分歧条目分别核对） | `<3.x 的 venv>/bin/python tests/differential/generate_dynamic_infer_fixtures.py --verify`；重新生成须用 Arrow 25 并指定 `--arrow15-python <Arrow15 的参照解释器>` |
-| S1 Unicode 分类表与小写表核验（CPython 3.12 / Unicode 15.0） | `<CPython 3.12>/bin/python tests/differential/generate_filter_unicode.py --verify` |
-| standard 分词真值核验（真实 3.x / `1320d26`） | `<3.x 的 venv>/bin/python tests/differential/generate_analyzer_fixtures.py --verify` |
-| jieba 内置数据与固定真值核验（装了 jieba 0.42.1 的 3.x 参照解释器；sdist 的 `test/test.py` 取自 sha256 固定的 jieba 0.42.1 sdist） | `<参照 python> tests/differential/generate_jieba_data.py --verify`；`<参照 python> tests/differential/generate_jieba_fixtures.py --jieba-test <sdist>/test/test.py --verify` |
-| jieba 直接模糊对照（不经服务；含用户词；报告放仓库外） | `cargo build -p milvus-lite-core --release --example jieba_probe`，再 `<参照 python> tests/differential/fuzz_jieba.py --cases 200000 --groups 150 --seed 36 --output <work_dir>/jieba.json` |
-| standard 分词模糊对照（不经服务；参照环境为 CPython 3.12） | `cargo build -p milvus-lite-core --example analyzer_probe`，再 `<3.x 的 venv>/bin/python tests/differential/fuzz_analyzer.py --cases 200000 --seed 29` |
-| GEOMETRY 组件真值核验（真实 3.x / `1320d26`，CPython 3.12；生成器的码位穷举约半分钟，读取它的 Rust 单测在 debug 下约 45 秒） | `<3.x 的 venv>/bin/python tests/differential/generate_geometry_fixtures.py --verify` |
-| GEOMETRY 直接模糊对照（不经服务；WKT 解析、五个谓词与 `hypot`；参照环境为 CPython 3.12，报告放仓库外；验收用种子 34 与 35 各跑一次） | `cargo build -p milvus-lite-core --example geometry_probe`，再 `<3.x 的 venv>/bin/python tests/differential/fuzz_geometry.py --cases 200000 --seed 34 --output <work_dir>/geometry.json` |
-| 公共 function chain 组件真值核验（真实 3.x / `1320d26` 与 pymilvus 3.0.2，CPython 3.12；解码、校验与执行的结果，以及测试用的线格式编码与 SDK `to_proto()` 的等价） | `<3.x 的 venv>/bin/python tests/differential/generate_function_chain_fixtures.py --verify` |
 | 端到端测试（真实 pymilvus；含 [tests/python/adapter/](tests/python/adapter/) 与 [tests/python/compatibility/](tests/python/compatibility/) 中复制自参照实现的用例，逐条状态见 adapter 的 INVENTORY.md） | `.venv/bin/python -m pytest tests/python` |
-| 与 3.x 的差分测试（3.x 的 venv 按 [互通 README](tests/storage_interop/README.md) 建 Arrow 25 参照环境，含 jieba 0.42.1（[0036](docs/decisions/0036-jieba.md) 决策 G）；`benchmarks/baseline/setup.sh` 建出的环境不固定 pyarrow，arm64 上会被 S1 用例拒绝；不设环境变量时报错，不跳过；上一行的命令不包含它） | `MILVUS_LITE_3X_PYTHON=<3.x 的 venv>/bin/python .venv/bin/python -m pytest tests/differential` |
-| ARRAY 元素转换、schema/default 与三路线组件真值（真实 3.x / `1320d26`，Arrow 15/25 各执行） | `<参照解释器> tests/differential/generate_array_fixtures.py --verify`；重新生成用 Arrow 25，随后以 Arrow 15 核验 |
-| 固定兼容样本统计、nullable 反事实与 schema 真值（离线、显式执行，不进入默认测试） | [统计工具与命令](tests/compatibility_audit/README.md)；`<参照解释器> tests/compatibility_audit/schema_truth.py --reference references/milvus-lite --kind filters --output <仓库外报告> --verify-nullable-filter-fixture` 核验空值过滤组件 |
-| M2 存储文件双向互通矩阵（环境准备见 [tests/storage_interop/README.md](tests/storage_interop/README.md)；Arrow 15/25 均须安装固定参照引擎与 jieba 0.42.1，Arrow 15 固定 pyarrow 15.0.0 / NumPy 1.26.4） | `MILVUS_LITE_3X_PYTHON=<v3>/bin/python MILVUS_LITE_ARROW15_PYTHON=<arrow15>/bin/python MILVUS_LITE_ARROW25_PYTHON=<v3>/bin/python .venv/bin/python -m pytest tests/storage_interop` |
+| 与 3.x 的差分测试（参照环境见 [tests/differential/README.md](tests/differential/README.md) 的公共前提，`benchmarks/baseline/setup.sh` 建出的环境不固定 pyarrow，不能用；不设环境变量时报错，不跳过；与上一行分别运行，不能合为同一 pytest 进程） | `MILVUS_LITE_3X_PYTHON=<3.x 的 venv>/bin/python .venv/bin/python -m pytest tests/differential` |
+| M2 存储文件双向互通矩阵（Arrow 15/25 两套参照环境，准备见 [tests/storage_interop/README.md](tests/storage_interop/README.md)） | `MILVUS_LITE_3X_PYTHON=<v3>/bin/python MILVUS_LITE_ARROW15_PYTHON=<arrow15>/bin/python MILVUS_LITE_ARROW25_PYTHON=<v3>/bin/python .venv/bin/python -m pytest tests/storage_interop` |
+| 组件真值核验（`generate_*.py --verify`）与直接模糊对照（`fuzz_*.py`）：改了过滤、时间、分词、几何、function chain 等组件时跑对应项 | [tests/differential/README.md](tests/differential/README.md) |
+| 合并受控等待 / 提交点进程退出（隔离的 fault-injection wheel；需由 py → grpc → core 显式启用，正式 wheel 不含测试入口） | `<fi>/bin/python -m pytest tests/compaction` |
+| 子进程与关闭重开测试的隔离 / 默认并行 30 轮复验 | [进程内测试隔离记录与命令](docs/testing/process-test-isolation.md) |
 | 独立 CLI server | `.venv/bin/milvus-lite server --data-dir <data_dir> --host 127.0.0.1 --port 19530 --max-workers 10`；也可 `python -m milvus_lite server ...`，合同见 0012 |
 | 构建 wheel / sdist | `.venv/bin/maturin build --release -m crates/py/Cargo.toml` / `.venv/bin/maturin sdist -m crates/py/Cargo.toml` |
-| 核对依赖图中没有 C++ 构建与 protoc | `cargo tree --workspace -e all` |
-| 发行物与安装验收（本地诊断，候选以发行工作流为准；根配置；工作目录在仓库外） | `.venv/bin/python tests/packaging/run_acceptance.py --work-dir <work_dir> --constraints <constraints.txt> --suite --suite-expect 706`；约束文件与完整步骤见 [打包验收](tests/packaging/README.md) |
-| 发行物/平台脚本自检 | `.venv/bin/python -m pytest tests/packaging tests/platform` |
-| CI 纯文档分类、汇总判定与参照环境 jieba 构建工具的自检 | `.venv/bin/python -m pytest tests/ci` |
-| 发行工作流：演练 / 正式运行（0021；从以冻结提交为最新提交的已推送分支触发，正式运行引用同一提交含 PID 1 的成功演练） | `gh workflow run release.yml --repo <owner/repo> --ref <冻结分支> -f commit=<完整 SHA> -f version=<版本> -f dry_run=true`；正式运行改为 `-f dry_run=false -f pid1_dry_run=<演练运行 ID>.<attempt>` |
-| 签发环境配置只读核对（0021 第 19 条；改动 `release-signing` 后、下一次正式运行前） | `gh api repos/<owner/repo>/environments/release-signing`；`gh api repos/<owner/repo>/environments/dry-run-signing` |
-| 版本台账校验（0021 第 3 条） | `python3 tests/release/ledger.py docs/releases/consumed-versions.json` |
-| 发布准备：核对待发布的七个附件（0021 第 20 条；用候选冻结提交中的工具） | `python3 tests/release/release_set.py --dir <附件目录> --version <版本> --repo <owner/repo> --prepare` |
-| 发布后公开下载核验（0021 第 20 条；只在 `main` 上触发） | `gh workflow run public-check.yml --repo <owner/repo> --ref main -f version=<版本>` |
-| 签发前保全：本机保存候选证据集并输出审批行 / 复核已保存目录（0022；在冻结提交的干净 worktree 中运行，演练用 `--mode dry-run`） | `python3 <worktree>/tests/release/preserve.py save --mode release --repo <owner/repo> --run <运行 ID>.<attempt> --version <版本> --root <本地留存根目录>`；`python3 tests/release/preserve.py verify <保存目录>` |
-| 候选测试的确定性分片（plan / run / verify，合同见 0019）及自检 | 用法见 [tests/sharding/README.md](tests/sharding/README.md)；自检：`.venv/bin/python -m pytest tests/sharding` |
-| Linux PID 1、命名卷 LOCK 与强杀恢复 | `.venv/bin/python tests/platform/linux_pid1_probe.py --formal-wheel <linux-wheel> --fi-wheel <linux-fi-wheel> --image <image-id> --constraints .github/ci/requirements/sdk30.txt --output <work_dir>`；见 [平台流程](tests/platform/README.md) |
-| Windows 准备检查（无运行证据） | `pwsh -NoProfile -File tests/platform/windows_run.ps1 -WorkDirectory <work_dir>`（PowerShell ≥7.2）；见 [平台流程](tests/platform/README.md) |
+| 发行物与安装验收（本地诊断，候选以发行工作流为准；工作目录在仓库外） | `.venv/bin/python tests/packaging/run_acceptance.py --work-dir <work_dir> --constraints <constraints.txt> --suite --suite-expect 706`；约束文件与完整步骤见 [打包验收](tests/packaging/README.md) |
+| 工具自检：发行物与平台脚本 / CI 脚本 / 发行工具 / 分片 / 基准脚本 | `.venv/bin/python -m pytest tests/packaging tests/platform`；`tests/ci`；`tests/release`；`tests/sharding`（用法见 [分片 README](tests/sharding/README.md)，合同见 0019）；`tests/benchmarks` |
+| 平台验收：Linux PID 1 与命名卷 LOCK、容器 LOCK 与 strace、已安装产物联合冒烟、Windows 准备检查 | [tests/platform/README.md](tests/platform/README.md) |
+| 兼容性调查与参照真值（固定样本统计、schema 真值、分区与 Query iterator、partition key；离线显式执行，不进入默认测试） | [tests/compatibility_audit/README.md](tests/compatibility_audit/README.md) |
+| 发行工作流的演练与正式运行、台账、发布准备、公开核验与签发前保全 | [docs/README.md「发行」](docs/README.md#发行) |
 
 pymilvus 两条线都要测。2.6.x 线用单独的 venv 安装构建出的 wheel，再运行同一套用例（在仓库外的目录执行，避免从源码目录导入）：
 
@@ -224,33 +147,7 @@ cd <work_dir> && v26/bin/python -m pytest <repo>/tests/python
 cd <work_dir> && MILVUS_LITE_3X_PYTHON=<3.x 的 venv>/bin/python v26/bin/python -m pytest <repo>/tests/differential
 ```
 
-性能基线（2.5.1、3.x 与本仓的 Rust 实现对照，工作目录须在仓库外；完整步骤见 [benchmarks/baseline/README.md](benchmarks/baseline/README.md)）：
-
-| 任务 | 命令 |
-| --- | --- |
-| 建两套对照环境 | `benchmarks/baseline/setup.sh <work_dir>` |
-| 跑一组配置 | `benchmarks/baseline/run.sh <work_dir> <N> <dim> <out.jsonl> v2:FLAT:inproc v3:HNSW:server ...`（须顺序执行） |
-| 汇总 | `<work_dir>/v3/bin/python benchmarks/baseline/summarize.py <work_dir>/<out.jsonl>` |
-| 并发吞吐 | `<work_dir>/{v2,v3}/bin/python benchmarks/baseline/concurrency.py <work_dir>/r_<env>_<idx>_inproc_<N>_<dim>.db <dim> 1,2,4,8`（用与库对应版本的 python） |
-| 3.x 耗时归属 | `<work_dir>/v3/bin/python benchmarks/baseline/profile_v3.py <3.x 的库>` |
-| 为本仓的 Rust 实现建第三套环境 | `benchmarks/baseline/setup_rs.sh <work_dir>` |
-| M1 口径三方对照（每轮轮换顺序，跑 3 轮后汇总；完整命令见基准 README） | `benchmarks/baseline/run.sh <work_dir> <N> 128 m1.jsonl rs:FLAT:inproc:m1 v2:FLAT:inproc:m1 v3:FLAT:inproc:m1` |
-| M2 持久化三方对照（轮换三轮；RSS 另跑 `memory`，完整口径见基准 README） | `benchmarks/baseline/run.sh <work_dir> <N> 128 m2.jsonl rs:FLAT:inproc:m2 v2:FLAT:inproc:m2 v3:FLAT:inproc:m2` |
-| 基准脚本自检（失败传播、吞吐分母与多轮汇总） | `.venv/bin/python -m pytest tests/benchmarks` |
-| 后台合并退出等待与删除重负载条件验收 | [benchmarks/compaction/README.md](benchmarks/compaction/README.md)；正式 wheel 与隔离 fault-injection wheel 分开记录 |
-| 合并受控等待 / 提交点进程退出（隔离测试 wheel） | `<fi>/bin/python -m pytest tests/compaction`；需由 py → grpc → core 显式启用 fault-injection，正式 wheel 不含测试入口 |
-| 独立删除表组件 RSS 诊断 | `cargo build -p milvus-lite-core --release --example committed_delete_memory`；过程与边界见合并验收记录 |
-| 恢复内存与进程冷启动专项（已有健康库、独立服务；口径见 [专项 README](benchmarks/recovery/README.md)） | `<实现的 python> benchmarks/recovery/run.py <existing.db> --rows 1000000 --dim 128 --round 1 --build <artifact-identity>` |
-| 批量 FLAT 检索专项（真值准备与计时分开；口径见 [专项 README](benchmarks/batch-search/README.md)） | `<实现的 python> benchmarks/batch-search/run.py --database <existing.db> --truth <truth_dir> --rows 1000000 --dim 128 --round 1 --build <artifact-identity>` |
-| S1 过滤性能专项（优化前后与两代参照，顺序三轮、结果逐次校验） | 环境、数据与命令见 [benchmarks/s1/README.md](benchmarks/s1/README.md) |
-| Range search / V1 与普通检索回归四方对照 | 环境、数据与轮换见 [专项 README](benchmarks/range-search/README.md) |
-| 稀疏向量检索三方对照（写入、首次检索含建倒排、热查询、RSS，逐次核对精确内积） | 环境、数据与轮换见 [专项 README](benchmarks/sparse/README.md) |
-| BM25 全文检索三方对照（写入含生成、首次检索含建倒排、热查询、RSS；本实现与 3.x 的全部结果摘要须相同） | 环境、数据与轮换见 [专项 README](benchmarks/bm25/README.md) |
-| Query iterator 首批、全量分页及普通读取回归 | 环境、轮换与命令见 [专项 README](benchmarks/query-iterator/README.md) |
-| JSON 写入回归专项（预序列化 raw RPC / SDK 端到端，逐批校验） | 环境、轮换与命令见 [benchmarks/json-write/README.md](benchmarks/json-write/README.md) |
-| JSON 原组件与分进程资源诊断（独立冻结副本；不修改产品） | [构建、运行与口径](benchmarks/json-write/diagnostics/README.md)；`python benchmarks/json-write/diagnostics/selfcheck.py` |
-| Linux 容器的 LOCK 与 strace 验收 | 环境、非 root 执行与命令见 [tests/platform/README.md](tests/platform/README.md) |
-| 已安装产物的 nullable／ARRAY／iterator／range 联合冒烟 | `<installed-wheel-python> tests/platform/feature_smoke.py --repo <source-root> --work-dir <new-outside-directory>`；见 [平台流程](tests/platform/README.md) |
+性能：三方基线（2.5.1、3.x 与本实现；规则 7 的口径）见 [benchmarks/baseline/README.md](benchmarks/baseline/README.md)；各专项基准在 [benchmarks/](benchmarks/) 下按专项分目录（目录名即专项，如 `recovery`、`sparse`、`bm25`、`json-write`），环境、数据、轮换与命令见各目录的 README。工作目录须在仓库外，各配置须顺序执行。
 
 参照实现侧（生成真值时用，在 [references/milvus-lite/](references/milvus-lite/) 内执行）：
 
@@ -291,7 +188,7 @@ cd <work_dir> && MILVUS_LITE_3X_PYTHON=<3.x 的 venv>/bin/python v26/bin/python 
 9. **参照实现只读**：[references/milvus-lite/](references/milvus-lite/) 不修改、不提交（已被 `.gitignore` 忽略）；需要改它来辅助对照时先告诉用户。从中借用的代码或测试数据须遵守其 Apache-2.0 许可并注明来源。
 10. **文档与代码同源，禁止双源**：机制细节的权威源是本仓 README / docs 与参照实现的代码和设计文档；本文及代码他处需提及时**链接**，不拷贝。改代码同步更新被影响的文档（对外行为差异、CLI 参数、持久化格式、支持矩阵）。
 11. **变更范围最小化**：不扩展用户给的任务边界；顺手能改的小问题报告而不动手；一次发现 N 个独立问题列出来让用户挑。
-12. **探索性问题给 2-3 句 + tradeoff**：用户问“该怎么做 / 你觉得呢”时先给推荐方向与主要取舍，等确认再实现。[技术栈](#技术栈)中尚未细化的选型（如 HNSW 实现、分词器）尤其如此。
+12. **探索性问题给 2-3 句 + tradeoff**：用户问“该怎么做 / 你觉得呢”时先给推荐方向与主要取舍，等确认再实现。[技术栈](#技术栈)中尚未细化的选型（如 ANN 索引的实现）尤其如此。
 13. **不轻易 commit + 线性历史**：默认不主动 commit，仅用户明确要求时提交；一次 commit 一件事。拉远端用 `git pull --rebase` 或 `--ff-only`，不产生 merge commit；不 amend / force-push 已 push 的 commit。
 14. **面向开源的落库卫生**：项目将对外开放。不提交 `.db` 数据目录、基准原始输出、API Key、`.env`；文档不引用个人绝对路径或内部链接；commit message、PR 描述、代码注释与文档中**不留 AI 协作痕迹**（不加 `Co-Authored-By` AI 署名、“Generated with …” 尾注或「由 AI 生成」类措辞）。发现机密已入库立即报告用户，不自行改写历史。
 15. **路径用 markdown link 而非 backtick**：引用文件 / 目录 / 行号写 `[name](path#L42)`，IDE 里可点击。

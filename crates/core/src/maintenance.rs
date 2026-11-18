@@ -1,4 +1,4 @@
-//! 每个 Db 的维护队列；一次触发消费一轮，线程不持有常驻 Db 强引用。
+//! 每个 Db 的维护队列：单线程、按句柄计数，正常关闭时排空（0010）；一次触发消费一轮，线程不持有常驻 Db 强引用。
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};

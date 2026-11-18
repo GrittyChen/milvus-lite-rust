@@ -1,4 +1,5 @@
-//! 五层锁与叶子锁的 debug 顺序检查；release 只保留 parking_lot 的锁与守卫。
+//! 五层锁与查表叶子锁的 debug 顺序检查；release 只保留 parking_lot 的锁与守卫。同层只允许改名按名字
+//! 字节序持有两把名字锁（0007「取锁顺序」）。
 use std::ops::{Deref, DerefMut};
 
 #[derive(Debug)]

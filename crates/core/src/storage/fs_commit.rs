@@ -1,4 +1,5 @@
-//! schema / manifest 的原子文件提交原语；调用方持有目录变更锁或 collection flush 锁。
+//! schema / manifest 与 `aliases.json` 等共享 JSON 文件的原子提交原语，以及其崩溃残留的打开时清扫；
+//! 调用方持有目录变更锁或 collection flush 锁。
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};

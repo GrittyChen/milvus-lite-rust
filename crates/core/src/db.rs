@@ -1,4 +1,5 @@
-//! 数据库：多 collection 的生命周期与引擎的关闭。M1 只有 `default` 一个数据库（0004「范围」）。
+//! 数据库与 collection 的生命周期：数据库注册表（0023 B）、写入许可、显式分区 Create/Drop 的独占许可、
+//! 按名字懒打开与失败判定缓存，以及引擎的关闭闸门（0003「进程退出」）。锁序见 0007「取锁顺序」。
 
 use std::collections::BTreeMap;
 use std::fs;

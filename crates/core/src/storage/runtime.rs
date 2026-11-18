@@ -1,4 +1,5 @@
-//! collection 写路径的持久化状态；读视图由 collection 的列式块维护。
+//! collection 写路径的持久化状态：按逻辑批次冻结并一次提交的多分区输出、WAL 代与同步、独立的已提交删除表
+//! （0011）与故障状态；读视图由 collection 的列式块维护。
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs::{self, File};
