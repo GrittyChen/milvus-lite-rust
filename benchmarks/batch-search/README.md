@@ -24,3 +24,11 @@
 - 顺序测量，不并行构建、测试或采样。进程内 RSS 不用于内存比较。nq100 的十个样本不足以声称稳定 p99。
 
 计算池、4 查询分组、行块、分波及公平性边界沿用 [0005](../../docs/decisions/0005-search-thread-model.md)。性能记录见[批量检索专项](../../docs/testing/batch-search-performance.md)；不得为数字放松 L2 精度、召回或持久化。
+
+引擎层的距离核与任务切分不经服务计时，用 [flat_batch_probe](../../crates/core/examples/flat_batch_probe.rs)：它在内存集合上按 1000 行一批建库，输出各 nq 的中位耗时与结果指纹，改动前后的指纹必须相同；`fair <bg_nq>` 模式计时有大批量检索在进行时的单条检索。
+
+```bash
+cargo build -p milvus-lite-core --release --example flat_batch_probe
+target/release/examples/flat_batch_probe 1000000 128 16 30 1 10 100 1000
+target/release/examples/flat_batch_probe 1000000 128 16 200 fair 700
+```

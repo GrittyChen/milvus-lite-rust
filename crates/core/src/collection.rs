@@ -1415,20 +1415,20 @@ impl ReadSnapshot {
             let mut tops: Vec<TopK> = queries.iter().map(|_| TopK::new(metric, take)).collect();
             let blocks = row_blocks(&chunks, rows_per_block);
             if take > 0 && !blocks.is_empty() {
-                let groups: Vec<&[flat::Query]> = queries.chunks(flat::BATCH).collect();
-                let per_wave = groups_per_wave(compute.threads(), blocks.len());
-                for wave in (0..groups.len()).step_by(per_wave) {
-                    let mut leaves: Vec<Leaf> = (wave..groups.len().min(wave + per_wave))
-                        .flat_map(|group| {
+                let per_wave = flat::BATCH * groups_per_wave(compute.threads(), blocks.len(), take);
+                for wave in (0..queries.len()).step_by(per_wave) {
+                    let wave = wave..queries.len().min(wave + per_wave);
+                    let mut leaves: Vec<Leaf> = wave_slices(wave, compute.threads(), blocks.len())
+                        .flat_map(|slice| {
                             blocks.iter().map(move |block| Leaf {
-                                group,
+                                queries: slice.clone(),
                                 block,
                                 tops: Vec::new(),
                             })
                         })
                         .collect();
                     compute.for_each(&mut leaves, |leaf| {
-                        let queries = groups[leaf.group];
+                        let queries = &queries[leaf.queries.clone()];
                         leaf.tops = queries.iter().map(|_| TopK::new(metric, take)).collect();
                         scan(
                             &chunks,
@@ -1442,7 +1442,7 @@ impl ReadSnapshot {
                     });
                     for leaf in leaves {
                         for (i, top) in leaf.tops.into_iter().enumerate() {
-                            tops[leaf.group * flat::BATCH + i].absorb(top);
+                            tops[leaf.queries.start + i].absorb(top);
                         }
                     }
                 }
@@ -4843,20 +4843,50 @@ fn row_blocks(chunks: &[Chunk], rows_per_block: usize) -> Vec<Vec<Segment>> {
     blocks
 }
 
-/// 每波提交的查询组数：刚好填满计算池（0005「查询组分波提交」）。同时存活的候选数因此与查询条数无关。
-fn groups_per_wave(threads: usize, blocks: usize) -> usize {
-    threads.div_ceil(blocks.max(1)).max(1)
+/// 行块内一次交给各查询组复用的存活行数：128 维时一段 32 KiB，留在 L1 / L2 缓存中。
+const TILE_ROWS: usize = 64;
+
+/// 一波最多的查询组数（0005「查询组分波提交」）：再多时批量检索只快约 5%，后到请求的等待却随之线性增长。
+const MAX_WAVE_GROUPS: usize = 4;
+
+/// 一波中各叶子任务同时持有的候选总数的预算（0005「查询组分波提交」）。
+const WAVE_CANDIDATES: usize = 1 << 19;
+
+/// 每波提交的查询组数：至少填满计算池；在候选预算内再多放几组（不超过 [`MAX_WAVE_GROUPS`]），
+/// 让一个行块读入一次供更多查询使用。同时存活的候选数因此与查询条数无关，
+/// 且不超过 max(填满计算池所需, [`WAVE_CANDIDATES`])。
+fn groups_per_wave(threads: usize, blocks: usize, take: usize) -> usize {
+    let blocks = blocks.max(1);
+    let fill = threads.div_ceil(blocks).max(1);
+    // TopK 攒到这么多候选才筛一次（见 TopK::push）。
+    let keep = take.saturating_mul(2).max(64);
+    let budget = WAVE_CANDIDATES / flat::BATCH.saturating_mul(blocks).saturating_mul(keep);
+    fill.max(budget.min(MAX_WAVE_GROUPS))
 }
 
-/// 一个叶子任务：一个查询组在一个行块上的前 k 名。
+/// 把一波查询切成连续的几片，片数为 min(组数, ⌈线程数 ÷ 块数⌉)：块数少于线程数时，
+/// 「片 × 行块」的叶子任务仍能填满计算池（0005「查询组分波提交」）。每片的起点对齐到
+/// [`flat::BATCH`] 的倍数（`wave.start` 本身对齐），查询的分组与逐组扫描时相同。
+fn wave_slices(
+    wave: std::ops::Range<usize>,
+    threads: usize,
+    blocks: usize,
+) -> impl Iterator<Item = std::ops::Range<usize>> {
+    let groups = wave.len().div_ceil(flat::BATCH);
+    let slices = groups.min(threads.div_ceil(blocks.max(1))).max(1);
+    // 各片的组数相差至多 1：第 i 片从第 ⌊i × 组数 ÷ 片数⌋ 组开始。
+    let at = move |i: usize| (wave.start + i * groups / slices * flat::BATCH).min(wave.end);
+    (0..slices).map(move |i| at(i)..at(i + 1))
+}
+
+/// 一个叶子任务：一片查询在一个行块上各自的前 k 名。
 struct Leaf<'a> {
-    group: usize,
+    /// 这一片查询在请求中的下标区间。
+    queries: std::ops::Range<usize>,
     block: &'a [Segment],
     tops: Vec<TopK>,
 }
 
-/// 为一个查询组（至多 [`flat::BATCH`] 条）扫描一个行块中的存活行，候选交给各自的 [`TopK`]。
-/// 组满 [`flat::BATCH`] 条时一起打分，共用读入的候选向量。
 /// 目标向量字段的范数在 `ChunkData.norms` 中的位置（`行号 * stride + ordinal`）。
 #[derive(Clone, Copy)]
 struct NormSlot {
@@ -4864,6 +4894,8 @@ struct NormSlot {
     stride: usize,
 }
 
+/// 为一片查询扫描一个行块中的存活行，候选交给各自的 [`TopK`]。至多 [`flat::BATCH`] 条时，
+/// 组满 [`flat::BATCH`] 条一起打分，共用读入的候选向量；更多时见 [`scan_tiled`]。
 fn scan(
     chunks: &[Chunk],
     block: &[Segment],
@@ -4872,6 +4904,9 @@ fn scan(
     queries: &[flat::Query],
     tops: &mut [TopK],
 ) {
+    if queries.len() > flat::BATCH {
+        return scan_tiled(chunks, block, field_pos, norms, queries, tops);
+    }
     for seg in block {
         let chunk = &chunks[seg.chunk];
         let (dim, values) = vector_values(&chunk.columns[field_pos]);
@@ -4911,6 +4946,67 @@ fn scan(
                 }
             }
         }
+    }
+}
+
+/// 多于一组查询时，存活行按 [`TILE_ROWS`] 行一小段收集，这一段依次交给每个查询组打分：
+/// 从内存读入的候选向量留在缓存中供全部查询组复用。每条查询仍按扫描顺序看到全部存活行，
+/// 推入各自 [`TopK`] 的先后与逐组扫描相同，结果逐位不变。
+fn scan_tiled(
+    chunks: &[Chunk],
+    block: &[Segment],
+    field_pos: usize,
+    norms: NormSlot,
+    queries: &[flat::Query],
+    tops: &mut [TopK],
+) {
+    let mut buf: Vec<(usize, &[f32], f32)> = Vec::with_capacity(TILE_ROWS);
+    for seg in block {
+        let chunk = &chunks[seg.chunk];
+        let (dim, values) = vector_values(&chunk.columns[field_pos]);
+        let at = |row| {
+            RankedRow::dense(
+                chunk.source_rank,
+                RowRef {
+                    order: row_order(chunk, row),
+                    chunk: seg.chunk,
+                    row,
+                },
+            )
+        };
+        let mut flush = |buf: &mut Vec<(usize, &[f32], f32)>| {
+            for (qs, ts) in queries
+                .chunks(flat::BATCH)
+                .zip(tops.chunks_mut(flat::BATCH))
+            {
+                if let Ok(batch) = <&[flat::Query; flat::BATCH]>::try_from(qs) {
+                    for &(row, candidate, norm) in buf.iter() {
+                        let scores = flat::score_batch(batch, candidate, norm);
+                        for (top, score) in ts.iter_mut().zip(scores) {
+                            top.push(score, || at(row));
+                        }
+                    }
+                } else {
+                    for (query, top) in qs.iter().zip(ts.iter_mut()) {
+                        for &(row, candidate, norm) in buf.iter() {
+                            top.push(query.score(candidate, norm), || at(row));
+                        }
+                    }
+                }
+            }
+            buf.clear();
+        };
+        for row in seg.rows.clone().filter(|row| chunk.live.get(*row)) {
+            buf.push((
+                row,
+                &values[row * dim..(row + 1) * dim],
+                chunk.norms[row * norms.stride + norms.ordinal],
+            ));
+            if buf.len() == TILE_ROWS {
+                flush(&mut buf);
+            }
+        }
+        flush(&mut buf);
     }
 }
 
@@ -7699,7 +7795,8 @@ mod tests {
             let dim = [1, 3, 17, 33][case % 4];
             let c = collection(&mut rng, dim);
             let metric = [Metric::L2, Metric::Ip, Metric::Cosine][rng.below(3)];
-            let nq = [1, 3, 4, 5, 9][rng.below(5)];
+            // 70 条：小 limit 时每波 MAX_WAVE_GROUPS 组、分多波，最后一波带不满一组的余数。
+            let nq = [1, 3, 4, 5, 9, 70][rng.below(6)];
             let (limit, offset) =
                 [(0, 0), (1, 0), (5, 2), (10, 0), (3, 40), (500, 0), (7, 500)][rng.below(7)];
             let vectors = (0..nq)
@@ -7758,11 +7855,76 @@ mod tests {
     /// 0005「查询组分波提交」：每波的查询组数只由线程数与块数决定，同时存活的候选数与查询条数无关。
     #[test]
     fn groups_per_wave_fills_the_pool_without_depending_on_nq() {
-        assert_eq!(groups_per_wave(10, 123), 1);
-        assert_eq!(groups_per_wave(10, 13), 1);
-        assert_eq!(groups_per_wave(10, 3), 4);
-        assert_eq!(groups_per_wave(10, 1), 10);
-        assert_eq!(groups_per_wave(1, 0), 1);
+        // 小 limit：在候选预算内放到上限。
+        assert_eq!(groups_per_wave(10, 123, 10), MAX_WAVE_GROUPS);
+        assert_eq!(groups_per_wave(10, 13, 10), MAX_WAVE_GROUPS);
+        assert_eq!(groups_per_wave(1, 0, 10), MAX_WAVE_GROUPS);
+        // 预算只够几组时按预算。
+        assert_eq!(groups_per_wave(10, 123, 1024), 1);
+        assert_eq!(groups_per_wave(10, 13, 1024), 4);
+        // 大 limit：预算不够一组，退回只填满计算池。
+        assert_eq!(groups_per_wave(10, 123, 16384), 1);
+        assert_eq!(groups_per_wave(10, 3, 16384), 4);
+        assert_eq!(groups_per_wave(10, 1, 16384), 10);
+        assert_eq!(groups_per_wave(10, 1, usize::MAX), 10);
+    }
+
+    /// 一波中同时存活的候选数不超过 max(只填满计算池时的数量, WAVE_CANDIDATES)，与 nq 无关。
+    #[test]
+    fn wave_candidates_stay_within_the_budget() {
+        for threads in [1usize, 2, 4, 10, 16, 64] {
+            for blocks in [1usize, 2, 3, 13, 48, 123, 1221] {
+                for take in [0usize, 1, 10, 100, 1000, 16384, 1 << 20] {
+                    let keep = (take * 2).max(64);
+                    let fill = threads.div_ceil(blocks);
+                    let per_wave = groups_per_wave(threads, blocks, take);
+                    assert!(per_wave >= fill, "{threads} {blocks} {take}");
+                    assert!(per_wave <= fill.max(MAX_WAVE_GROUPS));
+                    let alive = per_wave * flat::BATCH * blocks * keep;
+                    let bound = (fill * flat::BATCH * blocks * keep).max(WAVE_CANDIDATES);
+                    assert!(
+                        alive <= bound,
+                        "{threads} {blocks} {take}: {alive} > {bound}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// 片按顺序覆盖整波、起点对齐到 BATCH；块数少于线程数时叶子数（片数 × 块数）填满计算池。
+    #[test]
+    fn wave_slices_fill_the_pool_when_blocks_are_few() {
+        for threads in [1usize, 2, 10, 16, 64] {
+            for blocks in [1usize, 2, 3, 13, 48] {
+                for (start, len) in [
+                    (0usize, 1usize),
+                    (0, 4),
+                    (0, 5),
+                    (8, 16),
+                    (16, 70),
+                    (0, 1000),
+                ] {
+                    let wave = start..start + len;
+                    let slices: Vec<_> = wave_slices(wave.clone(), threads, blocks).collect();
+                    let mut next = wave.start;
+                    for slice in &slices {
+                        assert_eq!(slice.start, next);
+                        assert_eq!(slice.start % flat::BATCH, 0);
+                        assert!(!slice.is_empty());
+                        next = slice.end;
+                    }
+                    assert_eq!(next, wave.end);
+                    let groups = len.div_ceil(flat::BATCH);
+                    let want = (groups * blocks).min(threads.max(blocks));
+                    assert!(
+                        slices.len() * blocks >= want,
+                        "{threads} {blocks} {len}: {} slices",
+                        slices.len()
+                    );
+                    assert!(slices.len() <= groups);
+                }
+            }
+        }
     }
 
     /// TopK 与「对全部分数按名次稳定排序、取前 take 个」逐位相同：并列、±0、±inf、NaN（含负 NaN）都覆盖。

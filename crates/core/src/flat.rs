@@ -12,6 +12,10 @@
 //!
 //! 累加函数单独成函数、不内联：与归约和尾部写在一起时，LLVM 在 aarch64 上只生成 2 路的向量代码，
 //! 慢近一倍。改动这里的写法时要用基准确认没有退化。
+//!
+//! x86_64 的编译基线只有 SSE2。CPU 支持 AVX2 时，累加函数改走以 AVX2 编译的副本（[`avx2`]），
+//! 与基线副本是同一份源码，只放宽向量宽度；不启用 FMA，求和顺序仍只由源码决定，结果逐位相同
+//! （NaN 同上）。aarch64 的基线已有 NEON，不分派。
 
 use std::cmp::Ordering;
 
@@ -173,8 +177,8 @@ fn finish(lanes: Lanes, a: &[f32], b: &[f32], op: fn(f32, f32) -> f32) -> f32 {
         .fold(l[0], |s, (x, y)| s + op(*x, *y))
 }
 
-#[inline(never)]
-fn diff_sq_lanes(a: &[f32], b: &[f32]) -> Lanes {
+#[inline(always)]
+fn diff_sq_lanes_body(a: &[f32], b: &[f32]) -> Lanes {
     let mut acc = [0.0; LANES];
     for (x, y) in a
         .as_chunks::<LANES>()
@@ -190,8 +194,8 @@ fn diff_sq_lanes(a: &[f32], b: &[f32]) -> Lanes {
     acc
 }
 
-#[inline(never)]
-fn product_lanes(a: &[f32], b: &[f32]) -> Lanes {
+#[inline(always)]
+fn product_lanes_body(a: &[f32], b: &[f32]) -> Lanes {
     let mut acc = [0.0; LANES];
     for (x, y) in a
         .as_chunks::<LANES>()
@@ -207,8 +211,8 @@ fn product_lanes(a: &[f32], b: &[f32]) -> Lanes {
 }
 
 // 显式复用同一候选元素；每条查询的 16 路累加顺序和原归约保持不变。
-#[inline(never)]
-fn diff_sq_lanes_batch(qs: &[&[f32]; BATCH], b: &[f32]) -> [Lanes; BATCH] {
+#[inline(always)]
+fn diff_sq_lanes_batch_body(qs: &[&[f32]; BATCH], b: &[f32]) -> [Lanes; BATCH] {
     let [q0, q1, q2, q3] = qs.map(|q| q.as_chunks::<LANES>().0);
     let (mut a0, mut a1, mut a2, mut a3) = ([0.0; LANES], [0.0; LANES], [0.0; LANES], [0.0; LANES]);
     for (k, y) in b.as_chunks::<LANES>().0.iter().enumerate() {
@@ -227,8 +231,8 @@ fn diff_sq_lanes_batch(qs: &[&[f32]; BATCH], b: &[f32]) -> [Lanes; BATCH] {
     [a0, a1, a2, a3]
 }
 
-#[inline(never)]
-fn product_lanes_batch(qs: &[&[f32]; BATCH], b: &[f32]) -> [Lanes; BATCH] {
+#[inline(always)]
+fn product_lanes_batch_body(qs: &[&[f32]; BATCH], b: &[f32]) -> [Lanes; BATCH] {
     let [q0, q1, q2, q3] = qs.map(|q| q.as_chunks::<LANES>().0);
     let (mut a0, mut a1, mut a2, mut a3) = ([0.0; LANES], [0.0; LANES], [0.0; LANES], [0.0; LANES]);
     for (k, y) in b.as_chunks::<LANES>().0.iter().enumerate() {
@@ -241,6 +245,71 @@ fn product_lanes_batch(qs: &[&[f32]; BATCH], b: &[f32]) -> [Lanes; BATCH] {
         }
     }
     [a0, a1, a2, a3]
+}
+
+/// 以 AVX2 编译的累加函数副本，函数体与基线副本相同。只在 [`avx2::available`] 为真时调用。
+#[cfg(target_arch = "x86_64")]
+mod avx2 {
+    use super::{BATCH, Lanes};
+
+    /// 标准库缓存检测结果，每次调用只是一次原子读取。
+    #[inline(always)]
+    pub(super) fn available() -> bool {
+        std::arch::is_x86_feature_detected!("avx2")
+    }
+
+    #[target_feature(enable = "avx2")]
+    pub(super) fn diff_sq_lanes(a: &[f32], b: &[f32]) -> Lanes {
+        super::diff_sq_lanes_body(a, b)
+    }
+
+    #[target_feature(enable = "avx2")]
+    pub(super) fn product_lanes(a: &[f32], b: &[f32]) -> Lanes {
+        super::product_lanes_body(a, b)
+    }
+
+    #[target_feature(enable = "avx2")]
+    pub(super) fn diff_sq_lanes_batch(qs: &[&[f32]; BATCH], b: &[f32]) -> [Lanes; BATCH] {
+        super::diff_sq_lanes_batch_body(qs, b)
+    }
+
+    #[target_feature(enable = "avx2")]
+    pub(super) fn product_lanes_batch(qs: &[&[f32]; BATCH], b: &[f32]) -> [Lanes; BATCH] {
+        super::product_lanes_batch_body(qs, b)
+    }
+}
+
+/// 按 CPU 选择累加函数的副本。`$avx2` 是 [`avx2`] 中同名的函数。
+macro_rules! dispatch {
+    ($avx2:ident, $body:ident, $($arg:expr),+) => {{
+        #[cfg(target_arch = "x86_64")]
+        if avx2::available() {
+            // SAFETY: avx2 副本只要求 CPU 支持 AVX2（target_feature），available() 刚在运行时确认过。
+            #[allow(unsafe_code)]
+            return unsafe { avx2::$avx2($($arg),+) };
+        }
+        $body($($arg),+)
+    }};
+}
+
+#[inline(never)]
+fn diff_sq_lanes(a: &[f32], b: &[f32]) -> Lanes {
+    dispatch!(diff_sq_lanes, diff_sq_lanes_body, a, b)
+}
+
+#[inline(never)]
+fn product_lanes(a: &[f32], b: &[f32]) -> Lanes {
+    dispatch!(product_lanes, product_lanes_body, a, b)
+}
+
+#[inline(never)]
+fn diff_sq_lanes_batch(qs: &[&[f32]; BATCH], b: &[f32]) -> [Lanes; BATCH] {
+    dispatch!(diff_sq_lanes_batch, diff_sq_lanes_batch_body, qs, b)
+}
+
+#[inline(never)]
+fn product_lanes_batch(qs: &[&[f32]; BATCH], b: &[f32]) -> [Lanes; BATCH] {
+    dispatch!(product_lanes_batch, product_lanes_batch_body, qs, b)
 }
 
 #[cfg(test)]
@@ -458,6 +527,81 @@ mod tests {
                             assert_eq!(got[i].to_bits(), expected[i].to_bits(), "{case}");
                         }
                     }
+                }
+            }
+        }
+    }
+
+    /// AVX2 副本与基线副本逐位相同（NaN 只要求同为 NaN）：随机值、特殊值、各种维度与尾部。
+    /// x86_64 的测试机必须支持 AVX2，否则这条用例无法核对分派后的路径，直接失败而不是跳过。
+    #[cfg(target_arch = "x86_64")]
+    #[allow(unsafe_code)]
+    #[test]
+    fn avx2_kernels_are_bit_identical_to_the_baseline_kernels() {
+        assert!(avx2::available(), "x86_64 测试机须支持 AVX2");
+        let mut seed = 0x51f1_5eed_u32;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            (seed as f32 / u32::MAX as f32 - 0.5) * 2000.0
+        };
+        let specials = [
+            0.0,
+            -0.0,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::from_bits(0x7fc0_0123),
+            1e30,
+            -1e30,
+            f32::MIN_POSITIVE / 4.0,
+        ];
+        let same = |x: Lanes, y: Lanes, case: &str| {
+            for i in 0..LANES {
+                if x[i].is_nan() {
+                    assert!(y[i].is_nan(), "{case} lane {i}");
+                } else {
+                    assert_eq!(x[i].to_bits(), y[i].to_bits(), "{case} lane {i}");
+                }
+            }
+        };
+        for dim in [1, 15, 16, 17, 33, 128, 257, 1024, 32768] {
+            for special in [false, true] {
+                let mut vectors: [Vec<f32>; BATCH] =
+                    std::array::from_fn(|_| (0..dim).map(|_| next()).collect());
+                let mut b: Vec<f32> = (0..dim).map(|_| next()).collect();
+                if special {
+                    for (i, v) in b.iter_mut().enumerate() {
+                        *v = specials[i % specials.len()];
+                    }
+                    for (qi, q) in vectors.iter_mut().enumerate() {
+                        for (i, v) in q.iter_mut().enumerate() {
+                            if (i + qi) % 3 == 0 {
+                                *v = specials[(i + qi) % specials.len()];
+                            }
+                        }
+                    }
+                }
+                let qs = vectors.each_ref().map(|v| v.as_slice());
+                let case = format!("dim={dim} special={special}");
+                // SAFETY: 用例开头已确认 CPU 支持 AVX2。
+                let (l2, ip, l2_batch, ip_batch) = unsafe {
+                    (
+                        avx2::diff_sq_lanes(qs[0], &b),
+                        avx2::product_lanes(qs[0], &b),
+                        avx2::diff_sq_lanes_batch(&qs, &b),
+                        avx2::product_lanes_batch(&qs, &b),
+                    )
+                };
+                same(l2, diff_sq_lanes_body(qs[0], &b), &case);
+                same(ip, product_lanes_body(qs[0], &b), &case);
+                let (base_l2, base_ip) = (
+                    diff_sq_lanes_batch_body(&qs, &b),
+                    product_lanes_batch_body(&qs, &b),
+                );
+                for i in 0..BATCH {
+                    same(l2_batch[i], base_l2[i], &case);
+                    same(ip_batch[i], base_ip[i], &case);
                 }
             }
         }
