@@ -11,7 +11,7 @@
 
 1. **顶层动态字段过滤**：在 S1 的六种字段/字面量比较与 and 基础上，增加动态字段对应的比较和 `in`；用于 Search、Query、count、Delete。覆盖 Quick Start 常见的 `category == 'tech'`、`category in ['tech', 'ai']`，并固定缺失/null、异构值、数值边界、错误优先级、分页与发布/重开行为。嵌套 JSON 路径另做切片；or/not、LIKE、JSON/数组函数、时间与全文等求值仍显式拒绝。
 2. **compaction 与 tombstone GC**：回收覆盖和删除旧版本，限制长期写入的文件与恢复开销。实施前按规则 3 单独确认锁、快照/文件钉住、提交与重试、删除证据保留及测试矩阵，不在过滤实现中顺手加入后台任务。相关 RPC 的契约按真实 3.x 代码确定，不能仅返回成功。
-3. **CLI `milvus-lite server`**：按参照实现定义参数、信号、退出持久化和错误传播；`--max-workers` 的 Rust 含义在设计时确认。`dump` 后续补齐。
+3. **CLI `milvus-lite server`**：按参照实现定义参数、信号、退出持久化和错误传播；`--max-workers` 的 Rust 含义在设计时确认。`dump` 后续补齐（已由 [0037](0037-dump.md) 补齐）。
 4. **发布工程与跨平台**：支持的 pymilvus 2.6.x/3.0.x 两条线、Python 下限、Linux/macOS 的构建和生命周期/存储测试；wheel/sdist 可仅靠 cargo 构建、没有额外 C++/系统依赖。负责人于 2026-10-10 决定首发暂不提供 Windows wheel，Windows 延后；Intel Mac 采用构建与冒烟分层。源码回退及证据层级按 [0013](0013-first-release-platform-and-packaging.md)。发布前确认许可证与来源、发行包冲突检测、支持矩阵、安装验证和版本号。
 
 ANN、BM25/function chain、query iterator、field_ops、别名/多数据库与 snapshot RPC，以及未纳入本决策的类型和过滤构造，保留明确的 UNIMPLEMENTED 与限制清单。若决定增加其中任何能力，先更新范围和验收，不由 adapter 静默补能力。

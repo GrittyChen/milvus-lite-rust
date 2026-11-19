@@ -13,8 +13,12 @@ SDKS = ("2.6.17", "3.0.2")
 SUITE_PYTHONS = ("3.10", "3.15")
 SMOKE_PYTHONS = ("3.11", "3.12", "3.13", "3.14")
 
-PYTHON_SUITE = 706
+PYTHON_SUITE = 752
 DIFFERENTIAL = (867, 405)
+# tests/dump 依赖 BulkWriter，只在 3.10 上叠装 dump30 / dump26 运行，不进 3.15（0037「测试」）。
+DUMP_PYTHON = "3.10"
+DUMP_E2E = 28
+DUMP_DIFF = 19
 INTEROP = 321
 FI_RECOVERY = 5
 PREVIOUS_READER_CASES = 6
@@ -62,6 +66,8 @@ def platform_stages(platform):
     for sdk in SDKS:
         stages[f"fi-recovery-{sdk}"] = sharded(FI_RECOVERY)
         stages[f"differential-{sdk}"] = sharded(*DIFFERENTIAL)
+        stages[f"dump-{DUMP_PYTHON}-{sdk}"] = sharded(DUMP_E2E)
+        stages[f"dump-diff-{sdk}"] = sharded(DUMP_DIFF)
     if platform.startswith("linux-"):
         stages.update({"lock": {}, "strace": {"successful_calls": POSITIVE}, "pid1": {}})
     if platform == "linux-x86_64":

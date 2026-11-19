@@ -65,7 +65,7 @@ python -m pip install .
 
 Python 元数据保持 `>=3.10`，不预先封顶；首发验证窗口是 **GIL CPython 3.10–3.15**，未来未测版本不据此宣称通过。3.10 保留为兼容下限，不以此承诺解释器的安全维护。
 
-Linux 上使用 CPython 3.15 时，pymilvus 依赖的 orjson 目前只为 glibc 2.39 及以上提供预编译 wheel；在更低的 glibc 上安装 pymilvus 时可能需要从源码构建 orjson，因此需要 Rust 工具链。本包自身的 wheel 不受影响。
+Linux 上使用 CPython 3.15 时，pymilvus 依赖的 orjson 目前只为 glibc 2.39 及以上提供预编译 wheel；在更低的 glibc 上安装 pymilvus 时可能需要从源码构建 orjson，因此需要 Rust 工具链。本包自身的 wheel 不受影响。dump 所需的 bulk_writer 依赖 pyarrow，它在 CPython 3.15 上是否有预编译 wheel，取决于安装时 PyPI 上的版本。
 
 继续提供 sdist：矩阵内纳入验收；musl、其它架构及较低 glibc 的自行构建仅为实验性尝试，无支持承诺。**Windows、free-threaded 与非 CPython 在构建时明确拒绝**；Windows 当前仍有目录/句柄同步缺陷，首发既无 Windows wheel，也不允许 pip 从 sdist 安装出该已知不可用版本。Windows 未安装 Rust 时会先得到 cargo 缺失错误，本项目的拒绝检查可能尚未执行。
 
@@ -139,9 +139,28 @@ python -m milvus_lite server --data-dir ./demo.db --host 127.0.0.1 --port 19530 
 
 客户端使用 `MilvusClient(uri="http://127.0.0.1:19530")`。data-dir 不要求 .db 后缀；port 0 自动分配，ready 行显示实际地址。hostname 只绑定解析结果中首个成功 bind 的地址。当前验证的 pymilvus 2.6.17/3.0.2 会丢失 IPv6 URI 方括号，用这两条 SDK 时应绑定 `127.0.0.1`。
 
-默认 `0.0.0.0` 监听所有网卡，当前没有认证/TLS；仅本机使用应显式指定回环地址。max-workers 控制引擎 RPC 阻塞池，CLI 默认 10，嵌入服务保持 512 上限；计算池和维护线程独立。现在仅提供 server，dump 尚未纳入。
+默认 `0.0.0.0` 监听所有网卡，当前没有认证/TLS；仅本机使用应显式指定回环地址。max-workers 控制引擎 RPC 阻塞池，CLI 默认 10，嵌入服务保持 512 上限；计算池和维护线程独立。导出见下一节。
 
 argparse 语法/数值错误退出 2；括号 host 格式、启动和停止错误退出 1。数值/格式校验在资源前完成，DNS/bind 失败可能已经创建目录。任何存储收尾失败（包括因目录持久化未确认跳过最终 flush）均使显式 stop 报错、CLI 退出 1；退出 0 不是全部文件已确认持久化的证明。
+
+## 导出 dump
+
+把一个集合的全部可见行导出为 Milvus BulkWriter 的 JSON 文件，用于导入 Milvus 或 Zilliz Cloud。只导出行，不导出 schema、索引、分区与别名，目标集合需要先在 Milvus 侧建好。
+
+```bash
+pip install "pymilvus[bulk_writer]"
+milvus-lite dump -d ./demo.db -c docs -p ./dump
+milvus-lite dump --uri http://127.0.0.1:19530 -c docs -p ./dump
+```
+
+- 依赖：dump 需要 pymilvus 的 bulk_writer 附加依赖（pyarrow、minio、azure-storage-blob 等），本包不声明它，缺少时在打开数据目录之前报错。
+- `-d` 在 dump 进程内打开数据目录，路径必须以 `.db` 结尾（这是 pymilvus 的规则）；目录正被 server 或其他进程占用时会报 `Open local milvus failed`，此时改用 `--uri` 连接正在运行的 server。`--uri` 写成以 `.db` 结尾的本地路径时同样要求它已存在。
+- 输出写在 `-p` 下新建的随机子目录中，文件依次为 `1.json`、`2.json`……；集合为空时不写文件。`-p` 的父目录必须存在，已有内容保留。
+- `--batch-size` 取 1–16384（默认 1000），`--chunk-size` 至少为 1 字节（默认 512 MiB）。chunk 越小文件越多，每多一个文件最多多等约 1 秒。
+- 自增主键不导出，导入时重新分配；BM25 等 function 的输出字段不导出，导入时由 Milvus 按输入重新生成（text embedding 的输出字段因此需要目标端有 provider 凭据）。
+- 失败时一行说明、退出 1，并删除本次创建的子目录；参数错误退出 2；SIGINT / SIGTERM 同样清理后退出 130 / 143。SIGKILL、断电、关闭终端或清理途中的第二次信号可能留下不完整的子目录；在容器 PID 1 上第二次信号不起作用，dump 照常清理后退出。
+- 与官方 3.x 的差异：带 BM25 function 或 ARRAY VARCHAR 字段的集合在 3.x 上导出失败，这里正常导出；3.x 在批大小为 0 时报告成功却导出 0 行、在写文件失败时报告成功却没有文件、遇到 NaN 或 Infinity 时写出不合法的 JSON，这里分别拒绝参数、报告失败、报错并指出字段与主键；3.x 失败时打印 traceback。
+- 已知限制：VARCHAR 主键含双引号或反斜杠时 pymilvus 的分页查询失败，无法导出；`--uri` 指向仍在写入的服务时，导出不是一致快照；`--uri` 会把已 release 的集合重新 load。
 
 ## 停止、恢复与限制
 

@@ -148,6 +148,11 @@ jobs:
           uv pip install --python .venv/bin/python --no-build -r $req/dev.txt
           uv venv -p python3.10 "$RUNNER_TEMP/v26"
           uv pip install --python "$RUNNER_TEMP/v26/bin/python" --no-build -r $req/sdk26.txt
+          # tests/dump/diff 要求两侧都有 BulkWriter：本实现侧叠装同版本的超集锁，ref25 的锁已含它（0037「测试」）。
+          case "${{ matrix.suite }}" in
+            diff-3.0.2) uv pip install --python .venv/bin/python --no-build -r $req/dump30.txt ;;
+            diff-2.6.17) uv pip install --python "$RUNNER_TEMP/v26/bin/python" --no-build -r $req/dump26.txt ;;
+          esac
           for arrow in 25 15; do
             uv venv -p python3.12 "$RUNNER_TEMP/ref$arrow"
             uv pip install --python "$RUNNER_TEMP/ref$arrow/bin/python" --no-build -r $req/ref$arrow.txt
@@ -182,6 +187,9 @@ jobs:
             --out "$RUNNER_TEMP/plan" --shards ${{ matrix.shards }} \
             --group-fixture diff --group-fixture rust_uri --group-fixture ref_uri --expect 867 --expect-group 405
           .venv/bin/python tests/sharding/shard.py run --plan "$RUNNER_TEMP/plan/plan.json" --out "$RUNNER_TEMP/run"
+          .venv/bin/python tests/sharding/shard.py plan --python .venv/bin/python --suite tests/dump/diff \
+            --out "$RUNNER_TEMP/dump-plan" --shards 1 --order round-robin --expect 19 --expect-group 0
+          .venv/bin/python tests/sharding/shard.py run --plan "$RUNNER_TEMP/dump-plan/plan.json" --out "$RUNNER_TEMP/dump-run"
       - name: 差分（pymilvus 2.6.17，安装 wheel，仓库外运行）
         if: matrix.suite == 'diff-2.6.17'
         env:
@@ -193,6 +201,9 @@ jobs:
             --cwd "$RUNNER_TEMP/outside" --out "$RUNNER_TEMP/plan" --shards ${{ matrix.shards }} \
             --group-fixture diff --group-fixture rust_uri --group-fixture ref_uri --expect 867 --expect-group 405
           .venv/bin/python tests/sharding/shard.py run --plan "$RUNNER_TEMP/plan/plan.json" --out "$RUNNER_TEMP/run"
+          .venv/bin/python tests/sharding/shard.py plan --python "$RUNNER_TEMP/v26/bin/python" --suite "$PWD/tests/dump/diff" \
+            --cwd "$RUNNER_TEMP/outside" --out "$RUNNER_TEMP/dump-plan" --shards 1 --order round-robin --expect 19 --expect-group 0
+          .venv/bin/python tests/sharding/shard.py run --plan "$RUNNER_TEMP/dump-plan/plan.json" --out "$RUNNER_TEMP/dump-run"
       - name: 存储互通
         if: matrix.suite == 'interop'
         env:

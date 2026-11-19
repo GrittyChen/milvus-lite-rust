@@ -365,7 +365,7 @@ def test_installed_help_is_available_without_starting_a_server(module):
     command = [sys.executable, "-m", "milvus_lite"] if module else [str(Path(sys.executable).with_name("milvus-lite.exe" if os.name == "nt" else "milvus-lite"))]
     result = subprocess.run([*command, "--help"], capture_output=True, text=True, timeout=15)
     assert result.returncode == 0, result.stderr
-    assert "server" in result.stdout and "dump" not in result.stdout
+    assert "server" in result.stdout and "dump" in result.stdout
     assert "listening" not in result.stdout
 
 

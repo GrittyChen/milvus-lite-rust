@@ -464,6 +464,20 @@ jobs:
             done
           done
           unset UV_FIND_LINKS ORJSON_RECORD
+          # tests/dump/e2e 只在 3.10 运行（BulkWriter 的 pyarrow 没有 cp315 wheel）：在上面已装正式 wheel 的环境上
+          # 叠装同版本的超集锁，仓库外运行以导入已安装的 wheel（0037「测试」）。
+          mkdir "$RUNNER_TEMP/outside-dump"
+          for sdk in 2.6.17 3.0.2; do
+            env_py="$RUNNER_TEMP/acc-3.10-$sdk/sdk/bin/python"
+            dump_req="$req/dump30.txt"
+            [ "$sdk" = 2.6.17 ] && dump_req="$req/dump26.txt"
+            uv pip install -q --python "$env_py" --no-build -r "$dump_req"
+            collected=$("$DEV_PY" tests/release/scorecard.py expect "$SCOPE" "dump-3.10-$sdk" collected)
+            "$DEV_PY" tests/sharding/shard.py plan --python "$env_py" --suite "$PWD/tests/dump/e2e" --cwd "$RUNNER_TEMP/outside-dump" \
+              --out "$RUNNER_TEMP/dump-$sdk-plan" --shards 1 --order round-robin --expect "$collected" --expect-group 0
+            "$DEV_PY" tests/sharding/shard.py run --plan "$RUNNER_TEMP/dump-$sdk-plan/plan.json" --out "$RUNNER_TEMP/dump-$sdk-run"
+            record --stage "dump-3.10-$sdk" --summary "$RUNNER_TEMP/dump-$sdk-run/summary.json"
+          done
           for python in 3.11 3.12 3.13 3.14; do
             interpreter="PY3${python#3.}"
             "$DEV_PY" tests/packaging/run_acceptance.py --work-dir "$RUNNER_TEMP/smoke-$python" --python "${!interpreter}" \
@@ -516,6 +530,15 @@ jobs:
               --group-fixture diff --group-fixture rust_uri --group-fixture ref_uri --expect "$collected" --expect-group "$group"
             "$DEV_PY" tests/sharding/shard.py run --plan "$RUNNER_TEMP/diff-$sdk-plan/plan.json" --out "$RUNNER_TEMP/diff-$sdk-run"
             record --stage "differential-$sdk" --summary "$RUNNER_TEMP/diff-$sdk-run/summary.json"
+            # dump 差分单独记分（0021 第 12 条：每个计数唯一来源）；两侧都需要 BulkWriter，ref25 的锁已含它。
+            dump_req="$req/dump30.txt"
+            [ "$sdk" = 2.6.17 ] && dump_req="$req/dump26.txt"
+            uv pip install -q --python "$py" --no-build -r "$dump_req"
+            collected=$("$DEV_PY" tests/release/scorecard.py expect "$SCOPE" "dump-diff-$sdk" collected)
+            "$DEV_PY" tests/sharding/shard.py plan --python "$py" --suite "$PWD/tests/dump/diff" --cwd "$RUNNER_TEMP/outside" \
+              --out "$RUNNER_TEMP/dump-diff-$sdk-plan" --shards 1 --order round-robin --expect "$collected" --expect-group 0
+            "$DEV_PY" tests/sharding/shard.py run --plan "$RUNNER_TEMP/dump-diff-$sdk-plan/plan.json" --out "$RUNNER_TEMP/dump-diff-$sdk-run"
+            record --stage "dump-diff-$sdk" --summary "$RUNNER_TEMP/dump-diff-$sdk-run/summary.json"
           else
             # 互通用例另行调用的 Rust 示例与 FI 测试程序从冻结提交构建，属源码级组件（0021 第 9 条）。
             export PYO3_PYTHON="$PY312"

@@ -55,9 +55,9 @@
 
 ### 1. 包入口与胶水边界
 
-在 crates/py 的 Python 包新增 cmdline.py、__main__.py，在 pyproject.toml 注册 `milvus-lite = milvus_lite.cmdline:main`。仅使用 Python 标准库解析参数和处理信号；调用已有 NativeServer，不引入 numpy、grpcio、pymilvus 或新的 Rust 依赖作为 CLI 的运行要求。
+在 crates/py 的 Python 包新增 cmdline.py、__main__.py，在 pyproject.toml 注册 `milvus-lite = milvus_lite.cmdline:main`。仅使用 Python 标准库解析参数和处理信号；调用已有 NativeServer，不引入 numpy、grpcio、pymilvus 或新的 Rust 依赖作为 CLI 的运行要求。例外：[0037](0037-dump.md) 的 dump 分支在执行时才导入 numpy、pymilvus 与其 bulk_writer，server 与帮助的导入面不变。
 
-帮助与参数解析先完成，server 分支再导入 native。包级的官方发行包冲突检测照旧：同时安装官方 milvus-lite 与本包仍拒绝导入，不能为了帮助命令绕过冲突策略。本包仅列出实际支持的 server 子命令；dump 明确不可用、非零退出，不放成功占位。
+帮助与参数解析先完成，server 分支再导入 native。包级的官方发行包冲突检测照旧：同时安装官方 milvus-lite 与本包仍拒绝导入，不能为了帮助命令绕过冲突策略。首发时本包仅列出实际支持的 server 子命令，dump 明确不可用、非零退出，不放成功占位；dump 已由 [0037](0037-dump.md) 补齐，帮助随之列出。
 
 cmdline 保留 `run_server(data_dir, host, port, max_workers)` 同名同签名入口，server_func 只转交解析结果；上游 monkeypatch 的分发用例可原样复用。模块入口用例也保留原测试主体。
 
@@ -155,7 +155,8 @@ Server.stop 在所有收尾结束、LOCK 释放后检查标志；失败返回 St
 | 非主线程 server 调用 | 参照可阻塞调用 | 创建资源前拒绝，main 返回 1；其它帮助/解析仍可用 | 不安装跨线程信号方案，真实线程用例 |
 | Windows SIGBREAK | 参照未接管 | 作为首次正常停止请求 | CTRL_BREAK_EVENT 新进程组测试；TerminateProcess 不承诺优雅 |
 | 启动错误呈现 | 参照未捕获异常会输出 traceback | CLI 简短说明完整原因，退出 1 | 系统错误原因保留，stdout 不输出虚假 ready |
-| CLI 能力面 | server/dump | 只列出 server，dump 非零拒绝 | 首发范围，帮助不虚构能力 |
+| CLI 能力面 | server/dump | 首发只列出 server，dump 非零拒绝；dump 已由 [0037](0037-dump.md) 补齐 | 首发范围，帮助不虚构能力 |
+| dump 的错误呈现与信号 | 参照打印 traceback；没有信号 handler，被信号杀死 | 一行 `MilvusLite dump failed: …`、退出 1；SIGINT / SIGTERM 的 handler 抛出专用异常以打断阻塞的 RPC，清理本次输出后退出 130 / 143，第一次信号即恢复 SIG_DFL | 与 server 的“只置标志”不同：dump 被中断时导出未完成，必须打断阻塞调用并清理；见 [0037](0037-dump.md)「错误呈现」 |
 | 关闭存储错误 | 参照吞 collection 异常，退出码不报告 | 保留日志/WAL 保护；标志使 stop 返回错误，CLI 退出 1 | 覆盖全部收尾错误、因持久化未确认跳过最终 flush 与 panic；嵌入停止也记录，Drop 仍只日志 |
 
 ## 放弃的方案

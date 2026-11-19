@@ -822,7 +822,7 @@
 
 ## CLI 入口用例（独立来源）
 
-[test_cli_entrypoints.py](../test_cli_entrypoints.py) 另原样复制参照 tests/test_dump_tool.py 的 test_main_dispatches_server 和 test_package_module_main_delegates_to_cmdline，共 2 条。它们不属于 tests/adapter 的 637 条统计，起服务/信号与参数的真实验证见 test_cli.py 和差分的 test_cli_server.py；dump 尚未复用。
+[test_cli_entrypoints.py](../test_cli_entrypoints.py) 另原样复制参照 tests/test_dump_tool.py 的 test_main_dispatches_server 和 test_package_module_main_delegates_to_cmdline，共 2 条。它们不属于 tests/adapter 的 637 条统计，起服务/信号与参数的真实验证见 test_cli.py 和差分的 test_cli_server.py。该文件其余 5 条 dump 用例改后复制在 [test_cli_dump.py](../test_cli_dump.py)：本实现改用 MilvusClient，fake 对象随之改写，用例主体保持原意（[0037](../../../docs/decisions/0037-dump.md)）。
 
 0014 切片 B 原样恢复 8 个函数、参数化 23 条：CRUD LIKE、动态路径/数组及零命中投影、VARCHAR 主键 LIKE、JSON 路径、VARCHAR in/not in。nullable、分区、ARRAY 字段、算术等其他阻断仍保留，不因新增过滤能力扩大复制范围。
 

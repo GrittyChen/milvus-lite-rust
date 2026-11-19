@@ -52,6 +52,7 @@
 9. 以下 0013 门槛在托管机器上执行，判据不变：
     - 归档与二进制检查（`check_artifacts.py`，正式与 FI 两类，含 glibc 2.28 动态库版本与 Mach-O 最低系统字段）；
     - 四个标准层：CPython 3.10 / 3.15 × 两条 SDK 的端到端全套，3.11–3.14 安装与联合冒烟，默认与完整 FI 的 Rust，FI wheel 恢复专项；
+    - 四个标准层，CPython 3.10 × 两条 SDK 的 dump 端到端（`tests/dump/e2e`，阶段 `dump-3.10-<sdk>`），以及正式 wheel 上两条 SDK 的 dump 差分（`tests/dump/diff`，阶段 `dump-diff-<sdk>`）：它们需要 `pymilvus[bulk_writer]`，叠装在同一 job 已有的环境上，3.15 不跑；计数各自独立，不并入端到端全套或完整差分（[0037](0037-dump.md)「测试」）；
     - 四个标准层，正式 wheel 上的两条 SDK 完整差分与 Arrow 15 / 25 双向互通：沿用 0020 对照层的参照环境、分片与收集数，但 Python 侧改为安装装配 job 交出的正式 wheel（先核对 SHA256），安装后核对环境中原生模块的 SHA256 与正式 wheel 一致。互通用例另行调用的 Rust 示例与 FI 测试程序仍从冻结提交构建，属源码级组件，与过去候选相同；
     - Linux 的 LOCK、strace 与 PID 1（托管 Linux 机器自带 Docker；strace 需给容器 ptrace 权限）；
     - sdist：根与 `-m` 两种构建入口、PEP 517 安装，free-threaded / PyPy / Windows 的明确拒绝，以及在解包的 sdist 上执行 MSRV 检查（源码树上的 MSRV 已由前置条件继承，sdist 不含 `rust-toolchain.toml`，单独执行）；
