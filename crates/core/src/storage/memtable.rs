@@ -631,10 +631,7 @@ fn validate_decoded(schema: &CollectionSchema, decoded: &DecodedData) -> Result<
         if let Some(validity) = column.validity()
             && (!field.nullable
                 || validity.len() != n
-                || matches!(
-                    column.values(),
-                    ColumnData::Nullable { .. } | ColumnData::FloatVector { .. }
-                ))
+                || matches!(column.values(), ColumnData::Nullable { .. }))
         {
             return Err(MemTableError::Column(field.name.clone()));
         }
@@ -672,7 +669,7 @@ fn validate_decoded(schema: &CollectionSchema, decoded: &DecodedData) -> Result<
         {
             return Err(MemTableError::Column(field.name.clone()));
         }
-        if let ColumnData::FloatVector { dim, .. } = column
+        if let ColumnData::FloatVector { dim, .. } = column.values()
             && field.dim != i64::try_from(*dim).ok()
         {
             return Err(MemTableError::Column(field.name.clone()));

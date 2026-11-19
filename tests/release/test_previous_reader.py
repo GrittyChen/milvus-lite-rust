@@ -11,7 +11,8 @@ REPO = Path(__file__).resolve().parents[2]
 
 def test_snippets_come_from_interop_tests():
     for test, name in [("test_nullable_scalars.py", "RUST_WRITE"), ("test_nullable_scalars.py", "READ_CHANGE"),
-                       ("test_partition_key.py", "WRITE"), ("test_partition_key.py", "READ_APPEND")]:
+                       ("test_partition_key.py", "WRITE"), ("test_partition_key.py", "READ_APPEND"),
+                       ("test_nullable_vectors.py", "RUST_WRITE"), ("test_nullable_vectors.py", "RUST_READ")]:
         code = pr.snippet(REPO, test, name)
         assert "MilvusClient" in code and code in (REPO / "tests/storage_interop" / test).read_text()
     with pytest.raises(SystemExit, match="cannot locate"):

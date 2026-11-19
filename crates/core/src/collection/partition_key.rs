@@ -76,6 +76,7 @@ impl Collection {
                 )));
             }
             if let Some(vector) = self.vector_pos.map(|pos| &self.schema.fields[pos])
+                && !vector.nullable
                 && !has(&vector.name)
             {
                 return Err(EngineError::schema(format!(

@@ -2,20 +2,22 @@
 
 本套件独立于 [差分测试](../differential/)：直接调用参照实现 `1320d26`（v3.2.2 之后）的引擎 API、本仓 [Rust 文件测试入口](../../crates/core/examples/storage_interop.rs)及真实的 `MilvusClient("./x.db")` 入口。所有数据目录由 pytest 建在临时目录中；测试不修改 [参照 checkout](../../references/milvus-lite/)。
 
-准备仓库外的两个 Python 环境；`<work_dir>` 也应在仓库外。先确认参照 checkout 的 HEAD 为 `1320d26ec3d88b23b525e774df6e3c8e7c208f81`，以下命令从仓库根目录执行。两套环境都需要安装这个 checkout 的参照引擎；Arrow 15 环境也会写入并合并真实的 3.x 目录，不能只装文件解析依赖：
+准备仓库外的三个 Python 环境；`<work_dir>` 也应在仓库外。先确认参照 checkout 的 HEAD 为 `1320d26ec3d88b23b525e774df6e3c8e7c208f81`，以下命令从仓库根目录执行。三套环境都需要安装这个 checkout 的参照引擎；Arrow 15 环境也会写入并合并真实的 3.x 目录，不能只装文件解析依赖。Arrow 26 环境只有 nullable 稠密向量的互通用到（pyarrow 低于 26 读不了含空行的定长列表 Parquet，[0038](../../docs/decisions/0038-nullable-dense-vectors.md)），依赖与 Arrow 25 相同，只换 pyarrow：
 
 ```bash
 uv venv -p 3.12 <work_dir>/v3
 uv pip install -p <work_dir>/v3/bin/python -e references/milvus-lite 'pymilvus==3.0.2' 'pyarrow==25.0.1' pytest
 uv venv -p 3.12 <work_dir>/arrow15
 uv pip install -p <work_dir>/arrow15/bin/python -e references/milvus-lite 'pymilvus==3.0.2' 'pyarrow==15.0.0' 'numpy==1.26.4'
-# jieba 0.42.1 只有 sdist：下载后按固定哈希构建一次 wheel，装进两套环境（0036 决策 G，与 CI 相同）
+uv venv -p 3.12 <work_dir>/arrow26
+uv pip install -p <work_dir>/arrow26/bin/python -e references/milvus-lite 'pymilvus==3.0.2' 'pyarrow==26.0.1' pytest
+# jieba 0.42.1 只有 sdist：下载后按固定哈希构建一次 wheel，装进三套环境（0036 决策 G，与 CI 相同）
 curl -sSfL -o <work_dir>/jieba-0.42.1.tar.gz https://files.pythonhosted.org/packages/source/j/jieba/jieba-0.42.1.tar.gz
 python3 .github/ci/jieba_wheel.py build --sdist <work_dir>/jieba-0.42.1.tar.gz --uv "$(command -v uv)" --python 3.12 --out <work_dir>/jieba
-for env in v3 arrow15; do uv pip install -p <work_dir>/$env/bin/python --no-deps --no-index <work_dir>/jieba/jieba-0.42.1-py3-none-any.whl; done
+for env in v3 arrow15 arrow26; do uv pip install -p <work_dir>/$env/bin/python --no-deps --no-index <work_dir>/jieba/jieba-0.42.1-py3-none-any.whl; done
 ```
 
-前置检查要求所有参照解释器都能导入 `milvus_lite.db.MilvusLite`，并从本地固定 checkout 导入；Arrow 15 环境的 NumPy 为 1.26.4；两套环境都装了 jieba 0.42.1。差分测试的参照解释器同样要求 jieba 0.42.1。缺失引擎依赖时直接报告对应环境变量和准备文档，不跳过用例。这两套环境与安装 Rust wheel 的测试解释器分开，不能同时安装两个提供 `milvus_lite` 的发行包。
+前置检查要求所有参照解释器（含 Arrow 26）都能导入 `milvus_lite.db.MilvusLite`，并从本地固定 checkout 导入；Arrow 15 环境的 NumPy 为 1.26.4；三套环境都装了 jieba 0.42.1。差分测试的参照解释器同样要求 jieba 0.42.1。缺失引擎依赖时直接报告对应环境变量和准备文档，不跳过用例。这三套环境与安装 Rust wheel 的测试解释器分开，不能同时安装两个提供 `milvus_lite` 的发行包。
 
 运行（从仓库根目录）：
 
@@ -23,10 +25,11 @@ for env in v3 arrow15; do uv pip install -p <work_dir>/$env/bin/python --no-deps
 MILVUS_LITE_3X_PYTHON=<work_dir>/v3/bin/python \
 MILVUS_LITE_ARROW15_PYTHON=<work_dir>/arrow15/bin/python \
 MILVUS_LITE_ARROW25_PYTHON=<work_dir>/v3/bin/python \
+MILVUS_LITE_ARROW26_PYTHON=<work_dir>/arrow26/bin/python \
 .venv/bin/python -m pytest tests/storage_interop
 ```
 
-缺少环境变量或解释器版本不符时套件直接失败，不跳过。覆盖：3.x 已 flush 目录与未提交 WAL → Rust；Rust 已 flush 目录与 WAL → 3.x；3.x 读取后继续写入 → Rust；pyarrow 15 与 25 各自读取 Rust 文件、重写同格式文件后由 Rust 读取。真实数据库路径还覆盖 3.x→Rust→3.x 交替写入、Rust 删除与部分 upsert 后由 3.x 重开、3.x 崩溃 WAL 的恢复、Rust 索引定义由 3.x 重开、3.x 自身无法 build 的索引定义（已提交、全部删除、只有 WAL）由两侧重开并 load、同号 data/delta 的应用顺序、截断 WAL 的告警，以及 JSON／`$meta` 浮点平局值在 Parquet 中的逐字节一致性。文件矩阵与真实路径只覆盖当前切片，不能证明完整崩溃矩阵、过滤或 Linux／Windows 的持久化语义。
+缺少环境变量或解释器版本不符时套件直接失败，不跳过。覆盖：3.x 已 flush 目录与未提交 WAL → Rust；Rust 已 flush 目录与 WAL → 3.x；3.x 读取后继续写入 → Rust；pyarrow 15 与 25 各自读取 Rust 文件、重写同格式文件后由 Rust 读取。真实数据库路径还覆盖 3.x→Rust→3.x 交替写入、Rust 删除与部分 upsert 后由 3.x 重开、3.x 崩溃 WAL 的恢复、Rust 索引定义由 3.x 重开、3.x 自身无法 build 的索引定义（已提交、全部删除、只有 WAL）由两侧重开并 load、同号 data/delta 的应用顺序、截断 WAL 的告警，以及 JSON／`$meta` 浮点平局值在 Parquet 中的逐字节一致性。nullable 稠密向量的空值（[test_nullable_vectors.py](test_nullable_vectors.py)）在 pyarrow 15 / 25 / 26 上按 0038 登记的形态逐项断言，包括没写过空值的集合在旧版 pyarrow 上照常可读。文件矩阵与真实路径只覆盖当前切片，不能证明完整崩溃矩阵、过滤或 Linux／Windows 的持久化语义。
 
 WAL 故障矩阵另覆盖 data/delta 多批流的每个字节截断位置、中间消息格式损坏与零填充：直接运行参照实现（`1320d26`）的 `_read_wal_file`，并以 pyarrow 15/25 完整校验，对照 Rust 的批前缀和内容。结构仍有效的向量符号位变化被双方接受，用例不把完整校验误称为校验和；真实 3.x 目录的 schema 整数宽度位翻转另证明未捕获的 ArrowNotImplementedError 会使 collection 访问失败。
 

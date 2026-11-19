@@ -16,6 +16,10 @@ PYTHONS = (
     "MILVUS_LITE_ARROW15_PYTHON",
     "MILVUS_LITE_ARROW25_PYTHON",
 )
+# 只有 0038 的空向量互通用到：pyarrow 低于 26 读不了含空行的定长列表 Parquet。不放进 PYTHONS，
+# 其他用例按 PYTHONS[1:] 参数化的 Arrow 15 / 25 矩阵保持不变；前置检查同样核对它。
+ARROW26 = "MILVUS_LITE_ARROW26_PYTHON"
+REQUIRED = PYTHONS + (ARROW26,)
 
 
 @pytest.mark.parametrize("writer", ["rust", "reference"])
@@ -210,14 +214,14 @@ def run(args, *, cwd=REPO):
 
 @pytest.fixture(scope="session")
 def interpreters():
-    missing = [name for name in PYTHONS if not os.environ.get(name)]
+    missing = [name for name in REQUIRED if not os.environ.get(name)]
     if missing:
         raise pytest.UsageError(f"storage interop requires: {', '.join(missing)}")
-    result = {name: os.environ[name] for name in PYTHONS}
+    result = {name: os.environ[name] for name in REQUIRED}
     commit = run(["git", "-C", str(REPO / "references" / "milvus-lite"), "rev-parse", "--short", "HEAD"])
     assert commit == "1320d26", f"reference checkout is {commit}, expected 1320d26"
     for name, python in result.items():
-        expected = "3.2.2" if name == PYTHONS[0] else ("15." if name == PYTHONS[1] else "25.")
+        expected = "3.2.2" if name == PYTHONS[0] else {PYTHONS[1]: "15.", PYTHONS[2]: "25.", ARROW26: "26."}[name]
         expression = (
             'from importlib.metadata import version; print(version("milvus-lite"))'
             if name == PYTHONS[0]
@@ -226,7 +230,7 @@ def interpreters():
         actual = run([python, "-c", expression])
         valid = actual == expected if name == PYTHONS[0] else actual.startswith(expected)
         assert valid, f"{name} has {actual}, expected {expected}"
-    # Arrow 15/25 既校验文件，也运行参照引擎；提前报告缺失依赖，避免到子用例才失败。
+    # Arrow 15/25/26 既校验文件，也运行参照引擎；提前报告缺失依赖，避免到子用例才失败。
     for name, python in result.items():
         probe = subprocess.run([
             python, "-c",

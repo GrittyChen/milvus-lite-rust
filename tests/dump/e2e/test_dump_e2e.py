@@ -91,6 +91,8 @@ def test_array_of_varchar(tmp_path):
     ("tz_geo", [{"id": 1, "vec": [1.0, 1.0], "ts": "2024-01-01T19:04:05Z", "g": "POINT(1 2)"},
                 {"id": 2, "vec": [1.0, 1.0], "ts": None, "g": None}]),
     ("multivec", [{"id": 1, "v1": [1.0, 2.0], "v2": [3.0, 4.0, 5.0]}]),
+    # 空向量导出为 null（0038）；3.x 导出零向量，见 diff 的登记差异。
+    ("nullable_vec", [{"id": 1, "vec": [1.0, 1.0]}, {"id": 2, "vec": None}, {"id": 3, "vec": [2.0, 2.0]}]),
     ("released", [{"id": 1, "vector": [1.0, 2.0], "$meta": {}}]),
 ])
 def test_other_schemas(tmp_path, case, expected):

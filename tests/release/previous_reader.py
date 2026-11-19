@@ -1,7 +1,9 @@
 """已发布的上一版本读取新产物生成的数据目录（0021 第 9 条的兼容探针）。
 
 新版本解释器写出普通与 partition key 集合的 WAL、flush 与实际合并三种目录，上一版本解释器读取并核对值；
-key 集合由上一版本追加后，再由新版本重开核对。写入与读取代码取自仓库的互通用例，与其断言保持同源。
+key 集合由上一版本追加后，再由新版本重开核对。含空向量的集合（0038）：上一版本先在另一个目录试建 nullable
+向量集合，不支持时须拒绝该集合且不改动它的文件，支持时须读出相同的值；之后新版本重开核对。
+写入与读取代码取自仓库的互通用例，与其断言保持同源。
 上一版本环境先核对版本号与原生模块哈希，避免把未知产物当作已发布的上一版本。
 """
 
@@ -25,6 +27,33 @@ assert list(c.get('c',ids=[1],output_fields=['extra']))==[{'id':1,'extra':100}]
 assert list(c.get('c',ids=[100],output_fields=['k','j']))==[{'id':100,'k':1,'j':None}]
 c.close();m.release_server(sys.argv[1]);print('ok')
 """
+
+
+# 上一版本打开含空向量的集合：先在 probe 目录试建 nullable 向量集合判断是否支持（0038 之前的版本建表即
+# UNIMPLEMENTED）。不支持时 load 必须失败；支持时输出每行的向量，与新版本写入的值比较。
+NULLABLE_OLD = """
+import json,sys
+from pymilvus import MilvusClient,DataType
+from milvus_lite.server_manager import server_manager_instance as m
+path,probe=sys.argv[1:]
+p=MilvusClient(probe,dedicated=True);s=p.create_schema(auto_id=False,enable_dynamic_field=False)
+s.add_field('id',DataType.INT64,is_primary=True);s.add_field('v',DataType.FLOAT_VECTOR,dim=2,nullable=True)
+try:p.create_collection('probe',schema=s);supported=True
+except Exception:supported=False
+p.close();m.release_server(probe)
+c=MilvusClient(path,dedicated=True)
+try:
+ c.load_collection('c');rows=sorted([r['id'],r['v']] for r in c.query('c',filter='id >= 0',output_fields=['v']))
+ print(json.dumps(['read',supported,rows]))
+except Exception as e:print(json.dumps(['refused',supported,str(e)[:200]]))
+c.close();m.release_server(path)
+"""
+NULLABLE_ROWS = [[0, [1.0, 0.0]], [1, None], [2, None], [3, [0.0, 1.0]], [4, [2.0, 2.0]]]
+
+
+def tree_digest(root):
+    return sorted((str(p.relative_to(root)), hashlib.sha256(p.read_bytes()).hexdigest())
+                  for p in Path(root).rglob("*") if p.is_file())
 
 
 def snippet(repo, test, name):
@@ -81,6 +110,23 @@ def probe(repo, work, new_python, old_python, old_version, old_native):
                 if run(work, f"reopen-{name}", new_python, REOPEN, [database]).strip() != "ok":
                     raise SystemExit(f"{name} reopen by the new version failed")
             cases.append(name)
+    name = "nullable-vector-flushed"
+    database = work / f"{name}.db"
+    run(work, f"write-{name}", new_python, snippet(repo, "test_nullable_vectors.py", "RUST_WRITE"),
+        [database, "flushed", "nulls"])
+    before = tree_digest(database / "collections/c")
+    outcome, supported, detail = json.loads(
+        run(work, f"read-{name}", old_python, NULLABLE_OLD, [database, work / "nullable-probe.db"]).splitlines()[-1])
+    if supported:
+        if outcome != "read" or detail != NULLABLE_ROWS:
+            raise SystemExit(f"{name}: previous version supports nullable vectors but read {outcome} {detail}")
+    elif outcome != "refused" or tree_digest(database / "collections/c") != before:
+        raise SystemExit(f"{name}: previous version without nullable vectors must refuse the collection, got {outcome}")
+    rows = json.loads(run(work, f"reopen-{name}", new_python, snippet(repo, "test_nullable_vectors.py", "RUST_READ"),
+                          [database, "read"]).splitlines()[-1])
+    if rows != [NULLABLE_ROWS, [0, 3, 4]]:
+        raise SystemExit(f"{name} reopen by the new version read {rows}")
+    cases.append(name)
     return {"previous_version": old_version, "previous_native_sha256": old_native, "cases": len(cases), "names": cases,
             "reopen_code_sha256": hashlib.sha256(REOPEN.encode()).hexdigest()}
 

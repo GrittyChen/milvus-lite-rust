@@ -215,8 +215,7 @@ impl SchemaFile {
                         field.name
                     )));
                 }
-                if (field.dtype == "float_vector"
-                    && (field.nullable || field.default_value.is_some()))
+                if (field.dtype == "float_vector" && field.default_value.is_some())
                     || (field.dtype != "array"
                         && (field.element_type.is_some() || field.max_capacity.is_some()))
                 {

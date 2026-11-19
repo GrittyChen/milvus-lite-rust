@@ -1,0 +1,6 @@
+pyarrow==26.0.1
+# 只为 0038 的互通：pyarrow 低于 26 读不了含空行的定长列表 Parquet。只放宽 pyarrow 的截止日期，其余包与 ref25 相同。
+pymilvus[bulk_writer]==3.0.2
+# 两条上限的原因见 dump30.in（0037）。
+argon2-cffi-bindings<26
+cryptography<49

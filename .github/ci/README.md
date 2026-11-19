@@ -14,13 +14,14 @@
 | `sdk30` | CPython 3.10–3.15 | 发行工作流中各解释器的 pymilvus 3.0.2 线（3.10 / 3.15 全套与 3.11–3.14 冒烟）；逐解释器、逐平台核对过 wheel |
 | `dump30` / `dump26` | CPython 3.10、3.12 | `tests/dump` 需要的 `pymilvus[bulk_writer]`，分别叠装在 3.0.2 线（`dev`、发行的 3.10 环境）与 2.6.17 线（`sdk26`）已有的环境上：两份锁是同版本的超集，叠装不改变已有包的版本。BulkWriter 依赖的 pyarrow 没有 cp315 wheel，因此不进 3.15 的环境，tests/dump 也不进 `tests/python`（[0037](../../docs/decisions/0037-dump.md)「测试」） |
 | `ref25` / `ref15` | CPython 3.12 | 参照实现（`compare.yml` 的 `REFERENCE_COMMIT`）的 Arrow 25 / Arrow 15 环境，`ref25` 另含 `pymilvus[bulk_writer]` 供 dump 差分使用；参照实现的依赖取自其 `pyproject.toml`，checkout 另以 `--no-deps -e` 安装 |
+| `ref26` | CPython 3.12 | 只用于存储互通：与 `ref25` 相同，只把 pyarrow 换成 26.0.1。pyarrow 低于 26 读不了含空行的定长列表 Parquet，nullable 稠密向量的互通要在 Arrow 26 上验证 3.x 的读取（[0038](../../docs/decisions/0038-nullable-dense-vectors.md)）。生成时沿用 `ref25` 的 `--exclude-newer 2026-10-08T00:00:00Z`，另加 `--exclude-newer-package pyarrow=2026-11-05T00:00:00Z`，其余包与 `ref25` 逐行相同；整体放宽日期会改动 13 个共同包。[tests/ci](../../tests/ci/test_dump_requirements.py) 核对这一点 |
 | `build` | — | 可编辑安装参照时的构建依赖（hatchling 及其可编辑安装额外请求的 editables），以及从 sdist 构建 jieba 的 setuptools，经 `--build-constraint` 使用 |
 
 Linux 上的 CPython 3.15 例外：`orjson==3.13.0` 的 cp315 Linux wheel 只有 `manylinux_2_39`，无法在 glibc 2.28 的测试环境安装，按 [0021](../../docs/decisions/0021-release-build-in-ci.md) 第 11 条只允许它从 sdist（SHA256 `d1de5eb04485110c5da4c657e49168995d55e076b1ce60f1a042e254f4186c4f`）在独立 job 中构建一次，其余依赖仍只用 wheel。
 
 参照环境的 jieba 例外：3.x 的 jieba 分词器依赖 `jieba==0.42.1`，它在 PyPI 上只有 sdist。按 [0021](../../docs/decisions/0021-release-build-in-ci.md) 第 11 条，对照层与发行工作流各有一个独立的 `jieba` job，用 [jieba_wheel.py](jieba_wheel.py) 从 sdist（SHA256 `055ca12f62674fafed09427f176506079bc135638a14e23e25be909131928db2`）构建一次纯 Python wheel，构建后端 setuptools 由 `build.txt` 固定，并取出 sdist 中的 `test/test.py` 供 jieba 固定真值核验使用；测试 job 把这份 wheel 以 `--no-deps --no-index` 装入两套参照环境，再以 `check-installed` 核对 wheel 的哈希、实际导入的版本与词典（[0036](../../docs/decisions/0036-jieba.md) 决策 G）。本地准备参照环境的等价命令见[互通 README](../../tests/storage_interop/README.md)。
 
-`dump30`、`dump26`、`ref25` 的 `.in` 带两条上限 `argon2-cffi-bindings<26` 与 `cryptography<49`：两者由 BulkWriter 依赖的 minio / azure-storage-blob 引入，argon2-cffi-bindings 26.1.0 在 macOS 上只有 arm64 wheel，cryptography 自 49.0.0 起不再提供 macOS x86_64 wheel，而发行工作流在 macOS x86_64 上以 `--no-build` 安装。[tests/ci](../../tests/ci/test_dump_requirements.py) 同时核对 `.in` 与 `.txt` 中的上限。
+`dump30`、`dump26`、`ref25`、`ref26` 的 `.in` 带两条上限 `argon2-cffi-bindings<26` 与 `cryptography<49`：两者由 BulkWriter 依赖的 minio / azure-storage-blob 引入，argon2-cffi-bindings 26.1.0 在 macOS 上只有 arm64 wheel，cryptography 自 49.0.0 起不再提供 macOS x86_64 wheel，而发行工作流在 macOS x86_64 上以 `--no-build` 安装。[tests/ci](../../tests/ci/test_dump_requirements.py) 同时核对 `.in` 与 `.txt` 中的上限。
 
 更新任一 `.in` 或参照版本后，在仓库根目录按各 `.txt` 文件头记录的命令重新生成，并随同一提交评审。生成使用 CI 固定的 uv 版本，并以 `--exclude-newer` 截止到生成日前两周，避免刚发布的版本进入环境；`--universal` 使同一份结果在三个平台通用，但不保证每个平台都有 wheel：例如参照环境的 faiss-cpu 1.15.1 在三个平台都有 wheel，但 macOS arm64 的最低目标是 macOS 14，更换托管机器或依赖版本时须重新核对。
 

@@ -66,6 +66,14 @@ def test_array_of_varchar(tmp_path, ref_python):
     assert ours.returncode == 0 and '"bc"' in ours_files["1.json"]
 
 
+def test_nullable_vectors(tmp_path, ref_python):
+    # 0038：3.x 写入时把空向量换成零向量，导出 [0.0, 0.0]；本实现存为空值，导出 null。
+    (ours, ours_files, _), (ref, ref_files, _) = both(tmp_path, ref_python, "nullable_vec")
+    assert ours.returncode == ref.returncode == 0, (ours.stderr[-2000:], ref.stderr[-2000:])
+    assert ours_files["1.json"].replace('"vec": null', '"vec": [\n        0.0,\n        0.0\n      ]') == ref_files["1.json"]
+    assert '"vec": null' in ours_files["1.json"] and '"vec": null' not in ref_files["1.json"]
+
+
 def test_batch_size_zero(tmp_path, ref_python):
     # 差异 C：3.x 报告成功、导出 0 行；本实现由参数解析拒绝。
     (ours, _, _), (ref, ref_files, _) = both(tmp_path, ref_python, "explicit_partitions", "--batch-size", 0)

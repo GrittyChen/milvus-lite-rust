@@ -1,5 +1,6 @@
 # 复制自 milvus-lite v3.2.1（43d1257）的 tests/adapter/test_crud_alignment_milvus.py，Apache-2.0 许可。
 # 仅保留 INVENTORY.md 中已复用的用例；S1 表达式及断言保持上游原文。
+# test_delete_with_filters_nullable_vector_field 去掉了建表失败时的 try/except + pytest.skip（0038）。
 """CRUD alignment tests adapted from upstream Milvus test suite.
 
 Each test is a self-contained adaptation of a specific Milvus pymilvus test
@@ -141,6 +142,56 @@ def test_delete_with_filters(milvus_client):
 # ===================================================================
 
 
+def test_delete_with_filters_nullable_vector_field(milvus_client):
+    """Adapted from test_milvus_client_delete_with_filters_nullable_vector_field
+    (test_milvus_client_delete.py:224).
+
+    Validates delete-by-id-filter and delete-by-float-filter on a collection
+    where the vector field is nullable (even rows have vectors, odd rows None).
+    Verifies surviving row count via count(*) after each round of deletes.
+    """
+    name = "del_nullable_vec"
+    nb = 20
+
+    schema = MilvusClient.create_schema(enable_dynamic_field=False)
+    schema.add_field("id", DataType.INT64, is_primary=True, auto_id=False)
+    schema.add_field("vec", DataType.FLOAT_VECTOR, dim=DIM, nullable=True)
+    schema.add_field("float_field", DataType.FLOAT)
+
+    milvus_client.create_collection(name, schema=schema)
+
+    rng = _rng()
+    rows = [
+        {
+            "id": i,
+            "vec": list(rng.random(DIM).astype(float)) if i % 2 == 0 else None,
+            "float_field": float(i),
+        }
+        for i in range(nb)
+    ]
+    milvus_client.insert(name, rows)
+
+    # Delete a few specific ids
+    ids_to_delete = [0, 3, 7, 11, 15]
+    milvus_client.delete(
+        name, filter=f"id in {ids_to_delete}"
+    )
+
+    _index_and_load(milvus_client, name)
+
+    # count(*) should reflect deleted ids
+    result = milvus_client.query(name, filter="", output_fields=["count(*)"])
+    assert result[0]["count(*)"] == nb - len(ids_to_delete)
+
+    # Second round: delete by float filter (float_field < 10)
+    milvus_client.delete(name, filter="float_field < 10")
+
+    # Remaining: ids with float_field >= 10 that were not already deleted
+    surviving = {i for i in range(nb) if i not in ids_to_delete and i >= 10}
+    result2 = milvus_client.query(name, filter="", output_fields=["count(*)"])
+    assert result2[0]["count(*)"] == len(surviving)
+
+    milvus_client.drop_collection(name)
 
 
 # ===================================================================

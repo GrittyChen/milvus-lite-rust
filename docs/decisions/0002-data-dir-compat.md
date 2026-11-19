@@ -56,6 +56,7 @@
    - 更危险的是**值**：3.x 解析 manifest 时一旦出现 `KeyError`、`ValueError` 或 `TypeError`，就回退到 `manifest.json.prev`，只打两条 warning 日志，调用方不会收到任何错误（[manifest.py:164](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/milvus_lite/storage/manifest.py#L164)）。随后 recovery 会把只登记在新 manifest 里的数据文件当作孤儿删掉。实测：把 `index_specs` 的 metric 改成 3.x 不接受的 `HAMMING` 后，10 行数据变成 5 行，较新的 Parquet 文件被删除。
    - 注意「能解析」与「能使用」不同：3.x 解析 manifest 时并不校验 index_type（[spec.py:58](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/milvus_lite/index/spec.py#L58) 只要求非空字符串），`create_index` 也只做大写化就持久化（[collection.py:1454](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/milvus_lite/engine/collection.py#L1454)）。实测：向量字段上的 `DISKANN` 被写进 manifest，3.x 重开照常，只在该 collection build 索引时（load 时，或已 load 时的 `create_index`）报 `unknown index_type`。
    - 因此，Rust 写入共享文件的枚举值必须落在 3.x 能 build / load 的集合内，而且要**按字段类型**判断。index_type 的值域为：稠密向量字段上的 FLAT、BRUTE_FORCE、AUTOINDEX、HNSW、HNSW_SQ、IVF_FLAT、IVF_SQ8（出自 [factory.py:53](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/milvus_lite/index/factory.py#L53) 的 `KNOWN_VECTOR_INDEX_TYPES`，去掉 3.x 自己也无法 build 的 `IVF_PQ`）；稀疏向量字段上只有 SPARSE_INVERTED_INDEX；标量字段上只有 INVERTED（[capabilities.py:6](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/milvus_lite/index/scalar/capabilities.py#L6)）。实测：稀疏字段上的 AUTOINDEX / FLAT / HNSW 都会被 3.x 持久化，但 load 时报 `vector column must be FixedSizeList, got binary`。metric 的可解析枚举限于 COSINE / L2 / IP / BM25 / NONE（[spec.py:60](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/milvus_lite/index/spec.py#L60)）；稠密向量上的 FAISS 类型（AUTOINDEX、HNSW、HNSW_SQ、IVF_FLAT、IVF_SQ8）能构建的 metric 仅为 COSINE / L2 / IP，创建时必须按类型与 metric 联合判定；FLAT / BRUTE_FORCE 保留 BM25 / NONE 的可 load 定义。dtype、function 类型同理。Rust 额外状态放进独立文件；索引等缓存可重建。例外是 0014 的索引删除意图与 0023 的改名意图、清空意图：它们是不可从当前目录重建的持久化安全状态，格式版本及旧目录处理必须显式登记，不往共享 manifest 增加私有字段。
+   - 唯一登记的例外是 nullable 稠密向量的空值（[0038](0038-nullable-dense-vectors.md)）：本实现写成 Arrow null（定长列表的父级 null，子元素为零），3.x 的读路径认识这种取值，但 pyarrow 低于 26 时，3.x 读不了含它的 Parquet，flush 含它的 WAL 也会失败。负责人在知情下接受这一代价，失败形态见下文「继承的 3.x 已知风险」；只有真正写过空值的集合受影响。
    - `.prev` 的维护协议与 3.x 相同：写 `manifest.json.tmp` 并 fsync，把当前 `manifest.json` 复制为 `.prev`，replace 为 `manifest.json`（提交点），再 fsync 父目录（[manifest.py:86](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/milvus_lite/storage/manifest.py#L86)）。
 2. **文件名中的 seq 范围是 tombstone GC 的依据，必须覆盖文件内容。**
    - 3.x 用 data 文件名里 seq_min 的全局最小值（[compaction.py:483](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/milvus_lite/engine/compaction.py#L483)），判断 delta 文件名里 seq_max 更小的 delta 文件可以删除（[compaction.py:446](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/milvus_lite/engine/compaction.py#L446)）。
@@ -117,7 +118,7 @@
 
 | 类型 / 特性 | 3.x 的表示 |
 | --- | --- |
-| `FLOAT_VECTOR` | `fixed_size_list<float32>[dim]`；nullable 向量的 null 落盘为全零向量，不是 Arrow null（[collection.py:2111](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/milvus_lite/engine/collection.py#L2111)） |
+| `FLOAT_VECTOR` | `fixed_size_list<float32>[dim]`；3.x 写入时把 nullable 向量的 null 换成全零向量，不写 Arrow null（[collection.py:2111](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/milvus_lite/engine/collection.py#L2111)）。本实现把 null 写成父级 Arrow null、子元素为零；3.x 读到时按 null 处理（[0038](0038-nullable-dense-vectors.md)） |
 | `SPARSE_FLOAT_VECTOR` | binary，内容为按 index 升序排列的小端 `(u32 index, f32 value)` 对（[sparse.py:37](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/milvus_lite/analyzer/sparse.py#L37)）；空向量与 None 都落为 `b""`，不是 null |
 | `JSON` 字段 | dict / list 经 `json.dumps(ensure_ascii=False)` 存为 UTF-8 文本，不排序，使用默认分隔符 `", "` / `": "`；字符串原样存储（[collection.py:2106](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/milvus_lite/engine/collection.py#L2106)） |
 | `$meta`（动态字段） | `json.dumps(extras, sort_keys=True)`，即按键排序、`ensure_ascii=True`、默认分隔符；没有动态字段时为 null（[validation.py:518](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/milvus_lite/schema/validation.py#L518)） |
@@ -145,7 +146,7 @@
 - **多数据库**（0023 B）：两边交替创建数据库（带属性）、在默认库与非默认库内建同名集合与别名、修改与删除属性、删除对方创建的空库，库列表、属性（含键序）、别名、集合与 `databases/` 的落盘字节互相一致；3.x 手工建立的目录形状（缺 `collections/`、符号链接库、损坏的属性文件）的差异登记在 [0006](0006-m2-scope.md#与-3x-的差异)。
 - **互斥**：一方持有 `LOCK` 时，另一方打开失败并明确报错。Linux（flock 与 fcntl 互不感知）与 Windows（字节范围锁）需要在对应平台上实测。
 - **fail-closed**：伪造未知的格式版本号、未知的键，以及未知的 dtype、metric 时，Rust 拒绝打开该 collection、其余 collection 照常，不改动任何文件；未知的 index_type 与 3.x 一致，只在该 collection build 索引时报错。
-- **库版本组合**：arrow-rs 写、pyarrow（3.x 支持的版本范围内）读，以及反过来，覆盖 IPC 与 Parquet；包括 TIMESTAMPTZ 时区串的写法。
+- **库版本组合**：arrow-rs 写、pyarrow（3.x 支持的版本范围内）读，以及反过来，覆盖 IPC 与 Parquet；包括 TIMESTAMPTZ 时区串的写法。含 nullable 稠密向量空值的文件是约束 1 的例外：3.x 一侧需要 pyarrow 26 及以上，pyarrow 15 / 25 上按登记的失败形态验证（[0038](0038-nullable-dense-vectors.md)）。
 - **分词**：包含 Unicode 组合字符、全角字符、各类标点的语料，Rust 与 3.x 产出的 term ID 序列一致。
 
 测试夹具由 3.x 在测试运行时现场生成，不提交生成好的数据目录（[AGENTS.md](../../AGENTS.md) 规则 14）。
@@ -159,7 +160,10 @@
 - 某个 snapshot 钉住旧 `.idx` 之后，如果先 drop_index，再以同类型、不同 metric 重建，3.x 自身也会加载到陈旧索引。本实现按 0014 在创建前删除未钉住的匹配旧文件；钉住且被当前 segment 使用的文件，须与所有钉住它的 snapshot manifest 中定义一致，否则拒绝创建。这限制本实现的新触发入口，不修复 3.x 自己的历史行为。
 - 非有限 JSON 编码的边界：3.x 可能把 raw gRPC 的 `{"a":1e999}` 写成含 `Infinity` 的文本，raw Query 可成功返回这些字节，但 pymilvus 的严格 JSON 解码会失败。本实现对新的 JSON 字段写入提前拒绝这类浮点溢出，差异与用例见 [0006「与 3.x 的差异」](0006-m2-scope.md#与-3x-的差异)；已有 JSON 列仍按文本读取，不代表能由严格客户端解析或再次编码。
 - **历史互通限制（尚未修复）**：`$meta` 含 `Infinity/-Infinity/NaN` 时，3.x 的 `json.loads` 可加载目录；本实现的 `$meta` 解码使用严格的 serde_json，collection 懒打开会返回 storage error，提示 `$meta is not a JSON object` 与解析位置。raw `$meta` 输入 `{"x":1e999}` 仍可能被双方接受写入并返回含 `Infinity` 的 raw 结果；本实现后续 flush 的批解码可在提交点前失败，并进入待提交重试状态；失败后一秒窗口内写入因节流被拒，窗口后重试仍会因同一元数据解析错误而失败，故故障未消除时对该 collection 的后续写入持续被拒绝。显式 Flush 和关闭同样不能完成该代提交；重启后该 collection 又会因 `$meta` 解码失败而拒绝打开，不能靠等待或重启自动恢复。其他健康 collection 不受影响。因此不能保证直接打开这类非标准元数据目录。此限制独立于 JSON 列的新写入政策；本轮仅登记，不改变 `$meta` 解析或 `pyjson` 输出规则。确认目录类型时，应检查 Arrow IPC/Parquet 的 `$meta` 文本，而不能将所有 `$meta` 解析错误都归因于非有限值，也不自动改写文件。
-- nullable 向量用全零表示 null，与真正的零向量无法区分。
+- 3.x 自己写下的 nullable 向量用全零表示 null，与真正的零向量无法区分；本实现读出零向量。
+- 本实现写下的 nullable 稠密向量空值（Arrow null，约束 1 的例外，[0038](0038-nullable-dense-vectors.md)）：
+  - pyarrow 低于 26 时，含空值 Parquet 的集合在 3.x 中整个不可用，load、count、query、search 都报 `Expected all lists to be of size=2 ...`；只有 WAL 含空值时 3.x 能回放（空行按零向量参与检索），但 flush 失败（Arrow 25 报同一错误，Arrow 15 报 `Lists with non-zero length null components are not supported`）。数据保留在盘上，pyarrow 26 与本实现都能读。CPython 3.10 没有 pyarrow 26 的 wheel。
+  - pyarrow 26 及以上时，3.x 的多行输出中排在空值之后的向量错位（3.x 的完整占位输出缺陷，单行 Get 不受影响）；尚未 flush 的空行按零向量参与检索；3.x 对这些行做 upsert 或 partial upsert，会把空值永久改写成零向量。
 - 校验失败的 insert 会消耗 auto_id；partition key 加 auto_id 的一次 insert 会拆成多个 batch 逐个落盘，中途崩溃也一样。两种情况下，重开后自动主键都可能重复并覆盖旧行（约束 4 的上界正是为此）。
 - 以下各条由 [0006](0006-m2-scope.md)「3.x 的缺陷」与第 8、10、12 项实测或推出：
   - flush 提交之后、删除 WAL 之前崩溃，3.x 重开时会回放已提交的 WAL，数据重复。本实现写出的目录若在这一点中断，3.x 打开时同样会重复；本实现在提交点之后的失败一直重试不成功时，盘上留着已提交的 WAL，3.x 打开时也会重复。

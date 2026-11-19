@@ -491,20 +491,25 @@ jobs:
           MILVUS_LITE_3X_PYTHON: ${{ runner.temp }}/ref25/bin/python
           MILVUS_LITE_ARROW25_PYTHON: ${{ runner.temp }}/ref25/bin/python
           MILVUS_LITE_ARROW15_PYTHON: ${{ runner.temp }}/ref15/bin/python
+          MILVUS_LITE_ARROW26_PYTHON: ${{ runner.temp }}/ref26/bin/python
         # 三个 part 共用一个步骤：崩溃采集的 ulimit 与 record 只在同一个 shell 内有效；参照核对拆成多步后须逐步重复，漏写不会让 job 失败。
         run: |
           . .github/ci/crash_capture.sh
           record() { "$DEV_PY" tests/release/stage.py --dir "$STAGES" --scope "$SCOPE" "$@"; }
           head=$(git -C references/milvus-lite rev-parse HEAD); test "$head" = "$REFERENCE_COMMIT"
           req=.github/ci/requirements
-          for arrow in 25 15; do
+          # Arrow 26 只有互通用到：pyarrow 低于 26 读不了含空行的定长列表 Parquet（0038）。
+          arrows=(25 15); if [ "${{ matrix.part }}" = interop ]; then arrows=(26 25 15); fi
+          pythons=()
+          for arrow in "${arrows[@]}"; do
             uv venv -q -p "$PY312" "$RUNNER_TEMP/ref$arrow"
             uv pip install -q --python "$RUNNER_TEMP/ref$arrow/bin/python" --no-build -r "$req/ref$arrow.txt"
             uv pip install -q --python "$RUNNER_TEMP/ref$arrow/bin/python" --no-deps --build-constraint "$req/build.txt" -e references/milvus-lite
             uv pip install -q --python "$RUNNER_TEMP/ref$arrow/bin/python" --no-deps --no-index "$RUNNER_TEMP/jieba/jieba-0.42.1-py3-none-any.whl"
+            pythons+=("$RUNNER_TEMP/ref$arrow/bin/python")
           done
           "$DEV_PY" .github/ci/jieba_wheel.py check-installed --record "$RUNNER_TEMP/jieba/record.json" \
-            --wheel "$RUNNER_TEMP/jieba/jieba-0.42.1-py3-none-any.whl" --python "$RUNNER_TEMP/ref25/bin/python" "$RUNNER_TEMP/ref15/bin/python"
+            --wheel "$RUNNER_TEMP/jieba/jieba-0.42.1-py3-none-any.whl" --python "${pythons[@]}"
           case "${{ matrix.part }}" in
             diff-3.0.2|interop) sdk=3.0.2 ;;
             diff-2.6.17) sdk=2.6.17 ;;

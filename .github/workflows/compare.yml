@@ -153,20 +153,24 @@ jobs:
             diff-3.0.2) uv pip install --python .venv/bin/python --no-build -r $req/dump30.txt ;;
             diff-2.6.17) uv pip install --python "$RUNNER_TEMP/v26/bin/python" --no-build -r $req/dump26.txt ;;
           esac
-          for arrow in 25 15; do
+          # Arrow 26 只有互通用到：pyarrow 低于 26 读不了含空行的定长列表 Parquet（0038）。
+          arrows=(25 15); refs=("$RUNNER_TEMP/ref25" "$RUNNER_TEMP/ref15")
+          if [ "${{ matrix.suite }}" = interop ]; then arrows=(26 25 15); refs+=("$RUNNER_TEMP/ref26"); fi
+          for arrow in "${arrows[@]}"; do
             uv venv -p python3.12 "$RUNNER_TEMP/ref$arrow"
-            uv pip install --python "$RUNNER_TEMP/ref$arrow/bin/python" --no-build -r $req/ref$arrow.txt
+            uv pip install --python "$RUNNER_TEMP/ref$arrow/bin/python" --no-build -r "$req/ref$arrow.txt"
             # 可编辑安装固定 checkout，参照解释器从它导入（互通与真值核验的前置检查要求）。
             uv pip install --python "$RUNNER_TEMP/ref$arrow/bin/python" --no-deps --build-constraint $req/build.txt -e references/milvus-lite
           done
           dirty=$(git -C references/milvus-lite status --porcelain); test -z "$dirty"
           wheel="$RUNNER_TEMP/jieba/jieba-0.42.1-py3-none-any.whl"
-          for env in "$RUNNER_TEMP/ref25" "$RUNNER_TEMP/ref15"; do
+          for env in "${refs[@]}"; do
             uv pip install --python "$env/bin/python" --no-deps --no-index "$wheel"
           done
+          pythons=(); for env in "${refs[@]}"; do pythons+=("$env/bin/python"); done
           .venv/bin/python .github/ci/jieba_wheel.py check-installed --record "$RUNNER_TEMP/jieba/record.json" --wheel "$wheel" \
-            --python "$RUNNER_TEMP/ref25/bin/python" "$RUNNER_TEMP/ref15/bin/python"
-          for env in "$RUNNER_TEMP/ref25" "$RUNNER_TEMP/ref15"; do uv pip freeze --python "$env/bin/python"; done
+            --python "${pythons[@]}"
+          for env in "${refs[@]}"; do uv pip freeze --python "$env/bin/python"; done
       - name: 构建扩展
         run: |
           if [ "${{ matrix.suite }}" = diff-2.6.17 ]; then
@@ -185,10 +189,10 @@ jobs:
           . .github/ci/crash_capture.sh
           .venv/bin/python tests/sharding/shard.py plan --python .venv/bin/python --suite tests/differential \
             --out "$RUNNER_TEMP/plan" --shards ${{ matrix.shards }} \
-            --group-fixture diff --group-fixture rust_uri --group-fixture ref_uri --expect 867 --expect-group 405
+            --group-fixture diff --group-fixture rust_uri --group-fixture ref_uri --expect 874 --expect-group 405
           .venv/bin/python tests/sharding/shard.py run --plan "$RUNNER_TEMP/plan/plan.json" --out "$RUNNER_TEMP/run"
           .venv/bin/python tests/sharding/shard.py plan --python .venv/bin/python --suite tests/dump/diff \
-            --out "$RUNNER_TEMP/dump-plan" --shards 1 --order round-robin --expect 19 --expect-group 0
+            --out "$RUNNER_TEMP/dump-plan" --shards 1 --order round-robin --expect 20 --expect-group 0
           .venv/bin/python tests/sharding/shard.py run --plan "$RUNNER_TEMP/dump-plan/plan.json" --out "$RUNNER_TEMP/dump-run"
       - name: 差分（pymilvus 2.6.17，安装 wheel，仓库外运行）
         if: matrix.suite == 'diff-2.6.17'
@@ -199,10 +203,10 @@ jobs:
           mkdir "$RUNNER_TEMP/outside"
           .venv/bin/python tests/sharding/shard.py plan --python "$RUNNER_TEMP/v26/bin/python" --suite "$PWD/tests/differential" \
             --cwd "$RUNNER_TEMP/outside" --out "$RUNNER_TEMP/plan" --shards ${{ matrix.shards }} \
-            --group-fixture diff --group-fixture rust_uri --group-fixture ref_uri --expect 867 --expect-group 405
+            --group-fixture diff --group-fixture rust_uri --group-fixture ref_uri --expect 874 --expect-group 405
           .venv/bin/python tests/sharding/shard.py run --plan "$RUNNER_TEMP/plan/plan.json" --out "$RUNNER_TEMP/run"
           .venv/bin/python tests/sharding/shard.py plan --python "$RUNNER_TEMP/v26/bin/python" --suite "$PWD/tests/dump/diff" \
-            --cwd "$RUNNER_TEMP/outside" --out "$RUNNER_TEMP/dump-plan" --shards 1 --order round-robin --expect 19 --expect-group 0
+            --cwd "$RUNNER_TEMP/outside" --out "$RUNNER_TEMP/dump-plan" --shards 1 --order round-robin --expect 20 --expect-group 0
           .venv/bin/python tests/sharding/shard.py run --plan "$RUNNER_TEMP/dump-plan/plan.json" --out "$RUNNER_TEMP/dump-run"
       - name: 存储互通
         if: matrix.suite == 'interop'
@@ -210,6 +214,7 @@ jobs:
           MILVUS_LITE_3X_PYTHON: ${{ runner.temp }}/ref25/bin/python
           MILVUS_LITE_ARROW25_PYTHON: ${{ runner.temp }}/ref25/bin/python
           MILVUS_LITE_ARROW15_PYTHON: ${{ runner.temp }}/ref15/bin/python
+          MILVUS_LITE_ARROW26_PYTHON: ${{ runner.temp }}/ref26/bin/python
         run: |
           . .github/ci/crash_capture.sh
           # 用例内部会以同样的环境调用这些命令；先构建并核对 fresh，避免分片同时编译（0019 P0 第 3 条）。
@@ -227,7 +232,7 @@ jobs:
             python3 .github/ci/cargo_fresh.py "$RUNNER_TEMP/fresh-$i.json"
           done
           .venv/bin/python tests/sharding/shard.py plan --python .venv/bin/python --suite tests/storage_interop \
-            --out "$RUNNER_TEMP/plan" --shards ${{ matrix.shards }} --expect 321 --expect-group 0
+            --out "$RUNNER_TEMP/plan" --shards ${{ matrix.shards }} --expect 336 --expect-group 0
           .venv/bin/python tests/sharding/shard.py run --plan "$RUNNER_TEMP/plan/plan.json" --out "$RUNNER_TEMP/run"
       - name: 固定真值核验
         # 在互通之后串行执行，不与互通的分片同时运行。

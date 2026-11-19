@@ -32,6 +32,8 @@ nullable 主键仍按参照拒绝。TIMESTAMPTZ / GEOMETRY 的默认值随类型
 
 **本决策延后 nullable 向量实施。** A/B 中仍明确拒绝其新建与存量 collection，不为追求一致的空值语义引入私有磁盘标记，也不把真实零向量判为 null。后续向量切片独立验证 raw gRPC、两条 SDK、Arrow null 来源、全部生命周期与度量，再按规则 2 对缺陷行为或差异作明确决定。上述实测是限定范围的引擎证据，不是向量协议的全量验收。
 
+后续：nullable 稠密向量已由 [0038](0038-nullable-dense-vectors.md) 接入，空值存为 Arrow null、读出 None、检索排除，与 3.x 的差异及互通代价见该文；上述两条约束（不引入私有磁盘标记、不把真实零向量判为 null）沿用。
+
 ## 四项先冻结的边界
 
 ### 缺失、显式 null、默认值与 partial Upsert

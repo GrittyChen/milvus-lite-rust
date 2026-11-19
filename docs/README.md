@@ -47,6 +47,7 @@
 | [0035](decisions/0035-function-chains.md) | 公共 function chain：执行位置、解码与校验先后、各算子求值、`order_by_fields` 的冲突判定、投影合同、三项登记差异、2.6 线的测试机制与“改后复制”的边界 | |
 | [0036](decisions/0036-jieba.md) | jieba 分词：jieba-rs 与 0.42.1 的差异及包装层、用户词与上限、3.x 目录的打开口径、参照环境的受控构建 | |
 | [0037](decisions/0037-dump.md) | `milvus-lite dump` 导出：3.x 的行为与实测、五处 3.x 缺陷的修正（function 输出、ARRAY VARCHAR、批大小 0、写文件失败、非有限浮点）、失败清理与信号、`tests/dump` 的依赖环境与发行阶段 | |
+| [0038](decisions/0038-nullable-dense-vectors.md) | nullable 稠密向量：3.x 写入时换成零向量的实测、按真实 Milvus 语义存为 Arrow null 的决策、pyarrow 低于 26 时 3.x 打不开的互通代价、解码三种形态与整批为空、检索排除、紧凑输出、`ref26` 互通环境 | |
 
 不依附某个决策的记录：[恢复内存与冷启动](testing/recovery-performance.md)、[批量检索性能](testing/batch-search-performance.md)、[关闭时显式解锁](testing/explicit-unlock.md)、[存量 FAISS 定义的 load 度量检查](testing/index-load-metric-investigation.md)（rc2 的 load 修复合同）、[子进程与关闭重开用例的隔离](testing/process-test-isolation.md)、[JSON 数字私有键修复](testing/json-private-number-key-fix.md)（`json_text` 唯一入口的来由）。
 

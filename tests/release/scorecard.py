@@ -13,15 +13,15 @@ SDKS = ("2.6.17", "3.0.2")
 SUITE_PYTHONS = ("3.10", "3.15")
 SMOKE_PYTHONS = ("3.11", "3.12", "3.13", "3.14")
 
-PYTHON_SUITE = 752
-DIFFERENTIAL = (867, 405)
+PYTHON_SUITE = 765
+DIFFERENTIAL = (874, 405)
 # tests/dump 依赖 BulkWriter，只在 3.10 上叠装 dump30 / dump26 运行，不进 3.15（0037「测试」）。
 DUMP_PYTHON = "3.10"
-DUMP_E2E = 28
-DUMP_DIFF = 19
-INTEROP = 321
+DUMP_E2E = 29
+DUMP_DIFF = 20
+INTEROP = 336
 FI_RECOVERY = 5
-PREVIOUS_READER_CASES = 6
+PREVIOUS_READER_CASES = 7
 NOT_USED = "not-used"
 
 # PID 1 的基础镜像按公开仓库摘要固定（0021 第 10 条）；工作流从这里取，候选结果按这里核对。

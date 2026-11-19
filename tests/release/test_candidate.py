@@ -74,18 +74,19 @@ def test_matrix_shape():
     assert set(scorecard.MATRIX) == {*scorecard.PLATFORMS, "sdist"}
     for platform in scorecard.PLATFORMS:
         stages_ = scorecard.MATRIX[platform]
-        assert stages_["python-3.15-2.6.17"] == {"collected": 752, "executed": 752, "group": 0}
-        assert stages_["differential-3.0.2"] == {"collected": 867, "executed": 867, "group": 405}
-        assert stages_["dump-3.10-2.6.17"] == {"collected": 28, "executed": 28, "group": 0}
-        assert stages_["dump-diff-3.0.2"] == {"collected": 19, "executed": 19, "group": 0}
+        assert stages_["python-3.15-2.6.17"] == {"collected": 765, "executed": 765, "group": 0}
+        assert stages_["differential-3.0.2"] == {"collected": 874, "executed": 874, "group": 405}
+        assert stages_["dump-3.10-2.6.17"] == {"collected": 29, "executed": 29, "group": 0}
+        assert stages_["dump-diff-3.0.2"] == {"collected": 20, "executed": 20, "group": 0}
         assert "dump-3.15-3.0.2" not in stages_
         assert ("pid1" in stages_) == platform.startswith("linux-")
     assert "previous-reader" in scorecard.MATRIX["linux-x86_64"] and "previous-reader" not in scorecard.MATRIX["linux-aarch64"]
+    assert scorecard.MATRIX["linux-x86_64"]["previous-reader"] == {"cases": 7}
 
 
 def test_scorecard_expect_cli(capsys):
     scorecard.main(["expect", "macos-x86_64", "interop", "collected"])
-    assert capsys.readouterr().out == "321\n"
+    assert capsys.readouterr().out == "336\n"
     with pytest.raises(SystemExit):
         scorecard.main(["expect", "linux-x86_64", "rust-default", "passed"])
 

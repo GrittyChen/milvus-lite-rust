@@ -198,9 +198,6 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<CollectionSchema, EngineError> {
                 (None, None)
             }
         };
-        if f.nullable && data_type == DataType::FloatVector {
-            note("nullable vectors");
-        }
         let default_value = match f.default_value.as_ref().and_then(|v| v.data.as_ref()) {
             None => None,
             Some(pb::value_field::Data::BoolData(v)) => Some(Value::from(*v)),

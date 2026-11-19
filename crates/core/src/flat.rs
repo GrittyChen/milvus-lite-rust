@@ -131,10 +131,11 @@ pub(crate) fn norm(v: &[f32]) -> f32 {
 }
 
 /// 每行每个 FLOAT_VECTOR 列一个范数，按行展开：下标是 `行号 * 向量列数 + 向量列序号`。
+/// nullable 列的空行值槽为零，范数为 0；检索跳过空行，这个值不会被用到（0038）。
 pub(crate) fn row_norms(columns: &[ColumnData]) -> Vec<f32> {
     let vectors: Vec<(usize, &[f32])> = columns
         .iter()
-        .filter_map(|column| match column {
+        .filter_map(|column| match column.values() {
             ColumnData::FloatVector { dim, values } => Some((*dim, values.as_slice())),
             _ => None,
         })

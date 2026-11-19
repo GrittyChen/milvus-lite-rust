@@ -248,7 +248,8 @@ impl ColumnData {
             DataType::VarChar | DataType::Geometry => Self::VarChar(vec![String::new(); n]),
             DataType::Json => Self::Json(vec![b"null".to_vec(); n]),
             DataType::Array => Self::Array(ArrayData::empty_rows(field, n)),
-            // schema 拒绝可空向量，存储层到不了这里；只有 boost 剥掉同名字段时输出占位（0026）。
+            // nullable 向量的空行与 boost 剥掉同名字段时的输出占位（0026）都走这里。空行的值槽填零：
+            // 扫描与范数按行号直接定位，3.x 读 WAL 时也按 n × dim 重塑（0038）。
             DataType::FloatVector => {
                 let dim = field_dim(field);
                 Self::FloatVector {
@@ -357,7 +358,11 @@ impl ColumnData {
                 Self::VarChar(_) => Self::VarChar(Vec::new()),
                 Self::Json(_) => Self::Json(Vec::new()),
                 Self::SparseFloatVector(_) => Self::SparseFloatVector(SparseData::default()),
-                _ => unreachable!("nullable storage contains a scalar or sparse column"),
+                Self::FloatVector { dim, .. } => Self::FloatVector {
+                    dim: *dim,
+                    values: Vec::new(),
+                },
+                Self::Nullable { .. } => unreachable!("nullable column nests another nullable"),
             };
             let previous = std::mem::replace(self, empty);
             let mut values = match previous {
@@ -392,8 +397,28 @@ impl ColumnData {
     /// 同一 schema 的相邻块只拼接，保留失效行与物理行号。
     pub(crate) fn append_column(&mut self, src: &ColumnData) {
         if self.validity().is_some() || src.validity().is_some() {
+            // 与逐行 push_row 结果相同：只有确实出现空行才转成 Nullable，全部有效时保持原变体，
+            // 写盘时才不会给全有效的列附上空值位图（0038）。值整列拼接，不按行分配。
+            let src_nulls = src
+                .validity()
+                .is_some_and(|v| (0..v.len()).any(|row| !v.get(row)));
+            if !matches!(self, Self::Nullable { .. }) {
+                if !src_nulls {
+                    return self.append_column(src.values());
+                }
+                let n = self.len();
+                let previous = std::mem::replace(self, Self::Bool(Vec::new()));
+                *self = Self::Nullable {
+                    values: Box::new(previous),
+                    validity: Validity::from_bools(&vec![true; n]),
+                };
+            }
+            let Self::Nullable { values, validity } = self else {
+                unreachable!("converted to Nullable above");
+            };
+            values.append_column(src.values());
             for row in 0..src.len() {
-                self.push_row(src, row);
+                validity.0.push(!src.is_null(row));
             }
             return;
         }
@@ -554,6 +579,56 @@ mod tests {
         assert_eq!(all_valid, ColumnData::Int64(vec![0, 1, 128, 999]));
         assert!(all_valid.validity().is_none());
     }
+    /// nullable 向量经逐行收集（compaction、gather、partition key 重组）与整列拼接后保持空行与零值槽，
+    /// 范数按解开包装后的值计算（0038）。
+    #[test]
+    fn nullable_vectors_survive_push_append_and_norms() {
+        let mut field = FieldSchema::new("v", DataType::FloatVector);
+        field.dim = Some(2);
+        field.nullable = true;
+        let source = ColumnData::FloatVector {
+            dim: 2,
+            values: vec![3.0, 4.0, 0.0, 0.0, 6.0, 8.0],
+        }
+        .with_validity(&[true, false, true]);
+        let mut gathered = ColumnData::empty(&field);
+        for row in [0, 1, 2] {
+            gathered.push_row(&source, row);
+        }
+        assert_eq!(gathered, source);
+        let mut only_valid = ColumnData::empty(&field);
+        only_valid.push_row(&source, 2);
+        assert!(only_valid.validity().is_none());
+
+        let mut appended = ColumnData::FloatVector {
+            dim: 2,
+            values: vec![1.0, 0.0],
+        };
+        appended.append_column(&source);
+        assert_eq!(appended.len(), 4);
+        assert_eq!(
+            (0..4).map(|row| appended.is_null(row)).collect::<Vec<_>>(),
+            [false, false, true, false]
+        );
+        let ColumnData::FloatVector { values, .. } = appended.values() else {
+            panic!("vector column lost its type");
+        };
+        assert_eq!(values, &[1.0, 0.0, 3.0, 4.0, 0.0, 0.0, 6.0, 8.0]);
+        let mut no_nulls = ColumnData::FloatVector {
+            dim: 2,
+            values: vec![1.0, 0.0],
+        };
+        no_nulls.append_column(&only_valid);
+        assert!(no_nulls.validity().is_none());
+
+        let blanked = source.blank_rows(&field, &[false, false, true]);
+        assert_eq!(
+            (0..3).map(|row| blanked.is_null(row)).collect::<Vec<_>>(),
+            [false, true, true]
+        );
+        assert_eq!(crate::flat::row_norms(&[source]), vec![5.0, 0.0, 10.0]);
+    }
+
     use std::collections::HashMap;
 
     #[test]

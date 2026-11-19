@@ -126,6 +126,14 @@ def multivec(c):
     c.insert("c", [{"id": 1, "v1": [1, 2], "v2": [3, 4, 5]}])
 
 
+def nullable_vec(c):
+    s = MilvusClient.create_schema(auto_id=False)
+    s.add_field("id", DataType.INT64, is_primary=True)
+    s.add_field("vec", DataType.FLOAT_VECTOR, dim=2, nullable=True)
+    c.create_collection("c", schema=s)
+    c.insert("c", [{"id": 1, "vec": [1, 1]}, {"id": 2, "vec": None}, {"id": 3, "vec": [2, 2]}])
+
+
 def varchar_pk(c):
     s = MilvusClient.create_schema(auto_id=False)
     s.add_field("pk", DataType.VARCHAR, is_primary=True, max_length=16)
@@ -178,7 +186,7 @@ def non_finite_array(c):
 
 
 CASES = {f.__name__: f for f in [basic, scalars, sparse, bm25, array_varchar, partitions, explicit_partitions,
-                                   tz_geo, multivec, varchar_pk, empty, released, many, large, non_finite,
+                                   tz_geo, multivec, nullable_vec, varchar_pk, empty, released, many, large, non_finite,
                                    non_finite_array]}
 
 

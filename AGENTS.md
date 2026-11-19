@@ -127,13 +127,13 @@ pymilvus ──server_manager──▶ adapter/grpc ──▶ db（多 collectio
 | 端到端测试（真实 pymilvus；含 [tests/python/adapter/](tests/python/adapter/) 与 [tests/python/compatibility/](tests/python/compatibility/) 中复制自参照实现的用例，逐条状态见 adapter 的 INVENTORY.md） | `.venv/bin/python -m pytest tests/python` |
 | 与 3.x 的差分测试（参照环境见 [tests/differential/README.md](tests/differential/README.md) 的公共前提，`benchmarks/baseline/setup.sh` 建出的环境不固定 pyarrow，不能用；不设环境变量时报错，不跳过；与上一行分别运行，不能合为同一 pytest 进程） | `MILVUS_LITE_3X_PYTHON=<3.x 的 venv>/bin/python .venv/bin/python -m pytest tests/differential` |
 | dump 的端到端与差分（需要 `pymilvus[bulk_writer]`，环境与运行方式见 [tests/dump/README.md](tests/dump/README.md)；差分不设环境变量时报错，不跳过） | `.venv/bin/python -m pytest tests/dump/e2e`；`MILVUS_LITE_3X_PYTHON=<3.x 的 venv>/bin/python .venv/bin/python -m pytest tests/dump/diff` |
-| M2 存储文件双向互通矩阵（Arrow 15/25 两套参照环境，准备见 [tests/storage_interop/README.md](tests/storage_interop/README.md)） | `MILVUS_LITE_3X_PYTHON=<v3>/bin/python MILVUS_LITE_ARROW15_PYTHON=<arrow15>/bin/python MILVUS_LITE_ARROW25_PYTHON=<v3>/bin/python .venv/bin/python -m pytest tests/storage_interop` |
+| M2 存储文件双向互通矩阵（Arrow 15/25 两套参照环境，nullable 向量另需 Arrow 26，准备见 [tests/storage_interop/README.md](tests/storage_interop/README.md)） | `MILVUS_LITE_3X_PYTHON=<v3>/bin/python MILVUS_LITE_ARROW15_PYTHON=<arrow15>/bin/python MILVUS_LITE_ARROW25_PYTHON=<v3>/bin/python MILVUS_LITE_ARROW26_PYTHON=<arrow26>/bin/python .venv/bin/python -m pytest tests/storage_interop` |
 | 组件真值核验（`generate_*.py --verify`）与直接模糊对照（`fuzz_*.py`）：改了过滤、时间、分词、几何、function chain 等组件时跑对应项 | [tests/differential/README.md](tests/differential/README.md) |
 | 合并受控等待 / 提交点进程退出（隔离的 fault-injection wheel；需由 py → grpc → core 显式启用，正式 wheel 不含测试入口） | `<fi>/bin/python -m pytest tests/compaction` |
 | 子进程与关闭重开测试的隔离 / 默认并行 30 轮复验 | [进程内测试隔离记录与命令](docs/testing/process-test-isolation.md) |
 | 独立 CLI server | `.venv/bin/milvus-lite server --data-dir <data_dir> --host 127.0.0.1 --port 19530 --max-workers 10`；也可 `python -m milvus_lite server ...`，合同见 0012 |
 | 构建 wheel / sdist | `.venv/bin/maturin build --release -m crates/py/Cargo.toml` / `.venv/bin/maturin sdist -m crates/py/Cargo.toml` |
-| 发行物与安装验收（本地诊断，候选以发行工作流为准；工作目录在仓库外） | `.venv/bin/python tests/packaging/run_acceptance.py --work-dir <work_dir> --constraints <constraints.txt> --suite --suite-expect 752`；约束文件与完整步骤见 [打包验收](tests/packaging/README.md) |
+| 发行物与安装验收（本地诊断，候选以发行工作流为准；工作目录在仓库外） | `.venv/bin/python tests/packaging/run_acceptance.py --work-dir <work_dir> --constraints <constraints.txt> --suite --suite-expect 765`；约束文件与完整步骤见 [打包验收](tests/packaging/README.md) |
 | 工具自检：发行物与平台脚本 / CI 脚本 / 发行工具 / 分片 / 基准脚本 | `.venv/bin/python -m pytest tests/packaging tests/platform`；`tests/ci`；`tests/release`；`tests/sharding`（用法见 [分片 README](tests/sharding/README.md)，合同见 0019）；`tests/benchmarks` |
 | 平台验收：Linux PID 1 与命名卷 LOCK、容器 LOCK 与 strace、已安装产物联合冒烟、Windows 准备检查 | [tests/platform/README.md](tests/platform/README.md) |
 | 兼容性调查与参照真值（固定样本统计、schema 真值、分区与 Query iterator、partition key；离线显式执行，不进入默认测试） | [tests/compatibility_audit/README.md](tests/compatibility_audit/README.md) |

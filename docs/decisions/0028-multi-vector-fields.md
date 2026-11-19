@@ -47,15 +47,15 @@
 
 ### 恢复
 
-WAL 恢复原本把解码失败一律当作截断，只取已校验的前缀并打印警告。3.x 写入的 null 行会让 arrow-rs 以「非空列含 null」拒绝整批，按截断处理就丢掉了这一批及其后的全部写入，下一次 flush 清理 WAL 后无法挽回。这种批次是完整的，因此改为打开失败。Parquet 中同样的行是全 null 的子元素，由解码校验拒绝。
+WAL 恢复原本把解码失败一律当作截断，只取已校验的前缀并打印警告。3.x 写入的 null 行会让 arrow-rs 以「非空列含 null」拒绝整批，按截断处理就丢掉了这一批及其后的全部写入，下一次 flush 清理 WAL 后无法挽回。这种批次是完整的，因此改为打开失败。Parquet 中同样的行是全 null 的子元素，由解码校验拒绝。以上只针对非 nullable 字段；nullable 字段上的 null 是合法的空值，按 [0038](0038-nullable-dense-vectors.md) 读取。
 
 ## 与 3.x 的差异
 
 | 差异 | 3.x | 本实现 | 理由与影响 |
 | --- | --- | --- | --- |
-| 非首向量字段缺失或为 None（含 upsert 写入新行） | 写入成功。flush 后，输出该字段的 search 和 query 报 `float() argument must be a string or a real number, not 'NoneType'`，该字段的检索距离为 NaN | 拒绝，`vector field 'v2' missing or None`（code 6） | 3.x 的缺陷，`upsert(partial_update=True)` 写新行即可触发。负责人确认不复制 |
+| 非首向量字段缺失或为 None（含 upsert 写入新行；只限非 nullable 字段，nullable 字段见 [0038](0038-nullable-dense-vectors.md)） | 写入成功。flush 后，输出该字段的 search 和 query 报 `float() argument must be a string or a real number, not 'NoneType'`，该字段的检索距离为 NaN | 拒绝，`vector field 'v2' missing or None`（code 6） | 3.x 的缺陷，`upsert(partial_update=True)` 写新行即可触发。负责人确认不复制 |
 | 非首向量字段的 FieldData 不是向量类型（只有原始 RPC 能发送） | Arrow 内部文案 | `vector field 'v2' must be list/tuple, got int`（code 6） | 文案与首字段一致；pymilvus 按 schema 打包，不会发送这种请求 |
-| 3.x 数据目录中非首向量字段含 null | 可以打开，读取行为同第一行 | 打开该集合时明确报错，文件不改动 | 只有上述缺陷才会产生这种目录 |
+| 3.x 数据目录中非 nullable 的非首向量字段含 null | 可以打开，读取行为同第一行 | 打开该集合时明确报错，文件不改动 | 只有上述缺陷才会产生这种目录 |
 
 `drop_index(c, "<字段名>")` 删除全部索引的行为沿用 [0014](0014-index-definitions-and-filter-expressions.md#dropindex)。多向量集合上它的影响更明显：删 `v2` 也会删掉 `v1` 的索引，`v1` 的默认度量随之回到 COSINE。只有 `<字段名>_idx` 或显式的 `field_name` 才定向删除。
 

@@ -3,6 +3,7 @@
 //! 语义以 3.x 的 memtable 路径为准；与 3.x 不同之处见 0004「决策」与「阶段性差异」。
 
 use std::collections::{BTreeMap, HashMap};
+use std::io::Write as _;
 use std::sync::Arc;
 
 use serde_json::{Map, Value};
@@ -2152,6 +2153,8 @@ pub struct Collection {
     deleted: bool,
     /// schema 中的 BM25 function，写入时据此生成输出字段，检索时用同一分词器处理查询文本（0031）。
     bm25: Arc<[crate::schema::Bm25Function]>,
+    /// 本次打开后是否已提示过空向量的互通限制（0038）。
+    null_vector_warned: bool,
 }
 
 impl Collection {
@@ -2208,6 +2211,7 @@ impl Collection {
             memory_key,
             deleted: false,
             bm25,
+            null_vector_warned: false,
         })
     }
 
@@ -3912,7 +3916,8 @@ impl Collection {
         }
 
         // 与 validate_row 对第 0 行最先做的两项检查相同。提前做，避免在缺列时仍按 num_rows
-        // 为动态字段分配内存（num_rows 由请求给出，没有列时不受列长度检查的约束）。
+        // 为动态字段分配内存（num_rows 由请求给出，没有列时不受列长度检查的约束）。nullable 向量缺列时按全为空
+        // 写入，这时 num_rows × dim 由 gRPC 解码封顶在一个请求能携带的浮点数以内（0038）。
         let has_column = |name: &str| batch.columns.iter().any(|(n, _)| n == name);
         let pk = &self.schema.fields[self.pk_pos];
         if !pk.auto_id && pk.default_value.is_none() && !has_column(&pk.name) {
@@ -3922,6 +3927,7 @@ impl Collection {
             )));
         }
         if let Some(vector) = self.vector_pos.map(|pos| &self.schema.fields[pos])
+            && !vector.nullable
             && !has_column(&vector.name)
         {
             return Err(EngineError::schema(format!(
@@ -4041,6 +4047,31 @@ impl Collection {
         Ok(self.publish_insert(columns, meta, norms, seqs, source, row_start))
     }
 
+    /// 规则 8 不允许静默：空向量写成 Arrow null，pyarrow 低于 26 的 3.x 打不开这个集合（0038）。
+    fn warn_null_vectors(&mut self, columns: &[ColumnData]) {
+        if self.null_vector_warned || self.persistent.is_none() {
+            return;
+        }
+        if self
+            .schema
+            .fields
+            .iter()
+            .zip(columns)
+            .any(|(field, column)| {
+                field.data_type == DataType::FloatVector && column.validity().is_some()
+            })
+        {
+            self.null_vector_warned = true;
+            // 调用方在 WAL 追加之后、不可失败的区段里：eprintln! 在 stderr 不可写（如读端已退出的管道）时会
+            // panic 并毒化集合，而这只是提示，写不出去不影响写入。
+            let _ = writeln!(
+                std::io::stderr(),
+                "collection {} now stores null vectors; milvus-lite 3.x can open it only with pyarrow 26 or later",
+                py_repr(&self.name)
+            );
+        }
+    }
+
     fn publish_insert(
         &mut self,
         columns: Vec<ColumnData>,
@@ -4052,6 +4083,7 @@ impl Collection {
     ) -> Vec<Pk> {
         let n = seqs.len();
         // WAL 已成功追加；后续内存更新必须保持不可失败。
+        self.warn_null_vectors(&columns);
         let chunk_idx = self.next_chunk;
         self.next_chunk += 1;
         let generation = self.persistent.as_ref().map_or(1, |p| p.generation);
@@ -4519,21 +4551,25 @@ impl Collection {
             }
             let expected = field_dim(field);
             for row in 0..n {
-                match input(row, pos) {
-                    Some((InputValues::FloatVector { dim, .. }, _)) if *dim != expected => {
+                let valid =
+                    input(row, pos).filter(|(values, index)| !input_is_null(values, *index));
+                match valid.map(|(values, index)| (values.values(), values, index)) {
+                    Some((InputValues::FloatVector { dim, .. }, _, _)) if *dim != expected => {
                         return Err(EngineError::invalid(format!(
                             "Length of item not correct: expected {expected} but got array of size {dim}"
                         )));
                     }
-                    Some((InputValues::FloatVector { .. }, _)) => {}
-                    Some((values, index)) if !input_is_null(values, index) => {
+                    Some((InputValues::FloatVector { .. }, _, _)) => {}
+                    Some((_, values, index)) => {
                         return Err(EngineError::schema(format!(
                             "vector field {} must be list/tuple, got {}",
                             py_repr(&field.name),
                             py_type_name(values, index)
                         )));
                     }
-                    _ => missing = missing.or(Some(pos)),
+                    // nullable 的非首向量字段：缺失与 None 写为空值（0038）；非 nullable 仍拒绝（0028）。
+                    None if field.nullable => {}
+                    None => missing = missing.or(Some(pos)),
                 }
             }
         }
@@ -4644,17 +4680,26 @@ impl Collection {
                 py_repr(&pk.name)
             )));
         }
-        // 3.x `_find_float_vector`：只有稀疏向量字段时没有这一项检查。
+        // 3.x `_find_float_vector`：只有稀疏向量字段时没有这一项检查。nullable 时缺失与 None
+        // 都放行（3.x `validate_record`），空值来自紧凑形态、upsert 继承的空行（`Null`）或缺列。
         let vector = self.vector_pos.map(|pos| &self.schema.fields[pos]);
         match vector.map(|vector| (vector, by_name.get(vector.name.as_str()))) {
             None => {}
+            Some((vector, None)) if vector.nullable => {}
+            Some((vector, Some(other))) if vector.nullable && input_is_null(other, row) => {}
             Some((vector, None)) => {
                 return Err(EngineError::schema(format!(
                     "vector field {} missing or None",
                     py_repr(&vector.name)
                 )));
             }
-            Some((vector, Some(InputValues::FloatVector { dim, .. }))) => {
+            Some((vector, Some(values)))
+                if !values.is_null(row)
+                    && matches!(values.values(), InputValues::FloatVector { .. }) =>
+            {
+                let InputValues::FloatVector { dim, .. } = values.values() else {
+                    unreachable!("matched FloatVector above");
+                };
                 if *dim != field_dim(vector) {
                     return Err(EngineError::schema(format!(
                         "vector field {} expected dim {}, got {dim}",
@@ -4909,11 +4954,11 @@ fn scan(
     }
     for seg in block {
         let chunk = &chunks[seg.chunk];
-        let (dim, values) = vector_values(&chunk.columns[field_pos]);
+        let (dim, values, valid) = vector_values(&chunk.columns[field_pos]);
         let live_rows = || {
             seg.rows
                 .clone()
-                .filter(|row| chunk.live.get(*row))
+                .filter(|row| chunk.live.get(*row) && valid.is_none_or(|v| v.get(*row)))
                 .map(|row| {
                     (
                         row,
@@ -4963,7 +5008,7 @@ fn scan_tiled(
     let mut buf: Vec<(usize, &[f32], f32)> = Vec::with_capacity(TILE_ROWS);
     for seg in block {
         let chunk = &chunks[seg.chunk];
-        let (dim, values) = vector_values(&chunk.columns[field_pos]);
+        let (dim, values, valid) = vector_values(&chunk.columns[field_pos]);
         let at = |row| {
             RankedRow::dense(
                 chunk.source_rank,
@@ -4996,7 +5041,7 @@ fn scan_tiled(
             }
             buf.clear();
         };
-        for row in seg.rows.clone().filter(|row| chunk.live.get(*row)) {
+        let mut push = |row: usize| {
             buf.push((
                 row,
                 &values[row * dim..(row + 1) * dim],
@@ -5005,6 +5050,19 @@ fn scan_tiled(
             if buf.len() == TILE_ROWS {
                 flush(&mut buf);
             }
+        };
+        // 有效位的判断提到循环外：非 nullable 列的热循环与引入空向量之前相同（0038 的服务器对照）。
+        match valid {
+            None => seg
+                .rows
+                .clone()
+                .filter(|row| chunk.live.get(*row))
+                .for_each(&mut push),
+            Some(valid) => seg
+                .rows
+                .clone()
+                .filter(|row| chunk.live.get(*row) && valid.get(*row))
+                .for_each(&mut push),
         }
         flush(&mut buf);
     }
@@ -5283,9 +5341,10 @@ fn order(metric: Metric, a: &(f32, RankedRow), b: &(f32, RankedRow)) -> std::cmp
     flat::rank(metric, a.0, b.0).then_with(|| a.1.cmp(&b.1))
 }
 
-fn vector_values(column: &ColumnData) -> (usize, &[f32]) {
-    match column {
-        ColumnData::FloatVector { dim, values } => (*dim, values),
+/// 检索字段的向量与有效位。nullable 列的空行不参与检索（0038，与稀疏检索跳过空行一致）。
+fn vector_values(column: &ColumnData) -> (usize, &[f32], Option<&crate::data::Validity>) {
+    match column.values() {
+        ColumnData::FloatVector { dim, values } => (*dim, values, column.validity()),
         // resolve_anns_field 只返回 FLOAT_VECTOR 字段的下标。
         _ => unreachable!("anns field column must be FLOAT_VECTOR"),
     }
@@ -5724,6 +5783,33 @@ fn convert_optional(
     values: Option<&InputValues>,
     n: usize,
 ) -> Result<ColumnData> {
+    // nullable 向量整列转换，不逐行克隆；空行的值槽清零，不保留调用方放在那里的值（0038）。
+    if field.nullable
+        && let Some(InputValues::Nullable {
+            values: inner,
+            validity,
+        }) = values
+        && let InputValues::FloatVector { dim, values: data } = inner.as_ref()
+    {
+        let valid: Vec<bool> = (0..n).map(|row| validity.get(row)).collect();
+        let expected = field_dim(field);
+        // 有效行的 dim 已由 validate_row / check_other_vectors 检查；全部为空的列不看 dim（3.x 按
+        // schema 的 dim 补零），这里按 schema 的 dim 重建，不能把别的 dim 存进列里。
+        let (dim, mut data) = if *dim == expected {
+            (*dim, data.clone())
+        } else if valid.iter().all(|v| !v) {
+            (expected, vec![0.0; n.saturating_mul(expected)])
+        } else {
+            return Err(EngineError::schema(format!(
+                "vector field {} expected dim {expected}, got {dim}",
+                py_repr(&field.name)
+            )));
+        };
+        for (row, _) in valid.iter().enumerate().filter(|(_, v)| !**v) {
+            data[row * dim..(row + 1) * dim].fill(0.0);
+        }
+        return Ok(ColumnData::FloatVector { dim, values: data }.with_validity(&valid));
+    }
     if let Some(values) = values
         && !matches!(
             values,
@@ -7762,7 +7848,7 @@ mod tests {
                 let q = flat::Query::new(metric, v);
                 let mut scored = Vec::new();
                 for chunk in c.chunks.values() {
-                    let (dim, values) = vector_values(&chunk.columns[c.vector_pos.unwrap()]);
+                    let (dim, values, _) = vector_values(&chunk.columns[c.vector_pos.unwrap()]);
                     for row in 0..chunk.live.len {
                         if chunk.live.get(row) {
                             let cand = &values[row * dim..(row + 1) * dim];

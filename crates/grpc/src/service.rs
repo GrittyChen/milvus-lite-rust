@@ -568,12 +568,13 @@ impl Service for MilvusService {
         self.run(Branch::Engine, move |db| {
             let handle = db.collection(&database, &req.collection_name)?;
             let database_timezone = || db.database_timezone(&database);
-            let (timestamptz_fields, timezone) =
-                insert::timezone_context(&handle, &database_timezone);
+            let (timestamptz_fields, vector_dims, timezone) =
+                insert::write_context(&handle, &database_timezone);
             let batch = insert::decode(
                 req.fields_data,
                 req.num_rows,
                 &timestamptz_fields,
+                &vector_dims,
                 &timezone,
             )?;
             let outcome = db.insert_partition_with_pk_type(
@@ -630,12 +631,13 @@ impl Service for MilvusService {
                 return Err(schema::unsupported("field_ops"));
             }
             let database_timezone = || db.database_timezone(&database);
-            let (timestamptz_fields, timezone) =
-                insert::timezone_context(&handle, &database_timezone);
+            let (timestamptz_fields, vector_dims, timezone) =
+                insert::write_context(&handle, &database_timezone);
             let batch = insert::decode(
                 req.fields_data,
                 req.num_rows,
                 &timestamptz_fields,
+                &vector_dims,
                 &timezone,
             )?;
             let outcome = db.upsert_partition_with_pk_type(

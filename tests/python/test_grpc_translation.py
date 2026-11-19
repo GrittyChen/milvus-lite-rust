@@ -332,9 +332,10 @@ def test_create_collection_remaining_unsupported(env):
     unimplemented(create, stub, "c", pk, v, arr)
     arr.element_type = DataType.ARRAY
     unimplemented(create, stub, "c", pk, v, arr)
+    # nullable 稠密向量已接入（0038）。
     nullable = field("v", DataType.FLOAT_VECTOR, dim=2)
     nullable.nullable = True
-    unimplemented(create, stub, "c", pk, nullable)
+    assert status_of(create(stub, "nv", pk, nullable)) == (0, 0, "")
     unimplemented(create, stub, "c", pk, v, field("t", DataType.VARCHAR, max_length=8,
                                                   analyzer_params='{"type": "english", "x": NaN}'))
     # 集合的 timezone 属性随 TIMESTAMPTZ 一起接入（0025）：合法值保存，坏值 6 且不创建。
@@ -412,12 +413,59 @@ def test_insert_default_partition_and_all_valid_data(env):
     t = str_fd("t", ["a"])
     t.valid_data.append(True)
     assert status_of(insert(stub, "c", long_fd("id", [2]), vec_fd("v", [[1, 0]]), t))[0] == 0
-    # 向量列按完整长度发送时 3.x 忽略 valid_data，哪怕它的长度不对。
+    # 向量列按完整长度发送时 3.x 忽略 valid_data，哪怕它的长度不对；本实现按标量的规则以 valid_data
+    # 为空值的唯一依据，长度不对时报错（0038 决策 3，登记的差异）。全部为真时照常写入。
     v = vec_fd("v", [[1, 0], [0, 1]])
+    v.valid_data.append(True)
+    r = insert(stub, "c", long_fd("id", [3, 4]), v, str_fd("t", ["a", "b"]))
+    assert status_of(r) == (6, 6, "FieldData 'v' valid_data length 1 != num_rows 2")
     v.valid_data.append(True)
     r = insert(stub, "c", long_fd("id", [3, 4]), v, str_fd("t", ["a", "b"]))
     assert status_of(r)[0] == 0
 
+
+def test_raw_dense_valid_data_is_the_only_null_source(env):
+    """valid_data 是向量空值的唯一依据（0038 决策 3）：完整形态中空行的占位值丢弃，非 nullable 字段由引擎拒绝；
+    3.x 对向量忽略 valid_data，把占位值当作向量写入，这是登记的差异。"""
+    client, stub, _ = env
+    nullable = field("v", DataType.FLOAT_VECTOR, dim=2)
+    nullable.nullable = True
+    assert status_of(create(stub, "n", field("id", DataType.INT64, primary=True), nullable)) == (0, 0, "")
+    full = vec_fd("v", [[1, 0], [9, 9], [0, 1]])
+    full.valid_data.extend([True, False, True])
+    compact = vec_fd("v", [[1, 1]])
+    compact.valid_data.extend([False, True])
+    assert status_of(insert(stub, "n", long_fd("id", [1, 2, 3]), full))[0] == 0
+    assert status_of(insert(stub, "n", long_fd("id", [4, 5]), compact))[0] == 0
+    client.load_collection("n")
+    rows = client.query("n", filter="id >= 0", output_fields=["v"])
+    assert {r["id"]: r["v"] for r in rows} == {1: [1.0, 0.0], 2: None, 3: [0.0, 1.0], 4: None, 5: [1.0, 1.0]}
+
+    basic(stub)
+    strict = vec_fd("v", [[1, 0], [9, 9]])
+    strict.valid_data.extend([True, False])
+    r = insert(stub, "c", long_fd("id", [1, 2]), strict, str_fd("t", ["a", "b"]))
+    assert status_of(r) == (6, 6, "vector field 'v' missing or None")
+
+
+
+def test_raw_null_vector_expansion_is_capped_at_one_request(env):
+    """空行按 dim 补零：展开后的向量数据不超过一个请求能携带的 6400 万个 float，超限明确报错，不分配
+    （0038「实施结果」）。缺列（auto_id 加 nullable 向量时可以没有任何列）同样封顶；3.x 不设上限。"""
+    client, stub, _ = env
+    pk = field("id", DataType.INT64, primary=True)
+    pk.autoID = True
+    vector = field("v", DataType.FLOAT_VECTOR, dim=128)
+    vector.nullable = True
+    assert status_of(create(stub, "n", pk, vector, auto_id=True)) == (0, 0, "")
+    over = "vector field 'v' has {} rows of dim 128, more than the 67108864 floats one insert request can carry; split the batch"
+    nulls = schema_pb2.FieldData(type=DataType.FLOAT_VECTOR, field_name="v", valid_data=[False] * 600_000)
+    nulls.vectors.dim = 128
+    assert status_of(insert(stub, "n", nulls, num_rows=600_000)) == (6, 6, over.format(600_000))
+    assert status_of(insert(stub, "n", num_rows=2**32 - 1)) == (6, 6, over.format(2**32 - 1))
+    assert status_of(insert(stub, "n", num_rows=3))[0] == 0
+    client.load_collection("n")
+    assert [r["v"] for r in client.query("n", filter="", output_fields=["v"], limit=10)] == [None] * 3
 
 def test_insert_m1_unsupported(env):
     _, stub, _ = env
@@ -1253,7 +1301,6 @@ def test_pymilvus_entry_points_remaining_unsupported(env):
     model = Function(name="r", function_type=FunctionType.RERANK, input_field_names=["s"],
                      params={"reranker": "model", "provider": "cohere", "queries": ["q"]})
     cases = [
-        (with_field("n", DataType.FLOAT_VECTOR, dim=2, nullable=True), f"nullable vectors: {feature}"),
         # GEOMETRY 字段已支持（0034）；ARRAY 的 GEOMETRY 元素仍是登记的差异。
         (with_field("g", DataType.ARRAY, element_type=DataType.GEOMETRY, max_capacity=2), f"ARRAY element type: {feature}"),
         # pymilvus 3.0 先发 AlterCollectionSchema，收到 UNIMPLEMENTED 后回退到 AddCollectionField。

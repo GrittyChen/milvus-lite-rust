@@ -367,11 +367,12 @@ impl CollectionSchema {
         if self
             .fields
             .iter()
-            .any(|f| f.data_type.is_dense_vector() && (f.nullable || f.default_value.is_some()))
+            .any(|f| f.data_type.is_dense_vector() && f.default_value.is_some())
         {
+            // pymilvus 在客户端拒绝向量默认值，proto 的 ValueField 也表达不了（0038）。
             return Err(EngineError::unsupported(
-                "nullable vectors and vector defaults",
-                "nullable vectors and vector defaults are not supported in this build of milvus-lite-rust yet",
+                "vector defaults",
+                "not supported in this build of milvus-lite-rust",
             ));
         }
         Ok(())
@@ -656,18 +657,22 @@ mod tests {
                 .contains("default value of sparse vector field 'sp' is not supported")
         );
 
+        // 稠密字段可以 nullable（0038）；向量默认值仍不支持。
+        let dense_schema = |dense: FieldSchema| CollectionSchema {
+            functions: Vec::new(),
+            fields: vec![pk("id"), dense],
+            enable_dynamic_field: false,
+            properties: Vec::new(),
+        };
         let mut dense = vec("v", 2);
         dense.nullable = true;
-        assert!(matches!(
-            CollectionSchema {
-                functions: Vec::new(),
-                fields: vec![pk("id"), dense],
-                enable_dynamic_field: false,
-                properties: Vec::new(),
-            }
-            .validate(),
-            Err(EngineError::Unsupported { .. })
-        ));
+        dense_schema(dense).validate().unwrap();
+        let mut dense = vec("v", 2);
+        dense.default_value = Some(serde_json::json!([0.0, 0.0]));
+        assert_eq!(
+            dense_schema(dense).validate().unwrap_err().to_string(),
+            "vector defaults: not supported in this build of milvus-lite-rust"
+        );
     }
 
     #[test]

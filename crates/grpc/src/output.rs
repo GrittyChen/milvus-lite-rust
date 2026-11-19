@@ -261,14 +261,29 @@ fn field_data(
         }
         Column::Data(parts) => {
             if data_type == DataType::FloatVector {
-                let values = parts
-                    .iter()
-                    .flat_map(|c| match c.values() {
-                        ColumnData::FloatVector { values, .. } => values.as_slice(),
-                        _ => unreachable!("{MISMATCH}"),
-                    })
-                    .copied()
-                    .collect();
+                // 有空值时只放有效行，与 valid_data 一起按 pymilvus 的紧凑约定解码（真实 Milvus 相同）；
+                // 3.x 给空行写零占位，pymilvus 因此把其后的有效行读错，这一差异见 0038。全部为空时没有可读错的
+                // 有效行，按 3.x 写零占位（boost 剥掉同名向量字段的输出与 3.x 逐字节相同，0026）。
+                let all_null = parts.iter().all(|c| (0..c.len()).all(|row| c.is_null(row)));
+                let mut values = Vec::new();
+                for column in parts {
+                    if all_null {
+                        if let ColumnData::FloatVector { values: data, .. } = column.values() {
+                            values.extend(std::iter::repeat_n(0.0, data.len()));
+                        }
+                        continue;
+                    }
+                    let ColumnData::FloatVector { dim, values: data } = column.values() else {
+                        unreachable!("{MISMATCH}");
+                    };
+                    if column.validity().is_none() {
+                        values.extend_from_slice(data);
+                        continue;
+                    }
+                    for row in (0..column.len()).filter(|row| !column.is_null(*row)) {
+                        values.extend_from_slice(&data[row * dim..(row + 1) * dim]);
+                    }
+                }
                 field_data::Field::Vectors(pb::VectorField {
                     dim: dim.unwrap_or(0),
                     data: Some(vector_field::Data::FloatVector(pb::FloatArray {
@@ -584,5 +599,44 @@ mod tests {
             error.to_string(),
             "sparse vector bytes length 7 is not a multiple of 8"
         );
+    }
+
+    /// 稠密向量有空值时 float_vector 只含有效行（0038）；全部为空或没有空值时与 3.x 相同。
+    #[test]
+    fn dense_nulls_use_compact_values() {
+        let dense = |parts: &[&ColumnData]| {
+            let fd = field_data(
+                "v",
+                DataType::FloatVector,
+                Some(2),
+                None,
+                &Column::Data(parts.to_vec()),
+            )
+            .unwrap();
+            let Some(field_data::Field::Vectors(vectors)) = fd.field else {
+                panic!("vector field missing");
+            };
+            let Some(vector_field::Data::FloatVector(values)) = vectors.data else {
+                panic!("float_vector missing");
+            };
+            (fd.valid_data, vectors.dim, values.data)
+        };
+        let nullable = |values: Vec<f32>, valid: &[bool]| ColumnData::Nullable {
+            values: Box::new(ColumnData::FloatVector { dim: 2, values }),
+            validity: Validity::from_bools(valid),
+        };
+        let first = nullable(vec![1.0, 2.0, 0.0, 0.0], &[true, false]);
+        let second = ColumnData::FloatVector {
+            dim: 2,
+            values: vec![3.0, 4.0],
+        };
+        assert_eq!(
+            dense(&[&first, &second]),
+            (vec![true, false, true], 2, vec![1.0, 2.0, 3.0, 4.0])
+        );
+        let all_null = nullable(vec![0.0; 4], &[false, false]);
+        // 全部为空时与 3.x 相同，写零占位。
+        assert_eq!(dense(&[&all_null]), (vec![false, false], 2, vec![0.0; 4]));
+        assert_eq!(dense(&[&second]), (Vec::new(), 2, vec![3.0, 4.0]));
     }
 }

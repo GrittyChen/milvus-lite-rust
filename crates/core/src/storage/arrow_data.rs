@@ -714,6 +714,25 @@ fn nullable_array(
                 .enumerate()
                 .map(|(i, row)| validity.get(i).then_some(row)),
         )),
+        // 空行的子元素写成非 null 的零：3.x `_extract_vector_array` 按 n × dim 重塑值缓冲区。
+        // pyarrow 低于 26 读不了含空行的定长列表 Parquet，只在确有空行时才走到这里（0038）。
+        ColumnData::FloatVector { dim, values } => {
+            let width = i32::try_from(*dim)
+                .ok()
+                .filter(|dim| *dim > 0)
+                .ok_or_else(|| ArrowDataError::VectorDim { name: name.into() })?;
+            let valid: Vec<bool> = (0..validity.len()).map(|row| validity.get(row)).collect();
+            let mut values = values.clone();
+            for (row, _) in valid.iter().enumerate().filter(|(_, v)| !**v) {
+                values[row * dim..(row + 1) * dim].fill(0.0);
+            }
+            Arc::new(FixedSizeListArray::try_new(
+                Arc::new(Field::new("item", ArrowType::Float32, true)),
+                width,
+                Arc::new(Float32Array::from(values)),
+                Some(valid.into()),
+            )?)
+        }
         _ => return Err(ArrowDataError::TypeMismatch { name: name.into() }),
     })
 }
@@ -915,24 +934,30 @@ fn decode_column(field: &FieldSchema, array: &ArrayRef) -> Result<ColumnData, Ar
             if Some(dim as i64) != field.dim {
                 return Err(bad());
             }
-            // 3.x 不校验非首向量字段，WAL 里可能有 null 行（0028「与 3.x 的差异」）；Parquet 里
-            // 这种行是全 null 的子元素，由下面的子列检查拒绝。
-            if array.null_count() != 0 {
-                return Err(bad());
-            }
+            // 父级空行只允许出现在 nullable 字段上（函数开头已检查）：3.x 不校验非首向量字段，
+            // 非 nullable 字段上的空行由此拒绝（0028「与 3.x 的差异」）。
             // Parquet 读出的 list 子字段名可为 `element`，WAL 中为 `item`；只校验值的类型与维度。
             let floats = list.values();
             let floats = floats
                 .as_any()
                 .downcast_ref::<Float32Array>()
                 .ok_or_else(bad)?;
-            if floats.null_count() != 0 {
+            if floats.len() != n.checked_mul(dim).ok_or_else(bad)? {
                 return Err(bad());
             }
-            ColumnData::FloatVector {
-                dim,
-                values: floats.values().to_vec(),
+            // Parquet 读回的空行子元素是 null，WAL 中是写入时的零；有效行内的子元素 null 是坏数据（0038）。
+            if floats.null_count() != 0
+                && (0..floats.len()).any(|i| floats.is_null(i) && list.is_valid(i / dim))
+            {
+                return Err(bad());
             }
+            let mut values = floats.values().to_vec();
+            if array.null_count() != 0 {
+                for row in (0..n).filter(|row| list.is_null(*row)) {
+                    values[row * dim..(row + 1) * dim].fill(0.0);
+                }
+            }
+            ColumnData::FloatVector { dim, values }
         }
         // 只读出原始字节，不解码：3.x 打开与计数都不解码，坏行在使用时才报错（0030）。
         DataType::SparseFloatVector => {
@@ -1258,6 +1283,119 @@ mod tests {
         };
         assert_eq!(rows.row(0), unsorted.as_slice());
         assert_eq!(rows.row(2), &[1, 2, 3]);
+    }
+
+    fn nullable_vector_schema(nullable: bool) -> CollectionSchema {
+        let mut pk = FieldSchema::new("id", DataType::Int64);
+        pk.is_primary = true;
+        let mut v = FieldSchema::new("v", DataType::FloatVector);
+        v.dim = Some(2);
+        v.nullable = nullable;
+        CollectionSchema {
+            functions: Vec::new(),
+            fields: vec![pk, v],
+            enable_dynamic_field: false,
+            properties: Vec::new(),
+        }
+    }
+
+    /// 空行写成父级 null、子元素为零（0038）；WAL 批与 Parquet 都读回同一列，Parquet 读出的空行子元素是
+    /// null，读取时填零。
+    #[test]
+    fn nullable_vector_round_trips_through_batch_and_parquet() {
+        let schema = nullable_vector_schema(true);
+        let column = ColumnData::FloatVector {
+            dim: 2,
+            values: vec![1.0, 2.0, 0.0, 0.0, 3.0, 4.0],
+        }
+        .with_validity(&[true, false, true]);
+        let batch = data_batch(
+            &schema,
+            &[1, 2, 3],
+            &[ColumnData::Int64(vec![1, 2, 3]), column.clone()],
+            None,
+        )
+        .unwrap();
+        let list = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<FixedSizeListArray>()
+            .unwrap();
+        assert_eq!(list.null_count(), 1);
+        assert_eq!(list.values().null_count(), 0);
+        assert_eq!(
+            decode_data_batch(&schema, &batch).unwrap().columns[1],
+            column
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("d.parquet");
+        crate::storage::parquet_file::write_new(&path, &batch).unwrap();
+        let read = crate::storage::parquet_file::read_all(&path).unwrap();
+        let read_list = read[0]
+            .column(2)
+            .as_any()
+            .downcast_ref::<FixedSizeListArray>()
+            .unwrap();
+        assert_eq!(read_list.values().null_count(), 2);
+        assert_eq!(
+            decode_data_batch(&schema, &read[0]).unwrap().columns[1],
+            column
+        );
+
+        // 全部有效的 nullable 列不带空值位图：pyarrow 15 / 25 的 3.x 照常能读。
+        let plain = ColumnData::FloatVector {
+            dim: 2,
+            values: vec![1.0, 2.0],
+        }
+        .with_validity(&[true]);
+        let batch = data_batch(&schema, &[1], &[ColumnData::Int64(vec![1]), plain], None).unwrap();
+        assert!(batch.column(2).nulls().is_none());
+    }
+
+    /// 有效行内的子元素 null、非 nullable 字段上的父级 null 都是坏数据。
+    #[test]
+    fn vector_nulls_outside_nullable_parent_rows_are_rejected() {
+        let item = Arc::new(Field::new("item", ArrowType::Float32, true));
+        let batch = |schema: &CollectionSchema, list: FixedSizeListArray| {
+            RecordBatch::try_new(
+                Arc::new(data_schema(schema).unwrap()),
+                vec![
+                    Arc::new(UInt64Array::from(vec![1_u64, 2])),
+                    Arc::new(Int64Array::from(vec![1_i64, 2])),
+                    Arc::new(list),
+                ],
+            )
+            .unwrap()
+        };
+        let child_null = FixedSizeListArray::try_new(
+            item.clone(),
+            2,
+            Arc::new(Float32Array::from(vec![
+                Some(1.0),
+                None,
+                Some(0.0),
+                Some(0.0),
+            ])),
+            None,
+        )
+        .unwrap();
+        let schema = nullable_vector_schema(true);
+        assert!(decode_data_batch(&schema, &batch(&schema, child_null)).is_err());
+
+        let parent_null = FixedSizeListArray::try_new(
+            item,
+            2,
+            Arc::new(Float32Array::from(vec![1.0, 2.0, 0.0, 0.0])),
+            Some(vec![true, false].into()),
+        )
+        .unwrap();
+        let strict = nullable_vector_schema(false);
+        let mut lenient = strict.clone();
+        lenient.fields[1].nullable = true;
+        let rejected = batch(&lenient, parent_null);
+        assert!(decode_data_batch(&strict, &rejected).is_err());
+        assert!(decode_data_batch(&lenient, &rejected).is_ok());
     }
 
     #[test]
