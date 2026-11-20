@@ -7,6 +7,7 @@
 
 from pathlib import Path
 import re
+import subprocess
 
 WORKFLOWS = Path(__file__).resolve().parents[2] / ".github" / "workflows"
 
@@ -81,3 +82,29 @@ jobs:
             b
 """
     assert multiline_container_paths(text) == [("boxed", 1)]
+
+
+def test_collect_records_drops_names_upload_artifact_rejects(tmp_path):
+    # upload-artifact 拒绝名字含 " : < > | * ? 与回车、换行的文件，只要有一个整份记录就上传失败，而差分用例会建
+    # 名为 a:b 的数据库目录。收集脚本剔除并列出这些条目，保留其余记录；在 CI 的 Linux（GNU find）与
+    # macOS（BSD find、bash 3.2）上都运行。
+    temp = tmp_path / "temp"
+    run = temp / "diff-3.0.2-run"
+    for bad in ["a:b", 'q"', "l<g>", "p|i", "s*t", "q?m", "c\rr", "n\nl"]:
+        (run / "dbs" / bad).mkdir(parents=True)
+        (run / "dbs" / bad / "f.json").write_text("x")
+    (run / "dbs" / "ok").mkdir()
+    (run / "dbs" / "ok" / "f.json").write_text("x")
+    (run / "summary.json").write_text("x")
+    (run / "x:y.txt").write_text("x")
+    (temp / "smoke-3.14").mkdir()
+    (temp / "smoke-3.14" / "sdk-install.log").write_text("x")
+    script = WORKFLOWS.parent / "ci" / "collect_records.sh"
+    result = subprocess.run(["bash", str(script), "*-run", "smoke-*/*.log"], cwd=temp, env={"RUNNER_TEMP": str(temp), "PATH": "/usr/bin:/bin"},
+                            capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    dest = temp / "failure-records"
+    kept = sorted(str(p.relative_to(dest)) for p in dest.rglob("*") if p.is_file())
+    assert kept == ["diff-3.0.2-run/dbs/ok/f.json", "diff-3.0.2-run/summary.json", "smoke-3.14/sdk-install.log"]
+    assert result.stdout.count("skipped (name not uploadable)") == 9
+    assert "skipped (name not uploadable) diff-3.0.2-run/dbs/a:b\n" in result.stdout

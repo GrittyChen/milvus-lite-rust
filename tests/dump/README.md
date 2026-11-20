@@ -3,7 +3,7 @@
 `milvus-lite dump` 的端到端与差分（[0037](../../docs/decisions/0037-dump.md)「测试」）。不依赖 BulkWriter 的单测在 [tests/python/test_cli_dump.py](../python/test_cli_dump.py)。
 
 - [e2e/](e2e/)：子进程运行已安装的 CLI，读回 BulkWriter 产物；覆盖各类 schema、3.x 五处缺陷的修正、写文件失败与线程竞态、失败清理、信号、`--uri` 与 LOCK 冲突。
-- [diff/](diff/)：两侧分别建相同数据、运行各自的 dump，逐字节比较产物；登记的差异逐项断言。
+- [diff/](diff/)：两侧分别建相同数据、运行各自的 dump 并比较产物：除小 chunk 的多文件场景外逐字节比较；多文件场景按顺序拼接全部行逐行比较，并核对每个文件是这些行的标准序列化（行在文件间的切分取决于 pymilvus 写线程的时机，见该目录用例的文件头）。登记的差异逐项断言。
 - [dump_cases.py](dump_cases.py)：两者共用的建数据场景，只依赖 pymilvus，本实现与 3.x 的 python 都直接运行它。
 
 ## 环境

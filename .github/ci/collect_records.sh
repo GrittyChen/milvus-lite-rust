@@ -18,3 +18,9 @@ for pattern in "$@"; do
     echo "collected $item"
   done
 done
+# upload-artifact 拒绝名字含 " : < > | * ? 与回车、换行的文件（为兼容 NTFS），只要有一个就使整份记录上传失败；
+# 差分用例会建名为 a:b 的数据库目录。这类条目逐个列出后剔除，其余记录照常上传。
+cr=$'\r'
+lf=$'\n'
+find "$dest" -mindepth 1 \( -name '*[":<>|*?]*' -o -name "*${cr}*" -o -name "*${lf}*" \) -prune \
+  -exec sh -c 'for path; do echo "skipped (name not uploadable) ${path#"$0"/}"; rm -rf "$path"; done' "$dest" {} +

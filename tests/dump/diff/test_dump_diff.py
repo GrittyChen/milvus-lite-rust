@@ -1,8 +1,16 @@
-"""dump 差分：相同场景下本实现与 3.x 的产物逐字节一致；登记的差异逐项断言（0037「3.x 的缺陷」）。"""
+"""dump 差分：相同场景下本实现与 3.x 的产物一致；登记的差异逐项断言（0037「3.x 的缺陷」）。
+
+除 many 外的场景用默认 chunk，只在最后同步提交一次，产物逐字节比较。many 用小 chunk 切出多个文件，行在文件间怎么切分取决于
+pymilvus LocalBulkWriter 的线程时机：
+缓冲区超过 chunk_size 后它起写线程并立即返回、继续追加，写线程开始运行时才换掉旧缓冲区，起得晚时后续的行落进上一个文件。
+两侧共用这段代码，切分不是本实现的行为，因此按顺序拼接全部行逐行比较，并核对每个文件正好是这些行的标准序列化。
+"""
 
 from __future__ import annotations
 
+import json
 import os
+import re
 import sys
 
 import pytest
@@ -18,6 +26,8 @@ def run(tmp_path, python, side, case, *extra, built=True, **kwargs):
         h.build(case, db, python=python)
     out = root / "out"
     result = h.dump(["-d", db, "-c", "c", "-p", out, *extra], python=python, **kwargs)
+    # 文件按名字放进字典，多个 uuid 目录会互相覆盖而漏检；一次 dump 至多一个。
+    assert len(h.outputs(out)) <= 1, h.outputs(out)
     files = {name: open(os.path.join(out, uuid, name), encoding="utf-8").read()
              for uuid, names in h.outputs(out).items() for name in names}
     return result, files, str(root)
@@ -46,7 +56,28 @@ def test_same_output(tmp_path, ref_python, case, extra):
     (ours, ours_files, ours_root), (ref, ref_files, ref_root) = both(tmp_path, ref_python, case, *extra)
     assert ours.returncode == ref.returncode == 0, (ours.stderr[-2000:], ref.stderr[-2000:])
     assert ours.stdout.replace(ours_root, "<root>") == ref.stdout.replace(ref_root, "<root>")
-    assert ours_files == ref_files
+    if case != "many":
+        # 默认 chunk 下只在最后同步提交一次，产物与时机无关，逐字节比较；切成多个文件本身就是差异。
+        assert ours_files == ref_files
+    else:
+        # 小 chunk 必须切出多个文件，否则这一条没有覆盖多文件的路径。
+        assert len(ours_files) > 1 and len(ref_files) > 1, (sorted(ours_files), sorted(ref_files))
+        assert rows_text(ours_files) == rows_text(ref_files)
+
+
+def rows_text(files):
+    """按文件序号拼接全部行，每行保留键序的序列化文本。
+
+    每个文件须正好是 json.dumps({"rows": [...]}, indent=2) 的文本且行非空（BulkWriter 不写空缓冲区）；
+    文件名为正整数序号（字典的键互不相同），因此空缓冲区跳过的序号不影响比较。
+    """
+    assert all(re.fullmatch(r"[1-9][0-9]*\.json", name) for name in files), sorted(files)
+    rows = []
+    for name in sorted(files, key=lambda f: int(f.removesuffix(".json"))):
+        data = json.loads(files[name])
+        assert list(data) == ["rows"] and data["rows"] and files[name] == json.dumps(data, indent=2), name
+        rows.extend(json.dumps(row) for row in data["rows"])
+    return rows
 
 
 def test_function_output_fields(tmp_path, ref_python):
