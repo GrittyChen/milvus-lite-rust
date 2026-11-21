@@ -96,6 +96,7 @@
 9. **Parquet 写入参数。**
    - 必须写入 `ARROW:schema` 元数据（pyarrow 的 `store_schema` 默认开启）。缺少时，3.x 把定长向量列读成变长 list，打开 collection 直接失败。
    - 压缩与 3.x 默认一致，用 snappy。3.x 调 `pq.write_table` 时没有指定压缩，用的是 pyarrow 的默认值。
+   - 行组与 3.x 不同：3.x 用 pyarrow 默认值，一个文件在 1048576 行以内只有一个行组；本实现每个行组最多 65536 行、约 32 MiB（字节为软上限，最多超出一个 4096 行的写入分片），以限制写入期的内存峰值（[测试记录](../testing/parquet-row-group-memory.md)）。两边的读取都不依赖行组数量，旧的单行组文件照常读取，不需要迁移；pyarrow 15 与 25 读取多行组文件由存储互通用例覆盖。行组带来的文件大小变化（百万行约 +2%）可能让个别文件落进不同的合并档，文件布局本来就受编码器影响，不作为行为差异。
 10. **`LOCK` 的互斥。**
     - 3.x 在 Unix 上用 `fcntl.flock(LOCK_EX | LOCK_NB)`，在 Windows 上用 `msvcrt.locking(fd, LK_NBLCK, 1)`，后者是锁住第 0 字节的强制字节范围锁。
     - Rust 在 Unix 上必须用 flock，不能用 `fcntl` / `lockf` 锁：两者在 Linux 上互不感知。在 Windows 上，锁定区间必须覆盖第 0 字节。

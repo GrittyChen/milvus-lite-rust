@@ -50,7 +50,7 @@
 | [0038](decisions/0038-nullable-dense-vectors.md) | nullable 稠密向量：3.x 写入时换成零向量的实测、按真实 Milvus 语义存为 Arrow null 的决策、pyarrow 低于 26 时 3.x 打不开的互通代价、解码三种形态与整批为空、检索排除、紧凑输出、`ref26` 互通环境 | |
 | [0039](decisions/0039-release-speedup.md) | 发行提速：签发路径（头部、最后两个 job、签发工具的 import 闭包）相对已发布基线未变时演练可选、基线规则、候选结果格式 2 的 `dry_run_basis`；测试 job 直接取构建产物与已测摘要交叉核对；macOS 按平台限流；差分会话组只测量 | [试点](testing/0039-release-speedup-pilot.md) |
 
-不依附某个决策的记录：[恢复内存与冷启动](testing/recovery-performance.md)、[批量检索性能](testing/batch-search-performance.md)、[分配器保留内存](testing/allocator-retention.md)（Linux 上维护轮次后的 `malloc_trim`）、[关闭时显式解锁](testing/explicit-unlock.md)、[存量 FAISS 定义的 load 度量检查](testing/index-load-metric-investigation.md)（rc2 的 load 修复合同）、[子进程与关闭重开用例的隔离](testing/process-test-isolation.md)、[JSON 数字私有键修复](testing/json-private-number-key-fix.md)（`json_text` 唯一入口的来由）。
+不依附某个决策的记录：[恢复内存与冷启动](testing/recovery-performance.md)、[批量检索性能](testing/batch-search-performance.md)、[分配器保留内存](testing/allocator-retention.md)（Linux 上维护轮次后的 `malloc_trim`）、[Parquet 行组上限与写入峰值](testing/parquet-row-group-memory.md)、[关闭时显式解锁](testing/explicit-unlock.md)、[存量 FAISS 定义的 load 度量检查](testing/index-load-metric-investigation.md)（rc2 的 load 修复合同）、[子进程与关闭重开用例的隔离](testing/process-test-isolation.md)、[JSON 数字私有键修复](testing/json-private-number-key-fix.md)（`json_text` 唯一入口的来由）。
 
 ## 发行
 

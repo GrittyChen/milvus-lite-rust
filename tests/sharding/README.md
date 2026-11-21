@@ -16,7 +16,7 @@ python tests/sharding/shard.py run --plan <plan_dir>/plan.json --out <run_dir>
 
 # 互通没有会话级服务 fixture。
 python tests/sharding/shard.py plan --python <被测解释器> --suite tests/storage_interop --out <plan_dir> \
-    --shards 4 --expect 336 --expect-group 0
+    --shards 4 --expect 337 --expect-group 0
 
 # 对已有输出离线重做核对，供候选门槛使用。
 python tests/sharding/shard.py verify --plan <plan_dir>/plan.json --out <run_dir>

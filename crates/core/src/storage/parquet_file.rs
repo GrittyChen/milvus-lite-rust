@@ -44,8 +44,33 @@ pub fn inject_read_failure_once(fault: ParquetReadFault) {
     READ_FAULT.with(|slot| slot.set(Some(fault)));
 }
 
+/// 行组上限：ArrowWriter 缓存整个行组的编码结果后才落盘，默认的 100 万行上限使一次 flush
+/// 的整代数据都以编码形式留在内存里，成为写入期的内存峰值。行数上限约束窄行，字节上限约束
+/// 宽向量。测量见 docs/testing/parquet-row-group-memory.md。
+const ROW_GROUP_ROWS: usize = 64 * 1024;
+const ROW_GROUP_BYTES: usize = 32 * 1024 * 1024;
+/// 字节上限只在行组已有缓存行之后按平均行宽检查，整批一次写入时不起作用，所以分片写入；
+/// 因而它是软上限，一个行组最多超出一个分片。
+const WRITE_SLICE_ROWS: usize = 4096;
+
 /// 只创建新文件；上层保证没有 manifest / snapshot 引用同名文件。
 pub fn write_new(path: &Path, batch: &RecordBatch) -> Result<(), ParquetFileError> {
+    write_limited(
+        path,
+        batch,
+        ROW_GROUP_ROWS,
+        ROW_GROUP_BYTES,
+        WRITE_SLICE_ROWS,
+    )
+}
+
+fn write_limited(
+    path: &Path,
+    batch: &RecordBatch,
+    row_group_rows: usize,
+    row_group_bytes: usize,
+    slice_rows: usize,
+) -> Result<(), ParquetFileError> {
     let file = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -58,6 +83,8 @@ pub fn write_new(path: &Path, batch: &RecordBatch) -> Result<(), ParquetFileErro
     let properties = WriterProperties::builder()
         .set_compression(Compression::SNAPPY)
         .set_coerce_types(true)
+        .set_max_row_group_row_count(Some(row_group_rows))
+        .set_max_row_group_bytes(Some(row_group_bytes))
         .build();
     let mut writer =
         ArrowWriter::try_new(file, batch.schema(), Some(properties)).map_err(|source| {
@@ -66,12 +93,20 @@ pub fn write_new(path: &Path, batch: &RecordBatch) -> Result<(), ParquetFileErro
                 source,
             }
         })?;
-    writer
-        .write(batch)
-        .map_err(|source| ParquetFileError::Format {
-            path: path.to_path_buf(),
-            source,
-        })?;
+    let mut offset = 0;
+    loop {
+        let len = slice_rows.min(batch.num_rows() - offset);
+        writer
+            .write(&batch.slice(offset, len))
+            .map_err(|source| ParquetFileError::Format {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        offset += len;
+        if offset == batch.num_rows() {
+            break;
+        }
+    }
     let file = writer
         .into_inner()
         .map_err(|source| ParquetFileError::Format {
@@ -171,6 +206,87 @@ mod tests {
             write_new(&path, &batch),
             Err(ParquetFileError::Io { .. })
         ));
+    }
+
+    fn row_groups(path: &Path) -> Vec<i64> {
+        let builder = ParquetRecordBatchReaderBuilder::try_new(File::open(path).unwrap()).unwrap();
+        builder
+            .metadata()
+            .row_groups()
+            .iter()
+            .map(|group| group.num_rows())
+            .collect()
+    }
+
+    #[test]
+    fn row_group_limits_bound_each_group_and_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("_seq", DataType::UInt64, false),
+            Field::new("payload", DataType::Binary, false),
+        ]));
+        let rows = 10u64;
+        let payload: Vec<Vec<u8>> = (0..rows).map(|i| vec![i as u8; 1000]).collect();
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(UInt64Array::from((1..=rows).collect::<Vec<_>>())),
+                Arc::new(arrow_array::BinaryArray::from_iter_values(&payload)),
+            ],
+        )
+        .unwrap();
+        let same = |path: &Path| {
+            let mut offset = 0;
+            for read in read_all(path).unwrap() {
+                assert_eq!(read, batch.slice(offset, read.num_rows()));
+                offset += read.num_rows();
+            }
+            offset == batch.num_rows()
+        };
+
+        let by_rows = dir.path().join("rows.parquet");
+        write_limited(&by_rows, &batch, 4, usize::MAX, 3).unwrap();
+        assert_eq!(row_groups(&by_rows), [4, 4, 2]);
+        assert!(same(&by_rows));
+
+        // 每行约 1 KB：字节上限在约 2.5 行处切分，分片写入使它在第一个行组内也生效。
+        let by_bytes = dir.path().join("bytes.parquet");
+        write_limited(&by_bytes, &batch, usize::MAX, 2500, 1).unwrap();
+        let groups = row_groups(&by_bytes);
+        assert!(groups.len() >= 3, "{groups:?}");
+        assert!(groups.iter().all(|&n| n <= 3), "{groups:?}");
+        assert_eq!(groups.iter().sum::<i64>(), rows as i64);
+        assert!(same(&by_bytes));
+
+        // 生产常量：窄行由行数上限切分。
+        let narrow_rows = 70_000u64;
+        let narrow = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("_seq", DataType::UInt64, false),
+                Field::new("id", DataType::Int64, false),
+            ])),
+            vec![
+                Arc::new(UInt64Array::from((1..=narrow_rows).collect::<Vec<_>>())),
+                Arc::new(Int64Array::from(
+                    (0..narrow_rows as i64).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .unwrap();
+        let production = dir.path().join("production.parquet");
+        write_new(&production, &narrow).unwrap();
+        assert_eq!(row_groups(&production), [65_536, 4_464]);
+        let mut offset = 0;
+        for read in read_all(&production).unwrap() {
+            assert_eq!(read, narrow.slice(offset, read.num_rows()));
+            offset += read.num_rows();
+        }
+        assert_eq!(offset, narrow.num_rows());
+
+        let empty = dir.path().join("empty.parquet");
+        write_new(&empty, &batch.slice(0, 0)).unwrap();
+        assert!(row_groups(&empty).is_empty());
+        assert!(read_all(&empty).unwrap().iter().all(|b| b.num_rows() == 0));
     }
 
     #[test]

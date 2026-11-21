@@ -366,6 +366,59 @@ finally:
     assert final_manifest["partitions"]["_default"]["delta_files"] == []
 
 
+def test_rust_multi_row_group_data_file_opens_in_reference(tmp_path, interpreters):
+    # 本实现限制每个行组的行数与字节数（parquet_file.rs），3.x 用 pyarrow 默认参数写出单个行组；
+    # 这里让一次 flush 超过行数上限，确认两个 pyarrow 版本与 3.x 引擎都按多行组读出。
+    root = tmp_path / "row_groups.db"
+    rows = 70_000
+    rust_code = """
+import sys
+from pymilvus import DataType, MilvusClient
+from milvus_lite.server_manager import server_manager_instance
+path, rows = sys.argv[1], int(sys.argv[2])
+schema = MilvusClient.create_schema(auto_id=False)
+schema.add_field('id', DataType.INT64, is_primary=True)
+schema.add_field('vector', DataType.FLOAT_VECTOR, dim=2)
+schema.add_field('tag', DataType.VARCHAR, max_length=16)
+client = MilvusClient(path)
+client.create_collection('c', schema=schema)
+for start in range(0, rows, 10_000):
+    client.insert('c', [{'id': i, 'vector': [float(i), 1.0], 'tag': f't{i % 7}'} for i in range(start, min(start + 10_000, rows))])
+client.flush('c')
+client.close()
+server_manager_instance.release_server(path)
+"""
+    arrow_code = """
+import sys
+from pathlib import Path
+import pyarrow.parquet as pq
+data = sorted((Path(sys.argv[1]) / 'collections/c/partitions/_default/data').glob('*.parquet'))
+assert len(data) == 1, data
+assert pq.ParquetFile(data[0]).metadata.num_row_groups >= 2
+table = pq.read_table(data[0])
+table.validate(full=True)
+rows = int(sys.argv[2])
+assert table.column('_seq').to_pylist() == list(range(1, rows + 1))
+assert table.column('id').to_pylist() == list(range(rows))
+"""
+    reference_code = """
+import sys
+from milvus_lite.db import MilvusLite
+rows = int(sys.argv[2])
+db = MilvusLite(sys.argv[1])
+collection = db.get_collection('c')
+assert collection.num_entities == rows
+ids = [0, 65_535, 65_536, 65_537, rows - 1]
+got = sorted(collection.get(ids), key=lambda row: row['id'])
+assert [(row['id'], row['vector'], row['tag']) for row in got] == [(i, [float(i), 1.0], f't{i % 7}') for i in ids], got
+db.close()
+"""
+    run([sys.executable, "-c", rust_code, str(root), str(rows)], cwd=tmp_path)
+    for name in (PYTHONS[1], PYTHONS[2]):
+        run([interpreters[name], "-c", arrow_code, str(root), str(rows)], cwd=tmp_path)
+        run([interpreters[name], "-c", reference_code, str(root), str(rows)], cwd=tmp_path)
+
+
 def test_rust_delete_and_upsert_files_open_in_reference(tmp_path, interpreters):
     root = tmp_path / "mutations.db"
     rust_code = """

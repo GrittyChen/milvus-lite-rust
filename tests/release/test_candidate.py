@@ -92,7 +92,7 @@ def test_matrix_shape():
 
 def test_scorecard_expect_cli(capsys):
     scorecard.main(["expect", "macos-x86_64", "interop", "collected"])
-    assert capsys.readouterr().out == "336\n"
+    assert capsys.readouterr().out == "337\n"
     with pytest.raises(SystemExit):
         scorecard.main(["expect", "linux-x86_64", "rust-default", "passed"])
 
