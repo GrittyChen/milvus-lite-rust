@@ -19,7 +19,7 @@ on:
         type: boolean
         default: false
       pid1_dry_run:
-        description: 正式运行引用的同一提交上含 PID 1 的成功演练，形如 <run-id>.<attempt>
+        description: 正式运行引用的同一提交上含 PID 1 的成功演练，形如 <run-id>.<attempt>；签发路径相对已发布基线未变时可留空（0039）
         type: string
         default: ""
 
@@ -70,9 +70,10 @@ jobs:
         env:
           INPUT_COMMIT: ${{ inputs.commit }}
         run: test "$GITHUB_SHA" = "$INPUT_COMMIT"
-      - name: 日常门槛、版本、PID 1 演练与签发环境
+      - name: 签发环境、版本、演练引用或签发路径与日常门槛
         # 正式运行在构建之前核对 release-signing 的保护规则（0022 第 1 节）：环境被删除或写错时 GitHub 会自动建出
-        # 无保护的同名环境。环境名是字面量，不来自输入。
+        # 无保护的同名环境。环境名是字面量，不来自输入。未引用演练时，签发路径须与台账中最近的已发布版本相同，
+        # 基线读自本 checkout 的台账与 tag（0039 第 2、3 条）。
         env:
           GH_TOKEN: ${{ github.token }}
           PID1_DRY_RUN: ${{ inputs.pid1_dry_run }}
@@ -177,6 +178,7 @@ jobs:
           retention-days: 30
 
   build:
+    # Intel Mac 构建最慢（约 11–14 分钟），单独成 build-mac-x86_64：其他平台的测试只等本 job（0039 第 7 条）。
     needs: identity
     name: build (${{ matrix.scope }})
     strategy:
@@ -195,17 +197,14 @@ jobs:
             os: macos-15
             container: ""
             compat: ""
-          - scope: macos-x86_64
-            os: macos-15-intel
-            container: ""
-            compat: ""
     runs-on: ${{ matrix.os }}
     container: ${{ matrix.container }}
     timeout-minutes: 60
     env:
       MACOSX_DEPLOYMENT_TARGET: "11.0"
       RUNNER_IMAGE: ${{ matrix.container && format('{0} container {1}', matrix.os, matrix.container) || '' }}
-    steps:
+    # 步骤由 build-mac-x86_64 共用，产物名同为 build-<平台>，装配按 build-* 收集。
+    steps: &build-steps
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
@@ -253,8 +252,27 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+  build-mac-x86_64:
+    needs: identity
+    name: build (${{ matrix.scope }})
+    strategy:
+      matrix:
+        include:
+          - scope: macos-x86_64
+            os: macos-15-intel
+            container: ""
+            compat: ""
+    runs-on: ${{ matrix.os }}
+    container: ${{ matrix.container }}
+    timeout-minutes: 60
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+      RUNNER_IMAGE: ""
+    steps: *build-steps
+
   assemble:
-    needs: build
+    # 装配仍等四个构建；测试 job 不等装配，所用文件由候选结果 job 与这里交出的清单交叉核对（0039 第 8 条）。
+    needs: [build, build-mac-x86_64]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
@@ -327,12 +345,12 @@ jobs:
   tests:
     # 第 9 条在四个标准层的门槛；Linux 在固定 manylinux_2_28 镜像中以非 root（UID 1001，托管机器工作区属主）运行，
     # 只在 root 下执行的权限用例属源码级门槛，由 CI 快速层在宿主机上以 root 覆盖。
-    needs: [assemble, orjson, jieba]
+    needs: [build, orjson, jieba]
     name: tests (${{ matrix.platform.scope }}, ${{ matrix.part }})
     strategy:
       fail-fast: false
       matrix:
-        # 与 tests-mac 用相同的 part 划分（差分两条线与互通各占一个 job），阶段与产物命名一致。
+        # 与两个 macOS 测试 job 用相同的 part 划分（差分两条线与互通各占一个 job），阶段与产物命名一致。
         part: [diff-3.0.2, diff-2.6.17, interop, python, static, fi]
         platform:
           - scope: linux-x86_64
@@ -360,7 +378,7 @@ jobs:
       MACOSX_DEPLOYMENT_TARGET: "11.0"
       # 容器内的崩溃由宿主机的 systemd-coredump 接收，其目录只读挂入容器（见 crash_capture.sh）。
       CRASH_CORE_DIR: /__coredump
-    # 步骤由 tests-mac 共用：不能引用只有本 job 矩阵才有的字段（如 platform.image），
+    # 步骤由 tests-mac-x86_64 与 tests-mac-arm64 共用：不能引用只有本 job 矩阵才有的字段（如 platform.image），
     # 也不能依赖只在容器 job 设置的 RUNNER_IMAGE / CRASH_CORE_DIR；后者 actionlint 查不出来。
     steps: &tests-steps
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -388,14 +406,15 @@ jobs:
             3.14
             ${{ matrix.part == 'python' && '3.15' || '' }}
             3.12
+      # 直接取构建产物，不等装配：本平台的正式与 FI wheel，以及 Linux x86_64 构建的 sdist（0039 第 8 条）。
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: formal
-          path: ${{ runner.temp }}/artifacts
+          name: build-${{ matrix.platform.scope }}
+          path: ${{ runner.temp }}/build-own
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: fi
-          path: ${{ runner.temp }}/fi-artifact
+          name: build-linux-x86_64
+          path: ${{ runner.temp }}/build-sdist
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         if: matrix.part == 'python' && matrix.platform.arch != ''
         with:
@@ -413,13 +432,17 @@ jobs:
         run: bash .github/ci/release_env.sh ${{ (matrix.part != 'python' && matrix.part != 'fi') && 'rust' || '' }}
       - name: 产物
         run: |
-          "$DEV_PY" tests/release/sums.py check "$RUNNER_TEMP/artifacts/formal.sha256" "$RUNNER_TEMP/artifacts/formal"
-          "$DEV_PY" tests/release/sums.py check "$RUNNER_TEMP/fi-artifact/fi.sha256" "$RUNNER_TEMP/fi-artifact/fi"
-          wheel="$RUNNER_TEMP/artifacts/formal/milvus_lite_rust-$VERSION-cp310-abi3-${{ matrix.platform.tag }}.whl"
-          fi_wheel="$RUNNER_TEMP/fi-artifact/fi/build-$SCOPE/milvus_lite_rust-$VERSION-cp310-abi3-${{ matrix.platform.tag }}.whl"
-          test -f "$wheel" && test -f "$fi_wheel"
-          { echo "WHEEL=$wheel"; echo "FI_WHEEL=$fi_wheel"; echo "SDIST=$RUNNER_TEMP/artifacts/formal/milvus_lite_rust-$VERSION.tar.gz";
-            echo "STAGES=$RUNNER_TEMP/stages"; } >> "$GITHUB_ENV"
+          # build.sha256 与产物同包，只能发现传输损坏；测试用的字节与签发字节的绑定由候选结果 job 交叉核对。
+          "$DEV_PY" tests/release/sums.py check "$RUNNER_TEMP/build-own/build.sha256" "$RUNNER_TEMP/build-own"
+          "$DEV_PY" tests/release/sums.py check "$RUNNER_TEMP/build-sdist/build.sha256" "$RUNNER_TEMP/build-sdist"
+          wheel="$RUNNER_TEMP/build-own/formal/milvus_lite_rust-$VERSION-cp310-abi3-${{ matrix.platform.tag }}.whl"
+          fi_wheel="$RUNNER_TEMP/build-own/fi/milvus_lite_rust-$VERSION-cp310-abi3-${{ matrix.platform.tag }}.whl"
+          sdist="$RUNNER_TEMP/build-sdist/sdist/milvus_lite_rust-$VERSION.tar.gz"
+          test -f "$wheel" && test -f "$fi_wheel" && test -f "$sdist"
+          mkdir -p "$RUNNER_TEMP/stages"
+          "$DEV_PY" tests/release/sums.py tested "$RUNNER_TEMP/stages/tested-$SCOPE-${{ matrix.part }}.sha256" "$SCOPE" \
+            "$wheel" "$fi_wheel" "$sdist"
+          { echo "WHEEL=$wheel"; echo "FI_WHEEL=$fi_wheel"; echo "SDIST=$sdist"; echo "STAGES=$RUNNER_TEMP/stages"; } >> "$GITHUB_ENV"
       - name: 归档、二进制与 Rust
         if: matrix.part == 'static'
         run: |
@@ -515,7 +538,7 @@ jobs:
             diff-2.6.17) sdk=2.6.17 ;;
             *) exit 1 ;;
           esac
-          # 与对照层相同的两条线，Python 侧改为装配交出的正式 wheel，并核对实际加载的原生模块；互通用 3.0.2 线的环境，同样核对。
+          # 与对照层相同的两条线，Python 侧改为本运行构建的正式 wheel（候选结果 job 与装配清单交叉核对），并核对实际加载的原生模块；互通用 3.0.2 线的环境，同样核对。
           if [ "$sdk" = 3.0.2 ]; then
             uv venv -q -p "$PY312" "$RUNNER_TEMP/w30"
             uv pip install -q --python "$RUNNER_TEMP/w30/bin/python" --no-build -r "$req/sdk30.txt" && uv pip install -q --python "$RUNNER_TEMP/w30/bin/python" --no-deps "$WHEEL"
@@ -612,23 +635,39 @@ jobs:
           # 只用于诊断（0020 公共约定 10）：环境步骤之前失败时没有测试步骤运行过，也没有 PY314。
           if [ -n "${PY314:-}" ]; then "$PY314" .github/ci/crash_report.py; else echo "no test step ran"; fi
 
-  tests-mac:
-    # 与 tests 相同的步骤，只是 macOS 两层：12 个 job 争 5 个 macOS 并发位，不限流时由 GitHub 决定谁先领到执行机，
-    # 最长的 Intel 差分可能排到最后。max-parallel 等于该上限，使排队留在矩阵内部，以期按矩阵顺序（part 在外层、
-    # 大致按 Intel 上的时长从长到短，同一 part 内 Intel 在前）放行；GitHub 文档未写明放行顺序。
-    needs: [assemble, orjson, jieba]
+  tests-mac-x86_64:
+    # 与 tests 相同的步骤。macOS 并发是账户级的 5 个，两个平台各自限流（Intel 4、arm64 3，按实测模拟选定，
+    # 可按实测调整）：arm64 构建后即开始，不等 Intel 构建；part 顺序大致按 Intel 上的时长从长到短，使 Intel 的
+    # python 在第一批放行（0039 第 9 条）。GitHub 文档未写明矩阵内的放行顺序。
+    needs: [build, build-mac-x86_64, orjson, jieba]
     name: tests (${{ matrix.platform.scope }}, ${{ matrix.part }})
     strategy:
       fail-fast: false
-      max-parallel: 5
+      max-parallel: 4
       matrix:
-        part: [diff-2.6.17, diff-3.0.2, interop, python, static, fi]
+        part: [diff-2.6.17, diff-3.0.2, python, interop, static, fi]
         platform:
           - scope: macos-x86_64
             os: macos-15-intel
             tag: macosx_11_0_x86_64
             arch: ""
             shards: 3
+    runs-on: ${{ matrix.platform.os }}
+    timeout-minutes: 120
+    env:
+      SCOPE: ${{ matrix.platform.scope }}
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+    steps: *tests-steps
+
+  tests-mac-arm64:
+    needs: [build, orjson, jieba]
+    name: tests (${{ matrix.platform.scope }}, ${{ matrix.part }})
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        part: [diff-2.6.17, diff-3.0.2, python, interop, static, fi]
+        platform:
           - scope: macos-arm64
             os: macos-15
             tag: macosx_11_0_arm64
@@ -929,7 +968,8 @@ jobs:
   candidate:
     # 只接受全部前序 job 为 success；随后生成候选结果与最终 SHA256SUMS（0021 第 12 条）。
     if: always()
-    needs: [precheck, identity, orjson, jieba, build, assemble, tests, tests-mac, linux-system, pid1, sdist, previous-reader]
+    needs: [precheck, identity, orjson, jieba, build, build-mac-x86_64, assemble, tests, tests-mac-x86_64, tests-mac-arm64,
+            linux-system, pid1, sdist, previous-reader]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
@@ -971,6 +1011,9 @@ jobs:
         run: |
           python3 tests/release/sums.py check "$RUNNER_TEMP/artifacts/formal.sha256" "$RUNNER_TEMP/artifacts/formal"
           python3 tests/release/sums.py check "$RUNNER_TEMP/fi-artifact/fi.sha256" "$RUNNER_TEMP/fi-artifact/fi"
+          # 测试 job 直接取构建产物：各自实际使用的文件须与装配清单成对一致（0039 第 8 条）。
+          python3 tests/release/candidate.py tested --dir "$RUNNER_TEMP/stages" --formal-sums "$RUNNER_TEMP/artifacts/formal.sha256" \
+            --fi-sums "$RUNNER_TEMP/fi-artifact/fi.sha256" --version "$VERSION"
           # 工作流产物里的归档须与身份记录一致，复核者才能直接拿它对照，而不必从冻结提交重建。
           test "$(python3 tests/release/sums.py digest "$RUNNER_TEMP/identity/source.tar")" = \
             "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["archive_sha256"])' "$RUNNER_TEMP/identity/source-identity.json")"

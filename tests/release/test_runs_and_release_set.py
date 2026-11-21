@@ -136,6 +136,16 @@ class FakeGh:
         return self.attempts[path]
 
 
+class NoGit:
+    """引用演练时不读本地仓库；被调用即说明判定走错了分支。"""
+
+    def __getattr__(self, name):
+        raise AssertionError(f"git.{name} must not be used when a dry run is referenced")
+
+
+NO_GIT = NoGit()
+
+
 def args(**changes):
     return SimpleNamespace(**{**dict(sha=COMMIT, version=VERSION, mode="release", run_id=100, run_attempt=1,
                                      pid1_dry_run="7.1", signing_environment=SIGNING, owner_id=OWNER), **changes})
@@ -151,11 +161,12 @@ def release_run(id, attempt):
 
 
 def test_precheck_passes_and_records_runs(gh):
-    out = runs.precheck(gh, args())
+    out = runs.precheck(gh, NO_GIT, args())
     assert out["inherited"] == {"ci": {"id": 1, "attempt": 1}, "compare": {"id": 2, "attempt": 1}}
     assert out["pid1_dry_run"] == {"id": 7, "attempt": 1}
     assert out["inherited_runs"] == {"ci": [[1, 1]], "compare": [[2, 1]]}
-    assert set(out) == {"mode", "version", "commit", "run", "inherited", "inherited_runs", "pid1_dry_run"}
+    assert out["dry_run_basis"] is None
+    assert set(out) == {"mode", "version", "commit", "run", "inherited", "inherited_runs", "pid1_dry_run", "dry_run_basis"}
 
 
 @pytest.mark.parametrize("mutate, message", [
@@ -180,7 +191,7 @@ def test_precheck_passes_and_records_runs(gh):
 def test_precheck_rejects(gh, mutate, message):
     mutate(gh)
     with pytest.raises(c.CandidateError, match=message):
-        runs.precheck(gh, args())
+        runs.precheck(gh, NO_GIT, args())
 
 
 def test_earlier_attempt_that_started_signing_consumes_the_version(gh):
@@ -188,7 +199,7 @@ def test_earlier_attempt_that_started_signing_consumes_the_version(gh):
     gh.jobs_by_attempt[(50, 1)] = [job("attest", conclusion="failure", steps=[step(conclusion="failure")])]
     gh.jobs_by_attempt[(50, 2)] = [job("attest", conclusion="skipped", steps=[])]
     with pytest.raises(c.CandidateError, match="attempt 1 started signing"):
-        runs.precheck(gh, args())
+        runs.precheck(gh, NO_GIT, args())
 
 
 def test_current_runs_earlier_attempt_that_started_signing_consumes_the_version(gh):
@@ -196,17 +207,17 @@ def test_current_runs_earlier_attempt_that_started_signing_consumes_the_version(
     gh.release_runs.append(release_run(100, 2))
     gh.jobs_by_attempt[(100, 1)] = [job("attest", conclusion="failure", steps=[step(conclusion="failure")])]
     with pytest.raises(c.CandidateError, match="run 100 attempt 1 started signing"):
-        runs.precheck(gh, args(run_attempt=2))
+        runs.precheck(gh, NO_GIT, args(run_attempt=2))
 
 
 def test_current_attempt_itself_is_not_counted(gh):
     gh.release_runs.append(release_run(100, 1))
     gh.jobs_by_attempt[(100, 1)] = [job("attest", "in_progress", None, steps=[step("in_progress", None)])]
-    runs.precheck(gh, args(run_attempt=1))
+    runs.precheck(gh, NO_GIT, args(run_attempt=1))
 
 
 def test_recheck_rejects_partial_rerun(gh):
-    recorded = runs.precheck(gh, args())
+    recorded = runs.precheck(gh, NO_GIT, args())
     with pytest.raises(c.CandidateError, match="re-run all jobs"):
         runs.recheck(gh, recorded, {"id": 100, "attempt": 2})
 
@@ -217,26 +228,23 @@ def test_failures_before_signing_and_dry_runs_do_not_consume(gh):
     gh.jobs_by_attempt[(50, 2)] = [job("attest", conclusion="failure", steps=[step(conclusion="skipped")])]
     gh.release_runs.append(dry_run(id=60))
     gh.jobs_by_attempt[(60, 1)] = [job("attest", steps=[step()])]
-    runs.precheck(gh, args())
+    runs.precheck(gh, NO_GIT, args())
 
 
-def test_every_release_run_needs_its_own_pid1_dry_run(gh):
-    gh.ledger["versions"].append({"version": "0.9.0", "run_id": 5, "run_attempt": 1, "outcome": "released"})
-    with pytest.raises(c.CandidateError, match="must reference a dry run"):
-        runs.precheck(gh, args(pid1_dry_run=""))
+def test_dry_run_reference_must_be_well_formed(gh):
     with pytest.raises(c.CandidateError, match="run reference"):
-        runs.precheck(gh, args(pid1_dry_run="7"))
+        runs.precheck(gh, NO_GIT, args(pid1_dry_run="7"))
 
 
 def test_dry_run_mode(gh):
     gh.tags.add(f"v{VERSION}")
-    assert runs.precheck(gh, args(mode="dry-run", pid1_dry_run=""))["pid1_dry_run"] is None
+    assert runs.precheck(gh, NO_GIT, args(mode="dry-run", pid1_dry_run=""))["pid1_dry_run"] is None
     with pytest.raises(c.CandidateError, match="does not reference"):
-        runs.precheck(gh, args(mode="dry-run"))
+        runs.precheck(gh, NO_GIT, args(mode="dry-run"))
 
 
 def test_recheck_rejects_newer_inherited_run_and_consumed_version(gh):
-    recorded = runs.precheck(gh, args())
+    recorded = runs.precheck(gh, NO_GIT, args())
     runs.recheck(gh, recorded, {"id": 100, "attempt": 1})
     gh.compare.append(run(9, "12:00", path=COMPARE, title="Compare"))
     with pytest.raises(c.CandidateError, match="newer"):
@@ -256,7 +264,7 @@ def test_recheck_rejects_newer_inherited_run_and_consumed_version(gh):
 def test_recheck_rejects_rerun_of_an_older_run(gh, status, conclusion):
     # 前置检查时较旧的运行 A 已成功、较新的 B 被选中；构建期间重跑 A，A 的创建时间不变，按创建时间仍选 B。
     gh.ci.insert(0, run(3, "09:00"))
-    recorded = runs.precheck(gh, args())
+    recorded = runs.precheck(gh, NO_GIT, args())
     assert recorded["inherited"]["ci"] == {"id": 1, "attempt": 1}
     gh.ci[0] = run(3, "09:00", status, conclusion, attempt=2)
     with pytest.raises(c.CandidateError, match="re-run appeared"):
@@ -480,12 +488,12 @@ def test_signing_environment_rejects(env, message):
 def test_precheck_checks_the_signing_environment_only_for_release_runs():
     gh = env_gh(dict(signing_environment(), can_admins_bypass=True))
     with pytest.raises(c.CandidateError, match="bypass"):
-        runs.precheck(gh, args())
-    runs.precheck(gh, args(mode="dry-run", pid1_dry_run=""))
-    runs.precheck(env_gh(None), args(mode="dry-run", pid1_dry_run="", signing_environment="", owner_id=0))
+        runs.precheck(gh, NO_GIT, args())
+    runs.precheck(gh, NO_GIT, args(mode="dry-run", pid1_dry_run=""))
+    runs.precheck(env_gh(None), NO_GIT, args(mode="dry-run", pid1_dry_run="", signing_environment="", owner_id=0))
     for missing in (dict(signing_environment=""), dict(owner_id=0)):
         with pytest.raises(c.CandidateError, match="signing environment and owner"):
-            runs.precheck(env_gh(signing_environment()), args(**missing))
+            runs.precheck(env_gh(signing_environment()), NO_GIT, args(**missing))
 
 
 def probe_attest(name):
@@ -509,4 +517,4 @@ def test_probe_waiting_and_rejected_attest_has_not_started_signing():
 def test_release_run_rejected_at_the_gate_does_not_consume(gh):
     gh.release_runs.append(release_run(50, 1))
     gh.jobs_by_attempt[(50, 1)] = probe_attest("jobs-rejected.json")
-    runs.precheck(gh, args())
+    runs.precheck(gh, NO_GIT, args())

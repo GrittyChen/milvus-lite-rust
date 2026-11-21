@@ -34,3 +34,40 @@ def test_check_rejects(tree, mutate, message):
     mutate(tree)
     with pytest.raises(SystemExit, match=message):
         sums.check(tree / "build.sha256", tree)
+
+
+def test_tested_output_passes_the_candidate_cross_check(tmp_path, capsys):
+    """sums.py tested 的真实输出须能通过 candidate.py tested 的成对核对（0039 第 8 条），两者经 CLI 衔接。"""
+    import candidate as c
+    version = "1.2.0rc3"
+    formal, fi, stages = tmp_path / "formal", tmp_path / "fi", tmp_path / "stages"
+    formal.mkdir()
+    stages.mkdir()
+    sdist = formal / f"milvus_lite_rust-{version}.tar.gz"
+    sdist.write_bytes(b"sdist")
+    for scope in c.SCOPE_TAGS:
+        name = c.wheel_name(version, scope)
+        (formal / name).write_bytes(f"formal {scope}".encode())
+        (fi / f"build-{scope}").mkdir(parents=True)
+        (fi / f"build-{scope}" / name).write_bytes(f"fi {scope}".encode())
+    sums.write(formal, tmp_path / "formal.sha256")
+    sums.write(fi, tmp_path / "fi.sha256")
+    for scope in c.SCOPE_TAGS:
+        for part in c.TEST_PARTS:
+            name = c.wheel_name(version, scope)
+            sums.tested(stages / c.tested_name(scope, part), scope, formal / name, fi / f"build-{scope}" / name, sdist)
+    argv = ["tested", "--dir", str(stages), "--formal-sums", str(tmp_path / "formal.sha256"),
+            "--fi-sums", str(tmp_path / "fi.sha256"), "--version", version]
+    assert c.main(argv) == 0
+    assert "24 files" in capsys.readouterr().out
+    # 某个 job 用错平台的 FI wheel：成对核对拒绝。
+    scope = "macos-arm64"
+    name = c.wheel_name(version, scope)
+    other = fi / "build-macos-x86_64" / c.wheel_name(version, "macos-x86_64")
+    sums.tested(stages / c.tested_name(scope, "fi"), scope, formal / name, other, sdist)
+    assert c.main(argv) == 1
+
+
+def test_wheel_tags_literal_matches_the_scope_map():
+    import candidate as c
+    assert c.WHEEL_TAGS == tuple(sorted(c.SCOPE_TAGS.values()))

@@ -1,4 +1,5 @@
-"""发行工作流的签发前保全门闩（0022）：环境、依赖、权限与「保全回执」→ sign 的先后都锁死在工作流文本上。
+"""发行工作流的签发前保全门闩（0022）：环境、依赖、权限与「保全回执」→ sign 的先后都锁死在工作流文本上；
+提速编排（0039）：测试 job 直接取构建产物、依赖表、macOS 按平台限流、已测摘要的交叉核对与签发路径的边界。
 
 开发环境不装 YAML 解析库，按工作流固定的缩进切分：jobs 下两格缩进为 job，六格的 "- " 开始一个步骤。每条约束另有一个
 变异用例，确认改坏后能被发现。
@@ -10,6 +11,7 @@ import shlex
 
 import pytest
 
+import candidate as c
 import runs
 
 WORKFLOW = Path(__file__).resolve().parents[2] / ".github" / "workflows" / "release.yml"
@@ -34,7 +36,7 @@ def parse(text):
     head, body = text.split("\njobs:\n", 1)
     jobs, job = {}, None
     for line in body.splitlines():
-        if re.match(r"^  [a-z][a-z0-9-]*:\s*$", line):
+        if re.match(r"^  [a-z][a-z0-9_-]*:\s*$", line):
             job = line.strip()[:-1]
             jobs[job] = {"head": [], "steps": []}
         elif job and line.startswith("      - "):
@@ -255,3 +257,125 @@ def test_gate_shape_mutations_detected(mutate):
     mutated = mutate(text)
     assert mutated != text
     assert problems(mutated)
+
+
+# 0039 第 8 条的依赖表；candidate 依赖除签发两段之外的全部 job，由 speedup_problems 另行核对。
+NEEDS = {"assemble": ["build", "build-mac-x86_64"], "tests": ["build", "orjson", "jieba"],
+         "tests-mac-x86_64": ["build", "build-mac-x86_64", "orjson", "jieba"], "tests-mac-arm64": ["build", "orjson", "jieba"],
+         # 其余验收 job 仍在装配之后（0039 第 8 条「不变」）。
+         "linux-system": ["assemble"], "pid1": ["assemble"], "sdist": ["assemble", "identity"], "previous-reader": ["assemble"]}
+MAC_TESTS = {"tests-mac-x86_64": ("macos-x86_64", "4"), "tests-mac-arm64": ("macos-arm64", "3")}
+MAC_PARTS = "        part: [diff-2.6.17, diff-3.0.2, python, interop, static, fi]"
+MODE_LINE = "  MODE: ${{ inputs.dry_run && 'dry-run' || 'release' }}"
+VERSION_LINE = "  VERSION: ${{ inputs.version }}"
+# YAML 锚点与别名：签发路径内若用别名，展开的内容在路径之外，摘要看不到它的变化。
+ALIAS = re.compile(r"(?:^\s*-|:)\s+[&*][A-Za-z_]|<<:")
+
+
+def needs(job):
+    text = " ".join(line.strip() for line in job["head"])
+    match = re.search(r"needs: (\[[^\]]*\]|\S+)", text)
+    if match is None:
+        return None
+    value = match.group(1)
+    return [x.strip() for x in value.strip("[]").split(",")] if value.startswith("[") else [value]
+
+
+def scope_tags(job):
+    """矩阵中各 platform 的 (scope, tag)。"""
+    found, scope = [], None
+    for line in job["head"]:
+        if m := re.match(r"^          - scope: (\S+)$", line):
+            scope = m.group(1)
+        elif (m := re.match(r"^            tag: (\S+)$", line)) and scope:
+            found.append((scope, m.group(1)))
+    return found
+
+
+def speedup_problems(text):
+    head, jobs = parse(text)
+    found = []
+    for name, want in NEEDS.items():
+        if needs(jobs.get(name, {"head": []})) != want:
+            found.append(f"{name} needs {needs(jobs.get(name, {'head': []}))}")
+    expected = sorted(set(jobs) - {"candidate", "preserve-digests", "attest"})
+    if sorted(needs(jobs.get("candidate", {"head": []})) or []) != expected:
+        found.append("candidate does not need every job before signing")
+    tags = [pair for name in ("tests", *MAC_TESTS) for pair in scope_tags(jobs.get(name, {"head": []}))]
+    if sorted(tags) != sorted(c.SCOPE_TAGS.items()):
+        found.append(f"test matrix platforms and tags {tags} differ from candidate.SCOPE_TAGS")
+    for name, (scope, limit) in MAC_TESTS.items():
+        job = jobs.get(name, {"head": [], "steps": []})
+        if f"      max-parallel: {limit}" not in job["head"] or MAC_PARTS not in job["head"] \
+                or "    steps: *tests-steps" not in job["head"] or [s for s, _ in scope_tags(job)] != [scope]:
+            found.append(f"{name} matrix, limit or steps")
+    tests = jobs.get("tests", {"head": [], "steps": []})
+    parts = [line for line in tests["head"] if line.startswith("        part: ")]
+    if len(parts) != 1 or sorted(parts[0].split("[")[1].rstrip("]").split(", ")) != sorted(c.TEST_PARTS):
+        found.append(f"tests parts {parts}")
+    downloads = [line.strip() for step in tests["steps"] for line in step if re.match(r"^\s+name: \S", line)
+                 and "download-artifact" in step[0]]
+    if any(d in ("name: formal", "name: fi") for d in downloads) \
+            or not {"name: build-${{ matrix.platform.scope }}", "name: build-linux-x86_64"} <= set(downloads):
+        found.append(f"test jobs must take build artifacts, not the assembled ones: {downloads}")
+    produced = tests["steps"][step_named(tests["steps"], "产物")] if step_named(tests["steps"], "产物") is not None else []
+    if not any("tests/release/sums.py tested" in line for line in produced):
+        found.append("test jobs do not record the files they used")
+    candidate = " ".join(line for step in jobs.get("candidate", {"steps": []})["steps"] for line in step)
+    if "tests/release/candidate.py tested" not in candidate:
+        found.append("candidate does not cross-check the tested files")
+    header = head.splitlines()
+    if MODE_LINE not in header or VERSION_LINE not in header or [line for line in block(header, "defaults", 0) or [] if not line.strip().startswith("#")] != ["  run:", "    shell: bash"]:
+        found.append("MODE, VERSION or defaults.run.shell changed")
+    try:
+        signing = runs.signing_jobs(text)
+    except c.CandidateError as error:
+        return found + [str(error)]
+    env_keys = {m.group(1) for line in block(header, "env", 0) or [] if (m := re.match(r"^  ([A-Z][A-Z0-9_]*):", line))}
+    for key in sorted(env_keys - set(runs.SIGNING_ENV_KEYS)):
+        if re.search(rf"\$\{{?{key}\b|env\.{key}\b", signing):
+            found.append(f"signing jobs read env {key}, which is outside the signing path")
+    if any(ALIAS.search(line) for line in signing.splitlines()):
+        found.append("signing jobs use a YAML anchor or alias")
+    tools = set(re.findall(r"tests/release/[A-Za-z0-9_]+\.py", signing))
+    if not tools <= set(c.SIGNING_ENTRIES) or ".github/ci/" in signing:
+        found.append(f"signing jobs call tools outside the signing entries: {sorted(tools - set(c.SIGNING_ENTRIES))}")
+    return found
+
+
+def test_release_workflow_speedup_shape():
+    assert speedup_problems(WORKFLOW.read_text()) == []
+
+
+@pytest.mark.parametrize("mutate", [
+    replace("    needs: [build, build-mac-x86_64]\n", "    needs: build\n"),
+    replace("    needs: [build, orjson, jieba]\n    name: tests (${{ matrix.platform.scope }}, ${{ matrix.part }})\n    strategy:\n      fail-fast: false\n      matrix:\n        # ",
+            "    needs: [assemble, orjson, jieba]\n    name: tests (${{ matrix.platform.scope }}, ${{ matrix.part }})\n    strategy:\n      fail-fast: false\n      matrix:\n        # "),
+    replace("    needs: [build, build-mac-x86_64, orjson, jieba]\n", "    needs: [build, orjson, jieba]\n"),
+    replace(" tests-mac-x86_64, tests-mac-arm64,\n", " tests-mac-x86_64,\n"),
+    replace("      max-parallel: 4\n", "      max-parallel: 5\n"),
+    replace("      max-parallel: 3\n", ""),
+    replace("        part: [diff-2.6.17, diff-3.0.2, python, interop, static, fi]\n        platform:\n          - scope: macos-arm64",
+            "        part: [diff-2.6.17, diff-3.0.2, interop, python, static, fi]\n        platform:\n          - scope: macos-arm64"),
+    replace("            tag: macosx_11_0_arm64\n", "            tag: macosx_11_0_x86_64\n"),
+    replace("          name: build-linux-x86_64\n          path: ${{ runner.temp }}/build-sdist",
+            "          name: formal\n          path: ${{ runner.temp }}/build-sdist"),
+    replace("          \"$DEV_PY\" tests/release/sums.py tested", "          true"),
+    replace("python3 tests/release/candidate.py tested", "true"),
+    replace(MODE_LINE, "  MODE: release"),
+    replace("    shell: bash\n", "    shell: sh\n"),
+    replace("--mode \"$MODE\" --version \"$VERSION\" \\\n            --candidate-dir",
+            "--mode \"$MODE\" --version \"$PREVIOUS_VERSION\" \\\n            --candidate-dir"),
+    replace("      - name: sign\n", "      - name: sign\n        env: &sign-env\n          X: y\n"),
+    replace("          python3 tests/release/preserve.py gate", "          python3 tests/release/stage.py --help\n          python3 tests/release/preserve.py gate"),
+    replace("          python3 tests/release/preserve.py gate", "          bash .github/ci/install_uv.sh\n          python3 tests/release/preserve.py gate"),
+    lambda text: text + "  after:\n    runs-on: x\n",
+    replace("    needs: [assemble, identity]\n", "    needs: [build, identity]\n"),
+], ids=["assemble-needs", "tests-assemble", "intel-build", "candidate-needs", "intel-limit", "arm-limit", "arm-order",
+        "tag", "download-formal", "no-tested", "no-cross-check", "mode", "shell", "env-key", "alias", "tool", "ci-script",
+        "job-after-attest", "sdist-needs"])
+def test_speedup_shape_mutations_detected(mutate):
+    text = WORKFLOW.read_text()
+    mutated = mutate(text)
+    assert mutated != text
+    assert speedup_problems(mutated)

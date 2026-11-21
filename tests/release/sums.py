@@ -2,6 +2,9 @@
 
 manylinux 容器不一定带 shasum，因此用 Python 实现；格式与 `shasum -a 256` 相同。发布用的 SHA256SUMS 由
 candidate.py 生成，不用本工具。
+
+`tested` 写出测试 job 实际使用的三个文件，名字带装配清单的前缀（formal/ 或 fi/build-<平台>/），由候选结果
+job 与装配清单成对核对（0039 第 8 条）。
 """
 
 import hashlib
@@ -42,10 +45,19 @@ def check(sums, directory):
     print(f"{len(entries)} files match {Path(sums).name}")
 
 
+def tested(out, scope, wheel, fi_wheel, sdist):
+    entries = {f"formal/{Path(wheel).name}": digest(wheel), f"fi/build-{scope}/{Path(fi_wheel).name}": digest(fi_wheel),
+               f"formal/{Path(sdist).name}": digest(sdist)}
+    Path(out).write_text("".join(f"{value}  {name}\n" for name, value in sorted(entries.items())))
+
+
 if __name__ == "__main__":
     if sys.argv[1:2] == ["digest"] and len(sys.argv) == 3:
         print(digest(sys.argv[2]))
     elif len(sys.argv) == 4 and sys.argv[1] in ("write", "check"):
         (write if sys.argv[1] == "write" else check)(*sys.argv[2:])
+    elif len(sys.argv) == 7 and sys.argv[1] == "tested":
+        tested(*sys.argv[2:])
     else:
-        raise SystemExit("usage: sums.py write <dir> <out> | check <sums> <dir> | digest <file>")
+        raise SystemExit("usage: sums.py write <dir> <out> | check <sums> <dir> | digest <file>"
+                         " | tested <out> <scope> <wheel> <fi-wheel> <sdist>")

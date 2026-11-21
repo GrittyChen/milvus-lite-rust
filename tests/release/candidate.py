@@ -3,6 +3,7 @@
 候选结果带格式版本、键集合固定，读取方缺键、多键、格式版本不认识或取值不合规都拒绝；阶段按
 [scorecard.py](scorecard.py) 的固定矩阵逐项核对，缺平台、缺阶段、计数键或数量不符都拒绝。
 它不记录 SHA256SUMS 的哈希；SHA256SUMS 在它之后生成，覆盖五个正式附件与候选结果。
+正式运行未引用演练时，`dry_run_basis` 记录签发路径相对已发布基线未变的依据（0039）。
 """
 
 import argparse
@@ -14,11 +15,28 @@ import sys
 
 import scorecard
 
-FORMAT = 1
+FORMAT = 2
 MODES = ("release", "dry-run")
+# 平台到 wheel 标签：工作流测试矩阵的 platform.tag 须与此一致（test_release_workflow 核对）。
+SCOPE_TAGS = {"linux-x86_64": "manylinux_2_28_x86_64", "linux-aarch64": "manylinux_2_28_aarch64",
+              "macos-arm64": "macosx_11_0_arm64", "macos-x86_64": "macosx_11_0_x86_64"}
+# 字面量：tests/packaging 以 ast.literal_eval 读取（不导入本模块）；与 SCOPE_TAGS 的一致由 tests/release 核对。
 WHEEL_TAGS = ("macosx_11_0_arm64", "macosx_11_0_x86_64", "manylinux_2_28_aarch64", "manylinux_2_28_x86_64")
+# 测试 job 的 part；每个平台 × part 交出一份 tested-<平台>-<part>.sha256（0039 第 8 条）。
+TEST_PARTS = ("diff-2.6.17", "diff-3.0.2", "interop", "python", "static", "fi")
 KEYS = {"format", "scorecard", "mode", "candidate_id", "version", "commit", "run", "source", "inherited",
-        "pid1_dry_run", "artifacts", "fi_wheels", "build_environment", "stages"}
+        "pid1_dry_run", "dry_run_basis", "artifacts", "fi_wheels", "build_environment", "stages"}
+# 签发路径（0039 第 1 条）：工作流头部（env 只留 MODE 与 VERSION）、最后两个 job，以及签发入口工具在
+# tests/release 内的 import 闭包；scorecard.py 显式豁免。闭包由工具自检从入口重算并与此核对。
+RELEASE_WORKFLOW = ".github/workflows/release.yml"
+WORKFLOW_HEADER = RELEASE_WORKFLOW + "#header"
+WORKFLOW_SIGNING_JOBS = RELEASE_WORKFLOW + "#signing-jobs"
+SIGNING_ENTRIES = ("tests/release/preserve.py", "tests/release/release_set.py", "tests/release/runs.py", "tests/release/sums.py")
+SIGNING_EXEMPT = ("tests/release/scorecard.py",)
+SIGNING_TOOLS = ("tests/release/candidate.py", "tests/release/ledger.py", "tests/release/preserve.py",
+                 "tests/release/release_set.py", "tests/release/runs.py", "tests/release/sums.py")
+SIGNING_PATHS = (WORKFLOW_HEADER, WORKFLOW_SIGNING_JOBS, *SIGNING_TOOLS)
+BASIS_KEYS = {"baseline_version", "baseline_commit", "signing_path_sha256", "paths"}
 SOURCE_KEYS = {"commit", "version", "archive_sha256", "source_entries", "regular_files", "symlinks", "product_inputs",
                "source_manifest_sha256", "product_manifest_sha256", "tool_versions"}
 SOURCE_TOOL_KEYS = {"git", "python"}
@@ -76,6 +94,56 @@ def check_digests(value, keys, what):
     require(all(isinstance(v, str) and HEX64.fullmatch(v) for v in value.values()), f"{what} must be SHA256 digests")
 
 
+def check_basis(value):
+    require(isinstance(value, dict) and set(value) == BASIS_KEYS,
+            f"a release run without a dry run must record dry_run_basis with keys {sorted(BASIS_KEYS)}")
+    require(isinstance(value["baseline_version"], str) and VERSION.fullmatch(value["baseline_version"]),
+            f"bad baseline version {value['baseline_version']!r}")
+    require(isinstance(value["baseline_commit"], str) and HEX40.fullmatch(value["baseline_commit"]), "bad baseline commit")
+    require(isinstance(value["signing_path_sha256"], str) and HEX64.fullmatch(value["signing_path_sha256"]),
+            "bad signing path digest")
+    require(value["paths"] == list(SIGNING_PATHS), f"dry_run_basis paths must be exactly {list(SIGNING_PATHS)}")
+
+
+def wheel_name(version, scope):
+    return f"milvus_lite_rust-{version}-cp310-abi3-{SCOPE_TAGS[scope]}.whl"
+
+
+def tested_name(scope, part):
+    return f"tested-{scope}-{part}.sha256"
+
+
+def check_tested(directory, formal_sums, fi_sums, version):
+    """每个测试 job 实际使用的三个文件须与装配清单成对一致（0039 第 8 条）：24 份恰好齐全，每份恰为本平台的
+    正式 wheel、本平台的 FI wheel 与 sdist。build.sha256 与产物同包，只能发现传输损坏；这里把测试用的字节
+    与将要签发的字节绑在一起。"""
+    directory = Path(directory)
+    formal, fi = parse_manifest(formal_sums), parse_manifest(fi_sums)
+    expected = {tested_name(scope, part) for scope in SCOPE_TAGS for part in TEST_PARTS}
+    present = {p.name for p in directory.glob("tested-*.sha256")}
+    require(present == expected, f"tested digests differ: missing {sorted(expected - present)}, extra {sorted(present - expected)}")
+    for scope in SCOPE_TAGS:
+        wheel = wheel_name(version, scope)
+        want = {f"formal/{wheel}": formal.get(wheel), f"formal/milvus_lite_rust-{version}.tar.gz":
+                formal.get(f"milvus_lite_rust-{version}.tar.gz"), f"fi/build-{scope}/{wheel}": fi.get(f"build-{scope}/{wheel}")}
+        require(all(want.values()), f"assembled manifests lack the files for {scope}")
+        for part in TEST_PARTS:
+            got = parse_manifest((directory / tested_name(scope, part)).read_text())
+            require(got == want, f"{tested_name(scope, part)} does not match the assembled manifests: {got} != {want}")
+
+
+def parse_manifest(text):
+    """sums.py 写出的清单：「摘要  相对路径」，路径可含子目录。"""
+    entries = {}
+    for line in text.splitlines():
+        match = re.fullmatch(r"([0-9a-f]{64})  ([^/\\\s][^\\]*)", line)
+        require(match is not None and ".." not in match.group(2).split("/"), f"malformed manifest line {line!r}")
+        require(match.group(2) not in entries, f"duplicate manifest entry {match.group(2)}")
+        entries[match.group(2)] = match.group(1)
+    require(text.endswith("\n") and entries, "manifest must be non-empty and end with a newline")
+    return entries
+
+
 def check_stage(scope, stage, result):
     where = f"stages[{scope}][{stage}]"
     require(isinstance(result, dict) and set(result) == {"returncode", "counts", "environment"}, f"{where} keys differ")
@@ -129,9 +197,15 @@ def validate(data, filename=None):
     for name, ref in inherited.items():
         check_run_ref(ref, f"inherited {name}")
     if mode == "release":
-        check_run_ref(data["pid1_dry_run"], "pid1_dry_run")
+        # 正式运行二选一：引用演练，或记录签发路径未变的依据（0039 第 4 条）。
+        if data["pid1_dry_run"] is not None:
+            check_run_ref(data["pid1_dry_run"], "pid1_dry_run")
+            require(data["dry_run_basis"] is None, "a release run that references a dry run records no dry_run_basis")
+        else:
+            check_basis(data["dry_run_basis"])
     else:
         require(data["pid1_dry_run"] is None, "a dry run does not reference another dry run")
+        require(data["dry_run_basis"] is None, "a dry run records no dry_run_basis")
 
     check_digests(data["artifacts"], formal_names(version), "artifacts")
     check_digests(data["fi_wheels"], WHEEL_TAGS, "fi_wheels")
@@ -166,7 +240,7 @@ def load(path):
 
 
 def build(meta, identity, artifacts_dir, fi_dir, stages, build_environment):
-    """meta 来自前置检查：mode、version、commit、run、inherited、pid1_dry_run。"""
+    """meta 来自前置检查：mode、version、commit、run、inherited、pid1_dry_run、dry_run_basis。"""
     version = meta["version"]
     present = sorted(p.name for p in Path(artifacts_dir).iterdir())
     require(present == formal_names(version), f"formal artifact set differs: {present}")
@@ -176,7 +250,7 @@ def build(meta, identity, artifacts_dir, fi_dir, stages, build_environment):
         found = sorted(Path(fi_dir).glob(f"*/milvus_lite_rust-{version}-cp310-abi3-{tag}.whl"))
         require(len(found) == 1, f"expected one FI wheel for {tag}, found {len(found)}")
         fi_wheels[tag] = sha256_file(found[0])
-    data = {**{k: meta[k] for k in ("mode", "version", "commit", "run", "inherited", "pid1_dry_run")},
+    data = {**{k: meta[k] for k in ("mode", "version", "commit", "run", "inherited", "pid1_dry_run", "dry_run_basis")},
             "format": FORMAT, "scorecard": scorecard.FORMAT, "candidate_id": candidate_id(version, meta["commit"], meta["run"]),
             "source": identity, "artifacts": artifacts, "fi_wheels": fi_wheels, "build_environment": build_environment,
             "stages": stages}
@@ -242,6 +316,11 @@ def main(argv=None):
     w.add_argument("--run-attempt", type=int, required=True)
     c = sub.add_parser("check")
     c.add_argument("path", type=Path)
+    t = sub.add_parser("tested", help="cross-check the files each test job used against the assembled manifests")
+    t.add_argument("--dir", type=Path, required=True)
+    t.add_argument("--formal-sums", type=Path, required=True)
+    t.add_argument("--fi-sums", type=Path, required=True)
+    t.add_argument("--version", required=True)
     args = parser.parse_args(argv)
     try:
         if args.command == "write":
@@ -251,6 +330,9 @@ def main(argv=None):
                     f"precheck ran in {meta['run']}, not in run {args.run_id} attempt {args.run_attempt}; re-run all jobs")
             print(write(meta, json.loads(args.identity.read_text()), args.artifacts, args.fi, merge_stages(args.stage),
                         read_build_environment(args.build_env), args.out))
+        elif args.command == "tested":
+            check_tested(args.dir, args.formal_sums.read_text(), args.fi_sums.read_text(), args.version)
+            print(f"tested digests match the assembled manifests: {len(SCOPE_TAGS) * len(TEST_PARTS)} files")
         else:
             data = load(args.path)
             print(f"candidate result valid: {data['candidate_id']} ({data['mode']})")

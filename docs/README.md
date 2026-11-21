@@ -30,7 +30,7 @@
 | [0018](decisions/0018-json-write-normalization.md) | JSON 写入优化：复用已规范化 JSON 构造 WAL | [调查](testing/0018-json-write-investigation.md)、[验收](testing/0018-json-write-acceptance.md)、[诊断工具](../benchmarks/json-write/diagnostics/README.md) |
 | [0019](decisions/0019-test-sharding.md) | 候选测试的并行编排与确定性分片 | [试点](testing/0019-pilot-acceptance.md) |
 | [0020](decisions/0020-continuous-integration.md) | 持续集成：快速层与对照层、零跳过与汇总判定、`ci-pass` / `compare-pass`、推送方式、重新计数、不纳入 CI 的候选内容；判定层不加 retry；停服路径段错误的风险接受（适用范围与停止条件见调查记录） | [试点](testing/0020-ci-pilot.md)、[停服段错误调查](testing/shutdown-segfault-investigation.md)、[工作流与固定依赖](../.github/ci/README.md) |
-| [0021](decisions/0021-release-build-in-ci.md) | 在 CI 中构建与验收发行物：冻结身份、候选结果、版本消费、来源证明、禁止签发后重跑、传输层有限重试（第 11 条）；0013 的本地流程只作诊断 | [试点](testing/0021-release-pilot.md) |
+| [0021](decisions/0021-release-build-in-ci.md) | 在 CI 中构建与验收发行物：冻结身份、候选结果、版本消费、来源证明、禁止签发后重跑、传输层有限重试（第 11 条）、签发路径未变时演练可选（0039）；0013 的本地流程只作诊断 | [试点](testing/0021-release-pilot.md) |
 | [0022](decisions/0022-pre-signing-preservation-gate.md) | 签发前的候选保全门闩（已并入 0021 第 3、13、19、20 条，以 0021 为准） | [试点](testing/0022-gate-pilot.md) |
 | [0023](decisions/0023-aliases-rename-truncate-databases.md) | 别名、改名、清空与集合属性（A：清空与改名的私有意图与提交协议）；多数据库（B：数据库注册表、五个数据库 RPC、`db_name` 路由、属性与隔离）；锁与测试矩阵；跨数据库改名返回 UNIMPLEMENTED | [A 验收](testing/0023-a-acceptance.md)、[B 验收](testing/0023-b-acceptance.md) |
 | [0024](decisions/0024-group-by-search.md) | 分组检索的候选窗口、offset 切片、空值组与参数真值；两个不复制的 3.x 缺陷 | [验收](testing/0024-group-by-acceptance.md) |
@@ -48,6 +48,7 @@
 | [0036](decisions/0036-jieba.md) | jieba 分词：jieba-rs 与 0.42.1 的差异及包装层、用户词与上限、3.x 目录的打开口径、参照环境的受控构建 | |
 | [0037](decisions/0037-dump.md) | `milvus-lite dump` 导出：3.x 的行为与实测、五处 3.x 缺陷的修正（function 输出、ARRAY VARCHAR、批大小 0、写文件失败、非有限浮点）、失败清理与信号、`tests/dump` 的依赖环境与发行阶段 | |
 | [0038](decisions/0038-nullable-dense-vectors.md) | nullable 稠密向量：3.x 写入时换成零向量的实测、按真实 Milvus 语义存为 Arrow null 的决策、pyarrow 低于 26 时 3.x 打不开的互通代价、解码三种形态与整批为空、检索排除、紧凑输出、`ref26` 互通环境 | |
+| [0039](decisions/0039-release-speedup.md) | 发行提速：签发路径（头部、最后两个 job、签发工具的 import 闭包）相对已发布基线未变时演练可选、基线规则、候选结果格式 2 的 `dry_run_basis`；测试 job 直接取构建产物与已测摘要交叉核对；macOS 按平台限流；差分会话组只测量 | [试点](testing/0039-release-speedup-pilot.md) |
 
 不依附某个决策的记录：[恢复内存与冷启动](testing/recovery-performance.md)、[批量检索性能](testing/batch-search-performance.md)、[分配器保留内存](testing/allocator-retention.md)（Linux 上维护轮次后的 `malloc_trim`）、[关闭时显式解锁](testing/explicit-unlock.md)、[存量 FAISS 定义的 load 度量检查](testing/index-load-metric-investigation.md)（rc2 的 load 修复合同）、[子进程与关闭重开用例的隔离](testing/process-test-isolation.md)、[JSON 数字私有键修复](testing/json-private-number-key-fix.md)（`json_text` 唯一入口的来由）。
 
@@ -71,9 +72,10 @@
 
 | 任务 | 命令 |
 | --- | --- |
-| 演练 / 正式运行（从以冻结提交为最新提交的已推送分支触发；正式运行引用同一提交含 PID 1 的成功演练） | `gh workflow run release.yml --repo <owner/repo> --ref <冻结分支> -f commit=<完整 SHA> -f version=<版本> -f dry_run=true`；正式运行改为 `-f dry_run=false -f pid1_dry_run=<演练运行 ID>.<attempt>` |
+| 演练 / 正式运行（从以冻结提交为最新提交的已推送分支触发；签发路径相对已发布基线有变化时，正式运行引用同一提交含 PID 1 的成功演练，未变时可不引用，见 [0039](decisions/0039-release-speedup.md)） | `gh workflow run release.yml --repo <owner/repo> --ref <冻结分支> -f commit=<完整 SHA> -f version=<版本> -f dry_run=true`；正式运行改为 `-f dry_run=false -f pid1_dry_run=<演练运行 ID>.<attempt>`，不引用演练时省去 `pid1_dry_run` |
+| 签发路径判定（只读；触发正式运行前确认是否须演练，也可回放历史版本） | `python3 tests/release/runs.py --repo <owner/repo> basis --sha <冻结提交>` |
 | 签发环境配置只读核对（第 19 条；改动 `release-signing` 后、下一次正式运行前） | `gh api repos/<owner/repo>/environments/release-signing`；`gh api repos/<owner/repo>/environments/dry-run-signing` |
 | 版本台账校验（第 3 条） | `python3 tests/release/ledger.py docs/releases/consumed-versions.json` |
 | 发布准备：核对待发布的七个附件（第 20 条；用候选冻结提交中的工具） | `python3 tests/release/release_set.py --dir <附件目录> --version <版本> --repo <owner/repo> --prepare` |
 | 发布后公开下载核验（第 20 条；只在 `main` 上触发） | `gh workflow run public-check.yml --repo <owner/repo> --ref main -f version=<版本>` |
-| 签发前保全：保存候选证据集并输出审批行 / 复核已保存目录（[0022](decisions/0022-pre-signing-preservation-gate.md)；在冻结提交的干净 worktree 中运行，演练用 `--mode dry-run`） | `python3 <worktree>/tests/release/preserve.py save --mode release --repo <owner/repo> --run <运行 ID>.<attempt> --version <版本> --root <本地留存根目录>`；`python3 tests/release/preserve.py verify <保存目录>` |
+| 签发前保全：保存候选证据集并输出审批行 / 复核已保存目录（[0022](decisions/0022-pre-signing-preservation-gate.md)；在冻结提交的干净 worktree 中运行，演练用 `--mode dry-run`） | `python3 <worktree>/tests/release/preserve.py save --mode release --repo <owner/repo> --run <运行 ID>.<attempt> --version <版本> --root <本地留存根目录>`；`python3 tests/release/preserve.py verify <保存目录>`（复核 0.7.0rc1 及更早版本的目录时，用该版本 tag 中的工具：候选结果格式 2 起读取方只接受格式 2） |

@@ -21,10 +21,16 @@ def identity():
             "tool_versions": {"git": "git version 2.53.0", "python": "CPython 3.12.3"}}
 
 
-def meta(mode="release"):
+BASIS = {"baseline_version": "1.1.0", "baseline_commit": "c" * 40, "signing_path_sha256": "d" * 64,
+         "paths": list(c.SIGNING_PATHS)}
+
+
+def meta(mode="release", basis=False):
+    """正式运行默认引用演练；basis=True 时改为记录签发路径未变的依据（0039）。"""
     return {"mode": mode, "version": VERSION, "commit": COMMIT, "run": dict(RUN),
             "inherited": {"ci": {"id": 1, "attempt": 1}, "compare": {"id": 2, "attempt": 3}},
-            "pid1_dry_run": {"id": 90, "attempt": 1} if mode == "release" else None}
+            "pid1_dry_run": {"id": 90, "attempt": 1} if mode == "release" and not basis else None,
+            "dry_run_basis": copy.deepcopy(BASIS) if mode == "release" and basis else None}
 
 
 IMAGE_ID = "sha256:" + "e" * 64
@@ -66,8 +72,8 @@ def inputs(tmp_path):
     return build_inputs(tmp_path)
 
 
-def written(inputs, tmp_path, mode="release"):
-    return c.write(meta(mode), identity(), *inputs, stages(), build_env(), tmp_path / f"out-{mode}")
+def written(inputs, tmp_path, mode="release", basis=False):
+    return c.write(meta(mode, basis), identity(), *inputs, stages(), build_env(), tmp_path / f"out-{mode}-{basis}")
 
 
 def test_matrix_shape():
@@ -117,7 +123,7 @@ def first(d):
 MUTATIONS = {
     "missing key": lambda d: d.pop("stages"),
     "extra key": lambda d: d.update(note="x"),
-    "unknown format": lambda d: d.update(format=2),
+    "unknown format": lambda d: d.update(format=1),
     "boolean format": lambda d: d.update(format=True),
     "unknown scorecard": lambda d: d.update(scorecard=2),
     "unknown mode": lambda d: d.update(mode="test"),
@@ -134,8 +140,10 @@ MUTATIONS = {
     "source git not a version": lambda d: d["source"]["tool_versions"].update(git="unknown"),
     "inherited missing": lambda d: d["inherited"].pop("compare"),
     "inherited string id": lambda d: d["inherited"]["ci"].update(id="1"),
-    "release without pid1 dry run": lambda d: d.update(pid1_dry_run=None),
+    "release without pid1 dry run or basis": lambda d: d.update(pid1_dry_run=None),
     "pid1 ref keys": lambda d: d.update(pid1_dry_run={"id": 1}),
+    "both pid1 dry run and basis": lambda d: d.update(dry_run_basis=copy.deepcopy(BASIS)),
+    "basis missing key": lambda d: d.pop("dry_run_basis"),
     "artifact missing": lambda d: d["artifacts"].pop(first(d["artifacts"])),
     "artifact renamed": lambda d: d["artifacts"].update({"other.whl": d["artifacts"].pop(first(d["artifacts"]))}),
     "artifact digest": lambda d: d["artifacts"].update({first(d["artifacts"]): "Z" * 64}),
@@ -169,6 +177,115 @@ MUTATIONS = {
     "build env mac key on linux": lambda d: d["build_environment"]["linux-x86_64"].update(xcode="x"),
     "build env empty": lambda d: d["build_environment"]["macos-arm64"].update(rustc=""),
 }
+
+
+BASIS_MUTATIONS = {
+    "basis missing": lambda d: d.update(dry_run_basis=None),
+    "basis with pid1 dry run": lambda d: d.update(pid1_dry_run={"id": 90, "attempt": 1}),
+    "basis extra key": lambda d: d["dry_run_basis"].update(note="x"),
+    "basis missing key": lambda d: d["dry_run_basis"].pop("baseline_commit"),
+    "basis bad version": lambda d: d["dry_run_basis"].update(baseline_version="v1.1.0"),
+    "basis short commit": lambda d: d["dry_run_basis"].update(baseline_commit="c" * 7),
+    "basis digest not hex": lambda d: d["dry_run_basis"].update(signing_path_sha256="Z" * 64),
+    "basis paths shrunk": lambda d: d["dry_run_basis"]["paths"].pop(),
+    "basis paths reordered": lambda d: d["dry_run_basis"]["paths"].reverse(),
+    "basis paths as tuple-like string": lambda d: d["dry_run_basis"].update(paths=" ".join(c.SIGNING_PATHS)),
+}
+
+
+def test_release_with_basis_writes_and_reloads(inputs, tmp_path):
+    data = c.load(written(inputs, tmp_path, basis=True))
+    assert data["pid1_dry_run"] is None and data["dry_run_basis"] == BASIS and data["format"] == 2
+
+
+@pytest.mark.parametrize("name", BASIS_MUTATIONS)
+def test_validate_rejects_basis(inputs, tmp_path, name):
+    data = json.loads(written(inputs, tmp_path, basis=True).read_text())
+    c.validate(copy.deepcopy(data))
+    BASIS_MUTATIONS[name](data)
+    with pytest.raises(c.CandidateError):
+        c.validate(data)
+
+
+def test_dry_run_records_no_basis(inputs, tmp_path):
+    data = json.loads(written(inputs, tmp_path, "dry-run").read_text())
+    data["dry_run_basis"] = copy.deepcopy(BASIS)
+    with pytest.raises(c.CandidateError, match="no dry_run_basis"):
+        c.validate(data)
+
+
+def test_signing_tools_are_the_import_closure_of_the_entries():
+    """签发入口在 tests/release 内的 import 闭包（扣除显式豁免）须等于登记的清单；新增被签发工具导入的模块时，
+    清单与签发路径一起改（0039 第 1 条）。"""
+    import ast
+    root = Path(__file__).parent
+    seen, todo = set(), [Path(entry).name for entry in c.SIGNING_ENTRIES]
+    while todo:
+        name = todo.pop()
+        if name in seen:
+            continue
+        seen.add(name)
+        tree = ast.parse((root / name).read_text())
+        for node in ast.walk(tree):
+            modules = [a.name for a in node.names] if isinstance(node, ast.Import) else \
+                [node.module] if isinstance(node, ast.ImportFrom) and node.module and node.level == 0 else []
+            todo += [f"{m}.py" for m in modules if (root / f"{m}.py").is_file()]
+    closure = {f"tests/release/{name}" for name in seen}
+    assert closure - set(c.SIGNING_EXEMPT) == set(c.SIGNING_TOOLS)
+    assert set(c.SIGNING_EXEMPT) <= closure
+    assert c.SIGNING_PATHS == (c.WORKFLOW_HEADER, c.WORKFLOW_SIGNING_JOBS, *sorted(c.SIGNING_TOOLS))
+
+
+def write_manifests(tmp_path, version=VERSION):
+    """装配清单与 24 份正确的已测摘要。"""
+    formal = {name: f"{i:064x}" for i, name in enumerate(c.formal_names(version), 1)}
+    fi = {f"build-{scope}/{c.wheel_name(version, scope)}": f"{i:064x}" for i, scope in enumerate(c.SCOPE_TAGS, 100)}
+    tested = tmp_path / "stages"
+    tested.mkdir()
+    for scope in c.SCOPE_TAGS:
+        wheel, sdist = c.wheel_name(version, scope), f"milvus_lite_rust-{version}.tar.gz"
+        rows = {f"formal/{wheel}": formal[wheel], f"formal/{sdist}": formal[sdist],
+                f"fi/build-{scope}/{wheel}": fi[f"build-{scope}/{wheel}"]}
+        for part in c.TEST_PARTS:
+            (tested / c.tested_name(scope, part)).write_text(c.sums_text(rows))
+    (tested / "linux-x86_64--pid1.json").write_text("{}")
+    return tested, c.sums_text(formal), c.sums_text(fi)
+
+
+def test_tested_digests_match_the_assembled_manifests(tmp_path):
+    tested, formal, fi = write_manifests(tmp_path)
+    c.check_tested(tested, formal, fi, VERSION)
+    assert len(list(tested.glob("tested-*.sha256"))) == 24
+
+
+def swap_fi_scope(tested):
+    path = tested / c.tested_name("macos-arm64", "python")
+    other = (tested / c.tested_name("macos-x86_64", "python")).read_text()
+    fi_line = [line for line in other.splitlines() if line.split("  ")[1].startswith("fi/")][0]
+    rows = [line for line in path.read_text().splitlines() if not line.split("  ")[1].startswith("fi/")] + [fi_line]
+    path.write_text("".join(f"{row}\n" for row in rows))
+
+
+TESTED_MUTATIONS = {
+    "one file missing": lambda t: (t / c.tested_name("linux-aarch64", "fi")).unlink(),
+    "extra file": lambda t: (t / "tested-linux-x86_64-extra.sha256").write_text((t / c.tested_name("linux-x86_64", "fi")).read_text()),
+    "digest differs": lambda t: (t / c.tested_name("macos-x86_64", "diff-2.6.17")).write_text(
+        (t / c.tested_name("macos-x86_64", "diff-2.6.17")).read_text().replace("0", "f", 1)),
+    "other platform's wheel": lambda t: (t / c.tested_name("macos-arm64", "static")).write_text(
+        (t / c.tested_name("macos-x86_64", "static")).read_text()),
+    "fi wheel from another platform's directory": swap_fi_scope,
+    "missing line": lambda t: (t / c.tested_name("linux-x86_64", "python")).write_text(
+        "".join(f"{line}\n" for line in (t / c.tested_name("linux-x86_64", "python")).read_text().splitlines()[:2])),
+    "malformed line": lambda t: (t / c.tested_name("linux-x86_64", "interop")).write_text("x  formal/a\n"),
+}
+
+
+@pytest.mark.parametrize("name", TESTED_MUTATIONS)
+def test_tested_digests_reject(tmp_path, name):
+    tested, formal, fi = write_manifests(tmp_path)
+    TESTED_MUTATIONS[name](tested)
+    with pytest.raises(c.CandidateError):
+        c.check_tested(tested, formal, fi, VERSION)
 
 
 @pytest.mark.parametrize("name", MUTATIONS)
