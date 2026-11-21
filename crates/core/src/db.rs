@@ -2519,7 +2519,10 @@ impl Db {
                     let mut collection = handle.write();
                     let post_commit = publish_flushed(&mut collection, &work, outcome)?;
                     drop(collection);
-                    if schedule && work.table.size() > 0 {
+                    let flushed_rows = work.table.size() > 0;
+                    // 先放掉冻结代，维护轮次结束时交还空闲内存才包括它。
+                    drop(work);
+                    if schedule && flushed_rows {
                         self.schedule_maintenance(handle);
                     }
                     if let Some(error) = post_commit {
@@ -5109,6 +5112,27 @@ mod tests {
         assert_eq!(aliases, serde_json::json!({"keep":"live"}));
         db.close();
     }
+
+    #[test]
+    fn maintenance_rounds_release_free_memory() {
+        use std::sync::atomic::Ordering;
+        use std::time::{Duration, Instant};
+        let root = tempfile::tempdir().unwrap();
+        let db = test_db(root.path());
+        let before = crate::allocator::RELEASES.load(Ordering::Relaxed);
+        db.create_collection("", "c", basic_schema()).unwrap();
+        // 关闭排空时不交还，所以在关闭之前等建表排入的那一轮结束。
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while crate::allocator::RELEASES.load(Ordering::Relaxed) == before {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "maintenance round did not release"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        db.close();
+    }
+
     fn basic_schema() -> CollectionSchema {
         let mut pk = FieldSchema::new("id", DataType::Int64);
         pk.is_primary = true;

@@ -1,6 +1,7 @@
 //! milvus-lite-rust 的引擎层。不依赖 protobuf 与 Python（见 AGENTS.md「架构地图」）。
 
 mod alias;
+mod allocator;
 pub mod analyzer;
 pub mod collection;
 pub mod compute;

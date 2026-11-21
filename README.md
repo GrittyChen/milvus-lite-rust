@@ -173,6 +173,8 @@ SIGKILL 不执行正常停服。下次打开按 WAL/manifest 恢复已确认写�
 
 后台维护按 Db 串行，成功诊断默认静默，可在启动前设置 `MILVUS_LITE_COMPACTION_DIAGNOSTICS=1` 观察。删除状态有额外内存成本，文件布局受编码器影响；历史故障目录可能延后或拒绝维护。性能结论仅适用于各自测量场景，不能保证任意负载追平官方 2.5.1。
 
+内存：Linux（glibc）上后台维护每轮结束后调用 `malloc_trim`，把 flush、合并与打开集合释放的空闲内存交还系统，作用于整个进程。macOS 的系统分配器会把已释放的内存块留作缓存，实测 flush 后比重开后多约 300 MiB（10 万与 100 万行），本实现无法在进程内关闭；需要时可在启动 Python 之前设置环境变量 `MallocLargeCache=0`，它作用于整个进程，对其他代码的性能影响未测。测量数据见源码仓库中的分配器保留内存测试记录。
+
 ## 许可
 
 本项目使用 [Apache License 2.0](https://www.apache.org/licenses/LICENSE-2.0)。发行物随附本项目、proto 与内置 jieba 数据（MIT）的许可证副本，借用的协议和测试保留来源。

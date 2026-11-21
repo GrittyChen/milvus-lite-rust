@@ -244,6 +244,7 @@ impl Maintenance {
                             crate::error::panic_description(payload.as_ref())
                         )))
                     });
+                    let release = !matches!(result, Err(EngineError::Closed));
                     if let Err(error) = &result
                         && !matches!(error, EngineError::Closed)
                     {
@@ -272,6 +273,15 @@ impl Maintenance {
                     }
                     if let Some(status) = status {
                         status.complete(result, elapsed);
+                    }
+                    // flush 与打开集合都会排一轮维护，这里是它们释放临时内存之后唯一的后台时机。
+                    // 队列排空后才交还一次：多个集合同时打开时不逐个重复，关闭排空时进程即将释放全部内存。
+                    let idle = {
+                        let queue = maintenance.queue.lock();
+                        queue.order.is_empty() && !queue.stopped
+                    };
+                    if release && idle {
+                        crate::allocator::release_free_memory();
                     }
                 }
             })
