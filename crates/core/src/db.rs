@@ -765,6 +765,8 @@ pub struct Db {
     /// create/drop 与 collection 的写入/flush 互斥；目录提交点后失败时封锁后续写入。
     write_gate: RwLock<bool, 1>,
     maintenance: Arc<crate::maintenance::Maintenance>,
+    /// HNSW 后台构建（0041 第 3 步）；关闭时与维护线程在同一位置停止。
+    graphs: Arc<crate::graph_build::GraphBuilder>,
     namespace_waiters: AtomicUsize,
     shutdown_failed: AtomicBool,
     #[cfg(feature = "fault-injection")]
@@ -810,8 +812,35 @@ impl Drop for NamespaceIntent<'_> {
         self.0.fetch_sub(1, Ordering::AcqRel);
     }
 }
+/// 测试用：构建线程写完临时文件、取 flush 锁之前暂停（只对 `indexes_dir` 位于给定目录之下的任务生效，
+/// 并行运行的其他测试不受影响）。暂停时发一条消息，收到恢复消息后继续。
+#[cfg(test)]
+type GraphPause = (
+    std::path::PathBuf,
+    std::sync::mpsc::Sender<()>,
+    std::sync::mpsc::Receiver<()>,
+);
+#[cfg(test)]
+static GRAPH_PAUSE: std::sync::Mutex<Vec<GraphPause>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+fn graph_pause(task: &crate::graph_build::GraphTask) {
+    let hook = {
+        let mut hooks = GRAPH_PAUSE.lock().unwrap_or_else(|e| e.into_inner());
+        hooks
+            .iter()
+            .position(|(root, _, _)| task.indexes_dir.starts_with(root))
+            .map(|i| hooks.remove(i))
+    };
+    if let Some((_, paused, resume)) = hook {
+        let _ = paused.send(());
+        let _ = resume.recv_timeout(std::time::Duration::from_secs(60));
+    }
+}
+
 impl Drop for Db {
     fn drop(&mut self) {
+        self.graphs.stop();
         self.maintenance.stop(false);
         if self.gate.get_mut().data_dir.is_some() {
             self.finish_storage(false);
@@ -850,6 +879,7 @@ impl Db {
             open_failures: RwLock::new(BTreeMap::new()),
             write_gate: RwLock::new(false),
             maintenance: crate::maintenance::Maintenance::new(),
+            graphs: crate::graph_build::GraphBuilder::new(),
             namespace_waiters: AtomicUsize::new(0),
             shutdown_failed: AtomicBool::new(false),
             flush_budgets,
@@ -870,6 +900,7 @@ impl Db {
             }
         }
         db.maintenance.start(Arc::downgrade(&db))?;
+        db.graphs.start(Arc::downgrade(&db))?;
         Ok(db)
     }
 
@@ -933,6 +964,7 @@ impl Db {
             self.idle.wait(&mut gate);
         }
         drop(gate);
+        self.graphs.stop();
         self.finish_storage(true);
         if !self.maintenance.stop(true) {
             self.report_shutdown_failure("maintenance shutdown failed");
@@ -969,6 +1001,7 @@ impl Db {
                         db.idle.wait(&mut gate);
                     }
                     drop(gate);
+                    db.graphs.stop();
                     db.maintenance.stop(false);
                     db.finish_storage(false);
                     let mut gate = db.gate.lock();
@@ -983,6 +1016,7 @@ impl Db {
                 self.idle.wait(&mut gate);
             }
             drop(gate);
+            self.graphs.stop();
             self.maintenance.stop(false);
             self.finish_storage(false);
             let mut gate = self.gate.lock();
@@ -2273,7 +2307,12 @@ impl Db {
         self.change_index(database, name, |c| {
             c.prepare_create_index(field, request)
                 .map(crate::index::IndexChange::Create)
-        })
+        })?;
+        // 3.x 在 loaded 状态下同步为现有 segment 建索引；这里改为后台构建（0041「已确认的取舍」第 3 项）。
+        if let Ok(handle) = self.collection(database, name) {
+            self.schedule_graphs(&handle);
+        }
+        Ok(())
     }
 
     pub fn drop_index(
@@ -2552,6 +2591,144 @@ impl Db {
     fn maintenance_cancelled(&self) -> bool {
         self.maintenance.abort.load(Ordering::Acquire)
             || self.namespace_waiters.load(Ordering::Acquire) != 0
+    }
+
+    /// 为已 load 的 collection 中尚无图的已提交段排队构建 HNSW 图（0041 第 3 步）。没有 HNSW 定义或未 load
+    /// 时什么也不做。flush、compaction 与打开之后由维护线程调用，create_index 与 load 之后由入口调用。
+    pub(crate) fn schedule_graphs(&self, handle: &CollectionHandle) {
+        let tasks = handle.read().graph_tasks(&Arc::downgrade(handle));
+        self.graphs.enqueue(tasks);
+    }
+
+    /// LoadCollection：先按 3.x 判定并切换 load 状态；然后在锁外读入已有、有效的图文件写入槽位，缺失或
+    /// 无效的段排队后台构建（0041「已确认的取舍」第 3 项：不等待缺失图的构建）。
+    pub fn load_collection(&self, handle: &CollectionHandle) -> Result<()> {
+        handle.write().load()?;
+        let tasks = handle.read().graph_tasks(&Arc::downgrade(handle));
+        let mut missing = Vec::new();
+        for task in tasks {
+            let Some(chunks) = task.upgrade() else {
+                continue;
+            };
+            let graph = (|| -> Option<crate::hnsw::Graph> {
+                let key = task.file_key(&chunks).ok()?;
+                let bytes = std::fs::read(task.graph_path().ok()?).ok()?;
+                crate::hnsw::Graph::decode(&bytes, &key)
+            })();
+            match graph {
+                Some(graph) => {
+                    let c = handle.read();
+                    if c.graph_publishable(&chunks, task.seen)
+                        && let Some((_, first)) = chunks.first()
+                    {
+                        first.graphs.publish(
+                            task.field_pos,
+                            Arc::new(graph),
+                            &task.epoch,
+                            task.seen,
+                        );
+                    }
+                }
+                None => missing.push(task),
+            }
+        }
+        self.graphs.enqueue(missing);
+        Ok(())
+    }
+
+    /// 等待后台图构建全部结束（队列排空、无在途构建），供测试与基准使用。
+    pub fn wait_graph_builds(&self, timeout: std::time::Duration) -> Result<()> {
+        self.graphs.wait_idle(timeout)
+    }
+
+    /// 构建线程的发布（0041 第 3 步设计第 4 条）：在途计数 → 写入闸门共享许可（写临时文件）→ flush 锁 →
+    /// 状态读锁复核 → 改名与写槽位。取不到许可（整库写入封锁）时不写文件，只把图写入槽位。
+    pub(crate) fn publish_graph(
+        &self,
+        handle: &CollectionHandle,
+        chunks: &[(usize, Arc<crate::collection::ChunkData>)],
+        task: &crate::graph_build::GraphTask,
+        graph: crate::hnsw::Graph,
+    ) -> Result<()> {
+        let Some((_, first)) = chunks.first() else {
+            return Ok(());
+        };
+        static TMP: AtomicUsize = AtomicUsize::new(0);
+        let _task = {
+            let mut gate = self.gate.lock();
+            if gate.closed || gate.data_dir.is_none() {
+                return Err(EngineError::Closed);
+            }
+            gate.in_flight += 1;
+            InFlight { db: self }
+        };
+        let blocked = self.write_gate.read();
+        let final_path = task.graph_path()?;
+        let tmp = if *blocked {
+            None
+        } else {
+            let bytes = graph.encode(&task.file_key(chunks)?);
+            std::fs::create_dir_all(&task.indexes_dir).map_err(storage)?;
+            let name = final_path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .ok_or_else(|| storage("graph file name is not UTF-8"))?;
+            let tmp = task.indexes_dir.join(format!(
+                "{}{}",
+                name.trim_end_matches(crate::graph_build::GRAPH_SUFFIX),
+                format_args!(
+                    "{}{}",
+                    crate::graph_build::GRAPH_TMP_MARKER,
+                    TMP.fetch_add(1, Ordering::Relaxed)
+                )
+            ));
+            if let Err(error) = std::fs::write(&tmp, bytes) {
+                // 写了一半的临时文件当场删除：失败按退避重试，不清理的话磁盘满时每次重试都留下一个。
+                if let Err(cleanup) = std::fs::remove_file(&tmp)
+                    && cleanup.kind() != std::io::ErrorKind::NotFound
+                {
+                    eprintln!("cannot remove graph temp file {tmp:?}: {cleanup}");
+                }
+                return Err(storage(format!("cannot write graph file {tmp:?}: {error}")));
+            }
+            Some(tmp)
+        };
+        let remove_tmp = |tmp: &Option<std::path::PathBuf>| {
+            if let Some(tmp) = tmp
+                && let Err(error) = std::fs::remove_file(tmp)
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                eprintln!("cannot remove graph temp file {tmp:?}: {error}");
+            }
+        };
+        #[cfg(test)]
+        graph_pause(task);
+        let lock = match handle.read().persistent() {
+            Some(p) => p.flush_lock(),
+            None => {
+                remove_tmp(&tmp);
+                return Ok(());
+            }
+        };
+        let _flush = lock.lock();
+        let c = handle.read();
+        // 已有图（同一段被重复排队）时不覆盖文件，也不换图。
+        if !c.graph_publishable(chunks, task.seen) || first.graphs.get(task.field_pos).is_some() {
+            remove_tmp(&tmp);
+            return Ok(());
+        }
+        if let Some(tmp) = &tmp
+            && let Err(error) = std::fs::rename(tmp, &final_path)
+        {
+            remove_tmp(&Some(tmp.clone()));
+            return Err(storage(format!(
+                "cannot publish graph file {final_path:?}: {error}"
+            )));
+        }
+        first
+            .graphs
+            .publish(task.field_pos, Arc::new(graph), &task.epoch, task.seen);
+        Ok(())
     }
 
     pub(crate) fn compact_handle(&self, handle: &CollectionHandle) -> Result<usize> {
@@ -3344,6 +3521,7 @@ impl Db {
             p.mark_manifest_unconfirmed(reason.clone());
         }
         // 句柄身份不变；进行中的读请求仍使用其已取得的不可变快照。
+        collection.cancel_graph_builds();
         *collection = rebuilt;
         drop(collection);
         if let Some(reason) = durability {
@@ -6342,6 +6520,414 @@ mod tests {
             changing.join().unwrap();
             check(&db).unwrap();
             db.close();
+        }
+    }
+
+    /// 0041 第 3 步：HNSW 图的后台构建、落盘、重开读入、损坏重建与清理。
+    mod graphs {
+        use super::*;
+        use std::time::Duration;
+
+        const ROWS: usize = crate::graph_build::MIN_GRAPH_ROWS;
+
+        fn hnsw_collection(db: &Db) -> CollectionHandle {
+            db.create_collection("", "c", basic_schema()).unwrap();
+            db.create_index(
+                "",
+                "c",
+                "v",
+                IndexRequest {
+                    index_type: "HNSW".into(),
+                    metric_type: Some("L2".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let ids: Vec<i64> = (0..ROWS as i64).collect();
+            let values: Vec<f32> = (0..ROWS)
+                .flat_map(|i| [(i as f32 * 0.37) % 7.0, (i as f32 * 1.13) % 5.0])
+                .collect();
+            db.insert(
+                "",
+                "c",
+                InsertBatch {
+                    num_rows: ROWS,
+                    columns: vec![
+                        ("id".into(), InputValues::Int(ids)),
+                        ("v".into(), InputValues::FloatVector { dim: 2, values }),
+                    ],
+                },
+            )
+            .unwrap();
+            db.flush_collection("", "c").unwrap();
+            let handle = db.collection("", "c").unwrap();
+            db.schedule_graphs(&handle);
+            db.wait_graph_builds(Duration::from_secs(120)).unwrap();
+            handle
+        }
+
+        fn indexes(root: &std::path::Path) -> Vec<String> {
+            let dir = root.join("collections/c/partitions/_default/indexes");
+            let mut names: Vec<String> = match std::fs::read_dir(dir) {
+                Ok(entries) => entries
+                    .map(|e| e.unwrap().file_name().into_string().unwrap())
+                    .collect(),
+                Err(_) => Vec::new(),
+            };
+            names.sort();
+            names
+        }
+
+        fn graph_file(root: &std::path::Path) -> std::path::PathBuf {
+            let names = indexes(root);
+            let name = names
+                .iter()
+                .find(|n| n.ends_with(".v.hnsw.mlrs"))
+                .unwrap_or_else(|| panic!("no graph file in {names:?}"));
+            root.join("collections/c/partitions/_default/indexes")
+                .join(name)
+        }
+
+        #[test]
+        fn a_flushed_segment_gets_a_graph_file_and_reopen_reads_it_without_rebuilding() {
+            let root = tempfile::tempdir().unwrap();
+            let db = test_db(root.path());
+            let handle = hnsw_collection(&db);
+            assert_eq!(handle.read().graph_count(), 1);
+            let path = graph_file(root.path());
+            let bytes = std::fs::read(&path).unwrap();
+            drop(handle);
+            db.close();
+            drop(db);
+
+            let db = test_db(root.path());
+            let handle = db.collection("", "c").unwrap();
+            handle.write().release();
+            db.load_collection(&handle).unwrap();
+            // 读入在 load 内同步完成，不等后台构建。
+            assert_eq!(handle.read().graph_count(), 1);
+            db.wait_graph_builds(Duration::from_secs(120)).unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), bytes, "not rebuilt");
+            db.close();
+        }
+
+        #[test]
+        fn a_corrupt_graph_file_is_rebuilt_without_an_error() {
+            let root = tempfile::tempdir().unwrap();
+            let db = test_db(root.path());
+            let handle = hnsw_collection(&db);
+            let path = graph_file(root.path());
+            let good = std::fs::read(&path).unwrap();
+            drop(handle);
+            db.close();
+            drop(db);
+            let mut bad = good.clone();
+            let mid = bad.len() / 2;
+            bad[mid] ^= 0x55;
+            std::fs::write(&path, &bad).unwrap();
+
+            let db = test_db(root.path());
+            let handle = db.collection("", "c").unwrap();
+            handle.write().release();
+            db.load_collection(&handle).unwrap();
+            assert_eq!(handle.read().graph_count(), 0, "invalid file is not used");
+            db.wait_graph_builds(Duration::from_secs(120)).unwrap();
+            assert_eq!(handle.read().graph_count(), 1);
+            // 同一段、同一种子：重建结果与原文件逐字节相同。
+            assert_eq!(std::fs::read(&path).unwrap(), good);
+            db.close();
+        }
+
+        #[test]
+        fn release_drops_graphs_and_drop_index_deletes_the_file() {
+            let root = tempfile::tempdir().unwrap();
+            let db = test_db(root.path());
+            let handle = hnsw_collection(&db);
+            handle.write().release();
+            assert_eq!(handle.read().graph_count(), 0);
+            db.load_collection(&handle).unwrap();
+            assert_eq!(handle.read().graph_count(), 1);
+            handle.write().release();
+            db.drop_index("", "c", "v", "").unwrap();
+            assert!(
+                !indexes(root.path()).iter().any(|n| n.contains(".mlrs")),
+                "{:?}",
+                indexes(root.path())
+            );
+            db.close();
+        }
+
+        #[test]
+        fn opening_removes_temp_files_and_graphs_of_unknown_segments() {
+            let root = tempfile::tempdir().unwrap();
+            let db = test_db(root.path());
+            let handle = hnsw_collection(&db);
+            let dir = graph_file(root.path()).parent().unwrap().to_path_buf();
+            drop(handle);
+            db.close();
+            drop(db);
+            std::fs::write(dir.join("data_9.v.hnsw.mlrs.tmp-3"), b"partial").unwrap();
+            std::fs::write(dir.join("data_999999.v.hnsw.mlrs"), b"orphan").unwrap();
+
+            let db = test_db(root.path());
+            db.collection("", "c").unwrap();
+            let names = indexes(root.path());
+            assert_eq!(
+                names.iter().filter(|n| n.contains(".mlrs")).count(),
+                1,
+                "{names:?}"
+            );
+            db.close();
+        }
+
+        #[test]
+        fn segments_below_the_threshold_get_no_graph() {
+            let root = tempfile::tempdir().unwrap();
+            let db = test_db(root.path());
+            db.create_collection("", "c", basic_schema()).unwrap();
+            db.create_index(
+                "",
+                "c",
+                "v",
+                IndexRequest {
+                    index_type: "HNSW".into(),
+                    metric_type: Some("L2".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            db.insert(
+                "",
+                "c",
+                InsertBatch {
+                    num_rows: 2,
+                    columns: vec![
+                        ("id".into(), InputValues::Int(vec![1, 2])),
+                        (
+                            "v".into(),
+                            InputValues::FloatVector {
+                                dim: 2,
+                                values: vec![0.0, 1.0, 1.0, 0.0],
+                            },
+                        ),
+                    ],
+                },
+            )
+            .unwrap();
+            db.flush_collection("", "c").unwrap();
+            let handle = db.collection("", "c").unwrap();
+            db.schedule_graphs(&handle);
+            db.wait_graph_builds(Duration::from_secs(30)).unwrap();
+            assert_eq!(handle.read().graph_count(), 0);
+            db.close();
+        }
+
+        /// 让下一次构建停在发布前，返回（已暂停的通知，恢复发送端）。
+        fn pause_next_publish(
+            root: &std::path::Path,
+        ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+            let (paused_tx, paused_rx) = std::sync::mpsc::channel();
+            let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+            GRAPH_PAUSE
+                .lock()
+                .unwrap()
+                .push((root.to_path_buf(), paused_tx, resume_rx));
+            (paused_rx, resume_tx)
+        }
+
+        /// 删除图文件后 release + load，使构建重新排队，停在发布前。
+        fn rebuild_paused(
+            db: &Arc<Db>,
+            root: &std::path::Path,
+            handle: &CollectionHandle,
+        ) -> std::sync::mpsc::Sender<()> {
+            handle.write().release();
+            std::fs::remove_file(graph_file(root)).unwrap();
+            let (paused, resume) = pause_next_publish(root);
+            db.load_collection(handle).unwrap();
+            paused.recv_timeout(Duration::from_secs(120)).unwrap();
+            resume
+        }
+
+        #[test]
+        fn drop_index_while_a_build_waits_to_publish_leaves_no_graph() {
+            let root = tempfile::tempdir().unwrap();
+            let db = test_db(root.path());
+            let handle = hnsw_collection(&db);
+            let resume = rebuild_paused(&db, root.path(), &handle);
+            handle.write().release();
+            db.drop_index("", "c", "v", "").unwrap();
+            resume.send(()).unwrap();
+            db.wait_graph_builds(Duration::from_secs(60)).unwrap();
+            assert_eq!(handle.read().graph_count(), 0);
+            assert!(
+                !indexes(root.path()).iter().any(|n| n.contains(".mlrs")),
+                "{:?}",
+                indexes(root.path())
+            );
+            db.close();
+        }
+
+        #[test]
+        fn release_while_a_build_waits_to_publish_discards_it() {
+            let root = tempfile::tempdir().unwrap();
+            let db = test_db(root.path());
+            let handle = hnsw_collection(&db);
+            let resume = rebuild_paused(&db, root.path(), &handle);
+            handle.write().release();
+            resume.send(()).unwrap();
+            db.wait_graph_builds(Duration::from_secs(60)).unwrap();
+            assert_eq!(handle.read().graph_count(), 0);
+            assert!(
+                !indexes(root.path()).iter().any(|n| n.contains(".mlrs")),
+                "{:?}",
+                indexes(root.path())
+            );
+            db.close();
+        }
+
+        /// drop、清空与改名要取独占许可，等发布结束才执行；之后旧图不会出现在新目录里。
+        #[test]
+        fn namespace_changes_wait_for_the_publish_and_never_resurrect_a_graph() {
+            for op in ["drop", "truncate", "rename"] {
+                let root = tempfile::tempdir().unwrap();
+                let db = test_db(root.path());
+                let handle = hnsw_collection(&db);
+                let resume = rebuild_paused(&db, root.path(), &handle);
+                // 停在发布前的段槽位为空，这里拿到的是同一轮的任务；操作完成后它们都应已取消。
+                let tasks = handle.read().graph_tasks(&Arc::downgrade(&handle));
+                assert!(!tasks.is_empty() && !tasks.iter().any(|t| t.cancelled()));
+                drop(handle);
+                let worker = {
+                    let db = Arc::clone(&db);
+                    std::thread::spawn(move || match op {
+                        "drop" => db.drop_collection("", "c"),
+                        "truncate" => db.truncate_collection("", "c"),
+                        _ => db.rename_collection("", "c", "d", ""),
+                    })
+                };
+                std::thread::sleep(Duration::from_millis(200));
+                assert!(
+                    !worker.is_finished(),
+                    "{op} must wait for the shared permit"
+                );
+                resume.send(()).unwrap();
+                worker.join().unwrap().unwrap();
+                assert!(tasks.iter().all(|t| t.cancelled()), "{op}");
+                db.wait_graph_builds(Duration::from_secs(60)).unwrap();
+                match op {
+                    "drop" => assert!(!root.path().join("collections/c").exists()),
+                    "truncate" => {
+                        assert!(
+                            !indexes(root.path()).iter().any(|n| n.contains(".mlrs")),
+                            "{op}"
+                        )
+                    }
+                    _ => {
+                        let dir = root
+                            .path()
+                            .join("collections/d/partitions/_default/indexes");
+                        let names: Vec<_> = std::fs::read_dir(&dir)
+                            .unwrap()
+                            .map(|e| e.unwrap().file_name().into_string().unwrap())
+                            .collect();
+                        assert!(!names.iter().any(|n| n.contains(".tmp-")), "{names:?}");
+                        assert!(!root.path().join("collections/c").exists());
+                    }
+                }
+                db.close();
+            }
+        }
+
+        #[test]
+        fn blocked_database_writes_keep_the_graph_in_memory_only() {
+            let root = tempfile::tempdir().unwrap();
+            let db = test_db(root.path());
+            let handle = hnsw_collection(&db);
+            handle.write().release();
+            std::fs::remove_file(graph_file(root.path())).unwrap();
+            *db.write_gate.write() = true;
+            db.load_collection(&handle).unwrap();
+            db.wait_graph_builds(Duration::from_secs(120)).unwrap();
+            assert_eq!(handle.read().graph_count(), 1);
+            assert!(!indexes(root.path()).iter().any(|n| n.contains(".mlrs")));
+            *db.write_gate.write() = false;
+            db.close();
+        }
+
+        #[test]
+        fn compaction_replaces_the_graphs_of_merged_segments() {
+            let root = tempfile::tempdir().unwrap();
+            let db = test_db(root.path());
+            let handle = hnsw_collection(&db);
+            for round in 1..4 {
+                let start = (round * ROWS) as i64;
+                let ids: Vec<i64> = (start..start + ROWS as i64).collect();
+                let values: Vec<f32> = ids
+                    .iter()
+                    .flat_map(|&i| [(i as f32 * 0.37) % 7.0, (i as f32 * 1.13) % 5.0])
+                    .collect();
+                db.insert(
+                    "",
+                    "c",
+                    InsertBatch {
+                        num_rows: ROWS,
+                        columns: vec![
+                            ("id".into(), InputValues::Int(ids)),
+                            ("v".into(), InputValues::FloatVector { dim: 2, values }),
+                        ],
+                    },
+                )
+                .unwrap();
+                db.flush_collection("", "c").unwrap();
+            }
+            let data_dir = root.path().join("collections/c/partitions/_default/data");
+            let deadline = std::time::Instant::now() + Duration::from_secs(300);
+            loop {
+                db.schedule_graphs(&handle);
+                db.wait_graph_builds(Duration::from_secs(120)).unwrap();
+                let data: Vec<String> = std::fs::read_dir(&data_dir)
+                    .unwrap()
+                    .map(|e| e.unwrap().file_name().into_string().unwrap())
+                    .collect();
+                let graphs: Vec<String> = indexes(root.path())
+                    .into_iter()
+                    .filter(|n| n.ends_with(".mlrs"))
+                    .collect();
+                if data.len() == 1 && graphs.len() == 1 {
+                    let stem = data[0].trim_end_matches(".parquet");
+                    assert!(
+                        graphs[0].starts_with(&format!("{stem}.")),
+                        "{graphs:?} vs {data:?}"
+                    );
+                    assert_eq!(handle.read().graph_count(), 1);
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "data {data:?} graphs {graphs:?}"
+                );
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            db.close();
+        }
+
+        #[test]
+        fn close_waits_for_the_builders_before_unlocking() {
+            let root = tempfile::tempdir().unwrap();
+            let db = test_db(root.path());
+            let handle = hnsw_collection(&db);
+            handle.write().release();
+            // 删掉图文件，load 后排队重建；不等它完成就关闭。
+            std::fs::remove_file(graph_file(root.path())).unwrap();
+            db.load_collection(&handle).unwrap();
+            drop(handle);
+            db.close();
+            drop(db);
+            // LOCK 已释放，且没有残留的临时文件。
+            let reopened = DataDir::open(root.path()).unwrap();
+            drop(reopened);
+            assert!(!indexes(root.path()).iter().any(|n| n.contains(".tmp-")));
         }
     }
 }

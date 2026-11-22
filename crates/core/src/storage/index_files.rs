@@ -90,14 +90,15 @@ fn preflight_partition(
             continue;
         };
         let Some(spec) = change.specs().iter().find(|spec| {
+            let expected = match spec.index_type.as_str() {
+                "INVERTED" => ".sidx",
+                _ => ".idx",
+            };
+            // 本实现的 HNSW 图（0041）随同字段、同类型的定义一起删除。
             parsed.field_name == spec.field_name
                 && parsed.index_type == spec.index_type.to_lowercase()
-                && parsed.extension
-                    == if spec.index_type == "INVERTED" {
-                        ".sidx"
-                    } else {
-                        ".idx"
-                    }
+                && (parsed.extension == expected
+                    || (parsed.extension == ".mlrs" && spec.index_type == "HNSW"))
         }) else {
             continue;
         };

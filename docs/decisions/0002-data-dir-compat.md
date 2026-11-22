@@ -22,10 +22,10 @@
   - 下列分类都以**字段类型**为前提。3.x 只对标量字段校验索引类型，只放行 INVERTED（[collection.py:1463](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/milvus_lite/engine/collection.py#L1463)）；对稠密与稀疏向量字段则不校验，同一个类型名放在错误的向量字段上也会被持久化，只是 build 失败（见约束 1）。
   - **稠密向量字段上的 FLAT / BRUTE_FORCE**：原生支持。
   - **稠密向量字段上的 AUTOINDEX**：新建与存量都按 FLAT 精确执行，并登记为已知差异。AUTOINDEX 的含义本来就是「由实现选择」，pymilvus 的快速建表 `create_collection(name, dimension=...)` 固定使用它；3.x 在没有 faiss 时自己也退回暴力检索，装了 faiss 时（3.2.1 的必装依赖）建成 HNSW。
-  - **稠密向量字段上的显式 ANN 类型**（HNSW、HNSW_SQ、IVF_FLAT、IVF_SQ8）与**标量字段上的 INVERTED**：按 [0014 切片 A](0014-index-definitions-and-filter-expressions.md#切片-a索引定义与-dropindex)，当前源码接受新建定义；存量定义也**原样保留**，让 3.x 回来后还能照常使用。`0.1.0rc2` 及以前的发行物新建时仍返回 UNIMPLEMENTED，本切片尚未发布。向量检索按 FLAT 精确执行，召回只高不低，但更慢；标量过滤按扫描执行，更慢，结果也不一定相同：3.x 自身在已建索引的 segment 与 memtable 上结果就不一致，索引又是 load 之后在后台构建的，本实现按扫描求值并登记差异（[0006](0006-m2-scope.md) 第 14 项）。
+  - **稠密向量字段上的显式 ANN 类型**（HNSW、HNSW_SQ、IVF_FLAT、IVF_SQ8）与**标量字段上的 INVERTED**：按 [0014 切片 A](0014-index-definitions-and-filter-expressions.md#切片-a索引定义与-dropindex)，当前源码接受新建定义；存量定义也**原样保留**，让 3.x 回来后还能照常使用。`0.1.0rc2` 及以前的发行物新建时仍返回 UNIMPLEMENTED，本切片尚未发布。HNSW 自 [0041](0041-hnsw.md) 起在后台按段建本实现自己的图检索（不读写 3.x 的 `.idx`），其余 ANN 类型的向量检索按 FLAT 精确执行，召回只高不低，但更慢；标量过滤按扫描执行，更慢，结果也不一定相同：3.x 自身在已建索引的 segment 与 memtable 上结果就不一致，索引又是 load 之后在后台构建的，本实现按扫描求值并登记差异（[0006](0006-m2-scope.md) 第 14 项）。
   - **稀疏向量字段**：[0030](0030-sparse-vectors.md) 起按 3.x 接受 SPARSE_INVERTED_INDEX + IP，倒排只在内存中按 segment 惰性构建、不写索引文件（3.x 同样不落盘稀疏倒排）；load 时校验存量定义，规则与 3.x 相同。数据列沿用下表的打包字节，原样保存、只在输出、建倒排与 partial upsert 继承时解码，所以 3.x 写下的历史坏行与 3.x 在同样的时机报同样的错。带稀疏默认值的集合在打开时明确报错（已登记差异，见 0030）。
   - 以上执行方式与 3.x 不同的地方，都登记为已知的对外差异（[AGENTS.md](../../AGENTS.md) 规则 2）。
-  - **3.x 自身也无法 load 的索引定义**：包括 3.x 会原样持久化的 DISKANN、IVF_PQ 等无法 build 的类型，以及放错字段类型的定义，例如向量字段上的 INVERTED、稀疏字段上的 AUTOINDEX / FLAT / HNSW（见约束 1）。处理与 3.x 一致：目录照常打开，只有该 collection 在 build 索引时报错，即存在有行的已提交 segment 时 load 报错，错误信息与 3.x 相同；被删除的行仍计入，只有 WAL 时不报错，load 之后新提交的 segment 要到 release 之后再次 load 才判定。如果 collection 已处于 load 状态，`create_index` 持久化定义后会立刻 build 并报错。例外是索引参数：3.x 在 build ANN 索引时才解析 `build_params`（例如 `M` 不是整数时 load 报错），本实现不 build ANN、不解析这些参数，照常 load 并按 FLAT 执行，登记为差异；实测 pymilvus 3.0.2 的 `MilvusClient` 两种常见传参写法，3.x 存下的参数都为空，不触发这一差异。存量稠密向量 FAISS 类型的 BM25 / NONE 在至少一个有物理行的当前 segment 缺少匹配侧车时，本实现与 3.x 一样在 load 报原文；匹配路径全有、只有 WAL 或已经 loaded 时仍成功。路径存在性跟随符号链接，不验证文件内容；该检查仅在当前源码实现，rc2 发行物尚无此检查，冻结合同与验收见 [存量 metric 修复](../testing/index-load-metric-investigation.md)。构建参数仍不解析：与非法 metric 同时出现时，3.x 可能先报参数转换错误，本实现报 metric 错误。真实 metadata I/O 错误严格上报 Storage，而参照 os.path.exists 可能将部分错误当成缺失，两边错误原因可能不同；这是该检查的明确差异。
+  - **3.x 自身也无法 load 的索引定义**：包括 3.x 会原样持久化的 DISKANN、IVF_PQ 等无法 build 的类型，以及放错字段类型的定义，例如向量字段上的 INVERTED、稀疏字段上的 AUTOINDEX / FLAT / HNSW（见约束 1）。处理与 3.x 一致：目录照常打开，只有该 collection 在 build 索引时报错，即存在有行的已提交 segment 时 load 报错，错误信息与 3.x 相同；被删除的行仍计入，只有 WAL 时不报错，load 之后新提交的 segment 要到 release 之后再次 load 才判定。如果 collection 已处于 load 状态，`create_index` 持久化定义后会立刻 build 并报错。例外是索引参数：3.x 在 build ANN 索引时才解析 `build_params`（例如 `M` 不是整数时 load 报错），本实现不 build 3.x 的 ANN 索引，照常 load：HNSW 的参数无法解析时不建图、按 FLAT 执行（[0041](0041-hnsw.md)），其余类型不解析参数、按 FLAT 执行，登记为差异；实测 pymilvus 3.0.2 的 `MilvusClient` 两种常见传参写法，3.x 存下的参数都为空，不触发这一差异。存量稠密向量 FAISS 类型的 BM25 / NONE 在至少一个有物理行的当前 segment 缺少匹配侧车时，本实现与 3.x 一样在 load 报原文；匹配路径全有、只有 WAL 或已经 loaded 时仍成功。路径存在性跟随符号链接，不验证文件内容；该检查仅在当前源码实现，rc2 发行物尚无此检查，冻结合同与验收见 [存量 metric 修复](../testing/index-load-metric-investigation.md)。其余类型的构建参数仍不解析：与非法 metric 同时出现时，3.x 可能先报参数转换错误，本实现报 metric 错误。真实 metadata I/O 错误严格上报 Storage，而参照 os.path.exists 可能将部分错误当成缺失，两边错误原因可能不同；这是该检查的明确差异。
 
 互通的前提是**共享文件的语义也完全一致**，不只是格式能读。下面「共享状态的语义约束」中标注「实测」的条目，都已在 3.2.1 上复现：违反它们会造成数据丢失、已删除的行复活、主键重复覆盖，或检索结果静默出错。
 
@@ -47,6 +47,7 @@
 | 索引删除意图 | **Rust 私有** | collection 根的 `milvus-lite-rust.index-intent.json`，格式版本 1；记录删除可能开始而持久化未确认的状态。旧目录无标记无需迁移，3.x 保留最终标记、snapshot restore 不复制；格式、tmp、可信启动来源及人工恢复协议见 [0014](0014-index-definitions-and-filter-expressions.md#实施设计) |
 | 改名意图 | **Rust 私有** | 数据库根的 `milvus-lite-rust.rename-intent.json`，格式版本 1；记录目录改名开始而 `schema.json`、`aliases.json` 尚未随之改写的状态。旧目录无标记无需迁移，3.x 不认识也不删除；本实现重开时按精确名字把改名收尾到「改名前」或「改名后」，格式、判定与人工恢复协议见 [0023](0023-aliases-rename-truncate-databases.md#改名) |
 | 清空意图 | **Rust 私有** | collection 根的 `milvus-lite-rust.truncate-intent.json`，格式版本 1；保存旧 manifest、候选 manifest 与待删 snapshot / 文件清单，记录清空已提交而清理未完成的状态。旧目录无标记无需迁移，3.x 不认识也不删除；本实现重开时按 `manifest.json` 是否仍是候选把清空收尾到「未清空」或「已清空」，格式与人工恢复协议见 [0023](0023-aliases-rename-truncate-databases.md#清空) |
+| HNSW 图文件 | **Rust 私有缓存** | `indexes/<data_stem>.<field>.hnsw.mlrs`，格式版本 1（[0041](0041-hnsw.md)）：文件头记录度量、维度、构建参数、行数、段数据文件名、字节数与段内 `_seq` 的摘要，尾部为校验和；任何一项不符或版本不同都作废、从数据重建，不报错。随段删除，打开时清理孤儿与临时文件 `*.hnsw.mlrs.tmp-*`，不进 manifest 与 snapshot。3.x 跳过它（约束 5）。旧目录没有图文件，load 后在后台构建。删除意图与清空意图的文件清单自 0041 起可以列出 `.mlrs`：0.7.0rc1 及更早版本读到这样的标记会判为格式不符，只在 HNSW 字段的 DropIndex 或清空中断后又降级时出现，按 0014 / 0023 的人工恢复处理 |
 | Rust 独有的派生状态 | **否** | 只能放在 3.x 不会删除的位置（约束 5），并且必须能从数据文件重建 |
 
 ## 共享状态的语义约束
@@ -84,7 +85,7 @@
 7. **`index_specs` 是共享的索引定义。**
    - 3.x 索引文件名只由 stem、字段名、index_type 决定，不含 metric 和建索引参数。所以只有当字段的索引定义（type、metric、params）没有变化时，才可以保留 3.x 的 `.idx` / `.sidx`。
    - Rust 执行 drop_index，或改变某字段的索引定义时，要按 3.x `drop_index` 的规则（[collection.py:1552](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/milvus_lite/engine/collection.py#L1552)）删掉对应的 3.x 索引文件（被 snapshot 钉住的除外），否则 3.x 下次会加载参数不对的旧索引。实测：在 L2 定义下加载了按 COSINE 建的旧索引，返回的距离全部错误，排序也不同。
-   - Rust 不能执行的索引定义（第一阶段的 HNSW 等）原样保留，不改写成自己的类型。
+   - Rust 不按 3.x 方式构建的索引定义（HNSW 建本实现自己的图，其余 ANN 类型按 FLAT）原样保留，不改写成自己的类型。
 8. **分词与 BM25 必须和 3.x 逐位一致。**
    - 稀疏向量在写入时由 BM25 function 计算，存入 WAL 与 Parquet；查询时再对查询文本分词、求 term ID。要让「3.x 写入、Rust 查询」得到相同结果，分词和 term hash 都必须一致。
    - 3.x 的 standard 分词器是 Python `re` 的 `\w+`，作用在 `str.lower()` 之后（[standard.py](https://github.com/milvus-io/milvus-lite/blob/v3.2.1/milvus_lite/analyzer/standard.py#L26)），**不是** Lucene 的 standard。它的 Unicode 语义与 Rust `regex` 不同。实测：分解形式的 `"cafe\u0301"`（e 加组合重音符），Python 得到 `cafe`，Rust `regex` 得到 `cafe\u0301`；`"İstanbul"`，Python 得到 `i`、`stanbul` 两个词，Rust 得到一个词；`"x²y"`，Python 得到一个词，Rust 得到 `x`、`y`。而且 Python 各版本的 Unicode 表不同，3.x 支持 Python ≥ 3.10。
@@ -142,7 +143,7 @@
 - **索引文件共存**：两种索引文件同时存在时，各自只加载自己的格式；删除 segment、drop_index、修改索引定义之后，陈旧文件被正确清理，被 snapshot 钉住的文件保留（约束 5–7）。
 - **snapshot**：一方创建、另一方 restore；GC 不删除被钉住的文件。
 - **删除判定的分区语义**：tombstone 与其对应的数据行分处不同分区（包括约束 3 所述的误路由目录，以及 `_all` 删除），Rust 与 3.x 读出的结果一致（约束 13）。
-- **第一阶段的索引定义**：pymilvus 快速建表（AUTOINDEX）可用；当前源码新建 HNSW / HNSW_SQ / IVF_FLAT / IVF_SQ8 / 标量 INVERTED 可用，定义原样保存，向量按 FLAT、标量按扫描执行；3.x 自身无法构建的类型与稀疏字段继续拒绝；打开 3.x 写的 HNSW / AUTOINDEX / INVERTED / SPARSE_INVERTED_INDEX 目录时，定义原样保留，检索与过滤结果正确（稀疏检索按 0030 执行），3.x 再次打开时仍能使用原索引；Rust 写出的任何索引定义，3.x 都能 load。
+- **第一阶段的索引定义**：pymilvus 快速建表（AUTOINDEX）可用；当前源码新建 HNSW / HNSW_SQ / IVF_FLAT / IVF_SQ8 / 标量 INVERTED 可用，定义原样保存，HNSW 建本实现自己的图检索（[0041](0041-hnsw.md)），其余向量索引按 FLAT、标量按扫描执行；3.x 自身无法构建的类型与稀疏字段继续拒绝；打开 3.x 写的 HNSW / AUTOINDEX / INVERTED / SPARSE_INVERTED_INDEX 目录时，定义原样保留，检索与过滤结果正确（稀疏检索按 0030 执行），3.x 再次打开时仍能使用原索引；Rust 写出的任何索引定义，3.x 都能 load。
 - **集合管理与两种意图**（0023）：两边交替创建别名、改指、删除，改名（含经别名）与清空（含经别名），别名、分区、索引定义、属性顺序、load 状态与 auto_id 互相可读；本实现在改名、清空的每个退出点强制退出后由 3.x 打开并改动，再由本实现重开收尾；3.x 改名或清空中途退出留下的目录由本实现直接打开。覆盖见 [互通 README](../../tests/storage_interop/README.md) 与 [0023 验收](../testing/0023-a-acceptance.md)。
 - **多数据库**（0023 B）：两边交替创建数据库（带属性）、在默认库与非默认库内建同名集合与别名、修改与删除属性、删除对方创建的空库，库列表、属性（含键序）、别名、集合与 `databases/` 的落盘字节互相一致；3.x 手工建立的目录形状（缺 `collections/`、符号链接库、损坏的属性文件）的差异登记在 [0006](0006-m2-scope.md#与-3x-的差异)。
 - **互斥**：一方持有 `LOCK` 时，另一方打开失败并明确报错。Linux（flock 与 fcntl 互不感知）与 Windows（字节范围锁）需要在对应平台上实测。

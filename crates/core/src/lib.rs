@@ -15,6 +15,7 @@ mod flat;
 pub mod flush_budget;
 #[doc(hidden)]
 pub mod geometry;
+mod graph_build;
 mod hnsw;
 pub mod index;
 #[doc(hidden)]

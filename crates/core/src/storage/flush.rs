@@ -384,7 +384,12 @@ pub(crate) fn has_index_sidecar(data_or_delta_dir: &Path, stem: &str) -> Result<
         let entry = entry.map_err(|error| FlushError::before(&index_dir, error))?;
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
-        if name.starts_with(&prefix) && (name.ends_with(".idx") || name.ends_with(".sidx")) {
+        // 本实现的图文件也算：复用残留图的 stem 时，行数与大小恰好相同的旧图会被当作有效（0041）。
+        if name.starts_with(&prefix)
+            && (name.ends_with(".idx")
+                || name.ends_with(".sidx")
+                || crate::graph_build::is_graph_file(name))
+        {
             return Ok(true);
         }
     }

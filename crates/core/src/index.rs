@@ -131,11 +131,15 @@ pub(crate) struct SidecarName<'a> {
     pub extension: &'a str,
 }
 
+/// 3.x 的侧车 `<stem>.<字段>.<类型小写>.idx|.sidx`，以及本实现的 HNSW 图 `<stem>.<字段>.hnsw.mlrs`
+/// （0041；3.x 跳过它，0002 约束 5）。两者都与 segment 同生命周期，清理、预检与删除意图共用这一解析。
 pub(crate) fn parse_sidecar_name(name: &str) -> Option<SidecarName<'_>> {
     let extension = if name.ends_with(".idx") {
         ".idx"
     } else if name.ends_with(".sidx") {
         ".sidx"
+    } else if name.ends_with(".mlrs") {
+        ".mlrs"
     } else {
         return None;
     };

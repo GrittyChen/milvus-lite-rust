@@ -492,9 +492,7 @@ impl Service for MilvusService {
         let database = database(&request, |r| &r.db_name);
         let req = request.into_inner();
         self.run(Branch::Engine, move |db| {
-            db.collection(&database, &req.collection_name)?
-                .write()
-                .load()?;
+            db.load_collection(&db.collection(&database, &req.collection_name)?)?;
             Ok(success())
         })
         .await

@@ -239,6 +239,21 @@ pub(crate) fn cleanup_unreferenced(
         }
         for entry in entries(&partition.join("indexes"))? {
             let name = entry.file_name();
+            // 构建线程中途退出留下的图临时文件（0041）：打开时尚无构建在进行，一律清理。
+            if name
+                .to_str()
+                .is_some_and(|n| n.contains(crate::graph_build::GRAPH_TMP_MARKER))
+                && entry
+                    .file_type()
+                    .map_err(|source| RecoveryError::Cleanup {
+                        path: entry.path(),
+                        source,
+                    })?
+                    .is_file()
+            {
+                remove.push(entry.path());
+                continue;
+            }
             let Some(stem) = name.to_str().and_then(sidecar_source_stem) else {
                 continue;
             };

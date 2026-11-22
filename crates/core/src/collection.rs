@@ -1899,6 +1899,8 @@ pub(crate) struct ChunkData {
     pub(crate) seqs: Vec<u64>,
     orders: Vec<u64>,
     sparse: SparseCache,
+    /// 已提交段上每个 HNSW 向量字段的图（0041）。与稀疏倒排同样随块共享、随块释放，克隆块数据时不复制。
+    pub(crate) graphs: GraphCache,
 }
 
 /// 已提交块上每个稀疏字段的倒排（0030，3.x 的 `Segment.sparse_indexes`）。随块共享、随块释放；
@@ -1947,6 +1949,59 @@ impl SparseCache {
         {
             slots.push((field, Arc::clone(postings)));
         }
+    }
+
+    fn clear(&self) {
+        self.0.lock().clear();
+    }
+}
+
+/// 已提交块上的 HNSW 图槽位（0041 第 3 步）。叶子锁；检索与构建线程只在锁外使用取出的 `Arc`。
+pub(crate) struct GraphCache(crate::lock_order::Mutex<Vec<(usize, Arc<crate::hnsw::Graph>)>, 6>);
+
+impl Default for GraphCache {
+    fn default() -> Self {
+        Self(crate::lock_order::Mutex::new(Vec::new()))
+    }
+}
+
+impl Clone for GraphCache {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+impl std::fmt::Debug for GraphCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("GraphCache")
+    }
+}
+
+impl GraphCache {
+    pub(crate) fn get(&self, field: usize) -> Option<Arc<crate::hnsw::Graph>> {
+        self.0
+            .lock()
+            .iter()
+            .find(|(f, _)| *f == field)
+            .map(|(_, graph)| Arc::clone(graph))
+    }
+
+    /// 与 [`SparseCache::publish`] 同理：只在图代号仍是任务取得时的值时写入，作废的图不会写回。
+    pub(crate) fn publish(
+        &self,
+        field: usize,
+        graph: Arc<crate::hnsw::Graph>,
+        epoch: &std::sync::atomic::AtomicU64,
+        seen: u64,
+    ) -> bool {
+        let mut slots = self.0.lock();
+        if epoch.load(std::sync::atomic::Ordering::SeqCst) != seen
+            || slots.iter().any(|(f, _)| *f == field)
+        {
+            return false;
+        }
+        slots.push((field, graph));
+        true
     }
 
     fn clear(&self) {
@@ -2146,6 +2201,8 @@ pub struct Collection {
     indexes: Vec<IndexSpec>,
     /// release 与索引变更时递增，使在途检索构建的稀疏倒排不再写回缓存（0030）。
     sparse_epoch: Arc<std::sync::atomic::AtomicU64>,
+    /// release、load 与索引变更时递增，使在途的 HNSW 构建不再写回（0041 第 3 步）。
+    graph_epoch: Arc<std::sync::atomic::AtomicU64>,
     load_state: LoadState,
     next_order: u64,
     persistent: Option<PersistentCollection>,
@@ -2204,6 +2261,7 @@ impl Collection {
             next_seq: 1,
             indexes: Vec::new(),
             sparse_epoch: Arc::default(),
+            graph_epoch: Arc::default(),
             // 3.x：新建的 collection 没有索引定义，初始即为 loaded。
             load_state: LoadState::Loaded,
             next_order: 0,
@@ -2331,6 +2389,16 @@ impl Collection {
 
     pub(crate) fn mark_deleted(&mut self, deleted: bool) {
         self.deleted = deleted;
+        if deleted {
+            self.cancel_graph_builds();
+        }
+    }
+
+    /// drop、改名、清空让这个实例上在途的图构建尽早退出（0041），不白跑到发布前复核才放弃。
+    /// 不清空槽位：进行中的读请求仍可用快照里已有的图。
+    pub(crate) fn cancel_graph_builds(&self) {
+        self.graph_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 
     pub(crate) fn is_deleted(&self) -> bool {
@@ -2482,6 +2550,7 @@ impl Collection {
                 seqs: decoded.seqs,
                 orders,
                 sparse: SparseCache::default(),
+                graphs: GraphCache::default(),
             }),
             live: SourceBits::from_live(&live),
             generation,
@@ -2713,6 +2782,7 @@ impl Collection {
                     norms,
                     orders,
                     sparse: SparseCache::default(),
+                    graphs: GraphCache::default(),
                 }),
                 live: SourceBits::from_live(&live),
                 source,
@@ -2896,6 +2966,7 @@ impl Collection {
                             norms: data.norms,
                             orders,
                             sparse: SparseCache::default(),
+                            graphs: GraphCache::default(),
                         }),
                         live,
                         source,
@@ -3240,6 +3311,7 @@ impl Collection {
                         norms: output.norms,
                         orders,
                         sparse: SparseCache::default(),
+                        graphs: GraphCache::default(),
                     }),
                     live: SourceBits::from_live(&live[i]),
                     generation: 0,
@@ -3319,8 +3391,115 @@ impl Collection {
                 return Err(error);
             }
         }
+        self.invalidate_graphs();
         self.load_state = LoadState::Loaded;
         Ok(())
+    }
+
+    /// 已 load 的持久化 collection 上，每个 HNSW 定义（稠密 FLOAT_VECTOR 字段、度量与参数可用）在每个行数
+    /// 不低于 [`crate::graph_build::MIN_GRAPH_ROWS`]、尚无图的已提交段上产生一个构建任务（0041 第 3 步）。
+    /// 参数无法解析时不建图，该字段一直走 FLAT。
+    pub(crate) fn graph_tasks(
+        &self,
+        handle: &std::sync::Weak<crate::lock_order::RwLock<Collection, 5>>,
+    ) -> Vec<crate::graph_build::GraphTask> {
+        let Some(p) = &self.persistent else {
+            return Vec::new();
+        };
+        if self.deleted || self.load_state != LoadState::Loaded {
+            return Vec::new();
+        }
+        let seen = self.graph_epoch.load(std::sync::atomic::Ordering::SeqCst);
+        let mut tasks = Vec::new();
+        for spec in self.indexes.iter().filter(|s| s.index_type == "HNSW") {
+            let Some(field_pos) =
+                self.schema.fields.iter().position(|f| {
+                    f.name == spec.field_name && f.data_type == DataType::FloatVector
+                })
+            else {
+                continue;
+            };
+            let Some(metric) = Metric::parse(&spec.metric_type.to_uppercase()) else {
+                continue;
+            };
+            let Some(params) = crate::hnsw::Params::from_spec(&spec.params) else {
+                continue;
+            };
+            for ((partition, file), source) in &p.data_sources {
+                let mut parts: Vec<&Chunk> = self
+                    .chunks
+                    .values()
+                    .filter(|c| c.source == *source && c.generation == 0)
+                    .collect();
+                parts.sort_by_key(|c| c.row_start);
+                let mut next = 0;
+                for chunk in &parts {
+                    if chunk.row_start != next {
+                        next = usize::MAX;
+                        break;
+                    }
+                    next += chunk.data.seqs.len();
+                }
+                let Some(first) = parts.first() else {
+                    continue;
+                };
+                if next == usize::MAX
+                    || next < crate::graph_build::MIN_GRAPH_ROWS
+                    || first.data.graphs.get(field_pos).is_some()
+                {
+                    continue;
+                }
+                let ColumnData::FloatVector { dim, .. } = first.data.columns[field_pos].values()
+                else {
+                    continue;
+                };
+                let norm_stride = self.schema.vector_count();
+                let norm_offset = self.schema.vector_ordinal(field_pos);
+                let partition_dir = p.dir.join("partitions").join(partition);
+                tasks.push(crate::graph_build::GraphTask {
+                    collection: handle.clone(),
+                    chunks: parts
+                        .iter()
+                        .map(|c| (c.row_start, Arc::downgrade(&c.data)))
+                        .collect(),
+                    epoch: Arc::clone(&self.graph_epoch),
+                    seen,
+                    field_pos,
+                    field_name: spec.field_name.clone(),
+                    metric,
+                    dim: *dim,
+                    norm_stride,
+                    norm_offset,
+                    params,
+                    indexes_dir: partition_dir.join("indexes"),
+                    segment_path: partition_dir.join(file),
+                    attempts: 0,
+                    not_before: None,
+                });
+            }
+        }
+        tasks
+    }
+
+    /// 发布前的复核（0041 第 3 步设计第 4 条）：collection 未删除、仍是 loaded、代号未变，且块仍在当前块表中。
+    pub(crate) fn graph_publishable(&self, chunks: &[(usize, Arc<ChunkData>)], seen: u64) -> bool {
+        !self.deleted
+            && self.load_state == LoadState::Loaded
+            && self.graph_epoch.load(std::sync::atomic::Ordering::SeqCst) == seen
+            && chunks.iter().all(|(start, data)| {
+                self.chunks.values().any(|c| {
+                    c.generation == 0 && c.row_start == *start && Arc::ptr_eq(&c.data, data)
+                })
+            })
+    }
+
+    /// 已建图的（段数据文件名, 字段）数，供测试观察后台构建。
+    #[cfg(test)]
+    pub(crate) fn graph_count(&self) -> usize {
+        self.chunks
+            .values()
+            .map(|c| c.data.graphs.0.lock().len())
+            .sum()
     }
 
     /// 按物理行数：被删除隐藏的行仍在 segment 中，3.x 照样为它建索引。
@@ -3447,6 +3626,17 @@ impl Collection {
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         for chunk in self.chunks.values() {
             chunk.data.sparse.clear();
+        }
+        self.invalidate_graphs();
+    }
+
+    /// HNSW 图与稀疏倒排在同样的时机作废（release、create_index、drop_index），另外 load 时也递增代号：
+    /// release 之前排队、load 之后才完成的构建属于上一轮，丢弃后按新一轮重新排队。
+    fn invalidate_graphs(&self) {
+        self.graph_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        for chunk in self.chunks.values() {
+            chunk.data.graphs.clear();
         }
     }
 
@@ -4095,6 +4285,7 @@ impl Collection {
                 seqs: seqs.clone(),
                 orders: Vec::with_capacity(n),
                 sparse: SparseCache::default(),
+                graphs: GraphCache::default(),
             }),
             live: SourceBits::from_live(&vec![true; n]),
             generation,

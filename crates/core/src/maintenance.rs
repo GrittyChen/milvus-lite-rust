@@ -236,7 +236,11 @@ impl Maintenance {
                         if maintenance.abort.load(Ordering::Acquire) {
                             return Err(EngineError::Closed);
                         }
-                        db.compact_handle(&handle)
+                        let result = db.compact_handle(&handle);
+                        // flush、打开与 compaction 都会排一轮维护，新的已提交段在这之后排队建图（0041）。
+                        // compaction 失败时 flush 已提交的段照样排队：错误照常上报，不让新段等到下一次 flush。
+                        db.schedule_graphs(&handle);
+                        result
                     }))
                     .unwrap_or_else(|payload| {
                         Err(EngineError::Storage(format!(

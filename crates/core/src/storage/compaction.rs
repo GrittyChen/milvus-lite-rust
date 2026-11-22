@@ -561,7 +561,10 @@ pub(crate) fn cleanup(
                     let Some(file) = path.file_name().and_then(|s| s.to_str()) else {
                         continue;
                     };
-                    if !file.ends_with(".idx") && !file.ends_with(".sidx") {
+                    if !file.ends_with(".idx")
+                        && !file.ends_with(".sidx")
+                        && !crate::graph_build::is_graph_file(file)
+                    {
                         continue;
                     }
                     if obsolete.iter().filter(|p| p.starts_with("data")).any(|p| {
