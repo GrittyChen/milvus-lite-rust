@@ -8,11 +8,11 @@
 
 | 环境 | 解释器 | 用途 |
 | --- | --- | --- |
-| `dev` | CPython 3.12 | 构建并安装本实现、pymilvus 3.0.2 线、工具自检、驱动分片工具 |
-| `sdk26` | CPython 3.10 | 安装 wheel 后的 pymilvus 2.6.17 线 |
-| `sdk26-py315` | CPython 3.15 | 发行工作流中 3.15 的 pymilvus 2.6.17 线；`sdk26` 选中的 numpy 2.4.6 没有 cp315 wheel，因此单独解析，不复用 3.10 的集合 |
-| `sdk30` | CPython 3.10–3.15 | 发行工作流中各解释器的 pymilvus 3.0.2 线（3.10 / 3.15 全套与 3.11–3.14 冒烟）；逐解释器、逐平台核对过 wheel |
-| `dump30` / `dump26` | CPython 3.10、3.12 | `tests/dump` 需要的 `pymilvus[bulk_writer]`，分别叠装在 3.0.2 线（`dev`、发行的 3.10 环境）与 2.6.17 线（`sdk26`）已有的环境上：两份锁是同版本的超集，叠装不改变已有包的版本。BulkWriter 依赖的 pyarrow 没有 cp315 wheel，因此不进 3.15 的环境，tests/dump 也不进 `tests/python`（[0037](../../docs/decisions/0037-dump.md)「测试」） |
+| `dev` | CPython 3.12 | 构建并安装本实现、pymilvus 3.0.3 线、工具自检、驱动分片工具 |
+| `sdk26` | CPython 3.10 | 安装 wheel 后的 pymilvus 2.6.18 线 |
+| `sdk26-py315` | CPython 3.15 | 发行工作流中 3.15 的 pymilvus 2.6.18 线；`sdk26` 选中的 numpy 2.4.6 没有 cp315 wheel，因此单独解析，不复用 3.10 的集合 |
+| `sdk30` | CPython 3.10–3.15 | 发行工作流中各解释器的 pymilvus 3.0.3 线（3.10 / 3.15 全套与 3.11–3.14 冒烟）；逐解释器、逐平台核对过 wheel |
+| `dump30` / `dump26` | CPython 3.10、3.12 | `tests/dump` 需要的 `pymilvus[bulk_writer]`，分别叠装在 3.0.3 线（`dev`、发行的 3.10 环境）与 2.6.18 线（`sdk26`）已有的环境上：两份锁是同版本的超集，叠装不改变已有包的版本。BulkWriter 依赖的 pyarrow 没有 cp315 wheel，因此不进 3.15 的环境，tests/dump 也不进 `tests/python`（[0037](../../docs/decisions/0037-dump.md)「测试」） |
 | `ref25` / `ref15` | CPython 3.12 | 参照实现（`compare.yml` 的 `REFERENCE_COMMIT`）的 Arrow 25 / Arrow 15 环境，`ref25` 另含 `pymilvus[bulk_writer]` 供 dump 差分使用；参照实现的依赖取自其 `pyproject.toml`，checkout 另以 `--no-deps -e` 安装 |
 | `ref26` | CPython 3.12 | 只用于存储互通：与 `ref25` 相同，只把 pyarrow 换成 26.0.1。pyarrow 低于 26 读不了含空行的定长列表 Parquet，nullable 稠密向量的互通要在 Arrow 26 上验证 3.x 的读取（[0038](../../docs/decisions/0038-nullable-dense-vectors.md)）。生成时沿用 `ref25` 的 `--exclude-newer 2026-10-08T00:00:00Z`，另加 `--exclude-newer-package pyarrow=2026-11-05T00:00:00Z`，其余包与 `ref25` 逐行相同；整体放宽日期会改动 13 个共同包。[tests/ci](../../tests/ci/test_dump_requirements.py) 核对这一点 |
 | `build` | — | 可编辑安装参照时的构建依赖（hatchling 及其可编辑安装额外请求的 editables），以及从 sdist 构建 jieba 的 setuptools，经 `--build-constraint` 使用 |
@@ -23,7 +23,7 @@ Linux 上的 CPython 3.15 例外：`orjson==3.13.0` 的 cp315 Linux wheel 只有
 
 `dump30`、`dump26`、`ref25`、`ref26` 的 `.in` 带两条上限 `argon2-cffi-bindings<26` 与 `cryptography<49`：两者由 BulkWriter 依赖的 minio / azure-storage-blob 引入，argon2-cffi-bindings 26.1.0 在 macOS 上只有 arm64 wheel，cryptography 自 49.0.0 起不再提供 macOS x86_64 wheel，而发行工作流在 macOS x86_64 上以 `--no-build` 安装。[tests/ci](../../tests/ci/test_dump_requirements.py) 同时核对 `.in` 与 `.txt` 中的上限。
 
-更新任一 `.in` 或参照版本后，在仓库根目录按各 `.txt` 文件头记录的命令重新生成，并随同一提交评审。生成使用 CI 固定的 uv 版本，并以 `--exclude-newer` 截止到生成日前两周，避免刚发布的版本进入环境；`--universal` 使同一份结果在三个平台通用，但不保证每个平台都有 wheel：例如参照环境的 faiss-cpu 1.15.1 在三个平台都有 wheel，但 macOS arm64 的最低目标是 macOS 14，更换托管机器或依赖版本时须重新核对。
+更新任一 `.in` 或参照版本后，在仓库根目录按各 `.txt` 文件头记录的命令重新生成，并随同一提交评审。生成使用 CI 固定的 uv 版本，并以 `--exclude-newer` 截止到生成日前两周，避免刚发布的版本进入环境；只需跟进个别包时（各锁的 pymilvus、ref26 的 pyarrow），用 `--exclude-newer-package` 只放宽该包，其余包的截止日期不变。pymilvus 是被测对象，可以不受两周的限制：升级时须先核对接入点与 proto 的变化，并用新版跑完两条线的端到端与差分（pymilvus 3.0.3 发布 12 天后即按此纳入）；`--universal` 使同一份结果在三个平台通用，但不保证每个平台都有 wheel：例如参照环境的 faiss-cpu 1.15.1 在三个平台都有 wheel，但 macOS arm64 的最低目标是 macOS 14，更换托管机器或依赖版本时须重新核对。
 
 ### uv 的获取
 

@@ -1,2 +1,2 @@
-pymilvus==3.0.2
+pymilvus==3.0.3
 pytest

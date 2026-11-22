@@ -23,7 +23,7 @@ SCOPE_TAGS = {"linux-x86_64": "manylinux_2_28_x86_64", "linux-aarch64": "manylin
 # 字面量：tests/packaging 以 ast.literal_eval 读取（不导入本模块）；与 SCOPE_TAGS 的一致由 tests/release 核对。
 WHEEL_TAGS = ("macosx_11_0_arm64", "macosx_11_0_x86_64", "manylinux_2_28_aarch64", "manylinux_2_28_x86_64")
 # 测试 job 的 part；每个平台 × part 交出一份 tested-<平台>-<part>.sha256（0039 第 8 条）。
-TEST_PARTS = ("diff-2.6.17", "diff-3.0.2", "interop", "python", "static", "fi")
+TEST_PARTS = ("diff-2.6.18", "diff-3.0.3", "interop", "python", "static", "fi")
 KEYS = {"format", "scorecard", "mode", "candidate_id", "version", "commit", "run", "source", "inherited",
         "pid1_dry_run", "dry_run_basis", "artifacts", "fi_wheels", "build_environment", "stages"}
 # 签发路径（0039 第 1 条）：工作流头部（env 只留 MODE 与 VERSION）、最后两个 job，以及签发入口工具在

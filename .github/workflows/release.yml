@@ -351,7 +351,7 @@ jobs:
       fail-fast: false
       matrix:
         # 与两个 macOS 测试 job 用相同的 part 划分（差分两条线与互通各占一个 job），阶段与产物命名一致。
-        part: [diff-3.0.2, diff-2.6.17, interop, python, static, fi]
+        part: [diff-3.0.3, diff-2.6.18, interop, python, static, fi]
         platform:
           - scope: linux-x86_64
             os: ubuntu-24.04
@@ -463,13 +463,13 @@ jobs:
         run: |
           . .github/ci/crash_capture.sh
           record() { "$DEV_PY" tests/release/stage.py --dir "$STAGES" --scope "$SCOPE" "$@"; }
-          expect=$("$DEV_PY" tests/release/scorecard.py expect "$SCOPE" python-3.10-3.0.2 collected)
+          expect=$("$DEV_PY" tests/release/scorecard.py expect "$SCOPE" python-3.10-3.0.3 collected)
           req=.github/ci/requirements
           for python in 3.10 3.15; do
-            for sdk in 2.6.17 3.0.2; do
+            for sdk in 2.6.18 3.0.3; do
               constraints="$req/sdk30.txt"
-              [ "$sdk" = 2.6.17 ] && constraints="$req/sdk26.txt"
-              [ "$sdk" = 2.6.17 ] && [ "$python" = 3.15 ] && constraints="$req/sdk26-py315.txt"
+              [ "$sdk" = 2.6.18 ] && constraints="$req/sdk26.txt"
+              [ "$sdk" = 2.6.18 ] && [ "$python" = 3.15 ] && constraints="$req/sdk26-py315.txt"
               interpreter="PY3${python#3.}"
               # glibc 2.28 上 orjson 只有本运行构建的 cp315 wheel（0021 第 11 条），两条 SDK 共用同一份，构建记录写入阶段环境。
               unset UV_FIND_LINKS ORJSON_RECORD
@@ -490,10 +490,10 @@ jobs:
           # tests/dump/e2e 只在 3.10 运行（BulkWriter 的 pyarrow 没有 cp315 wheel）：在上面已装正式 wheel 的环境上
           # 叠装同版本的超集锁，仓库外运行以导入已安装的 wheel（0037「测试」）。
           mkdir "$RUNNER_TEMP/outside-dump"
-          for sdk in 2.6.17 3.0.2; do
+          for sdk in 2.6.18 3.0.3; do
             env_py="$RUNNER_TEMP/acc-3.10-$sdk/sdk/bin/python"
             dump_req="$req/dump30.txt"
-            [ "$sdk" = 2.6.17 ] && dump_req="$req/dump26.txt"
+            [ "$sdk" = 2.6.18 ] && dump_req="$req/dump26.txt"
             uv pip install -q --python "$env_py" --no-build -r "$dump_req"
             collected=$("$DEV_PY" tests/release/scorecard.py expect "$SCOPE" "dump-3.10-$sdk" collected)
             "$DEV_PY" tests/sharding/shard.py plan --python "$env_py" --suite "$PWD/tests/dump/e2e" --cwd "$RUNNER_TEMP/outside-dump" \
@@ -504,7 +504,7 @@ jobs:
           for python in 3.11 3.12 3.13 3.14; do
             interpreter="PY3${python#3.}"
             "$DEV_PY" tests/packaging/run_acceptance.py --work-dir "$RUNNER_TEMP/smoke-$python" --python "${!interpreter}" \
-              --sdk 3.0.2 --constraints "$req/sdk30.txt" --wheel "$WHEEL" --sdist "$SDIST"
+              --sdk 3.0.3 --constraints "$req/sdk30.txt" --wheel "$WHEEL" --sdist "$SDIST"
             "$RUNNER_TEMP/smoke-$python/sdk/bin/python" tests/platform/feature_smoke.py --repo . --work-dir "$RUNNER_TEMP/smoke-$python/features"
             record --stage "smoke-$python"
           done
@@ -534,12 +534,12 @@ jobs:
           "$DEV_PY" .github/ci/jieba_wheel.py check-installed --record "$RUNNER_TEMP/jieba/record.json" \
             --wheel "$RUNNER_TEMP/jieba/jieba-0.42.1-py3-none-any.whl" --python "${pythons[@]}"
           case "${{ matrix.part }}" in
-            diff-3.0.2|interop) sdk=3.0.2 ;;
-            diff-2.6.17) sdk=2.6.17 ;;
+            diff-3.0.3|interop) sdk=3.0.3 ;;
+            diff-2.6.18) sdk=2.6.18 ;;
             *) exit 1 ;;
           esac
-          # 与对照层相同的两条线，Python 侧改为本运行构建的正式 wheel（候选结果 job 与装配清单交叉核对），并核对实际加载的原生模块；互通用 3.0.2 线的环境，同样核对。
-          if [ "$sdk" = 3.0.2 ]; then
+          # 与对照层相同的两条线，Python 侧改为本运行构建的正式 wheel（候选结果 job 与装配清单交叉核对），并核对实际加载的原生模块；互通用 3.0.3 线的环境，同样核对。
+          if [ "$sdk" = 3.0.3 ]; then
             uv venv -q -p "$PY312" "$RUNNER_TEMP/w30"
             uv pip install -q --python "$RUNNER_TEMP/w30/bin/python" --no-build -r "$req/sdk30.txt" && uv pip install -q --python "$RUNNER_TEMP/w30/bin/python" --no-deps "$WHEEL"
             py="$RUNNER_TEMP/w30/bin/python"
@@ -560,7 +560,7 @@ jobs:
             record --stage "differential-$sdk" --summary "$RUNNER_TEMP/diff-$sdk-run/summary.json"
             # dump 差分单独记分（0021 第 12 条：每个计数唯一来源）；两侧都需要 BulkWriter，ref25 的锁已含它。
             dump_req="$req/dump30.txt"
-            [ "$sdk" = 2.6.17 ] && dump_req="$req/dump26.txt"
+            [ "$sdk" = 2.6.18 ] && dump_req="$req/dump26.txt"
             uv pip install -q --python "$py" --no-build -r "$dump_req"
             collected=$("$DEV_PY" tests/release/scorecard.py expect "$SCOPE" "dump-diff-$sdk" collected)
             "$DEV_PY" tests/sharding/shard.py plan --python "$py" --suite "$PWD/tests/dump/diff" --cwd "$RUNNER_TEMP/outside" \
@@ -598,9 +598,9 @@ jobs:
           record() { "$DEV_PY" tests/release/stage.py --dir "$STAGES" --scope "$SCOPE" "$@"; }
           req=.github/ci/requirements
           mkdir "$RUNNER_TEMP/outside"
-          for sdk in 2.6.17 3.0.2; do
+          for sdk in 2.6.18 3.0.3; do
             venv="$RUNNER_TEMP/fi-$sdk"; py="$PY312"; constraints="$req/sdk30.txt"
-            [ "$sdk" = 2.6.17 ] && py="$PY310" && constraints="$req/sdk26.txt"
+            [ "$sdk" = 2.6.18 ] && py="$PY310" && constraints="$req/sdk26.txt"
             uv venv -q -p "$py" "$venv"
             uv pip install -q --python "$venv/bin/python" --no-build -r "$constraints" && uv pip install -q --python "$venv/bin/python" --no-deps "$FI_WHEEL"
             (cd "$RUNNER_TEMP/outside" && "$DEV_PY" "$GITHUB_WORKSPACE/tests/release/native_check.py" --python "$venv/bin/python" --wheel "$FI_WHEEL")
@@ -645,7 +645,7 @@ jobs:
       fail-fast: false
       max-parallel: 4
       matrix:
-        part: [diff-2.6.17, diff-3.0.2, python, interop, static, fi]
+        part: [diff-2.6.18, diff-3.0.3, python, interop, static, fi]
         platform:
           - scope: macos-x86_64
             os: macos-15-intel
@@ -666,7 +666,7 @@ jobs:
       fail-fast: false
       max-parallel: 3
       matrix:
-        part: [diff-2.6.17, diff-3.0.2, python, interop, static, fi]
+        part: [diff-2.6.18, diff-3.0.3, python, interop, static, fi]
         platform:
           - scope: macos-arm64
             os: macos-15

@@ -33,5 +33,10 @@ def test_ref26_differs_from_ref25_only_in_pyarrow():
     assert [line for line in ref25 if not line.startswith("pyarrow==")] == [
         line for line in ref26 if not line.startswith("pyarrow==")]
     assert "pyarrow==25.0.1" in ref25 and "pyarrow==26.0.1" in ref26
-    header = (REQ / "ref26.txt").read_text().splitlines()[1]
-    assert "--exclude-newer 2026-10-08T00:00:00Z --exclude-newer-package pyarrow=" in header, header
+    # 生成命令也只多放宽 pyarrow 一项（日期不限）；其余参数（含各锁共用的 pymilvus 放宽）与 ref25 相同。
+    header25 = (REQ / "ref25.txt").read_text().splitlines()[1]
+    header26 = (REQ / "ref26.txt").read_text().splitlines()[1]
+    relaxed = re.findall(r" --exclude-newer-package pyarrow=\S+", header26)
+    assert len(relaxed) == 1, header26
+    assert header26.replace(relaxed[0], "").replace("ref26", "ref25") == header25, header26
+    assert "--exclude-newer 2026-10-08T00:00:00Z " in header25, header25

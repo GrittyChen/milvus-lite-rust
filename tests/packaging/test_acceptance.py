@@ -18,7 +18,7 @@ def test_run_propagates_child_failure(tmp_path):
 @pytest.fixture
 def constraints(tmp_path):
     path = tmp_path / "constraints.txt"
-    path.write_text("pymilvus==3.0.2\n")
+    path.write_text("pymilvus==3.0.3\n")
     return path
 
 

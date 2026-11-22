@@ -52,7 +52,7 @@ def run_suite(repo, work, interpreter, expect):
     return counts
 
 
-def execute(repo, work, python=sys.executable, sdk="3.0.2", suite=False, wheel=None, sdist=None, constraints=None, suite_expect=None):
+def execute(repo, work, python=sys.executable, sdk="3.0.3", suite=False, wheel=None, sdist=None, constraints=None, suite_expect=None):
     repo, work = Path(repo).resolve(), Path(work).resolve()
     if constraints is None or not Path(constraints).is_file():
         raise ValueError("an existing constraints file is required")
@@ -115,7 +115,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--work-dir", required=True, type=Path)
     parser.add_argument("--repo", type=Path, default=Path(__file__).resolve().parents[2])
-    parser.add_argument("--sdk", choices=["2.6.17", "3.0.2"], default="3.0.2")
+    parser.add_argument("--sdk", choices=["2.6.18", "3.0.3"], default="3.0.3")
     parser.add_argument("--python", default=sys.executable)
     parser.add_argument("--constraints", type=Path, required=True, help="complete pinned dependency set for the SDK environment")
     parser.add_argument("--suite", action="store_true")

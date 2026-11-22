@@ -134,7 +134,7 @@ jobs:
         env:
           PY: ${{ steps.python.outputs.python-path }}
         run: |
-          "$PY" default/.github/ci/public_release.py smoke --version "$VERSION" --sdk 3.0.2 --tag-dir frozen \
+          "$PY" default/.github/ci/public_release.py smoke --version "$VERSION" --tag-dir frozen \
             --python "$RUNNER_TEMP/venv/bin/python" --work-dir "$RUNNER_TEMP/smoke"
 
   public-pass:

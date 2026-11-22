@@ -6,11 +6,11 @@
 
 ```bash
 uv venv -p 3.12 <work_dir>/v3
-uv pip install -p <work_dir>/v3/bin/python -e references/milvus-lite 'pymilvus==3.0.2' 'pyarrow==25.0.1' pytest
+uv pip install -p <work_dir>/v3/bin/python -e references/milvus-lite 'pymilvus==3.0.3' 'pyarrow==25.0.1' pytest
 uv venv -p 3.12 <work_dir>/arrow15
-uv pip install -p <work_dir>/arrow15/bin/python -e references/milvus-lite 'pymilvus==3.0.2' 'pyarrow==15.0.0' 'numpy==1.26.4'
+uv pip install -p <work_dir>/arrow15/bin/python -e references/milvus-lite 'pymilvus==3.0.3' 'pyarrow==15.0.0' 'numpy==1.26.4'
 uv venv -p 3.12 <work_dir>/arrow26
-uv pip install -p <work_dir>/arrow26/bin/python -e references/milvus-lite 'pymilvus==3.0.2' 'pyarrow==26.0.1' pytest
+uv pip install -p <work_dir>/arrow26/bin/python -e references/milvus-lite 'pymilvus==3.0.3' 'pyarrow==26.0.1' pytest
 # jieba 0.42.1 只有 sdist：下载后按固定哈希构建一次 wheel，装进三套环境（0036 决策 G，与 CI 相同）
 curl -sSfL -o <work_dir>/jieba-0.42.1.tar.gz https://files.pythonhosted.org/packages/source/j/jieba/jieba-0.42.1.tar.gz
 python3 .github/ci/jieba_wheel.py build --sdist <work_dir>/jieba-0.42.1.tar.gz --uv "$(command -v uv)" --python 3.12 --out <work_dir>/jieba

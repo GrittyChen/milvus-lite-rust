@@ -265,7 +265,7 @@ NEEDS = {"assemble": ["build", "build-mac-x86_64"], "tests": ["build", "orjson",
          # 其余验收 job 仍在装配之后（0039 第 8 条「不变」）。
          "linux-system": ["assemble"], "pid1": ["assemble"], "sdist": ["assemble", "identity"], "previous-reader": ["assemble"]}
 MAC_TESTS = {"tests-mac-x86_64": ("macos-x86_64", "4"), "tests-mac-arm64": ("macos-arm64", "3")}
-MAC_PARTS = "        part: [diff-2.6.17, diff-3.0.2, python, interop, static, fi]"
+MAC_PARTS = "        part: [diff-2.6.18, diff-3.0.3, python, interop, static, fi]"
 MODE_LINE = "  MODE: ${{ inputs.dry_run && 'dry-run' || 'release' }}"
 VERSION_LINE = "  VERSION: ${{ inputs.version }}"
 # YAML 锚点与别名：签发路径内若用别名，展开的内容在路径之外，摘要看不到它的变化。
@@ -355,8 +355,8 @@ def test_release_workflow_speedup_shape():
     replace(" tests-mac-x86_64, tests-mac-arm64,\n", " tests-mac-x86_64,\n"),
     replace("      max-parallel: 4\n", "      max-parallel: 5\n"),
     replace("      max-parallel: 3\n", ""),
-    replace("        part: [diff-2.6.17, diff-3.0.2, python, interop, static, fi]\n        platform:\n          - scope: macos-arm64",
-            "        part: [diff-2.6.17, diff-3.0.2, interop, python, static, fi]\n        platform:\n          - scope: macos-arm64"),
+    replace("        part: [diff-2.6.18, diff-3.0.3, python, interop, static, fi]\n        platform:\n          - scope: macos-arm64",
+            "        part: [diff-2.6.18, diff-3.0.3, interop, python, static, fi]\n        platform:\n          - scope: macos-arm64"),
     replace("            tag: macosx_11_0_arm64\n", "            tag: macosx_11_0_x86_64\n"),
     replace("          name: build-linux-x86_64\n          path: ${{ runner.temp }}/build-sdist",
             "          name: formal\n          path: ${{ runner.temp }}/build-sdist"),

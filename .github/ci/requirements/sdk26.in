@@ -1,2 +1,2 @@
-pymilvus==2.6.17
+pymilvus==2.6.18
 pytest

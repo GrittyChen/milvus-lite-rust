@@ -132,7 +132,7 @@ def main(argv=None):
     parser.add_argument("--tool-python", type=Path, required=True, help="GIL CPython with maturin")
     parser.add_argument("--constraints", type=Path, required=True)
     parser.add_argument("--build-constraints", type=Path, required=True)
-    parser.add_argument("--sdk", default="3.0.2")
+    parser.add_argument("--sdk", default="3.0.3")
     parser.add_argument("--msrv", default="1.89.0")
     parser.add_argument("--free-threaded-python", type=Path, required=True)
     parser.add_argument("--pypy-python", type=Path, required=True)

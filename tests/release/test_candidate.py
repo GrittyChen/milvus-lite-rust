@@ -80,11 +80,11 @@ def test_matrix_shape():
     assert set(scorecard.MATRIX) == {*scorecard.PLATFORMS, "sdist"}
     for platform in scorecard.PLATFORMS:
         stages_ = scorecard.MATRIX[platform]
-        assert stages_["python-3.15-2.6.17"] == {"collected": 765, "executed": 765, "group": 0}
-        assert stages_["differential-3.0.2"] == {"collected": 874, "executed": 874, "group": 405}
-        assert stages_["dump-3.10-2.6.17"] == {"collected": 29, "executed": 29, "group": 0}
-        assert stages_["dump-diff-3.0.2"] == {"collected": 20, "executed": 20, "group": 0}
-        assert "dump-3.15-3.0.2" not in stages_
+        assert stages_["python-3.15-2.6.18"] == {"collected": 765, "executed": 765, "group": 0}
+        assert stages_["differential-3.0.3"] == {"collected": 874, "executed": 874, "group": 405}
+        assert stages_["dump-3.10-2.6.18"] == {"collected": 29, "executed": 29, "group": 0}
+        assert stages_["dump-diff-3.0.3"] == {"collected": 20, "executed": 20, "group": 0}
+        assert "dump-3.15-3.0.3" not in stages_
         assert ("pid1" in stages_) == platform.startswith("linux-")
     assert "previous-reader" in scorecard.MATRIX["linux-x86_64"] and "previous-reader" not in scorecard.MATRIX["linux-aarch64"]
     assert scorecard.MATRIX["linux-x86_64"]["previous-reader"] == {"cases": 7}
@@ -161,8 +161,8 @@ MUTATIONS = {
         pid1_image=pid1_env("linux-x86_64")(d)["pid1_image"]),
     "extra stage": lambda d: d["stages"]["macos-arm64"].update(pid1=d["stages"]["linux-x86_64"]["pid1"]),
     "failed stage": lambda d: d["stages"]["linux-x86_64"]["interop"].update(returncode=1),
-    "count short": lambda d: d["stages"]["macos-arm64"]["python-3.10-3.0.2"]["counts"].update(executed=472),
-    "group differs": lambda d: d["stages"]["macos-arm64"]["differential-2.6.17"]["counts"].update(group=117),
+    "count short": lambda d: d["stages"]["macos-arm64"]["python-3.10-3.0.3"]["counts"].update(executed=472),
+    "group differs": lambda d: d["stages"]["macos-arm64"]["differential-2.6.18"]["counts"].update(group=117),
     "positive count zero": lambda d: d["stages"]["linux-x86_64"]["rust-fi"]["counts"].update(passed=0),
     "ignored rust": lambda d: d["stages"]["linux-x86_64"]["rust-default"]["counts"].update(ignored=1),
     "boolean count": lambda d: d["stages"]["linux-x86_64"]["rust-default"]["counts"].update(failed=False),
@@ -269,8 +269,8 @@ def swap_fi_scope(tested):
 TESTED_MUTATIONS = {
     "one file missing": lambda t: (t / c.tested_name("linux-aarch64", "fi")).unlink(),
     "extra file": lambda t: (t / "tested-linux-x86_64-extra.sha256").write_text((t / c.tested_name("linux-x86_64", "fi")).read_text()),
-    "digest differs": lambda t: (t / c.tested_name("macos-x86_64", "diff-2.6.17")).write_text(
-        (t / c.tested_name("macos-x86_64", "diff-2.6.17")).read_text().replace("0", "f", 1)),
+    "digest differs": lambda t: (t / c.tested_name("macos-x86_64", "diff-2.6.18")).write_text(
+        (t / c.tested_name("macos-x86_64", "diff-2.6.18")).read_text().replace("0", "f", 1)),
     "other platform's wheel": lambda t: (t / c.tested_name("macos-arm64", "static")).write_text(
         (t / c.tested_name("macos-x86_64", "static")).read_text()),
     "fi wheel from another platform's directory": swap_fi_scope,

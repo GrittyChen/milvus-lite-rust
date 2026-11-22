@@ -28,7 +28,7 @@
 | standard 分词 | `<3.x 的 venv>/bin/python tests/differential/generate_analyzer_fixtures.py --verify` | |
 | jieba 内置数据与固定真值 | `<3.x 的 venv>/bin/python tests/differential/generate_jieba_data.py --verify`；`<3.x 的 venv>/bin/python tests/differential/generate_jieba_fixtures.py --jieba-test <sdist>/test/test.py --verify` | `test/test.py` 取自 sha256 固定的 jieba 0.42.1 sdist（[0036](../../docs/decisions/0036-jieba.md)） |
 | GEOMETRY | `<3.x 的 venv>/bin/python tests/differential/generate_geometry_fixtures.py --verify` | 码位穷举约半分钟，读取它的 Rust 单测在 debug 下约 45 秒（[0034](../../docs/decisions/0034-geometry.md)） |
-| 公共 function chain | `<3.x 的 venv>/bin/python tests/differential/generate_function_chain_fixtures.py --verify` | 同时需要 pymilvus 3.0.2；核对解码、校验与执行的结果，以及测试用的线格式编码与 SDK `to_proto()` 等价（[0035](../../docs/decisions/0035-function-chains.md)） |
+| 公共 function chain | `<3.x 的 venv>/bin/python tests/differential/generate_function_chain_fixtures.py --verify` | 同时需要 pymilvus 3.0.3；核对解码、校验与执行的结果，以及测试用的线格式编码与 SDK `to_proto()` 等价（[0035](../../docs/decisions/0035-function-chains.md)） |
 | 空值过滤组件 | `<3.x 的 venv>/bin/python tests/compatibility_audit/schema_truth.py --reference references/milvus-lite --kind filters --output <仓库外报告> --verify-nullable-filter-fixture` | Arrow 15/25 各执行；工具见 [compatibility_audit](../compatibility_audit/README.md) |
 | 分区可见性组件 | `cargo build -p milvus-lite-core --release --example partition_visibility_probe`，再 `target/release/examples/partition_visibility_probe verify-core tests/compatibility_audit/fixtures/partition_visibility_v321.json` | 不需要参照解释器；资源诊断见 [partition-visibility](../../benchmarks/partition-visibility/README.md) |
 

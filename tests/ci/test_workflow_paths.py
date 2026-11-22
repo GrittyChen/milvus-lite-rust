@@ -89,7 +89,7 @@ def test_collect_records_drops_names_upload_artifact_rejects(tmp_path):
     # 名为 a:b 的数据库目录。收集脚本剔除并列出这些条目，保留其余记录；在 CI 的 Linux（GNU find）与
     # macOS（BSD find、bash 3.2）上都运行。
     temp = tmp_path / "temp"
-    run = temp / "diff-3.0.2-run"
+    run = temp / "diff-3.0.3-run"
     for bad in ["a:b", 'q"', "l<g>", "p|i", "s*t", "q?m", "c\rr", "n\nl"]:
         (run / "dbs" / bad).mkdir(parents=True)
         (run / "dbs" / bad / "f.json").write_text("x")
@@ -105,6 +105,6 @@ def test_collect_records_drops_names_upload_artifact_rejects(tmp_path):
     assert result.returncode == 0, result.stderr
     dest = temp / "failure-records"
     kept = sorted(str(p.relative_to(dest)) for p in dest.rglob("*") if p.is_file())
-    assert kept == ["diff-3.0.2-run/dbs/ok/f.json", "diff-3.0.2-run/summary.json", "smoke-3.14/sdk-install.log"]
+    assert kept == ["diff-3.0.3-run/dbs/ok/f.json", "diff-3.0.3-run/summary.json", "smoke-3.14/sdk-install.log"]
     assert result.stdout.count("skipped (name not uploadable)") == 9
-    assert "skipped (name not uploadable) diff-3.0.2-run/dbs/a:b\n" in result.stdout
+    assert "skipped (name not uploadable) diff-3.0.3-run/dbs/a:b\n" in result.stdout

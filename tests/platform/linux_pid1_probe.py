@@ -206,7 +206,7 @@ def main():
     parser.add_argument("--fi-wheel", required=True, type=Path)
     parser.add_argument("--image", required=True)
     parser.add_argument("--output", required=True, type=Path)
-    parser.add_argument("--constraints", required=True, type=Path, help="complete pinned dependency set for CPython 3.10 and pymilvus 3.0.2")
+    parser.add_argument("--constraints", required=True, type=Path, help="complete pinned dependency set for CPython 3.10 and pymilvus 3.0.3")
     args = parser.parse_args()
     print(json.dumps(probe(args.formal_wheel, args.fi_wheel, args.image, args.output, args.constraints)))
 

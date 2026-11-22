@@ -9,7 +9,7 @@ import sys
 FORMAT = 1
 POSITIVE = ">0"
 PLATFORMS = ("linux-x86_64", "linux-aarch64", "macos-arm64", "macos-x86_64")
-SDKS = ("2.6.17", "3.0.2")
+SDKS = ("2.6.18", "3.0.3")
 SUITE_PYTHONS = ("3.10", "3.15")
 SMOKE_PYTHONS = ("3.11", "3.12", "3.13", "3.14")
 

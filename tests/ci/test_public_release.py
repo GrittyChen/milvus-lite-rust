@@ -268,25 +268,53 @@ def test_preinstalled_milvus_lite_rejected(tmp_path, answer):
 
 
 def smoke_output(**changes):
-    identity = {"version": VERSION, "sdk": "3.0.2", "passed": True, "stages": ["active"]}
+    identity = {"version": VERSION, "sdk": "3.0.3", "passed": True, "stages": ["active"]}
     identity.update(changes)
     return "log line\n" + json.dumps(identity) + "\n"
 
 
 def test_smoke_identity():
-    assert pr.check_smoke(smoke_output(), VERSION, "3.0.2")["version"] == VERSION
+    assert pr.check_smoke(smoke_output(), VERSION, "3.0.3")["version"] == VERSION
 
 
 @pytest.mark.parametrize("output, message", [
     (smoke_output(version="0.3.0rc2"), "loaded version"),
-    (smoke_output(sdk="2.6.17"), "used pymilvus"),
+    (smoke_output(sdk="2.6.18"), "used pymilvus"),
     (smoke_output(passed=False), "did not pass"),
     ("", "printed nothing"),
     ("not json\n", "not JSON"),
 ])
 def test_smoke_rejections(output, message):
     with pytest.raises(pr.PublicCheckError, match=message):
-        pr.check_smoke(output, VERSION, "3.0.2")
+        pr.check_smoke(output, VERSION, "3.0.3")
+
+
+def write_lock(tag_dir, text):
+    lock = tag_dir / ".github" / "ci" / "requirements" / "sdk30.txt"
+    lock.parent.mkdir(parents=True)
+    lock.write_text(text)
+
+
+def test_pinned_sdk_follows_the_tag_lock(tmp_path):
+    # 已发布的 tag 固定的是当时的版本；main 升级 pymilvus 后重跑公开核验，期望值仍取 tag 自己的锁。
+    write_lock(tmp_path, "grpcio==1.84.0\n    # via pymilvus\npymilvus==3.0.2\n    # via -r sdk30.in\n")
+    assert pr.pinned_sdk(tmp_path) == "3.0.2"
+
+
+@pytest.mark.parametrize("text, message", [
+    (None, "is missing"),
+    ("grpcio==1.84.0\n", "exactly once"),
+    ("pymilvus==3.0.2\npymilvus==3.0.3\n", "exactly once"),
+])
+def test_pinned_sdk_rejections(tmp_path, text, message):
+    if text is not None:
+        write_lock(tmp_path, text)
+    with pytest.raises(pr.PublicCheckError, match=message):
+        pr.pinned_sdk(tmp_path)
+
+
+def test_public_check_takes_sdk_from_the_tag():
+    assert "--sdk" not in WORKFLOW.read_text()
 
 
 WORKFLOW = Path(__file__).resolve().parents[2] / ".github" / "workflows" / "public-check.yml"

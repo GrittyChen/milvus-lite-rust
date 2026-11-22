@@ -1,7 +1,7 @@
-# tests/dump 的 pymilvus 3.0.2 线：叠装在 dev（3.12）与发行的 3.10 环境上（0037）。
+# tests/dump 的 pymilvus 3.0.3 线：叠装在 dev（3.12）与发行的 3.10 环境上（0037）。
 # 两条上限：argon2-cffi-bindings 26.1.0 在 macOS 上只有 arm64 wheel，cryptography 自 49.0.0 起
 # 不再提供 macOS x86_64 wheel；它们由 bulk_writer 依赖的 minio / azure-storage-blob 引入。
-pymilvus[bulk_writer]==3.0.2
+pymilvus[bulk_writer]==3.0.3
 pytest
 argon2-cffi-bindings<26
 cryptography<49

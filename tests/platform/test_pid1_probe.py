@@ -42,7 +42,7 @@ def test_retry_lines_are_forwarded_from_the_build_log(capsys):
         "#7 4.21 ERROR: Could not install packages due to an OSError",
         "#7 4.30 transport-retry: pid1 sdk install attempt 1 failed; retrying in 5s",
         "#7 19.9 transport-retry: pid1 sdk install attempt 2 failed; retrying in 15s",
-        "#7 40.1 Successfully installed pymilvus-3.0.2",
+        "#7 40.1 Successfully installed pymilvus-3.0.3",
     ])
     assert probe.forward_retries(log) == 2
     notices = [line for line in capsys.readouterr().err.splitlines() if line.startswith("::warning title=transport-retry::")]

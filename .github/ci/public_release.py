@@ -212,7 +212,17 @@ def check_smoke(output, version, sdk):
     return identity
 
 
+def pinned_sdk(tag_dir):
+    """冒烟环境按 tag 自己的 sdk30.txt 安装，期望的 pymilvus 版本也取自同一份锁，不随 main 的锁升级而变。"""
+    lock = Path(tag_dir) / ".github" / "ci" / "requirements" / "sdk30.txt"
+    require(lock.is_file(), f"{lock} is missing")
+    pins = re.findall(r"^pymilvus==(\S+)$", lock.read_text(), re.M)
+    require(len(pins) == 1, f"{lock} must pin pymilvus exactly once, found {pins}")
+    return pins[0]
+
+
 def smoke(args):
+    sdk = pinned_sdk(args.tag_dir)
     probe = Path(args.tag_dir) / "tests" / "platform" / "feature_smoke.py"
     argv = [str(args.python), "-I", str(probe), "--repo", str(args.tag_dir), "--work-dir", str(args.work_dir)]
     result = subprocess.run(argv, capture_output=True, text=True)
@@ -221,7 +231,7 @@ def smoke(args):
     # 管道中的 stdout 是块缓冲，先刷出冒烟输出，拒绝信息才会排在它后面。
     sys.stdout.flush()
     require(result.returncode == 0, f"feature smoke exited with {result.returncode}")
-    print(json.dumps(check_smoke(result.stdout, args.version, args.sdk)))
+    print(json.dumps(check_smoke(result.stdout, args.version, sdk)))
 
 
 def main(argv=None):
@@ -251,7 +261,6 @@ def main(argv=None):
     p.add_argument("--report", type=Path, required=True)
     p = sub.add_parser("smoke")
     p.add_argument("--version", required=True)
-    p.add_argument("--sdk", required=True)
     p.add_argument("--tag-dir", type=Path, required=True)
     p.add_argument("--python", type=Path, required=True)
     p.add_argument("--work-dir", type=Path, required=True)
