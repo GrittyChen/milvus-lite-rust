@@ -8,9 +8,6 @@
 //! 检索时遍历不受过滤限制，只有允许的行进入结果（与 faiss `IDSelector` 同义），因此过滤下也能返回
 //! 足 k 条；代价是通过率低时会遍历大半张图，调用方用距离计算预算截断并改走 FLAT（0041「据此确定的取值」）。
 
-// 第 4 步接入检索之前，检索用的接口尚未使用。
-#![allow(dead_code)]
-
 use std::cmp::{Ordering, Reverse};
 use std::collections::BinaryHeap;
 
@@ -721,6 +718,15 @@ impl<'a> Reader<'a> {
 }
 
 impl Graph {
+    /// 测试用：入口不可达的同一张图，检索返回空结果。
+    #[cfg(test)]
+    pub(crate) fn unreachable(&self) -> Graph {
+        Graph {
+            entry: None,
+            ..self.clone()
+        }
+    }
+
     pub(crate) fn encode(&self, key: &FileKey) -> Vec<u8> {
         let mut out = Vec::with_capacity(
             self.levels.len()

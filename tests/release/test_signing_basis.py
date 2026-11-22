@@ -110,7 +110,7 @@ def test_unchanged_signing_path_since_the_baseline(repo):
 
 
 @pytest.mark.parametrize("name, old, new", [
-    ("tests/release/scorecard.py", "PYTHON_SUITE = 765", "PYTHON_SUITE = 766"),
+    ("tests/release/scorecard.py", "PYTHON_SUITE = 767", "PYTHON_SUITE = 768"),
     (c.RELEASE_WORKFLOW, "  PREVIOUS_VERSION: ", "  PREVIOUS_VERSION: 9.9.9\n  OLD_PREVIOUS: "),
     (c.RELEASE_WORKFLOW, "  REFERENCE_COMMIT: ", "  # 注释可以改\n  REFERENCE_COMMIT: "),
     (c.RELEASE_WORKFLOW, "--expect-group 0", "--expect-group 1"),

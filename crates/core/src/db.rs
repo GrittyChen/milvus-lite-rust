@@ -6722,6 +6722,173 @@ mod tests {
             db.close();
         }
 
+        fn search(
+            handle: &CollectionHandle,
+            db: &Db,
+            q: [f32; 2],
+            limit: usize,
+            ef: Option<&str>,
+        ) -> Vec<(i64, u32)> {
+            let mut params = serde_json::Map::new();
+            if let Some(ef) = ef {
+                params.insert("ef".into(), serde_json::Value::String(ef.into()));
+            }
+            let req = crate::collection::SearchRequest {
+                anns_field: None,
+                vectors: crate::collection::QueryVectors::Dense(vec![q.to_vec()]),
+                metric_type: Some("L2".into()),
+                limit,
+                offset: 0,
+                output_fields: vec![],
+                params,
+                negative_top_k: false,
+            };
+            let hits = handle
+                .read()
+                .search(req, db.compute())
+                .unwrap()
+                .hits
+                .remove(0);
+            hits.rows
+                .pks
+                .iter()
+                .zip(&hits.scores)
+                .map(|(pk, s)| match pk {
+                    Pk::Int64(i) => (*i, s.to_bits()),
+                    _ => unreachable!(),
+                })
+                .collect()
+        }
+
+        fn queries() -> Vec<[f32; 2]> {
+            (0..40)
+                .map(|i| [(i as f32 * 0.71) % 7.0, (i as f32 * 0.29) % 5.0])
+                .collect()
+        }
+
+        /// 有图时检索走图：返回的每个分数与 FLAT 对同一主键逐位相同，召回达标。
+        #[test]
+        fn search_uses_the_graph_and_scores_match_flat() {
+            let root = tempfile::tempdir().unwrap();
+            let db = test_db(root.path());
+            let handle = hnsw_collection(&db);
+            let before = crate::collection::GRAPH_SEARCHES.load(Ordering::Relaxed);
+            let mut hit = 0;
+            for q in queries() {
+                let graph = search(&handle, &db, q, 10, None);
+                // ef 无法解析时不用图，等同 FLAT。
+                let flat = search(&handle, &db, q, 10, Some("not a number"));
+                assert_eq!(graph.len(), 10);
+                for (pk, bits) in &graph {
+                    if let Some((_, want)) = flat.iter().find(|(p, _)| p == pk) {
+                        assert_eq!(bits, want);
+                    }
+                }
+                hit += graph
+                    .iter()
+                    .filter(|g| flat.iter().any(|f| f.0 == g.0))
+                    .count();
+            }
+            assert!(crate::collection::GRAPH_SEARCHES.load(Ordering::Relaxed) >= before + 40);
+            assert!(hit as f64 / 400.0 >= 0.95, "recall {}", hit as f64 / 400.0);
+            db.close();
+        }
+
+        #[test]
+        fn deleted_rows_are_never_returned_by_the_graph() {
+            let root = tempfile::tempdir().unwrap();
+            let db = test_db(root.path());
+            let handle = hnsw_collection(&db);
+            let gone: Vec<Pk> = (0..3000).map(Pk::Int64).collect();
+            db.delete("", "c", &gone).unwrap();
+            let before = crate::collection::GRAPH_SEARCHES.load(Ordering::Relaxed);
+            for q in queries() {
+                let graph = search(&handle, &db, q, 10, None);
+                let flat = search(&handle, &db, q, 10, Some("x"));
+                assert_eq!(graph.len(), 10);
+                assert!(graph.iter().all(|(pk, _)| *pk >= 3000), "{graph:?}");
+                for (pk, bits) in &graph {
+                    if let Some((_, want)) = flat.iter().find(|(p, _)| p == pk) {
+                        assert_eq!(bits, want);
+                    }
+                }
+            }
+            assert!(crate::collection::GRAPH_SEARCHES.load(Ordering::Relaxed) >= before + 40);
+            db.close();
+        }
+
+        /// 窗口使有效行不足实际 ef 的 100 倍时走 FLAT，结果与 FLAT 完全相同。
+        #[test]
+        fn a_large_window_falls_back_to_exact_flat() {
+            let root = tempfile::tempdir().unwrap();
+            let db = test_db(root.path());
+            let handle = hnsw_collection(&db);
+            for q in queries().into_iter().take(5) {
+                assert_eq!(
+                    search(&handle, &db, q, 500, None),
+                    search(&handle, &db, q, 500, Some("x"))
+                );
+            }
+            db.close();
+        }
+
+        /// 图返回不足前 take 名（这里让入口不可达）时该段改为扫描，结果与 FLAT 完全相同。
+        #[test]
+        fn a_graph_that_finds_too_few_rows_falls_back_to_flat() {
+            let root = tempfile::tempdir().unwrap();
+            let db = test_db(root.path());
+            let handle = hnsw_collection(&db);
+            handle.read().make_graphs_unreachable();
+            for q in queries().into_iter().take(5) {
+                let got = search(&handle, &db, q, 10, None);
+                assert_eq!(got.len(), 10);
+                assert_eq!(got, search(&handle, &db, q, 10, Some("x")));
+            }
+            db.close();
+        }
+
+        /// 查询多于一波（10 段以下、take 99 时每波约 2600 条）时分波提交，每条的结果与单独检索逐位相同。
+        #[test]
+        fn many_queries_with_a_large_limit_are_searched_in_waves() {
+            let root = tempfile::tempdir().unwrap();
+            let db = test_db(root.path());
+            let handle = hnsw_collection(&db);
+            let qs: Vec<[f32; 2]> = (0..6000)
+                .map(|i| [(i as f32 * 0.013) % 7.0, (i as f32 * 0.007) % 5.0])
+                .collect();
+            let before = crate::collection::GRAPH_SEARCHES.load(Ordering::Relaxed);
+            let req = crate::collection::SearchRequest {
+                anns_field: None,
+                vectors: crate::collection::QueryVectors::Dense(
+                    qs.iter().map(|q| q.to_vec()).collect(),
+                ),
+                metric_type: Some("L2".into()),
+                limit: 99,
+                offset: 0,
+                output_fields: vec![],
+                params: serde_json::Map::new(),
+                negative_top_k: false,
+            };
+            let all = handle.read().search(req, db.compute()).unwrap().hits;
+            assert!(crate::collection::GRAPH_SEARCHES.load(Ordering::Relaxed) >= before + 5000);
+            assert_eq!(all.len(), qs.len());
+            for i in (0..qs.len()).step_by(397) {
+                let got: Vec<(i64, u32)> = all[i]
+                    .rows
+                    .pks
+                    .iter()
+                    .zip(&all[i].scores)
+                    .map(|(pk, s)| match pk {
+                        Pk::Int64(id) => (*id, s.to_bits()),
+                        _ => unreachable!(),
+                    })
+                    .collect();
+                assert_eq!(got.len(), 99);
+                assert_eq!(got, search(&handle, &db, qs[i], 99, None), "query {i}");
+            }
+            db.close();
+        }
+
         /// 让下一次构建停在发布前，返回（已暂停的通知，恢复发送端）。
         fn pause_next_publish(
             root: &std::path::Path,

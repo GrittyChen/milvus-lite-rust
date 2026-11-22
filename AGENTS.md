@@ -95,7 +95,7 @@ pymilvus ──server_manager──▶ adapter/grpc ──▶ db（多 collectio
 - **支持的 pymilvus 版本**：2.6.x 与 3.0.x 两条线都支持，兼容测试各跑一个最新版。
 - **Python 打包**：PyO3 + maturin 产出 abi3 wheel（`abi3-py310`，与 3.x 的下限一致；不能在 free-threaded CPython 上加载，作为已知限制）。服务以进程内后台线程上的 tokio runtime 运行，形态与 3.x 相同（[0003](docs/decisions/0003-in-process-server-lifecycle.md)）。PyPI 元数据与 README 都要声明非官方、与 Milvus / Zilliz 无隶属关系。首发 Linux / macOS，构建期拒绝 Windows（[0013](docs/decisions/0013-first-release-platform-and-packaging.md)，与 3.x 的差异见 [0008](docs/decisions/0008-first-release-scope.md)）。
 - **持久化格式**：数据文件与 3.x **双向互通**，索引文件各自独立。范围、约束与验证方式见 [0002](docs/decisions/0002-data-dir-compat.md)。
-- **向量索引**：检索为 SIMD 优化的暴力检索（FLAT），同时是召回与距离口径的正确性基准；HNSW 自行以纯 Rust 实现、不引入依赖，复用 FLAT 的距离核（[0041](docs/decisions/0041-hnsw.md)，实施中；接入检索前所有索引定义仍按 FLAT 执行）。各类索引定义的处理见 [0002 «结论»](docs/decisions/0002-data-dir-compat.md#结论) 与 [0014](docs/decisions/0014-index-definitions-and-filter-expressions.md)。
+- **向量索引**：检索为 SIMD 优化的暴力检索（FLAT），同时是召回与距离口径的正确性基准；HNSW 自行以纯 Rust 实现、不引入依赖，复用 FLAT 的距离核，按段在后台建图并写本实现私有的图文件（[0041](docs/decisions/0041-hnsw.md)）；其余 ANN 定义仍按 FLAT 执行。各类索引定义的处理见 [0002 «结论»](docs/decisions/0002-data-dir-compat.md#结论) 与 [0014](docs/decisions/0014-index-definitions-and-filter-expressions.md)。
 - **分词与 BM25**：因为数据目录互通，必须与 3.x 逐位一致（[0002](docs/decisions/0002-data-dir-compat.md#共享状态的语义约束) 约束 8）。standard 分词（[0029](docs/decisions/0029-text-match.md)）与 BM25（[0031](docs/decisions/0031-bm25.md)）自行实现，不引入依赖；jieba 以 jieba-rs 为依赖加包装层，约束 8 对它放宽为 [0036](docs/decisions/0036-jieba.md) 的口径。
 - **已引入的依赖**（引入理由与评估见括号中的决策；标「版本写死」的升级前须重跑对应的对照）：
   - tonic / prost 0.14 与 protox 0.9（gRPC 与 proto 代码生成）；tokio 1（每个服务实例独占一个 runtime，[0003](docs/decisions/0003-in-process-server-lifecycle.md)）；thiserror 2；md5 0.8.1（partition key 的 3.x 固定哈希，只用于路由）；tempfile 3（仅测试）。
@@ -133,7 +133,7 @@ pymilvus ──server_manager──▶ adapter/grpc ──▶ db（多 collectio
 | 子进程与关闭重开测试的隔离 / 默认并行 30 轮复验 | [进程内测试隔离记录与命令](docs/testing/process-test-isolation.md) |
 | 独立 CLI server | `.venv/bin/milvus-lite server --data-dir <data_dir> --host 127.0.0.1 --port 19530 --max-workers 10`；也可 `python -m milvus_lite server ...`，合同见 0012 |
 | 构建 wheel / sdist | `.venv/bin/maturin build --release -m crates/py/Cargo.toml` / `.venv/bin/maturin sdist -m crates/py/Cargo.toml` |
-| 发行物与安装验收（本地诊断，候选以发行工作流为准；工作目录在仓库外） | `.venv/bin/python tests/packaging/run_acceptance.py --work-dir <work_dir> --constraints <constraints.txt> --suite --suite-expect 765`；约束文件与完整步骤见 [打包验收](tests/packaging/README.md) |
+| 发行物与安装验收（本地诊断，候选以发行工作流为准；工作目录在仓库外） | `.venv/bin/python tests/packaging/run_acceptance.py --work-dir <work_dir> --constraints <constraints.txt> --suite --suite-expect 767`；约束文件与完整步骤见 [打包验收](tests/packaging/README.md) |
 | 工具自检：发行物与平台脚本 / CI 脚本 / 发行工具 / 分片 / 基准脚本 | `.venv/bin/python -m pytest tests/packaging tests/platform`；`tests/ci`；`tests/release`；`tests/sharding`（用法见 [分片 README](tests/sharding/README.md)，合同见 0019）；`tests/benchmarks` |
 | 平台验收：Linux PID 1 与命名卷 LOCK、容器 LOCK 与 strace、已安装产物联合冒烟、Windows 准备检查 | [tests/platform/README.md](tests/platform/README.md) |
 | 兼容性调查与参照真值（固定样本统计、schema 真值、分区与 Query iterator、partition key；离线显式执行，不进入默认测试） | [tests/compatibility_audit/README.md](tests/compatibility_audit/README.md) |

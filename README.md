@@ -65,7 +65,7 @@ milvus-lite dump -d ./demo.db -c docs -p ./dump
 
 ## 支持范围
 
-覆盖 pymilvus 的常用功能：数据增删改查与 flush、标量与向量字段、向量检索与过滤、全文检索与混合检索、分区与多数据库管理等。向量检索只有 FLAT，ANN 与 INVERTED 索引可以创建，但只保存定义，仍按精确检索与扫描执行。不支持的功能返回 `UNIMPLEMENTED`，不会静默成功。完整的支持范围、与 3.x 的差异、未实现清单与降级影响见[兼容性说明](https://github.com/GrittyChen/milvus-lite-rust/blob/main/docs/compatibility.md)。
+覆盖 pymilvus 的常用功能：数据增删改查与 flush、标量与向量字段、向量检索与过滤、全文检索与混合检索、分区与多数据库管理等。各类索引定义都可以创建：HNSW 在后台建图检索，其余索引按精确检索与扫描执行。不支持的功能返回 `UNIMPLEMENTED`，不会静默成功。完整的支持范围、与 3.x 的差异、未实现清单与降级影响见[兼容性说明](https://github.com/GrittyChen/milvus-lite-rust/blob/main/docs/compatibility.md)。
 
 ## 平台
 

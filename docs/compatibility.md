@@ -19,16 +19,21 @@
 - 长期数据文件沿用 3.x 的 `schema.json`、Arrow IPC WAL、Parquet 与 manifest format 2 编码，不增加长期私有格式，与 3.x 双向互通；范围与约束见 [0002](decisions/0002-data-dir-compat.md)。互通受下文各功能的差异与「降级」一节的版本限制约束，不宣称兼容 3.x 的全部功能。
 - 改名与清空过程中各有一个短暂存在的私有意图文件（文件名与格式见 0002），由本实现重开时收尾。**降级到不含该功能的版本之前，须先用本实现正常打开并关闭一次。**
 - `schema.json`、`aliases.json`、`database_properties.json` 等共享 JSON 按与 3.x 相同的键排序格式写出。
-- 索引文件不互通：本实现不写 3.x 的索引侧车，也不读取其内容（只检查是否存在，见「索引」）。
+- 索引文件不互通：本实现不写 3.x 的索引侧车，也不读取其内容（只检查是否存在，见「索引」）。HNSW 的图写在 `indexes/<段>.<字段>.hnsw.mlrs`，3.x 会忽略它、按自己的方式重建索引；它只是缓存，丢失或损坏时本实现从数据重建。
 - nullable 向量的空值存为 Arrow null，3.x 需要 pyarrow 26 及以上（因此需要 Python 3.11 及以上）才能打开含空值的集合，详见下文「nullable 稠密向量」。
 - Parquet 的行组更小（每组最多 65536 行、约 32 MiB），以限制写入时的内存峰值；两边的读取都不依赖行组数量（[0002 约束 9](decisions/0002-data-dir-compat.md)）。
 
 ## 索引
 
-- 向量检索只有 FLAT（精确暴力检索），同时是召回与距离口径的正确性基准。新建索引时，FLAT 与 BRUTE_FORCE 原生支持；AUTOINDEX（pymilvus 快速建表使用）、HNSW、HNSW_SQ、IVF_FLAT、IVF_SQ8 可以创建并原样保存定义，向量仍按 FLAT 执行，召回不低于 ANN，但数据量大时更慢。这五种新建定义只接受 COSINE / L2 / IP；BM25 / NONE 返回 UNIMPLEMENTED，避免写出 3.x 无法 load 的定义。FLAT / BRUTE_FORCE 保持原有的度量校验。
+- **HNSW** 建图检索（[0041](decisions/0041-hnsw.md)），纯 Rust 实现，参数 `M`、`efConstruction`、`ef` 的含义与默认值（16、200、64）与 3.x 相同。结果是近似的：返回的每一行都满足过滤与删除可见性，距离与 FLAT 对同一行算出的值逐位相同，但可能漏掉真正更近的行。与 3.x 的差异：
+  - 实际束宽取 `max(ef, 候选窗口)`；某段的图返回不足窗口条数时（如过滤后剩下的行在图上走不到），该段改走 FLAT，因此与 FLAT 一样返回足 k 条。3.x 在 k 或窗口大于 ef 时召回明显下降，甚至返回不足 k 条。
+  - 行数不足 1 万的段、内存中尚未落盘的数据、尚未建好图的段，以及过滤后有效行不多于实际束宽 100 倍的段，按 FLAT 精确检索；图搜索的距离计算超过该段有效行数时也改走 FLAT。3.x 只在有效行不多于 k 时才精确检索。
+  - 图在后台构建：load 与 CreateIndex 不等待，建好之前按 FLAT 检索，建好后自动切换；3.x 首次 load 与 loaded 状态下的 CreateIndex 会同步建完。构建失败时记录日志并重试，期间按 FLAT 检索，DescribeIndex 照常显示，load 不报错。
+  - `M`、`efConstruction`、`ef` 只接受整数、有限浮点数（截断）、ASCII 十进制整数字符串与布尔；其他写法（包括 Python `int()` 也接受的下划线分隔与非 ASCII 数字）以及 `M` 超过 512、`efConstruction` 超过 100000 时，不建图或不用图，按 FLAT 执行，不报错。3.x 对无法解析的值报错，对合法的大值照常构建。
+- 其余向量索引按 FLAT（精确暴力检索）执行，FLAT 同时是召回与距离口径的正确性基准。新建索引时，FLAT 与 BRUTE_FORCE 原生支持；AUTOINDEX（pymilvus 快速建表使用）、HNSW_SQ、IVF_FLAT、IVF_SQ8 可以创建并原样保存定义，向量仍按 FLAT 执行，召回不低于 ANN，但数据量大时更慢；3.x 的 AUTOINDEX 实际走 HNSW。需要 ANN 时请显式建 HNSW。这五种新建定义只接受 COSINE / L2 / IP；BM25 / NONE 返回 UNIMPLEMENTED，避免写出 3.x 无法 load 的定义。FLAT / BRUTE_FORCE 保持原有的度量校验。
 - INVERTED 可以在 BOOL、INT8/16/32/64、FLOAT/DOUBLE、VARCHAR、TIMESTAMPTZ 字段上创建（JSON、ARRAY、GEOMETRY 不支持），过滤仍按扫描执行，结果可能与官方在已建索引数据上的结果不同。
 - DropIndex 的名字行为与 3.x 一致：普通字段名或匹配不到的名字删除全部索引；`<字段名>_idx` 或明确传入 field_name 才定向删除。集合需要先 release，删完全部索引后自动变为 Loaded。
-- 打开 3.x 写入的目录时，索引定义原样保留；load 成功后，向量仍按 FLAT、标量仍按扫描执行。3.x 自己也无法构建的索引类型（如 IVF_PQ、DISKANN、向量字段上的 INVERTED），在集合尚未 load 且已有 flush 落盘的数据（包括已删除的行）时，与 3.x 一样 load 报错。
+- 打开 3.x 写入的目录时，索引定义原样保留；load 成功后，HNSW 字段在后台建本实现自己的图（不读 3.x 的 `.idx`），其余向量索引按 FLAT、标量仍按扫描执行。3.x 自己也无法构建的索引类型（如 IVF_PQ、DISKANN、向量字段上的 INVERTED），在集合尚未 load 且已有 flush 落盘的数据（包括已删除的行）时，与 3.x 一样 load 报错。
 - 存量的 AUTOINDEX、HNSW、HNSW_SQ、IVF_FLAT、IVF_SQ8 定义配 BM25 / NONE 时，如果集合尚未 load，且至少一个有物理行的当前 segment 缺少匹配的 3.x 侧车，load 与 3.x 一样报错（已删除的行仍计入）；匹配的侧车全有、只有 WAL 或已经 loaded 时不拒绝。侧车内容与构建参数不校验：3.x 因参数无效而 load 失败的目录，这里可能照常 load；参数与度量同时无效时，报错原因也可能不同。设计见 [0014](decisions/0014-index-definitions-and-filter-expressions.md)。
 
 ### 索引变更后的人工恢复

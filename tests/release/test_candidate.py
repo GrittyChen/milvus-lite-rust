@@ -80,7 +80,7 @@ def test_matrix_shape():
     assert set(scorecard.MATRIX) == {*scorecard.PLATFORMS, "sdist"}
     for platform in scorecard.PLATFORMS:
         stages_ = scorecard.MATRIX[platform]
-        assert stages_["python-3.15-2.6.18"] == {"collected": 765, "executed": 765, "group": 0}
+        assert stages_["python-3.15-2.6.18"] == {"collected": 767, "executed": 767, "group": 0}
         assert stages_["differential-3.0.3"] == {"collected": 874, "executed": 874, "group": 405}
         assert stages_["dump-3.10-2.6.18"] == {"collected": 29, "executed": 29, "group": 0}
         assert stages_["dump-diff-3.0.3"] == {"collected": 20, "executed": 20, "group": 0}
@@ -92,7 +92,7 @@ def test_matrix_shape():
 
 def test_scorecard_expect_cli(capsys):
     scorecard.main(["expect", "macos-x86_64", "interop", "collected"])
-    assert capsys.readouterr().out == "337\n"
+    assert capsys.readouterr().out == "338\n"
     with pytest.raises(SystemExit):
         scorecard.main(["expect", "linux-x86_64", "rust-default", "passed"])
 

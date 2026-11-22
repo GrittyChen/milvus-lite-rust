@@ -499,3 +499,59 @@ finally:
 """
     run([sys.executable, "-c", check, str(root)], cwd=tmp_path)
     assert marker.read_bytes() == before
+
+
+GRAPH_SETUP = """
+import sys, time
+from pathlib import Path
+from pymilvus import MilvusClient, DataType
+from milvus_lite.server_manager import server_manager_instance as manager
+
+path = sys.argv[1]
+c = MilvusClient(path, dedicated=True)
+s = MilvusClient.create_schema(auto_id=False)
+s.add_field("id", DataType.INT64, is_primary=True)
+s.add_field("vector", DataType.FLOAT_VECTOR, dim=2)
+p = c.prepare_index_params()
+p.add_index("vector", index_type="HNSW", metric_type="L2")
+c.create_collection("c", schema=s, index_params=p)
+c.insert("c", [{"id": i, "vector": [i % 97 / 10.0, i % 89 / 10.0]} for i in range(12000)])
+c.flush("c")
+deadline = time.monotonic() + 120
+while not list(Path(path).glob("collections/c/partitions/_default/indexes/*.hnsw.mlrs")):
+    assert time.monotonic() < deadline, "no graph file"
+    time.sleep(0.2)
+c.close()
+manager.release_server(path)
+"""
+GRAPH_READ = """
+import sys
+from pymilvus import MilvusClient
+from milvus_lite.server_manager import server_manager_instance as manager
+
+path = sys.argv[1]
+c = MilvusClient(path, dedicated=True)
+try:
+    c.load_collection("c")
+    assert c.query("c", output_fields=["count(*)"])[0]["count(*)"] == 12000
+    hits = c.search("c", [[0.0, 0.0]], limit=1, search_params={"metric_type": "L2"})[0]
+    assert hits[0]["id"] == 0 and hits[0]["distance"] == 0.0, hits
+finally:
+    c.close()
+    manager.release_server(path)
+"""
+
+
+def test_rust_hnsw_graph_files_are_ignored_by_reference_and_reused_by_rust(tmp_path, interpreters):
+    """0041：本实现的图文件 `.hnsw.mlrs` 3.x 不读不删，自建 `.idx`；本实现重开后照常读入原图，不读 `.idx`。"""
+    root = tmp_path / "g.db"
+    indexes = root / "collections/c/partitions/_default/indexes"
+    run([sys.executable, "-c", GRAPH_SETUP, str(root)], cwd=tmp_path)
+    graphs = sorted(indexes.glob("*.hnsw.mlrs"))
+    before = [g.read_bytes() for g in graphs]
+    assert len(graphs) == 1
+    run([interpreters[PYTHONS[0]], "-c", GRAPH_READ, str(root)], cwd=tmp_path)
+    assert list(indexes.glob("*.idx")), "3.x builds its own sidecar"
+    assert [g.read_bytes() for g in sorted(indexes.glob("*.hnsw.mlrs"))] == before
+    run([sys.executable, "-c", GRAPH_READ, str(root)], cwd=tmp_path)
+    assert [g.read_bytes() for g in sorted(indexes.glob("*.hnsw.mlrs"))] == before

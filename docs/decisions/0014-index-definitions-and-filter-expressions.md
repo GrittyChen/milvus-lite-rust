@@ -1,6 +1,6 @@
 # 0014 rc2 之后的兼容面：索引定义与过滤表达式
 
-- 状态：切片 A、B 均已实现、评审并提交；[收口统计](../testing/0014-compatibility-closure.md)已完成并评审通过。负责人于 2026-10-14 确认本文两个切片、索引方案（接受 ANN 定义、按 FLAT 执行）与[已确认的取舍](#已确认的取舍)。发布另行授权
+- 状态：切片 A、B 均已实现、评审并提交；[收口统计](../testing/0014-compatibility-closure.md)已完成并评审通过。负责人于 2026-10-14 确认本文两个切片、索引方案（接受 ANN 定义、按 FLAT 执行）与[已确认的取舍](#已确认的取舍)。发布另行授权。其后 HNSW 改为建图检索（[0041](0041-hnsw.md)），其余 ANN 类型仍按本文执行
 - 日期：2026-10-14
 - 参照：v3.2.1 / `43d1257`；pymilvus 3.0.2 / 2.6.17
 - 前置：[0002 结论与约束 1、5、7](0002-data-dir-compat.md)、[0006 第 13、14 项](0006-m2-scope.md)、[0007 提交协议](0007-m2-storage-engine.md)、[0009 顶层动态过滤](0009-top-level-dynamic-filter.md)、[0013 发布流程](0013-first-release-platform-and-packaging.md)
@@ -89,9 +89,9 @@
 
 | 行为 | 3.x | 本实现 |
 | --- | --- | --- |
-| 新建的 HNSW / HNSW_SQ / IVF_FLAT / IVF_SQ8 上的检索 | 近似检索，召回取决于参数 | 精确 FLAT，召回不低于 ANN；结果与顺序可能不同，大数据量时更慢 |
+| 新建的 HNSW / HNSW_SQ / IVF_FLAT / IVF_SQ8 上的检索 | 近似检索，召回取决于参数 | HNSW 自 [0041](0041-hnsw.md) 起建图近似检索（差异见该决策）；其余精确 FLAT，召回不低于 ANN；结果与顺序可能不同，大数据量时更慢 |
 | 稠密向量 FAISS 类型的 BM25 / NONE | 保存定义，有已提交行且需要构建时 load 报错 | 创建时返回 UNIMPLEMENTED，防止写出不可互通的定义；包括已发布 rc2 允许的 AUTOINDEX 组合 |
-| 构建参数与检索参数 | build 时解析 build_params、检索时解析 ef / nprobe，非法值报错 | 不解析，照常执行（扩展 0002 第 28 行已登记的参数差异） |
+| 构建参数与检索参数 | build 时解析 build_params、检索时解析 ef / nprobe，非法值报错 | 不报错，照常执行（扩展 0002 第 28 行已登记的参数差异）；HNSW 的 `M` / `efConstruction` / `ef` 自 0041 起用于建图与检索，无法解析时按 FLAT 执行 |
 | 新建的标量 INVERTED | 已建索引的 segment 与 memtable 的结果可能不同 | 按扫描求值（扩展 0006 已登记的 INVERTED 差异） |
 | 创建时遇到同字段、同类型的旧 3.x 索引文件 | 不处理，load 时直接加载；定义不同时结果错误（0002 已记录的继承风险） | 未被钉住的删除；被钉住且与钉住它的 snapshot 中的定义不同（或无法判定）时拒绝创建 |
 | DropIndex 删除旧索引文件失败 | 忽略，照常提交 | 报错；manifest 替换之前失败时，定义与 load 状态不变 |

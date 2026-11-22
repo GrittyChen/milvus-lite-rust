@@ -1414,7 +1414,20 @@ impl ReadSnapshot {
                 .map(|v| flat::Query::new(metric, v))
                 .collect();
             let mut tops: Vec<TopK> = queries.iter().map(|_| TopK::new(metric, take)).collect();
-            let blocks = row_blocks(&chunks, rows_per_block);
+            let plan = if take > 0 {
+                graph_plan(
+                    &self.indexes,
+                    &chunks,
+                    field,
+                    field_pos,
+                    metric,
+                    &req.params,
+                    take,
+                )
+            } else {
+                GraphPlan::default()
+            };
+            let blocks = row_blocks(&chunks, rows_per_block, &plan.excluded);
             if take > 0 && !blocks.is_empty() {
                 let per_wave = flat::BATCH * groups_per_wave(compute.threads(), blocks.len(), take);
                 for wave in (0..queries.len()).step_by(per_wave) {
@@ -1447,6 +1460,11 @@ impl ReadSnapshot {
                         }
                     }
                 }
+            }
+            if !plan.segments.is_empty() {
+                search_graphs(
+                    &chunks, &plan, field_pos, norm_slot, &queries, take, compute, &mut tops,
+                );
             }
             tops
         };
@@ -3493,6 +3511,16 @@ impl Collection {
             })
     }
 
+    /// 测试用：把已挂的图都换成入口不可达的图，检验图找不足结果时的回退。
+    #[cfg(test)]
+    pub(crate) fn make_graphs_unreachable(&self) {
+        for chunk in self.chunks.values() {
+            for slot in chunk.data.graphs.0.lock().iter_mut() {
+                slot.1 = Arc::new(slot.1.unreachable());
+            }
+        }
+    }
+
     /// 已建图的（段数据文件名, 字段）数，供测试观察后台构建。
     #[cfg(test)]
     pub(crate) fn graph_count(&self) -> usize {
@@ -5042,6 +5070,236 @@ struct Dynamic {
     errors: Vec<Option<String>>,
 }
 
+/// 测试用：用图完成的叶子数，用来确认检索确实走了图。
+#[cfg(test)]
+pub(crate) static GRAPH_SEARCHES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// 每段有效行不超过实际 ef 的这么多倍时直接走 FLAT（0041「据此确定的取值」）。
+const GRAPH_FLAT_FACTOR: usize = 100;
+
+/// 图检索的距离计算预算是有效行数的这么多倍；超出时改走 FLAT，最坏多花的代价不超过一次 FLAT 扫描。
+const GRAPH_BUDGET_PER_ROW: u64 = 1;
+
+/// 一个用图检索的已提交段（0041 第 4 步）。
+struct GraphSegment {
+    graph: Arc<crate::hnsw::Graph>,
+    /// 段内各块在快照块表中的下标，按段内起始行升序。
+    parts: Vec<usize>,
+    /// 段内存活（且通过过滤）的行数；等于物理行数时检索不设过滤。
+    valid: usize,
+    all_live: bool,
+    ef: usize,
+}
+
+#[derive(Default)]
+struct GraphPlan {
+    segments: Vec<GraphSegment>,
+    /// 与快照块表等长：已由图检索的块，FLAT 扫描跳过。
+    excluded: Vec<bool>,
+}
+
+/// 选出用图检索的段：字段有 HNSW 定义且检索参数可解析，段已建好与本次度量一致的图，块首尾相接，
+/// 并且有效行多于实际 ef 的 [`GRAPH_FLAT_FACTOR`] 倍。实际 ef 为 `min(max(ef, take), 有效行)`（0041
+/// 「已确认的取舍」第 7 项）；有效行不超过窗口时必走 FLAT，与 3.x 相同。其余数据照旧走 FLAT。
+fn graph_plan(
+    indexes: &[IndexSpec],
+    chunks: &[Chunk],
+    field: &FieldSchema,
+    field_pos: usize,
+    metric: Metric,
+    params: &Map<String, Value>,
+    take: usize,
+) -> GraphPlan {
+    let mut plan = GraphPlan::default();
+    if !indexes
+        .iter()
+        .any(|s| s.field_name == field.name && s.index_type == "HNSW")
+    {
+        return plan;
+    }
+    let Some(ef) = crate::hnsw::search_ef(params) else {
+        return plan;
+    };
+    let mut by_source: BTreeMap<SourceId, Vec<usize>> = BTreeMap::new();
+    for (i, chunk) in chunks.iter().enumerate() {
+        if chunk.generation == 0 {
+            by_source.entry(chunk.source).or_default().push(i);
+        }
+    }
+    plan.excluded = vec![false; chunks.len()];
+    for mut parts in by_source.into_values() {
+        parts.sort_by_key(|&i| chunks[i].row_start);
+        let Some(graph) = chunks[parts[0]].data.graphs.get(field_pos) else {
+            continue;
+        };
+        let mut next = 0;
+        let mut valid = 0;
+        for &i in &parts {
+            let chunk = &chunks[i];
+            if chunk.row_start != next {
+                next = usize::MAX;
+                break;
+            }
+            next += chunk.live.len;
+            valid += chunk.live.count_live();
+        }
+        if graph.metric() != metric || next != graph.rows() as usize {
+            continue;
+        }
+        let used = ef.max(take).min(valid);
+        if valid <= used.saturating_mul(GRAPH_FLAT_FACTOR) {
+            continue;
+        }
+        for &i in &parts {
+            plan.excluded[i] = true;
+        }
+        plan.segments.push(GraphSegment {
+            graph,
+            parts,
+            valid,
+            all_live: valid == next,
+            ef: used,
+        });
+    }
+    plan
+}
+
+/// 每个「查询 × 段」一个叶子任务，在计算池上执行，不拿锁（0005）。超出距离预算、或图返回不足前
+/// take 名（不可达的点、过滤后剩下的行在图上不连通）的叶子在本任务内改为扫描该段（与 FLAT 同一打分与
+/// 位置全序）。查询按 [`graph_queries_per_wave`] 分波提交，每波结束即并入 `tops`，同时存活的候选数与
+/// 查询条数无关（0005「查询组分波提交」）。
+#[allow(clippy::too_many_arguments)]
+fn search_graphs(
+    chunks: &[Chunk],
+    plan: &GraphPlan,
+    field_pos: usize,
+    norms: NormSlot,
+    queries: &[flat::Query],
+    take: usize,
+    compute: &Compute,
+    tops: &mut [TopK],
+) {
+    struct GraphLeaf {
+        query: usize,
+        segment: usize,
+        top: Option<TopK>,
+    }
+    let metric = plan.segments[0].graph.metric();
+    let dim = vector_values(&chunks[plan.segments[0].parts[0]].columns[field_pos]).0;
+    let run = |leaf: &mut GraphLeaf| {
+        let segment = &plan.segments[leaf.segment];
+        let query = &queries[leaf.query];
+        let mut top = TopK::new(metric, take);
+        let parts: Vec<crate::hnsw::Part> = segment
+            .parts
+            .iter()
+            .map(|&i| {
+                let (_, values, _) = vector_values(&chunks[i].columns[field_pos]);
+                crate::hnsw::Part {
+                    start: chunks[i].row_start,
+                    values,
+                    norms: &chunks[i].norms,
+                }
+            })
+            .collect();
+        let starts: Vec<usize> = segment.parts.iter().map(|&i| chunks[i].row_start).collect();
+        let locate = |row: u32| {
+            let row = row as usize;
+            let p = starts.partition_point(|&s| s <= row) - 1;
+            (segment.parts[p], row - starts[p])
+        };
+        let live = |row: u32| {
+            let (chunk, local) = locate(row);
+            chunks[chunk].live.get(local)
+        };
+        let searched =
+            crate::hnsw::Vectors::new(&parts, dim, norms.stride, norms.ordinal).map(|vectors| {
+                crate::hnsw::with_scratch(|scratch| {
+                    segment.graph.search(
+                        query,
+                        vectors,
+                        take.min(segment.ef),
+                        segment.ef,
+                        if segment.all_live { None } else { Some(&live) },
+                        Some(GRAPH_BUDGET_PER_ROW.saturating_mul(segment.valid as u64)),
+                        scratch,
+                    )
+                })
+            });
+        // 有效行多于 100 倍 ef（graph_plan），图返回不足 take.min(ef) 条只能是图没走到：与 FLAT 一样补足。
+        match searched {
+            Some(crate::hnsw::Search::Hits(hits)) if hits.len() >= take.min(segment.ef) => {
+                #[cfg(test)]
+                GRAPH_SEARCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                for (score, row) in hits {
+                    let (chunk, local) = locate(row);
+                    let c = &chunks[chunk];
+                    top.push(score, || {
+                        RankedRow::dense(
+                            c.source_rank,
+                            RowRef {
+                                order: row_order(c, local),
+                                chunk,
+                                row: local,
+                            },
+                        )
+                    });
+                }
+            }
+            // 超出预算、图返回不足，或块布局意外不连续：这一段改为 FLAT 扫描。
+            _ => {
+                let block: Vec<Segment> = segment
+                    .parts
+                    .iter()
+                    .map(|&chunk| Segment {
+                        chunk,
+                        rows: 0..chunks[chunk].live.len,
+                    })
+                    .collect();
+                scan(
+                    chunks,
+                    &block,
+                    field_pos,
+                    norms,
+                    std::slice::from_ref(query),
+                    std::slice::from_mut(&mut top),
+                );
+            }
+        }
+        top.shrink();
+        leaf.top = Some(top);
+    };
+    let per_wave = graph_queries_per_wave(compute.threads(), plan.segments.len(), take);
+    for wave in (0..queries.len()).step_by(per_wave) {
+        let wave = wave..queries.len().min(wave + per_wave);
+        let mut leaves: Vec<GraphLeaf> = wave
+            .flat_map(|query| {
+                (0..plan.segments.len()).map(move |segment| GraphLeaf {
+                    query,
+                    segment,
+                    top: None,
+                })
+            })
+            .collect();
+        compute.for_each(&mut leaves, run);
+        for leaf in leaves {
+            if let Some(top) = leaf.top {
+                tops[leaf.query].absorb(top);
+            }
+        }
+    }
+}
+
+/// 图检索每波提交的查询数：至少填满计算池，在候选预算内再多放；叶子的 TopK 攒到 keep 个候选才筛一次，
+/// 一波同时存活的候选数不超过 max(只填满计算池时的数量, [`WAVE_CANDIDATES`])，与查询条数无关。
+fn graph_queries_per_wave(threads: usize, segments: usize, take: usize) -> usize {
+    let segments = segments.max(1);
+    let fill = threads.div_ceil(segments).max(1);
+    let keep = take.saturating_mul(2).max(64);
+    fill.max(WAVE_CANDIDATES / segments.saturating_mul(keep))
+}
+
 /// 每个行块的计算量约为这么多个浮点数（0005，初值，由基准调整）。
 pub(crate) const BLOCK_ELEMS: usize = 1 << 20;
 
@@ -5053,11 +5311,15 @@ struct Segment {
 
 /// 按扫描顺序把全部行切成每块 `rows_per_block` 行（最后一块可以更少）；块可以跨 chunk，
 /// 也可以落在 chunk 内部，一次大批量写入的 chunk 同样能并行。
-fn row_blocks(chunks: &[Chunk], rows_per_block: usize) -> Vec<Vec<Segment>> {
+/// `excluded` 中为真的块（已由 HNSW 图检索的段，0041）不扫描；为空时扫描全部。
+fn row_blocks(chunks: &[Chunk], rows_per_block: usize, excluded: &[bool]) -> Vec<Vec<Segment>> {
     let mut blocks = Vec::new();
     let mut current = Vec::new();
     let mut filled = 0;
     for (chunk, c) in chunks.iter().enumerate() {
+        if excluded.get(chunk).copied().unwrap_or(false) {
+            continue;
+        }
         let mut start = 0;
         while start < c.live.len {
             let end = c.live.len.min(start + rows_per_block - filled);
@@ -8166,6 +8428,29 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// 图检索一波中同时存活的候选数不超过 max(只填满计算池时的数量, WAVE_CANDIDATES)，与 nq 无关（0005）。
+    #[test]
+    fn graph_wave_candidates_stay_within_the_budget() {
+        for threads in [1usize, 2, 4, 10, 16, 64] {
+            for segments in [1usize, 2, 3, 13, 48, 1221] {
+                for take in [0usize, 1, 10, 100, 999, 16384, 1 << 20] {
+                    let keep = (take * 2).max(64);
+                    let fill = threads.div_ceil(segments);
+                    let per_wave = graph_queries_per_wave(threads, segments, take);
+                    assert!(per_wave >= fill, "{threads} {segments} {take}");
+                    let alive = per_wave * segments * keep;
+                    let bound = (fill * segments * keep).max(WAVE_CANDIDATES);
+                    assert!(
+                        alive <= bound,
+                        "{threads} {segments} {take}: {alive} > {bound}"
+                    );
+                }
+            }
+        }
+        // 评审举的例子：10 段、take 999，一波不再是全部查询。
+        assert_eq!(graph_queries_per_wave(10, 10, 999), 26);
     }
 
     /// 片按顺序覆盖整波、起点对齐到 BATCH；块数少于线程数时叶子数（片数 × 块数）填满计算池。
