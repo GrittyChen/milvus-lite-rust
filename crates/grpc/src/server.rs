@@ -363,6 +363,17 @@ mod tests {
     use super::*;
     use milvus_lite_core::{EngineError, LoadState};
 
+    /// 本测试二进制会派生子进程；子进程在 exec 之前继承此刻打开的 LOCK 描述符。依赖关闭描述符（而不是
+    /// 显式解锁）释放锁、随后重开的用例持读锁，派生子进程时持写锁直到 exec。见
+    /// docs/testing/process-test-isolation.md。
+    static SUBPROCESS_SPAWN: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+    fn spawn_guard_read() -> std::sync::RwLockReadGuard<'static, ()> {
+        SUBPROCESS_SPAWN
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     fn config(data_dir: PathBuf, port: u16) -> ServerConfig {
         ServerConfig {
             data_dir,
@@ -436,6 +447,141 @@ mod tests {
             }
         }
     }
+
+    /// 停服途中进程死掉（不走析构与最后一次 flush）时，已应答的写入重开后都在：已 flush 的在数据文件里，
+    /// 其余只在 WAL 里。子进程在停服的两个间隙直接退出；flush 内部各提交点的退出由 core 的
+    /// crash_recovery 覆盖。
+    #[test]
+    fn process_exit_inside_stop_keeps_every_acknowledged_write() {
+        const NAME: &str = "server::tests::process_exit_inside_stop_keeps_every_acknowledged_write";
+        if let Ok(stage) = std::env::var("MILVUS_LITE_STOP_EXIT_STAGE") {
+            stop_exit_child(&stage);
+        }
+        for stage in ["during_grace", "after_runtime_shutdown"] {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("exit.db");
+            let child = {
+                let _spawn = SUBPROCESS_SPAWN
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                // std 在子进程 exec 之后才从 spawn 返回，写锁覆盖 fork 到 exec 的窗口。
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+                    .env("MILVUS_LITE_STOP_EXIT_STAGE", stage)
+                    .env("MILVUS_LITE_STOP_EXIT_DIR", &path)
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+                    .unwrap()
+            };
+            let output = child.wait_with_output().unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(88),
+                "{stage}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            // 退出时最后一次 flush 还没有开始，后两行只在 WAL 里。
+            let wal_bytes: u64 = std::fs::read_dir(path.join("collections/c/wal"))
+                .unwrap()
+                .map(|entry| entry.unwrap().metadata().unwrap().len())
+                .sum();
+            assert!(wal_bytes > 0, "{stage}: WAL already cleaned up");
+            let db = Db::new(DataDir::open(&path).unwrap(), Compute::for_host().unwrap()).unwrap();
+            let wanted: Vec<_> = (1..=3).map(milvus_lite_core::Pk::Int64).collect();
+            let mut found = db
+                .collection("", "c")
+                .unwrap()
+                .read()
+                .get(&wanted, &[])
+                .unwrap()
+                .rows
+                .pks;
+            found.sort_by_key(|pk| match pk {
+                milvus_lite_core::Pk::Int64(id) => *id,
+                other => panic!("unexpected pk {other:?}"),
+            });
+            assert_eq!(found, wanted, "{stage}");
+            db.close();
+        }
+    }
+
+    fn stop_exit_child(stage: &str) -> ! {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::mpsc;
+        let path = PathBuf::from(std::env::var("MILVUS_LITE_STOP_EXIT_DIR").unwrap());
+        // 交错没有按预期发生时，卡住的在途请求会让 Db::close 永远等下去；限时退出，让父进程以退出码失败而不是挂起。
+        std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_secs(60));
+            eprintln!("stop exit child timed out");
+            std::process::exit(97);
+        });
+        // 在宽限期内退出：让一个在途 RPC 卡在引擎入口，服务任务在宽限内结束不了。
+        let hold = Arc::new(AtomicBool::new(false));
+        let (held_tx, held_rx) = mpsc::channel();
+        let held_tx = std::sync::Mutex::new(held_tx);
+        let armed = Arc::clone(&hold);
+        let hooks = crate::service::RpcTestHooks {
+            after_attempt: Some(Arc::new(move |_| {
+                if armed.load(Ordering::Acquire) {
+                    held_tx.lock().unwrap().send(()).unwrap();
+                    loop {
+                        std::thread::park();
+                    }
+                }
+            })),
+            after_enqueue: None,
+        };
+        let mut server = Server::start_inner(config(path, 0), hooks).unwrap();
+        let db = Arc::clone(&server.running.as_ref().unwrap().db);
+        db.create_collection("", "c", schema()).unwrap();
+        let clients = io_client();
+        let channel = clients
+            .block_on(
+                tonic::transport::Endpoint::from_shared(format!(
+                    "http://{}",
+                    server.bound_address()
+                ))
+                .unwrap()
+                .connect(),
+            )
+            .unwrap();
+        let acked = |id| {
+            let reply = clients.block_on(insert_rpc(channel.clone(), id)).unwrap();
+            assert_eq!(reply.insert_cnt, 1, "{reply:?}");
+        };
+        acked(1);
+        db.flush_collection("", "c").unwrap();
+        acked(2);
+        acked(3);
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel::<()>();
+        match stage {
+            "during_grace" => {
+                hold.store(true, Ordering::Release);
+                let _pending = clients.spawn(insert_rpc(channel.clone(), 4));
+                held_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                server.after_shutdown_signal = Some(ShutdownStarted(entered_tx));
+            }
+            "after_runtime_shutdown" => {
+                server.after_runtime_shutdown = Some(ShutdownPause {
+                    entered: entered_tx,
+                    resume: resume_rx,
+                });
+            }
+            _ => panic!("unknown stop exit stage {stage}"),
+        }
+        std::thread::spawn(move || {
+            let _resume = resume_tx;
+            entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            std::process::exit(88);
+        });
+        // 宽限远长于观察者退出所需的时间；stop 返回说明退出没有发生在预期的间隙里。
+        let result = server.stop(Duration::from_secs(30));
+        panic!("process did not exit inside stop at {stage}: {result:?}");
+    }
+
     fn io_client() -> Runtime {
         tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
@@ -779,6 +925,7 @@ mod tests {
     #[test]
     fn shutdown_closes_admission_before_runtime_and_rejects_queued_writes() {
         use std::sync::{Mutex, mpsc};
+        let _spawn = spawn_guard_read();
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("queue.db");
         let (attempt_tx, attempt_rx) = mpsc::channel();
@@ -871,6 +1018,7 @@ mod tests {
     #[test]
     fn unlock_failure_is_reported_by_stop_after_storage_finishes() {
         use milvus_lite_core::data_dir::inject_unlock_failure_for_next_open;
+        let _spawn = spawn_guard_read();
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("unlock.db");
         inject_unlock_failure_for_next_open();

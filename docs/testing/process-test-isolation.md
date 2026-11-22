@@ -76,7 +76,7 @@ for round_number in range(1, 31):
 - 新增仅测试编译的进程内读写锁 [`data_dir::SUBPROCESS_SPAWN`](../../crates/core/src/data_dir.rs)。崩溃边界用例改为 `stdin` 空、`stdout` / `stderr` 管道后，只在写锁内调用 `spawn()`，退出写锁后再 `wait_with_output()`；std 在子进程 exec 之后才从 `spawn()` 返回，写锁覆盖 fork 到 exec 的窗口，不覆盖子进程运行的数秒。原有退出码与输出断言不变。
 - 依赖裸句柄析构释放锁、随后重开的 5 个用例，从首次打开到最后一次重开持读锁：partition key 的上述失败用例；`data_dir` 的 `second_open_in_same_process_is_locked_until_first_dropped`、`dropping_a_bare_handle_does_not_unlock_a_shared_description`、`lock_release_does_not_depend_on_existing_entries`；`db` 的 `unlock_failure_is_reported_by_synchronous_and_asynchronous_close`（注入解锁失败后只能靠关闭全部描述符释放锁，按循环的每次迭代取读锁）。读锁只让这些用例与派生互斥，用例内部的线程与真实并发不变。
 - 经 `Db` 正常关闭的用例不需要守卫：`Db` 收尾时显式解锁（[db.rs](../../crates/core/src/db.rs) 的 `release_data_dir`），对子进程继承的同一打开文件描述同样生效；`all_close_paths_unlock_while_a_duplicated_descriptor_remains_open` 的解锁成功路径即为这一点的覆盖。
-- 搜索范围：`Command::new|process::Command|current_exe|fork(` 于整个 workspace 的 `crates/**/*.rs`。库内只有 [partition_key.rs](../../crates/core/src/collection/partition_key.rs) 一个写者；集成测试中 `index_changes.rs`、`crash_recovery.rs`、`concurrency_faults.rs` 由上文的 CASE_LOCK 覆盖；`partitions.rs` 有两个派生点，但该二进制只经 `Db` 打开数据目录、不使用注入的解锁失败，`Db` 关闭总是显式解锁，不存在依赖裸句柄析构的重开，因此不加守卫。grpc 与 py crate 没有派生点。
+- 搜索范围：`Command::new|process::Command|current_exe|fork(` 于整个 workspace 的 `crates/**/*.rs`。库内只有 [partition_key.rs](../../crates/core/src/collection/partition_key.rs) 一个写者；集成测试中 `index_changes.rs`、`crash_recovery.rs`、`concurrency_faults.rs` 由上文的 CASE_LOCK 覆盖；`partitions.rs` 有两个派生点，但该二进制只经 `Db` 打开数据目录、不使用注入的解锁失败，`Db` 关闭总是显式解锁，不存在依赖裸句柄析构的重开，因此不加守卫。grpc 与 py crate 当时没有派生点（2026-11-22 起 grpc 库内有一个，见文末）。
 - 没有增加 retry、sleep 或放宽断言；产品代码未改。
 
 ### 验证
@@ -143,3 +143,13 @@ Linux arm64（本机 Docker 中固定摘要的 manylinux_2_28 容器，glibc 2.2
 修复后的 [linux_pid1_probe.py](../../tests/platform/linux_pid1_probe.py) 在本机 arm64 Docker 上以开发环境为驱动、本地 `python:3.10-slim-bookworm` 为基础镜像，安装同一演练的 Linux aarch64 正式与 FI wheel：normal / drain / kill 退出码 0 / 0 / 137，三项均通过，驱动日志中没有 fork 日志。容器内的服务进程不经过本函数，按默认配置运行。
 
 CI 上的结果以修复提交在最终拓扑上的 10 / 5 计数为准，计数完成后记入 [0020 试点记录](0020-ci-pilot.md)。本地重复只是有限次数，不声明该窗口在任何调度下都不再出现。
+
+## 后续：grpc 库内单元测试（2026-11-22）
+
+停服段错误第二轮调查（[调查记录](shutdown-segfault-investigation.md#第二轮调查2026-11-22)）在 [server.rs](../../crates/grpc/src/server.rs) 的测试模块新增 `process_exit_inside_stop_keeps_every_acknowledged_write`，以 `current_exe` 重新启动测试二进制作为子进程，grpc 库内单元测试由此处在上文的窗口中。
+
+- 按 core 的做法在测试模块内新增 `SUBPROCESS_SPAWN`（grpc 不依赖 parking_lot，用 std 的读写锁，中毒时照常取得）：该用例在写锁内 `spawn()`，`stdin` 空、`stdout` / `stderr` 管道，退出写锁后再 `wait_with_output()`。
+- 持读锁的用例：`shutdown_closes_admission_before_runtime_and_rejects_queued_writes`（裸 `DataDir` 打开后析构、随即重开）与 fault-injection 下的 `unlock_failure_is_reported_by_stop_after_storage_finishes`（注入解锁失败后只能靠关闭描述符释放锁）。
+- 不加守卫的用例：其余用例经 `Db` 正常关闭或析构，收尾时显式解锁；或末尾只有一次不再重开的裸打开；`drop_without_stop_releases_lock` 本身就在 2 秒内轮询重开。query.rs 与 service.rs 的用例各自只打开一次临时目录。
+- 搜索范围：`Command::new|current_exe|fork(` 于 `crates/grpc` 与 `crates/py` 的全部 `.rs`，除该用例外没有其他派生点；`DataDir::open|Db::new|Server::start` 于 `crates/grpc/src`。
+- 验证（本地 macOS arm64）：grpc 库测试按默认并行，普通构建 44 项与 fault-injection 构建 46 项各连续 20 轮全部通过。
