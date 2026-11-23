@@ -185,13 +185,17 @@ impl Maintenance {
             ));
         }
         let maintenance = Arc::clone(self);
-        // macOS 的 std 通道等待复用调用线程的 libdispatch parker，fork 子进程可能继承失效对象。
-        let ready = Arc::new((Mutex::new(false), Condvar::new()));
+        // 不用 std 通道：macOS 上它的等待复用调用线程的 libdispatch parker，fork 子进程可能继承失效对象。
+        // 也不用 parking_lot：它的等待者登记在进程级停车表里，fork 后留下残留节点（见 graph_build 的说明）。
+        let ready = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
         let started = Arc::clone(&ready);
         let worker = std::thread::Builder::new()
             .name("milvus-lite-maintenance".into())
             .spawn(move || {
-                *ready.0.lock() = true;
+                *ready
+                    .0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
                 ready.1.notify_all();
                 loop {
                     let next = {
@@ -294,7 +298,11 @@ impl Maintenance {
             .set(worker.thread().clone())
             .map_err(|_| EngineError::Storage("maintenance worker already started".into()))?;
         *self.join.lock() = Some(worker);
-        let mut awake = started.0.lock();
+        // 持锁区段只是读写一个 bool，锁中毒时取回内部值继续使用。
+        let mut awake = started
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let deadline = Instant::now() + Duration::from_secs(10);
         while !*awake {
             let remaining = deadline
@@ -302,7 +310,11 @@ impl Maintenance {
                 .ok_or_else(|| {
                     EngineError::Storage("maintenance worker readiness timed out".into())
                 })?;
-            started.1.wait_for(&mut awake, remaining);
+            awake = started
+                .1
+                .wait_timeout(awake, remaining)
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .0;
         }
         Ok(())
     }

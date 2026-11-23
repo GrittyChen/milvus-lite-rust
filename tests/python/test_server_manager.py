@@ -467,7 +467,9 @@ def fork_and_wait(child):
         sys.stdout.flush()
         sys.exit(0)  # 正常退出：触发子进程的 atexit（0003 E4 的场景）
     _, status = os.waitpid(pid, 0)
-    print("OUT child-exit", os.waitstatus_to_exitcode(status), flush=True)
+    code = os.waitstatus_to_exitcode(status)
+    print("OUT child-exit", code, flush=True)
+    return code
 """
 
 
@@ -518,22 +520,36 @@ print("OUT parent-still-serving", MilvusClient(uri).get_server_version().startsw
 
 @needs_fork
 def test_fork_child_owns_new_path(tmp_path):
+    # 子进程为新路径启动并停止自己的服务。父进程里停在进程级全局结构（parking_lot 的停车表）上的后台线程，
+    # 会在子进程中留下残留节点，使子进程停服挂起或段错误（0003「fork」）；单轮的概率只有百分之几，因此重复
+    # 多轮：偶数轮在父进程启动服务后立即 fork，奇数轮先等一会儿，让后台线程进入长期停放。子进程设 alarm，
+    # 挂起时被 SIGALRM 结束；子进程首个非 0 退出即停止，不再等后续轮次。只在 Linux 上有判别力。
+    rounds = 40
     out = run_script(
         FORK_PRELUDE
-        + """
-sm.start_and_get_uri("p.db")
+        + f"""
+import signal, time
+for r in range({rounds}):
+    sm.start_and_get_uri(f"p{{r}}.db")
+    if r % 2:
+        time.sleep(0.2)
 
-def child():
-    uri = sm.start_and_get_uri("c.db")
-    print("OUT child-new-ok", MilvusClient(uri).get_server_version().startswith("milvus_lite-"), flush=True)
+    def child():
+        signal.alarm(20)
+        uri = sm.start_and_get_uri(f"c{{r}}.db")
+        print("OUT child-new-ok", MilvusClient(uri).get_server_version().startswith("milvus_lite-"), flush=True)
 
-fork_and_wait(child)
-print("OUT child-lock-released", other_process_can_open("c.db"))
+    status = fork_and_wait(child)
+    sm.release_server(f"p{{r}}.db")
+    if status != 0:
+        break
+print("OUT child-lock-released", other_process_can_open(f"c{{{rounds - 1}}}.db"))
 """,
         tmp_path,
+        timeout=120,
     )
-    assert "child-exit 0" in out
-    assert "child-new-ok True" in out
+    assert out.count("child-exit 0") == rounds, [line for line in out if line.startswith("child-exit")]
+    assert out.count("child-new-ok True") == rounds
     assert "child-lock-released True" in out
 
 

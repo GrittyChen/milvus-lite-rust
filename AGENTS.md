@@ -101,7 +101,7 @@ pymilvus ──server_manager──▶ adapter/grpc ──▶ db（多 collectio
   - tonic / prost 0.14 与 protox 0.9（gRPC 与 proto 代码生成）；tokio 1（每个服务实例独占一个 runtime，[0003](docs/decisions/0003-in-process-server-lifecycle.md)）；thiserror 2；md5 0.8.1（partition key 的 3.x 固定哈希，只用于路由）；tempfile 3（仅测试）。
   - pyo3 0.29（`abi3-py310`）：Python 绑定；`pyo3-build-config` 0.29.2 为 py crate 的直接构建依赖，用于拒绝 free-threaded、非 CPython 与 Windows 目标。
   - rayon-core 1.13：服务的计算池，只用线程池部分，可用接口由 [clippy.toml](clippy.toml) 的 `disallowed-methods` 限定（[0005](docs/decisions/0005-search-thread-model.md)）。
-  - parking_lot 0.12：collection 表与各类锁，没有中毒语义（[0007](docs/decisions/0007-m2-storage-engine.md#取锁顺序)）。
+  - parking_lot 0.12：collection 表与各类锁，没有中毒语义（[0007](docs/decisions/0007-m2-storage-engine.md#取锁顺序)）；常驻后台线程的等待不用它，改用 std 的 Mutex / Condvar：它把等待者登记在进程级停车表里，fork 后父进程停放线程的残留节点会损坏子进程的队列（[0003「fork」](docs/decisions/0003-in-process-server-lifecycle.md#fork)）。
   - arrow-array / arrow-schema / arrow-ipc 与 parquet 60.0（Parquet 只开 `arrow`、`snap`）、serde 1：3.x 的 Arrow IPC WAL、Parquet 和 JSON 持久化格式；macOS 上经 chrono 链接系统自带的 CoreFoundation，无需额外安装（[0006 第 24 项](docs/decisions/0006-m2-scope.md#五工程)）。
   - serde_json 1：开启 `float_roundtrip`、`preserve_order` 与 `arbitrary_precision`，JSON 字段保留键序与宽整数，`$meta` 由 [pyjson.rs](crates/core/src/pyjson.rs) 按嵌套 key 排序后输出；文本解析的约定见[架构地图](#架构地图跨文件心智)。
   - libc 0.2：索引变更的 Unix 权限预检、文件系统类型与内核启动标识查询，以及 Linux glibc 上维护轮次后的 `malloc_trim`；FFI 局限在 `storage::index_platform`（[0014](docs/decisions/0014-index-definitions-and-filter-expressions.md#实施设计)）与 `allocator`（[分配器保留内存](docs/testing/allocator-retention.md)）。

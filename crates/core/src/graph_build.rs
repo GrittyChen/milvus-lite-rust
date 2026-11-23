@@ -4,11 +4,9 @@
 use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
-
-use parking_lot::{Condvar, Mutex};
 
 use crate::collection::{ChunkData, Collection};
 use crate::data::ColumnData;
@@ -223,6 +221,11 @@ struct State {
     stopped: bool,
 }
 
+/// 锁与条件变量用 std 而不用 parking_lot：建图线程大部分时间停在条件变量上，parking_lot 的等待者登记在
+/// 进程级的全局停车表里，节点放在等待线程自己的线程局部存储中。进程 fork 时（0003 允许子进程为新路径启动
+/// 服务），父进程停放线程的节点留在子进程的表里，而那些线程在子进程中并不存在；子进程新建的线程可能复用其栈
+/// 与 TLS，队列随之损坏，子进程自己的建图线程收不到唤醒（停服时 join 挂起）或 notify 时 SIGSEGV。std 的实现
+/// 把等待状态放在对象自身，不经进程级的表，子进程只用自己新建的对象。见 0003「fork」。
 pub(crate) struct GraphBuilder {
     state: Mutex<State>,
     wake: Condvar,
@@ -248,11 +251,20 @@ impl GraphBuilder {
         })
     }
 
+    /// 持锁区段只做队列与计数的增删、不会 panic，锁中毒时状态仍然一致，取回内部值继续使用。
+    fn state(&self) -> MutexGuard<'_, State> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn threads(&self) -> MutexGuard<'_, Vec<JoinHandle<()>>> {
+        self.threads.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// 线程数为可用核数的 1/8，限制在 1 到 4（0041 第 3 步设计第 2 条）。
     pub(crate) fn start(self: &Arc<Self>, owner: Weak<Db>) -> Result<()> {
         let cores = std::thread::available_parallelism().map_or(1, usize::from);
         let count = (cores / 8).clamp(1, 4);
-        let mut threads = self.threads.lock();
+        let mut threads = self.threads();
         for i in 0..count {
             let builder = Arc::clone(self);
             let owner = owner.clone();
@@ -270,7 +282,7 @@ impl GraphBuilder {
         if tasks.is_empty() {
             return;
         }
-        let mut state = self.state.lock();
+        let mut state = self.state();
         if state.stopped {
             return;
         }
@@ -285,13 +297,19 @@ impl GraphBuilder {
     /// 等队列排空、在途构建结束；超时报错。供测试与基准使用（0041 第 3 步设计第 10 条）。
     pub(crate) fn wait_idle(&self, timeout: Duration) -> Result<()> {
         let deadline = Instant::now() + timeout;
-        let mut state = self.state.lock();
+        let mut state = self.state();
         while !(state.queue.is_empty() && state.running == 0) {
-            if self.idle.wait_until(&mut state, deadline).timed_out() {
+            let now = Instant::now();
+            if now >= deadline {
                 return Err(EngineError::Storage(
                     "graph builds did not finish in time".into(),
                 ));
             }
+            state = self
+                .idle
+                .wait_timeout(state, deadline - now)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
         }
         Ok(())
     }
@@ -300,14 +318,14 @@ impl GraphBuilder {
     pub(crate) fn stop(&self) {
         self.stop.store(true, Ordering::Release);
         {
-            let mut state = self.state.lock();
+            let mut state = self.state();
             state.stopped = true;
             state.queue.clear();
             state.keys.clear();
         }
         self.wake.notify_all();
         self.idle.notify_all();
-        let threads = std::mem::take(&mut *self.threads.lock());
+        let threads = std::mem::take(&mut *self.threads());
         let me = std::thread::current().id();
         for thread in threads {
             // Db 的最后一个强引用可能恰好在构建线程上释放，析构在本线程调用 stop：不能 join 自己。
@@ -321,7 +339,7 @@ impl GraphBuilder {
     }
 
     fn next(&self) -> Option<GraphTask> {
-        let mut state = self.state.lock();
+        let mut state = self.state();
         loop {
             if state.stopped {
                 return None;
@@ -339,15 +357,24 @@ impl GraphBuilder {
             }
             match state.queue.iter().filter_map(|t| t.not_before).min() {
                 Some(at) => {
-                    self.wake.wait_until(&mut state, at);
+                    state = self
+                        .wake
+                        .wait_timeout(state, at.saturating_duration_since(now))
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .0;
                 }
-                None => self.wake.wait(&mut state),
+                None => {
+                    state = self
+                        .wake
+                        .wait(state)
+                        .unwrap_or_else(PoisonError::into_inner);
+                }
             }
         }
     }
 
     fn finish(&self, retry: Option<GraphTask>) {
-        let mut state = self.state.lock();
+        let mut state = self.state();
         state.running -= 1;
         if let Some(task) = retry
             && !state.stopped
@@ -431,13 +458,13 @@ mod tests {
             task(&epoch, 0, "a"),
             task(&epoch, 0, "b"),
         ]);
-        assert_eq!(builder.state.lock().queue.len(), 2);
+        assert_eq!(builder.state().queue.len(), 2);
         epoch.store(2, Ordering::SeqCst);
         builder.enqueue(vec![task(&epoch, 2, "a"), task(&epoch, 2, "b")]);
-        assert_eq!(builder.state.lock().queue.len(), 4);
+        assert_eq!(builder.state().queue.len(), 4);
         let other = Arc::new(AtomicU64::new(2));
         builder.enqueue(vec![task(&other, 2, "a")]);
-        assert_eq!(builder.state.lock().queue.len(), 5);
+        assert_eq!(builder.state().queue.len(), 5);
         builder.stop();
     }
 }

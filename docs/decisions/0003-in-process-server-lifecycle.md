@@ -96,6 +96,7 @@ E4、E5 违反了架构不变量 8（单进程独占 data_dir）和不变量 5�
 - **表锁与 fork**：胶水层用 `os.register_at_fork`（Windows 上没有这个函数，按平台判断后再注册），在 fork 前持有表锁，fork 后在父子进程中释放。这样子进程看到的表是一致的，表锁也不会在子进程中永久处于加锁状态。如果 fork 时另一线程正在启动服务，fork 要等启动结束，因为等锁时 GIL 已释放，所以不会死锁。直接从 C 调用的 `fork()` 不经过这些钩子。
 - **继承来的路径**：子进程返回父进程的 URI，与 3.x 的 E3 一致，multiprocessing 的 fork 子进程可以照常访问父进程打开的库。父进程退出后，这些请求会失败。
 - **新路径**：子进程启动自己的服务，使用新的 runtime 与线程池，服务归子进程所有，退出时由子进程停止。
+- **常驻后台线程的等待不经过进程级全局结构**：parking_lot 的锁在争用时、条件变量在等待时，把等待者登记在进程级的全局停车表里，节点放在等待线程自己的线程局部存储中。fork 时父进程里停放的线程在子进程中不存在，它们的节点却留在表里；子进程新建的线程可能复用其栈与 TLS（glibc 在子进程中回收其他线程的栈，这一环是推断），队列随之损坏。[0041](0041-hnsw.md) 的建图线程大部分时间停在 parking_lot 条件变量上，合入后 CI 出现过子进程停服挂起（Linux arm64）与 `notify_all` 中 SIGSEGV（Linux x86_64）各一次；本地 aarch64 容器中「启动服务后 fork、子进程为新路径启停服务」300 轮挂起 34 次，fork 前先等 0.5 秒仍挂起 9 次，说明长期停放的线程本身就会触发，启动窗口只提高概率。建图线程与维护线程的启动握手因此改用 std 的 Mutex / Condvar（等待状态在对象自身），维护线程的空闲等待一直用 `thread::park`；改后两种时序各 300 轮以上没有失败。tokio 与 rayon-core 用 std 的同步原语。新增常驻后台线程时沿用这一约束（没有 lint 拦截，靠评审）；`Db` 关闭时的 `idle` 等待者是子进程自己的线程，只要父进程没有长期停放的 parking_lot 线程即不受影响。回归用例为 [test_fork_child_owns_new_path](../../tests/python/test_server_manager.py)，在同一进程中多轮「启动服务后 fork」，一半轮次先等一会儿再 fork，子进程首个非 0 退出即停止；它在 Linux 上才有判别力。
 - **子进程中的 atexit 与 `release_server`**：跳过继承来的服务，并保留其表项。不关闭、不解锁、不删 WAL，之后对同一路径的调用仍返回父进程的 URI。这修正了 E4、E5，是与 3.x 的行为差异，见下文「与 3.x 的行为差异」。
 - **客户端的在途调用**：grpcio 的 fork 支持以 fork 时没有其他线程正在调用 gRPC 为前提（见其源码 `grpc/_cython/_cygrpc/fork.pyx.pxi` 的说明）。grpcio 1.84.0 在 Linux x86_64 上的实测与符号化 core 如下。fork 时若有线程阻塞在调用中，C-core 跳过自己的 fork 处理，并输出 `skipping fork() handlers`。EventEngine 仍在子进程中重启线程池，并执行遗留的完成回调。这些回调在 `pollset_kick` 中访问父进程那个已消失线程栈上的 pollset worker。这块栈若已被子进程的新线程复用并写过，就会读到垃圾指针，子进程偶发 SIGSEGV。其他版本与平台未实测。这是客户端库在 fork 时的限制，不属于服务实现，本实现不做处理：使用者应在没有在途调用时 fork，或改用 spawn / forkserver。[0005「验证」](0005-search-thread-model.md#验证)中的「检索进行中 fork」因此由另一个进程发起检索。
 - **平台差异**：Windows 没有 fork。macOS 上 multiprocessing 默认用 spawn，Linux 上 3.10–3.13 默认用 fork，3.14 起改为 forkserver；但 `os.fork()` 在这些平台上都可用，规则相同。Python 3.12 起，在多线程进程中 fork 会发出 `DeprecationWarning`，3.x 的 gRPC 线程同样会触发，不做处理。
@@ -103,7 +104,7 @@ E4、E5 违反了架构不变量 8（单进程独占 data_dir）和不变量 5�
 ### 接受的残余风险
 
 - **父进程异常死亡**：子进程继承的 LOCK 与监听 socket 的 fd 会一直保持到子进程退出，期间别的进程打不开该目录（E7），与 3.x 相同。
-- **依赖库的全局状态**：日志或 tracing 的全局 sink、stdout 锁等不在上面「所有权」的约束之内。如果 fork 时刻，某个已消失的线程正持有这类锁，子进程启动新服务时可能死锁。由验证中的 fork 用例兜底。
+- **依赖库的全局状态**：日志或 tracing 的全局 sink、stdout 锁等不在上面「所有权」的约束之内。如果 fork 时刻，某个已消失的线程正持有这类锁，子进程启动新服务时可能死锁。parking_lot 的停车表属于同一类：上一节消除了常驻线程这一来源，但 fork 时刻父进程里仍停放在 parking_lot 上的任何等待者（如请求线程在争用集合锁或在同步等待合并完成、`close_nowait` 的收尾线程在等在途任务）都会留下残留节点，子进程启停服务时仍可能挂起或崩溃。Python 侧的 `release_server` 在表锁内停服，fork 前的钩子会等它结束，这条路径被挡住；请求线程与收尾线程没有。由验证中的 fork 用例兜底。
 
 ## 与 3.x 的行为差异
 
