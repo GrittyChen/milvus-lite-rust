@@ -11,7 +11,7 @@ from pymilvus import DataType, MilvusClient
 
 from milvus_lite.server_manager import server_manager_instance
 
-ROWS = 20_000
+ROWS = 30_000
 DIM = 16
 
 
@@ -31,7 +31,9 @@ def _fill(client, name, data):
 
 
 def _search(client, name, queries, limit=10):
-    hits = client.search(name, data=queries, limit=limit, search_params={"metric_type": "L2"})
+    # ef=32：段的有效行（3 万）多于 800 × ef，检索走图（0041 第 5 步的门槛）。
+    params = {"metric_type": "L2", "params": {"ef": 32}}
+    hits = client.search(name, data=queries, limit=limit, search_params=params)
     return [[(hit["id"], np.float32(hit["distance"])) for hit in row] for row in hits]
 
 

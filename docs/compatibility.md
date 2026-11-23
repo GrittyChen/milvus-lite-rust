@@ -27,7 +27,7 @@
 
 - **HNSW** 建图检索（[0041](decisions/0041-hnsw.md)），纯 Rust 实现，参数 `M`、`efConstruction`、`ef` 的含义与默认值（16、200、64）与 3.x 相同。结果是近似的：返回的每一行都满足过滤与删除可见性，距离与 FLAT 对同一行算出的值逐位相同，但可能漏掉真正更近的行。与 3.x 的差异：
   - 实际束宽取 `max(ef, 候选窗口)`；某段的图返回不足窗口条数时（如过滤后剩下的行在图上走不到），该段改走 FLAT，因此与 FLAT 一样返回足 k 条。3.x 在 k 或窗口大于 ef 时召回明显下降，甚至返回不足 k 条。
-  - 行数不足 1 万的段、内存中尚未落盘的数据、尚未建好图的段，以及过滤后有效行不多于实际束宽 100 倍的段，按 FLAT 精确检索；图搜索的距离计算超过该段有效行数时也改走 FLAT。3.x 只在有效行不多于 k 时才精确检索。
+  - 行数不足 1 万的段、内存中尚未落盘的数据、尚未建好图的段，以及过滤后有效行不多于实际束宽 800 倍的段，按 FLAT 精确检索；图搜索的距离计算超过该段有效行数时也改走 FLAT。3.x 只在有效行不多于 k 时才精确检索。
   - 图在后台构建：load 与 CreateIndex 不等待，建好之前按 FLAT 检索，建好后自动切换；3.x 首次 load 与 loaded 状态下的 CreateIndex 会同步建完。构建失败时记录日志并重试，期间按 FLAT 检索，DescribeIndex 照常显示，load 不报错。
   - `M`、`efConstruction`、`ef` 只接受整数、有限浮点数（截断）、ASCII 十进制整数字符串与布尔；其他写法（包括 Python `int()` 也接受的下划线分隔与非 ASCII 数字）以及 `M` 超过 512、`efConstruction` 超过 100000 时，不建图或不用图，按 FLAT 执行，不报错。3.x 对无法解析的值报错，对合法的大值照常构建。
 - 其余向量索引按 FLAT（精确暴力检索）执行，FLAT 同时是召回与距离口径的正确性基准。新建索引时，FLAT 与 BRUTE_FORCE 原生支持；AUTOINDEX（pymilvus 快速建表使用）、HNSW_SQ、IVF_FLAT、IVF_SQ8 可以创建并原样保存定义，向量仍按 FLAT 执行，召回不低于 ANN，但数据量大时更慢；3.x 的 AUTOINDEX 实际走 HNSW。需要 ANN 时请显式建 HNSW。这五种新建定义只接受 COSINE / L2 / IP；BM25 / NONE 返回 UNIMPLEMENTED，避免写出 3.x 无法 load 的定义。FLAT / BRUTE_FORCE 保持原有的度量校验。

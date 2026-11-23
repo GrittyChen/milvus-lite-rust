@@ -6775,7 +6775,7 @@ mod tests {
             let before = crate::collection::GRAPH_SEARCHES.load(Ordering::Relaxed);
             let mut hit = 0;
             for q in queries() {
-                let graph = search(&handle, &db, q, 10, None);
+                let graph = search(&handle, &db, q, 10, Some("10"));
                 // ef 无法解析时不用图，等同 FLAT。
                 let flat = search(&handle, &db, q, 10, Some("not a number"));
                 assert_eq!(graph.len(), 10);
@@ -6799,14 +6799,15 @@ mod tests {
             let root = tempfile::tempdir().unwrap();
             let db = test_db(root.path());
             let handle = hnsw_collection(&db);
-            let gone: Vec<Pk> = (0..3000).map(Pk::Int64).collect();
+            // 留下的有效行仍多于 GRAPH_FLAT_FACTOR × 10，检索走图。
+            let gone: Vec<Pk> = (0..1000).map(Pk::Int64).collect();
             db.delete("", "c", &gone).unwrap();
             let before = crate::collection::GRAPH_SEARCHES.load(Ordering::Relaxed);
             for q in queries() {
-                let graph = search(&handle, &db, q, 10, None);
+                let graph = search(&handle, &db, q, 10, Some("10"));
                 let flat = search(&handle, &db, q, 10, Some("x"));
                 assert_eq!(graph.len(), 10);
-                assert!(graph.iter().all(|(pk, _)| *pk >= 3000), "{graph:?}");
+                assert!(graph.iter().all(|(pk, _)| *pk >= 1000), "{graph:?}");
                 for (pk, bits) in &graph {
                     if let Some((_, want)) = flat.iter().find(|(p, _)| p == pk) {
                         assert_eq!(bits, want);
@@ -6817,7 +6818,7 @@ mod tests {
             db.close();
         }
 
-        /// 窗口使有效行不足实际 ef 的 100 倍时走 FLAT，结果与 FLAT 完全相同。
+        /// 窗口使有效行不足实际 ef 的 GRAPH_FLAT_FACTOR 倍时走 FLAT，结果与 FLAT 完全相同。
         #[test]
         fn a_large_window_falls_back_to_exact_flat() {
             let root = tempfile::tempdir().unwrap();
@@ -6840,21 +6841,21 @@ mod tests {
             let handle = hnsw_collection(&db);
             handle.read().make_graphs_unreachable();
             for q in queries().into_iter().take(5) {
-                let got = search(&handle, &db, q, 10, None);
+                let got = search(&handle, &db, q, 10, Some("10"));
                 assert_eq!(got.len(), 10);
                 assert_eq!(got, search(&handle, &db, q, 10, Some("x")));
             }
             db.close();
         }
 
-        /// 查询多于一波（10 段以下、take 99 时每波约 2600 条）时分波提交，每条的结果与单独检索逐位相同。
+        /// 查询多于一波（单段、take 10 时每波 8192 条）时分波提交，每条的结果与单独检索逐位相同。
         #[test]
-        fn many_queries_with_a_large_limit_are_searched_in_waves() {
+        fn many_queries_are_searched_in_waves() {
             let root = tempfile::tempdir().unwrap();
             let db = test_db(root.path());
             let handle = hnsw_collection(&db);
-            let qs: Vec<[f32; 2]> = (0..6000)
-                .map(|i| [(i as f32 * 0.013) % 7.0, (i as f32 * 0.007) % 5.0])
+            let qs: Vec<[f32; 2]> = (0..20_000)
+                .map(|i| [(i as f32 * 0.0039) % 7.0, (i as f32 * 0.0021) % 5.0])
                 .collect();
             let before = crate::collection::GRAPH_SEARCHES.load(Ordering::Relaxed);
             let req = crate::collection::SearchRequest {
@@ -6863,16 +6864,16 @@ mod tests {
                     qs.iter().map(|q| q.to_vec()).collect(),
                 ),
                 metric_type: Some("L2".into()),
-                limit: 99,
+                limit: 10,
                 offset: 0,
                 output_fields: vec![],
-                params: serde_json::Map::new(),
+                params: serde_json::Map::from_iter([("ef".into(), "10".into())]),
                 negative_top_k: false,
             };
             let all = handle.read().search(req, db.compute()).unwrap().hits;
-            assert!(crate::collection::GRAPH_SEARCHES.load(Ordering::Relaxed) >= before + 5000);
+            assert!(crate::collection::GRAPH_SEARCHES.load(Ordering::Relaxed) >= before + 19_000);
             assert_eq!(all.len(), qs.len());
-            for i in (0..qs.len()).step_by(397) {
+            for i in (0..qs.len()).step_by(997) {
                 let got: Vec<(i64, u32)> = all[i]
                     .rows
                     .pks
@@ -6883,8 +6884,12 @@ mod tests {
                         _ => unreachable!(),
                     })
                     .collect();
-                assert_eq!(got.len(), 99);
-                assert_eq!(got, search(&handle, &db, qs[i], 99, None), "query {i}");
+                assert_eq!(got.len(), 10);
+                assert_eq!(
+                    got,
+                    search(&handle, &db, qs[i], 10, Some("10")),
+                    "query {i}"
+                );
             }
             db.close();
         }

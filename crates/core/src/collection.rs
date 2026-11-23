@@ -5075,8 +5075,9 @@ struct Dynamic {
 pub(crate) static GRAPH_SEARCHES: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
-/// 每段有效行不超过实际 ef 的这么多倍时直接走 FLAT（0041「据此确定的取值」）。
-const GRAPH_FLAT_FACTOR: usize = 100;
+/// 每段有效行不超过实际 ef 的这么多倍时直接走 FLAT。第 5 步在产品上实测（ef=64）：10 万行与 25 万行的段，
+/// 图与 FLAT 都在有效行约 5 万处持平，与段大小无关（0041「第 5 步」）。
+const GRAPH_FLAT_FACTOR: usize = 800;
 
 /// 图检索的距离计算预算是有效行数的这么多倍；超出时改走 FLAT，最坏多花的代价不超过一次 FLAT 扫描。
 const GRAPH_BUDGET_PER_ROW: u64 = 1;
@@ -5227,7 +5228,7 @@ fn search_graphs(
                     )
                 })
             });
-        // 有效行多于 100 倍 ef（graph_plan），图返回不足 take.min(ef) 条只能是图没走到：与 FLAT 一样补足。
+        // 有效行多于 GRAPH_FLAT_FACTOR 倍 ef（graph_plan），图返回不足 take.min(ef) 条只能是图没走到：与 FLAT 一样补足。
         match searched {
             Some(crate::hnsw::Search::Hits(hits)) if hits.len() >= take.min(segment.ef) => {
                 #[cfg(test)]
