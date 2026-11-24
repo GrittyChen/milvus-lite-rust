@@ -523,21 +523,21 @@ impl ReadSnapshot {
     }
 
     /// 只决定并行切分：`anns_field` 无效时检索流程会按 3.x 的先后报错，这里用默认字段即可。
-    fn rows_per_block(&self, anns_field: Option<&str>) -> usize {
+    fn blocking(&self, anns_field: Option<&str>) -> Blocking {
         let dim = resolve_anns_field(&self.schema, self.vector_pos, anns_field)
             .ok()
             .or(self.vector_pos)
             .map(|pos| &self.schema.fields[pos])
             .filter(|field| field.data_type.is_dense_vector())
             .map_or(1, field_dim);
-        (BLOCK_ELEMS / dim.max(1)).max(1)
+        Blocking::Auto((BLOCK_ELEMS / dim.max(1)).max(1))
     }
 
     /// 在 `compute` 上并行计算（[0005](../../../docs/decisions/0005-search-thread-model.md)），
     /// 结果与串行计算逐位相同。
     pub fn search(&self, req: SearchRequest, compute: &Compute) -> Result<SearchResult> {
-        let rows_per_block = self.rows_per_block(req.anns_field.as_deref());
-        self.search_in_blocks(req, compute, rows_per_block)
+        let blocking = self.blocking(req.anns_field.as_deref());
+        self.search_in_blocks(req, compute, blocking)
     }
 
     pub fn search_filtered(
@@ -588,11 +588,11 @@ impl ReadSnapshot {
         group: Option<GroupBy>,
         timezone: &crate::timezone::TimezoneSource<'_>,
     ) -> Result<SearchResult> {
-        let rows_per_block = self.rows_per_block(req.anns_field.as_deref());
+        let blocking = self.blocking(req.anns_field.as_deref());
         self.search_filtered_in_blocks(
             req,
             compute,
-            rows_per_block,
+            blocking,
             FilterContext {
                 expr,
                 range,
@@ -611,11 +611,11 @@ impl ReadSnapshot {
         filter: BoostedFilter<'_>,
         boost: &BoostPlan,
     ) -> Result<SearchResult> {
-        let rows_per_block = self.rows_per_block(req.anns_field.as_deref());
+        let blocking = self.blocking(req.anns_field.as_deref());
         self.search_filtered_in_blocks(
             req,
             compute,
-            rows_per_block,
+            blocking,
             FilterContext {
                 expr: filter.expr,
                 range: filter.range,
@@ -645,11 +645,11 @@ impl ReadSnapshot {
             timezone,
         } = filter;
         let plan = Plan::new(chain, &self.schema.fields[self.pk_pos].name)?;
-        let rows_per_block = self.rows_per_block(req.anns_field.as_deref());
+        let blocking = self.blocking(req.anns_field.as_deref());
         let mut ranking = self.rank_in_blocks(
             req,
             compute,
-            rows_per_block,
+            blocking,
             FilterContext {
                 expr,
                 range,
@@ -772,7 +772,7 @@ impl ReadSnapshot {
             keep: top_k,
             chained: true,
         });
-        let rows_per_block = self.rows_per_block(req.anns_field.as_deref());
+        let blocking = self.blocking(req.anns_field.as_deref());
         let ranking = self.rank_in_blocks(
             SearchRequest {
                 limit: top_k,
@@ -782,7 +782,7 @@ impl ReadSnapshot {
                 ..req
             },
             compute,
-            rows_per_block,
+            blocking,
             FilterContext {
                 expr,
                 range,
@@ -831,11 +831,11 @@ impl ReadSnapshot {
             keep: req.limit,
             chained: true,
         });
-        let rows_per_block = self.rows_per_block(req.anns_field.as_deref());
+        let blocking = self.blocking(req.anns_field.as_deref());
         let ranking = self.rank_in_blocks(
             SearchRequest { offset: 0, ..req },
             compute,
-            rows_per_block,
+            blocking,
             FilterContext {
                 expr: filter.expr,
                 range: None,
@@ -881,12 +881,12 @@ impl ReadSnapshot {
         &self,
         req: SearchRequest,
         compute: &Compute,
-        rows_per_block: usize,
+        blocking: Blocking,
     ) -> Result<SearchResult> {
         self.search_filtered_in_blocks(
             req,
             compute,
-            rows_per_block,
+            blocking,
             FilterContext {
                 expr: "",
                 range: None,
@@ -901,10 +901,10 @@ impl ReadSnapshot {
         &self,
         req: SearchRequest,
         compute: &Compute,
-        rows_per_block: usize,
+        blocking: Blocking,
         filter: FilterContext<'_>,
     ) -> Result<SearchResult> {
-        let ranking = self.rank_in_blocks(req, compute, rows_per_block, filter)?;
+        let ranking = self.rank_in_blocks(req, compute, blocking, filter)?;
         Ok(self.finish(ranking))
     }
 
@@ -1317,7 +1317,7 @@ impl ReadSnapshot {
         &self,
         req: SearchRequest,
         compute: &Compute,
-        rows_per_block: usize,
+        blocking: Blocking,
         filter: FilterContext<'_>,
     ) -> Result<Ranking> {
         let FilterContext {
@@ -1427,20 +1427,34 @@ impl ReadSnapshot {
             } else {
                 GraphPlan::default()
             };
+            let rows_per_block = match blocking {
+                Blocking::Auto(base) => {
+                    let scanned = chunks
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, _)| !plan.excluded.get(*i).copied().unwrap_or(false))
+                        .map(|(_, c)| c.live.len)
+                        .sum();
+                    scoped_rows_per_block(base, take, scanned, compute.threads(), queries.len())
+                }
+                #[cfg(test)]
+                Blocking::Fixed(rows) => rows,
+            };
             let blocks = row_blocks(&chunks, rows_per_block, &plan.excluded);
             if take > 0 && !blocks.is_empty() {
                 let per_wave = flat::BATCH * groups_per_wave(compute.threads(), blocks.len(), take);
                 for wave in (0..queries.len()).step_by(per_wave) {
                     let wave = wave..queries.len().min(wave + per_wave);
-                    let mut leaves: Vec<Leaf> = wave_slices(wave, compute.threads(), blocks.len())
-                        .flat_map(|slice| {
-                            blocks.iter().map(move |block| Leaf {
-                                queries: slice.clone(),
-                                block,
-                                tops: Vec::new(),
+                    let mut leaves: Vec<Leaf> =
+                        wave_slices(wave.clone(), compute.threads(), blocks.len())
+                            .flat_map(|slice| {
+                                blocks.iter().map(move |block| Leaf {
+                                    queries: slice.clone(),
+                                    block,
+                                    tops: Vec::new(),
+                                })
                             })
-                        })
-                        .collect();
+                            .collect();
                     compute.for_each(&mut leaves, |leaf| {
                         let queries = &queries[leaf.queries.clone()];
                         leaf.tops = queries.iter().map(|_| TopK::new(metric, take)).collect();
@@ -1454,11 +1468,14 @@ impl ReadSnapshot {
                         );
                         leaf.tops.iter_mut().for_each(TopK::shrink);
                     });
-                    for leaf in leaves {
-                        for (i, top) in leaf.tops.into_iter().enumerate() {
-                            tops[leaf.queries.start + i].absorb(top);
-                        }
-                    }
+                    merge_leaves(
+                        compute,
+                        &mut tops[wave.clone()],
+                        wave.start,
+                        leaves,
+                        blocks.len(),
+                        take,
+                    );
                 }
             }
             if !plan.segments.is_empty() {
@@ -1466,6 +1483,7 @@ impl ReadSnapshot {
                     &chunks, &plan, field_pos, norm_slot, &queries, take, compute, &mut tops,
                 );
             }
+            settle_all(compute, &mut tops, take);
             tops
         };
         if let Some(plan) = boost {
@@ -4676,10 +4694,10 @@ impl Collection {
         &self,
         req: SearchRequest,
         compute: &Compute,
-        rows_per_block: usize,
+        blocking: Blocking,
     ) -> Result<SearchResult> {
         self.read_snapshot()
-            .search_in_blocks(req, compute, rows_per_block)
+            .search_in_blocks(req, compute, blocking)
     }
 
     pub fn require_loaded(&self) -> Result<()> {
@@ -5378,6 +5396,93 @@ fn wave_slices(
     (0..slices).map(move |i| at(i)..at(i + 1))
 }
 
+/// 检索的行块切分。
+#[derive(Clone, Copy)]
+#[cfg_attr(test, derive(Debug))]
+enum Blocking {
+    /// 基础行数（[`BLOCK_ELEMS`] ÷ 维度），检索时由 [`scoped_rows_per_block`] 按 take 与查询条数放大。
+    Auto(usize),
+    /// 每块固定行数：测试用来覆盖各种块边界。
+    #[cfg(test)]
+    Fixed(usize),
+}
+
+/// 每个 top-k 覆盖的行数与 take 之比的下限（0005「top-k 的范围」）。
+const ROWS_PER_TAKE: usize = 64;
+
+/// 合并或收尾排序的候选数达到这么多时才放到计算池上；更少时调度开销超过收益（0005「top-k 的范围」）。
+const PARALLEL_MERGE_MIN: usize = 1 << 15;
+
+/// 实际的每块行数（0005「top-k 的范围」）：每条查询在每个块上各有一个 top-k，块内剪枝的门槛是块内第
+/// take 名；块只比 take 大几倍时，大部分行都要进入候选，候选又挤占每波的预算、拖长串行合并。
+/// 因此块至少是 take 的 [`ROWS_PER_TAKE`] 倍，但块数不少于 ⌈线程数 ÷ 查询组数⌉：查询组少时
+/// 只靠行块填满计算池，查询组多时 [`wave_slices`] 按查询切片即可。
+fn scoped_rows_per_block(
+    base: usize,
+    take: usize,
+    scanned: usize,
+    threads: usize,
+    queries: usize,
+) -> usize {
+    let groups = queries.div_ceil(flat::BATCH).max(1);
+    let min_blocks = threads.max(1).div_ceil(groups).max(1);
+    base.max(
+        take.saturating_mul(ROWS_PER_TAKE)
+            .min(scanned.div_ceil(min_blocks)),
+    )
+}
+
+/// 把一波叶子任务的结果并入 `tops`（这一波的查询，第一条的下标为 `start`）。候选多时按查询并行：
+/// 每个合并任务独占一条查询的结果与它在各块上的部分，结果与串行合并相同（[`TopK::absorb`]）。
+fn merge_leaves(
+    compute: &Compute,
+    tops: &mut [TopK],
+    start: usize,
+    leaves: Vec<Leaf<'_>>,
+    blocks: usize,
+    take: usize,
+) {
+    if blocks.saturating_mul(take).saturating_mul(tops.len()) < PARALLEL_MERGE_MIN {
+        for leaf in leaves {
+            for (i, top) in leaf.tops.into_iter().enumerate() {
+                tops[leaf.queries.start - start + i].absorb(top);
+            }
+        }
+        return;
+    }
+    struct Merge<'a> {
+        target: &'a mut TopK,
+        parts: Vec<TopK>,
+    }
+    let mut merges: Vec<Merge<'_>> = tops
+        .iter_mut()
+        .map(|target| Merge {
+            target,
+            parts: Vec::with_capacity(blocks),
+        })
+        .collect();
+    for leaf in leaves {
+        for (i, top) in leaf.tops.into_iter().enumerate() {
+            merges[leaf.queries.start - start + i].parts.push(top);
+        }
+    }
+    compute.for_each(&mut merges, |merge| {
+        for part in std::mem::take(&mut merge.parts) {
+            merge.target.absorb(part);
+        }
+    });
+}
+
+/// 候选多时在计算池上完成各查询的最终筛选与排序（[`TopK::settle`]），每个任务独占一段查询。
+fn settle_all(compute: &Compute, tops: &mut [TopK], take: usize) {
+    if tops.len() < 2 || tops.len().saturating_mul(take) < PARALLEL_MERGE_MIN {
+        return;
+    }
+    let per_task = tops.len().div_ceil(compute.threads().max(1));
+    let mut parts: Vec<&mut [TopK]> = tops.chunks_mut(per_task).collect();
+    compute.for_each(&mut parts, |part| part.iter_mut().for_each(TopK::settle));
+}
+
 /// 一个叶子任务：一片查询在一个行块上各自的前 k 名。
 struct Leaf<'a> {
     /// 这一片查询在请求中的下标区间。
@@ -5393,8 +5498,8 @@ struct NormSlot {
     stride: usize,
 }
 
-/// 为一片查询扫描一个行块中的存活行，候选交给各自的 [`TopK`]。至多 [`flat::BATCH`] 条时，
-/// 组满 [`flat::BATCH`] 条一起打分，共用读入的候选向量；更多时见 [`scan_tiled`]。
+/// 为一片查询扫描一个行块中的存活行，候选交给各自的 [`TopK`]。不足 [`flat::BATCH`] 条时逐条
+/// 打分；满一组及以上见 [`scan_tiled`]。
 fn scan(
     chunks: &[Chunk],
     block: &[Segment],
@@ -5403,7 +5508,7 @@ fn scan(
     queries: &[flat::Query],
     tops: &mut [TopK],
 ) {
-    if queries.len() > flat::BATCH {
+    if queries.len() >= flat::BATCH {
         return scan_tiled(chunks, block, field_pos, norms, queries, tops);
     }
     for seg in block {
@@ -5431,26 +5536,17 @@ fn scan(
                 },
             )
         };
-        if let Ok(batch) = <&[flat::Query; flat::BATCH]>::try_from(queries) {
+        for (query, top) in queries.iter().zip(tops.iter_mut()) {
             for (row, candidate, norm) in live_rows() {
-                let scores = flat::score_batch(batch, candidate, norm);
-                for (top, score) in tops.iter_mut().zip(scores) {
-                    top.push(score, || at(row));
-                }
-            }
-        } else {
-            for (query, top) in queries.iter().zip(tops.iter_mut()) {
-                for (row, candidate, norm) in live_rows() {
-                    top.push(query.score(candidate, norm), || at(row));
-                }
+                top.push(query.score(candidate, norm), || at(row));
             }
         }
     }
 }
 
-/// 多于一组查询时，存活行按 [`TILE_ROWS`] 行一小段收集，这一段依次交给每个查询组打分：
-/// 从内存读入的候选向量留在缓存中供全部查询组复用。每条查询仍按扫描顺序看到全部存活行，
-/// 推入各自 [`TopK`] 的先后与逐组扫描相同，结果逐位不变。
+/// 满一组及以上查询时，存活行按 [`TILE_ROWS`] 行一小段收集，这一段依次交给每个查询组打分
+/// （[`flat::score_tile`]）：从内存读入的候选向量留在缓存中供全部查询组复用。每条查询仍按扫描
+/// 顺序看到全部存活行，推入各自 [`TopK`] 的先后与逐组扫描相同，结果逐位不变。
 fn scan_tiled(
     chunks: &[Chunk],
     block: &[Segment],
@@ -5459,7 +5555,10 @@ fn scan_tiled(
     queries: &[flat::Query],
     tops: &mut [TopK],
 ) {
-    let mut buf: Vec<(usize, &[f32], f32)> = Vec::with_capacity(TILE_ROWS);
+    // 行号与候选分开存放：候选整段交给 flat::score_tile。
+    let mut rows: Vec<usize> = Vec::with_capacity(TILE_ROWS);
+    let mut candidates: Vec<flat::Candidate> = Vec::with_capacity(TILE_ROWS);
+    let mut scores = [[0.0; flat::BATCH]; TILE_ROWS];
     for seg in block {
         let chunk = &chunks[seg.chunk];
         let (dim, values, valid) = vector_values(&chunk.columns[field_pos]);
@@ -5473,36 +5572,39 @@ fn scan_tiled(
                 },
             )
         };
-        let mut flush = |buf: &mut Vec<(usize, &[f32], f32)>| {
+        let mut flush = |rows: &mut Vec<usize>, candidates: &mut Vec<flat::Candidate>| {
+            debug_assert_eq!(rows.len(), candidates.len());
             for (qs, ts) in queries
                 .chunks(flat::BATCH)
                 .zip(tops.chunks_mut(flat::BATCH))
             {
                 if let Ok(batch) = <&[flat::Query; flat::BATCH]>::try_from(qs) {
-                    for &(row, candidate, norm) in buf.iter() {
-                        let scores = flat::score_batch(batch, candidate, norm);
-                        for (top, score) in ts.iter_mut().zip(scores) {
+                    let scores = &mut scores[..candidates.len()];
+                    flat::score_tile(batch, candidates, scores);
+                    for (&row, scores) in rows.iter().zip(scores.iter()) {
+                        for (top, &score) in ts.iter_mut().zip(scores) {
                             top.push(score, || at(row));
                         }
                     }
                 } else {
                     for (query, top) in qs.iter().zip(ts.iter_mut()) {
-                        for &(row, candidate, norm) in buf.iter() {
-                            top.push(query.score(candidate, norm), || at(row));
+                        for (&row, candidate) in rows.iter().zip(candidates.iter()) {
+                            top.push(query.score(candidate.vector, candidate.norm), || at(row));
                         }
                     }
                 }
             }
-            buf.clear();
+            rows.clear();
+            candidates.clear();
         };
         let mut push = |row: usize| {
-            buf.push((
-                row,
-                &values[row * dim..(row + 1) * dim],
-                chunk.norms[row * norms.stride + norms.ordinal],
-            ));
-            if buf.len() == TILE_ROWS {
-                flush(&mut buf);
+            rows.push(row);
+            candidates.push(flat::Candidate {
+                vector: &values[row * dim..(row + 1) * dim],
+                norm: chunk.norms[row * norms.stride + norms.ordinal],
+            });
+            if rows.len() == TILE_ROWS {
+                flush(&mut rows, &mut candidates);
             }
         };
         // 有效位的判断提到循环外：非 nullable 列的热循环与引入空向量之前相同（0038 的服务器对照）。
@@ -5518,7 +5620,7 @@ fn scan_tiled(
                 .filter(|row| chunk.live.get(*row) && valid.get(*row))
                 .for_each(&mut push),
         }
-        flush(&mut buf);
+        flush(&mut rows, &mut candidates);
     }
 }
 
@@ -5662,6 +5764,13 @@ impl TopK {
         for (score, pos) in other.candidates {
             self.push(score, || pos);
         }
+    }
+
+    /// 先在计算池上完成 [`TopK::finish`] 的筛选与排序，之后的 `finish` 只需检查一遍有序。
+    fn settle(&mut self) {
+        self.shrink();
+        let metric = self.metric;
+        self.candidates.sort_unstable_by(|a, b| order(metric, a, b));
     }
 
     fn finish(mut self) -> Vec<(f32, RankedRow)> {
@@ -8336,6 +8445,8 @@ mod tests {
             let c = collection(&mut rng, dim);
             let metric = [Metric::L2, Metric::Ip, Metric::Cosine][rng.below(3)];
             // 70 条：小 limit 时每波 MAX_WAVE_GROUPS 组、分多波，最后一波带不满一组的余数。
+            // 70 条配 limit 500 或 offset 500 时，候选数与查询数 × take 达到 PARALLEL_MERGE_MIN，
+            // 覆盖并行合并与并行收尾；其余组合走串行合并与收尾。
             let nq = [1, 3, 4, 5, 9, 70][rng.below(6)];
             let (limit, offset) =
                 [(0, 0), (1, 0), (5, 2), (10, 0), (3, 40), (500, 0), (7, 500)][rng.below(7)];
@@ -8357,8 +8468,8 @@ mod tests {
                 negative_top_k: false,
             };
             let expected = reference(&c, &req, metric);
-            let run = |pool, rows_per_block| -> Vec<Vec<(u32, Pk)>> {
-                c.search_in_blocks(req.clone(), pool, rows_per_block)
+            let run = |pool, blocking| -> Vec<Vec<(u32, Pk)>> {
+                c.search_in_blocks(req.clone(), pool, blocking)
                     .unwrap()
                     .hits
                     .iter()
@@ -8372,7 +8483,7 @@ mod tests {
                     .collect()
             };
             // 单线程、单个行块即串行计算。
-            let serial = run(&pools[0], usize::MAX);
+            let serial = run(&pools[0], Blocking::Fixed(usize::MAX));
             let comparable = |hits: &[Vec<(u32, Pk)>]| -> Vec<Vec<(u32, Pk)>> {
                 hits.iter()
                     .map(|h| {
@@ -8383,13 +8494,43 @@ mod tests {
                     .collect()
             };
             assert_eq!(comparable(&serial), expected, "case {case}, serial");
-            for rows_per_block in [1, 2, 7, 64, 10_000] {
+            // Auto 用很小的基础块长，让测试规模的集合也经过 scoped_rows_per_block 的放大与块数下限。
+            let blockings = [1, 2, 7, 64, 10_000]
+                .map(Blocking::Fixed)
+                .into_iter()
+                .chain([1, 3].map(Blocking::Auto));
+            for blocking in blockings {
                 for pool in &pools {
-                    let got = run(pool, rows_per_block);
-                    assert_eq!(got, serial, "case {case}, block {rows_per_block}");
+                    let got = run(pool, blocking);
+                    assert_eq!(got, serial, "case {case}, {blocking:?}");
                 }
             }
         }
+    }
+
+    /// 0005「top-k 的范围」：小 take 不改变切分；大 take 时块至少是 take 的 64 倍，
+    /// 但查询组少时仍保留足以填满计算池的块数。
+    #[test]
+    fn scoped_rows_per_block_grows_with_take_but_keeps_the_pool_busy() {
+        let base = BLOCK_ELEMS / 128;
+        // 128 维、100 万行、16 线程：limit 10 / 100 不变。
+        assert_eq!(scoped_rows_per_block(base, 10, 1_000_000, 16, 1000), base);
+        assert_eq!(scoped_rows_per_block(base, 100, 1_000_000, 16, 1000), base);
+        // limit 1000：块为 64 000 行；nq 1 时块数不少于线程数（62 500 行，16 块）。
+        assert_eq!(
+            scoped_rows_per_block(base, 1000, 1_000_000, 16, 1000),
+            64_000
+        );
+        assert_eq!(scoped_rows_per_block(base, 1000, 1_000_000, 16, 1), 62_500);
+        // 10 万行：nq 1000 时 2 块，由查询切片填满计算池；nq 8（2 组）时至少 8 块。
+        assert_eq!(scoped_rows_per_block(base, 1000, 100_000, 16, 1000), 64_000);
+        assert_eq!(scoped_rows_per_block(base, 1000, 100_000, 16, 8), 12_500);
+        // 行数少于基础块时不变；极大的 take 不溢出。
+        assert_eq!(scoped_rows_per_block(base, 1000, 5_000, 16, 1), base);
+        assert_eq!(
+            scoped_rows_per_block(base, usize::MAX, 1_000_000, 1, 1),
+            1_000_000
+        );
     }
 
     /// 0005「查询组分波提交」：每波的查询组数只由线程数与块数决定，同时存活的候选数与查询条数无关。

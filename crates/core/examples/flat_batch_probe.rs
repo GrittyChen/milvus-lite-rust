@@ -2,8 +2,9 @@
 //! 输出各 nq 的中位耗时与结果指纹（主键与分数位模式），用于比较距离核与任务切分的改动。
 //!
 //! 用法：`flat_batch_probe <rows> <dim> <threads> <reps> [nq...]`，nq 默认 1 与 100。
-//! `flat_batch_probe <rows> <dim> <threads> <reps> fair <bg_nq>`：另一线程在同一计算池上不停执行
-//! nq 为 `bg_nq` 的检索，同时计时 `reps` 次单条检索（每次间隔 2 ms），观察后到请求的排队等待。
+//! `flat_batch_probe <rows> <dim> <threads> <reps> fair <bg_nq> [bg_limit]`：另一线程在同一计算池上
+//! 不停执行 nq 为 `bg_nq`、limit 为 `bg_limit`（默认 10）的检索，同时计时 `reps` 次 top10 单条检索
+//! （每次间隔 2 ms），观察后到请求的排队等待。
 use milvus_lite_core::collection::{QueryVectors, SearchRequest};
 use milvus_lite_core::{
     Collection, CollectionSchema, Compute, DataType, FieldSchema, IndexRequest, InputValues,
@@ -34,6 +35,10 @@ fn main() -> Result<(), Error> {
     let fair: Option<usize> = match args.get(5).map(String::as_str) {
         Some("fair") => Some(args.get(6).ok_or("bg_nq")?.parse()?),
         _ => None,
+    };
+    let bg_limit: usize = match (fair, args.get(7)) {
+        (Some(_), Some(limit)) => limit.parse()?,
+        _ => 10,
     };
     let nqs: Vec<usize> = if fair.is_some() {
         vec![1]
@@ -97,13 +102,13 @@ fn main() -> Result<(), Error> {
     let queries: Vec<Vec<f32>> = (0..max_nq)
         .map(|_| (0..dim).map(|_| rng.next()).collect())
         .collect();
-    let search = |nq: usize| {
+    let search_limit = |nq: usize, limit: usize| {
         collection.search(
             SearchRequest {
                 anns_field: None,
                 vectors: QueryVectors::Dense(queries[..nq].to_vec()),
                 metric_type: Some("L2".into()),
-                limit: 10,
+                limit,
                 offset: 0,
                 output_fields: Vec::new(),
                 params: Default::default(),
@@ -112,13 +117,14 @@ fn main() -> Result<(), Error> {
             &compute,
         )
     };
+    let search = |nq: usize| search_limit(nq, 10);
     if let Some(bg_nq) = fair {
         let stop = std::sync::atomic::AtomicBool::new(false);
         let (times, background) = std::thread::scope(|s| {
             let bg = s.spawn(|| {
                 let mut done = 0usize;
                 while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                    search(bg_nq).map_err(|e| e.to_string())?;
+                    search_limit(bg_nq, bg_limit).map_err(|e| e.to_string())?;
                     done += 1;
                 }
                 Ok::<_, String>(done)
@@ -138,7 +144,7 @@ fn main() -> Result<(), Error> {
         let background = background.map_err(|_| "background panicked")??;
         times.sort_by(f64::total_cmp);
         println!(
-            "{{\"rows\":{rows},\"dim\":{dim},\"threads\":{threads},\"fair_bg_nq\":{bg_nq},\"reps\":{reps},\"background_searches\":{background},\"p50_ms\":{:.3},\"p99_ms\":{:.3},\"max_ms\":{:.3}}}",
+            "{{\"rows\":{rows},\"dim\":{dim},\"threads\":{threads},\"fair_bg_nq\":{bg_nq},\"bg_limit\":{bg_limit},\"reps\":{reps},\"background_searches\":{background},\"p50_ms\":{:.3},\"p99_ms\":{:.3},\"max_ms\":{:.3}}}",
             times[reps / 2],
             times[(reps * 99 / 100).min(reps - 1)],
             times[reps - 1]

@@ -11,7 +11,8 @@
 //! L2 必须逐元素相减再平方（0004「决策」），不能展开成 ‖q‖² + ‖v‖² − 2q·v。
 //!
 //! 累加函数单独成函数、不内联：与归约和尾部写在一起时，LLVM 在 aarch64 上只生成 2 路的向量代码，
-//! 慢近一倍。改动这里的写法时要用基准确认没有退化。
+//! 慢近一倍。x86_64 的 AVX2 副本例外：按段打分（[`score_tile`]）时累加、归约与换算内联在同一个
+//! 函数中，热循环不跨函数（服务器实测四种代码布局下速度一致）。改动这里的写法时要在两种架构上用基准确认没有退化。
 //!
 //! x86_64 的编译基线只有 SSE2。CPU 支持 AVX2 时，累加函数改走以 AVX2 编译的副本（[`avx2`]），
 //! 与基线副本是同一份源码，只放宽向量宽度；不启用 FMA，求和顺序仍只由源码决定，结果逐位相同
@@ -68,7 +69,8 @@ impl<'a> Query<'a> {
         self.to_score(raw, candidate_norm)
     }
 
-    /// L2 与 IP 原样返回；COSINE 由点积换算成相似度。
+    /// L2 与 IP 原样返回；COSINE 由点积换算成相似度。与 [`finish`] 同理强制内联。
+    #[inline(always)]
     fn to_score(&self, raw: f32, candidate_norm: f32) -> f32 {
         if self.metric != Metric::Cosine {
             return raw;
@@ -106,23 +108,48 @@ pub(crate) fn rank(metric: Metric, a: f32, b: f32) -> Ordering {
     }
 }
 
-/// [`BATCH`] 条同一度量的查询对同一个候选打分，结果与逐条调用 [`Query::score`] 逐位相同（NaN
-/// 只保证仍是 NaN，见模块说明）：每条查询的每一路做同样顺序的运算，只是共用读入的候选向量。
-pub(crate) fn score_batch(
-    queries: &[Query; BATCH],
-    candidate: &[f32],
-    candidate_norm: f32,
-) -> [f32; BATCH] {
-    let vectors = queries.each_ref().map(|q| q.vector);
-    let (lanes, op): (_, fn(f32, f32) -> f32) = match queries[0].metric {
-        Metric::L2 => (diff_sq_lanes_batch(&vectors, candidate), diff_sq),
-        Metric::Ip | Metric::Cosine => (product_lanes_batch(&vectors, candidate), product),
+/// 交给 [`score_tile`] 的一个候选：向量与它的范数（[`norm`]，只有 COSINE 使用）。
+#[derive(Clone, Copy)]
+pub(crate) struct Candidate<'a> {
+    pub(crate) vector: &'a [f32],
+    pub(crate) norm: f32,
+}
+
+/// [`BATCH`] 条同一度量的查询对一段候选逐个打分，`out[r]` 是第 `r` 个候选的分数。结果与逐条调用
+/// [`Query::score`] 逐位相同（NaN 只保证仍是 NaN，见模块说明）：每条查询的每一路做同样顺序的
+/// 运算，只是共用读入的候选向量。
+///
+/// 按段而不是按单个候选调用：x86_64 上整段的行循环、累加、归约与换算在同一个函数内，热循环的
+/// 指令相对位置由这个函数自身决定。逐行调用时热循环跨越调用方、打分与累加几个函数，它们在
+/// 二进制中的相对位置随无关代码变化；在 Zen2 上曾因此使常规检索慢 10%–27%
+/// （docs/testing/large-limit-search-performance.md「代码布局」）。
+pub(crate) fn score_tile(queries: &[Query; BATCH], rows: &[Candidate], out: &mut [[f32; BATCH]]) {
+    debug_assert_eq!(rows.len(), out.len());
+    match queries[0].metric {
+        Metric::L2 => diff_sq_tile(queries, rows, out),
+        Metric::Ip | Metric::Cosine => product_tile(queries, rows, out),
         Metric::Bm25 => unreachable!("{DENSE_ONLY}"),
-    };
-    std::array::from_fn(|i| {
-        let raw = finish(lanes[i], vectors[i], candidate, op);
-        queries[i].to_score(raw, candidate_norm)
-    })
+    }
+}
+
+/// [`score_tile`] 的函数体。`lanes` 是本度量的批量累加函数：AVX2 副本中传入内联的函数体，
+/// 其余情形传入单独成函数的累加函数（aarch64 上与归约写在一起会退化，见模块说明）。
+#[inline(always)]
+fn tile_body(
+    queries: &[Query; BATCH],
+    rows: &[Candidate],
+    out: &mut [[f32; BATCH]],
+    lanes: impl Fn(&[&[f32]; BATCH], &[f32]) -> [Lanes; BATCH],
+    op: fn(f32, f32) -> f32,
+) {
+    let vectors = queries.each_ref().map(|q| q.vector);
+    for (row, scores) in rows.iter().zip(out.iter_mut()) {
+        let lanes = lanes(&vectors, row.vector);
+        *scores = std::array::from_fn(|i| {
+            let raw = finish(lanes[i], vectors[i], row.vector, op);
+            queries[i].to_score(raw, row.norm)
+        });
+    }
 }
 
 /// 向量的范数，与 COSINE 打分中的点积同一算法。
@@ -162,6 +189,10 @@ fn product(a: f32, b: f32) -> f32 {
 }
 
 /// 把 16 路两两归约，再按顺序加上尾部元素。
+///
+/// 强制内联：[`score_tile`] 的 AVX2 副本中它在每个候选、每条查询上执行一次，LLVM 有时不内联，
+/// 调用与按内存传递 16 路累加值使常规检索慢约四成（服务器实测）。
+#[inline(always)]
 fn finish(lanes: Lanes, a: &[f32], b: &[f32], op: fn(f32, f32) -> f32) -> f32 {
     let mut width = LANES;
     let mut l = lanes;
@@ -251,7 +282,7 @@ fn product_lanes_batch_body(qs: &[&[f32]; BATCH], b: &[f32]) -> [Lanes; BATCH] {
 /// 以 AVX2 编译的累加函数副本，函数体与基线副本相同。只在 [`avx2::available`] 为真时调用。
 #[cfg(target_arch = "x86_64")]
 mod avx2 {
-    use super::{BATCH, Lanes};
+    use super::{BATCH, Candidate, Lanes, Query};
 
     /// 标准库缓存检测结果，每次调用只是一次原子读取。
     #[inline(always)]
@@ -277,6 +308,36 @@ mod avx2 {
     #[target_feature(enable = "avx2")]
     pub(super) fn product_lanes_batch(qs: &[&[f32]; BATCH], b: &[f32]) -> [Lanes; BATCH] {
         super::product_lanes_batch_body(qs, b)
+    }
+
+    #[target_feature(enable = "avx2")]
+    pub(super) fn diff_sq_tile(
+        queries: &[Query; BATCH],
+        rows: &[Candidate],
+        out: &mut [[f32; BATCH]],
+    ) {
+        super::tile_body(
+            queries,
+            rows,
+            out,
+            super::diff_sq_lanes_batch_body,
+            super::diff_sq,
+        )
+    }
+
+    #[target_feature(enable = "avx2")]
+    pub(super) fn product_tile(
+        queries: &[Query; BATCH],
+        rows: &[Candidate],
+        out: &mut [[f32; BATCH]],
+    ) {
+        super::tile_body(
+            queries,
+            rows,
+            out,
+            super::product_lanes_batch_body,
+            super::product,
+        )
     }
 }
 
@@ -313,9 +374,95 @@ fn product_lanes_batch(qs: &[&[f32]; BATCH], b: &[f32]) -> [Lanes; BATCH] {
     dispatch!(product_lanes_batch, product_lanes_batch_body, qs, b)
 }
 
+fn diff_sq_tile_portable(queries: &[Query; BATCH], rows: &[Candidate], out: &mut [[f32; BATCH]]) {
+    tile_body(queries, rows, out, diff_sq_lanes_batch, diff_sq)
+}
+
+fn product_tile_portable(queries: &[Query; BATCH], rows: &[Candidate], out: &mut [[f32; BATCH]]) {
+    tile_body(queries, rows, out, product_lanes_batch, product)
+}
+
+#[inline(never)]
+fn diff_sq_tile(queries: &[Query; BATCH], rows: &[Candidate], out: &mut [[f32; BATCH]]) {
+    dispatch!(diff_sq_tile, diff_sq_tile_portable, queries, rows, out)
+}
+
+#[inline(never)]
+fn product_tile(queries: &[Query; BATCH], rows: &[Candidate], out: &mut [[f32; BATCH]]) {
+    dispatch!(product_tile, product_tile_portable, queries, rows, out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 单个候选的批量打分，经 [`score_tile`]。
+    fn score_batch(queries: &[Query; BATCH], c: &[f32], c_norm: f32) -> [f32; BATCH] {
+        let mut out = [[0.0; BATCH]; 1];
+        let rows = [Candidate {
+            vector: c,
+            norm: c_norm,
+        }];
+        score_tile(queries, &rows, &mut out);
+        out[0]
+    }
+
+    /// 一段多个候选（含空段与 64 行满段）与逐条 [`Query::score`] 逐位相同（NaN 只要求同为 NaN）。
+    #[test]
+    fn tile_scores_match_single_scores() {
+        let mut x = 0x7a11_e5ed_u32;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            (x as f32 / u32::MAX as f32) * 2.0 - 1.0
+        };
+        for dim in [1, 16, 17, 128, 257] {
+            // 最后一条查询为零向量：COSINE 的范数倒数为 0。
+            let qs: Vec<Vec<f32>> = (0..BATCH)
+                .map(|i| {
+                    (0..dim)
+                        .map(|_| if i + 1 == BATCH { 0.0 } else { next() })
+                        .collect()
+                })
+                .collect();
+            for len in [0, 1, 3, 64] {
+                let mut cs: Vec<Vec<f32>> = (0..len)
+                    .map(|_| (0..dim).map(|_| next()).collect())
+                    .collect();
+                if let Some(c) = cs.get_mut(1) {
+                    c[0] = f32::from_bits(0x7fc0_0123);
+                }
+                if let Some(c) = cs.get_mut(2) {
+                    c.iter_mut().for_each(|v| *v = 0.0);
+                }
+                let rows: Vec<Candidate> = cs
+                    .iter()
+                    .map(|c| Candidate {
+                        vector: c,
+                        norm: norm(c),
+                    })
+                    .collect();
+                for metric in [Metric::L2, Metric::Ip, Metric::Cosine] {
+                    let queries: [Query; BATCH] =
+                        std::array::from_fn(|i| Query::new(metric, &qs[i]));
+                    let mut out = vec![[f32::NAN; BATCH]; len];
+                    score_tile(&queries, &rows, &mut out);
+                    for (r, c) in cs.iter().enumerate() {
+                        for i in 0..BATCH {
+                            let want = queries[i].score(c, norm(c));
+                            let case = format!("dim={dim} len={len} {metric:?} row={r} q={i}");
+                            if want.is_nan() {
+                                assert!(out[r][i].is_nan(), "{case}");
+                            } else {
+                                assert_eq!(out[r][i].to_bits(), want.to_bits(), "{case}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     /// boost 由分数还原内部距离（`Metric::internal`）。这里证明还原结果与引擎的内部距离逐位相同：
     /// 3.x 的内部距离 COSINE 是 `max(1 - sim, 0)`、L2 是平方和开方、IP 是负点积。
@@ -603,6 +750,56 @@ mod tests {
                 for i in 0..BATCH {
                     same(l2_batch[i], base_l2[i], &case);
                     same(ip_batch[i], base_ip[i], &case);
+                }
+                // 按段打分的 AVX2 副本与基线副本：同一段中放入候选 b 与各条查询本身。
+                let rows: Vec<Candidate> = std::iter::once(b.as_slice())
+                    .chain(qs)
+                    .map(|v| Candidate {
+                        vector: v,
+                        norm: norm(v),
+                    })
+                    .collect();
+                for metric in [Metric::L2, Metric::Ip, Metric::Cosine] {
+                    let queries: [Query; BATCH] =
+                        std::array::from_fn(|i| Query::new(metric, qs[i]));
+                    let mut got = vec![[0.0; BATCH]; rows.len()];
+                    let mut want = vec![[0.0; BATCH]; rows.len()];
+                    // SAFETY: 用例开头已确认 CPU 支持 AVX2。
+                    unsafe {
+                        if metric == Metric::L2 {
+                            avx2::diff_sq_tile(&queries, &rows, &mut got);
+                        } else {
+                            avx2::product_tile(&queries, &rows, &mut got);
+                        }
+                    }
+                    // 基线副本：累加函数体以 SSE2 编译（不经分派）。
+                    if metric == Metric::L2 {
+                        tile_body(
+                            &queries,
+                            &rows,
+                            &mut want,
+                            diff_sq_lanes_batch_body,
+                            diff_sq,
+                        );
+                    } else {
+                        tile_body(
+                            &queries,
+                            &rows,
+                            &mut want,
+                            product_lanes_batch_body,
+                            product,
+                        );
+                    }
+                    for (r, (g, w)) in got.iter().zip(&want).enumerate() {
+                        for i in 0..BATCH {
+                            let case = format!("{case} {metric:?} row={r} q={i}");
+                            if w[i].is_nan() {
+                                assert!(g[i].is_nan(), "{case}");
+                            } else {
+                                assert_eq!(g[i].to_bits(), w[i].to_bits(), "{case}");
+                            }
+                        }
+                    }
                 }
             }
         }
