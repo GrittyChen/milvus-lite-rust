@@ -8,7 +8,7 @@
 
 - **pymilvus 代码不用改**：与官方相同的 `milvus_lite` 模块和 `milvus-lite` 命令，支持 pymilvus 2.6 与 3.0；对外行为以官方 3.x 为准，差异逐项登记。
 - **与官方 3.x 的数据目录双向互通**：沿用 3.x 的文件格式，两边可以交替打开同一个目录。
-- **更快、更省内存**：服务端不受 GIL 与 Python 解释器开销限制，与 2.5.1、3.x 的同机对照见[性能](https://github.com/GrittyChen/milvus-lite-rust/blob/main/docs/usage.md#性能)。
+- **更快**：服务端不受 GIL 与 Python 解释器开销限制；与 2.5.1、3.x 的同机对照（含内存，以及建 HNSW 与大批量写入时内存高于 2.5.1 的情形）见[性能](https://github.com/GrittyChen/milvus-lite-rust/blob/main/docs/usage.md#性能)与[已知限制](https://github.com/GrittyChen/milvus-lite-rust/blob/main/docs/compatibility.md#已知限制)。
 - **只依赖 Rust**：不需要 FAISS、CMake 或系统 protoc。
 
 ## 安装
@@ -23,17 +23,17 @@ python -m pip uninstall milvus-lite
 
 ```bash
 python -m pip install pymilvus
-python -m pip install --no-index --only-binary :all: --find-links https://github.com/GrittyChen/milvus-lite-rust/releases/expanded_assets/v0.7.0rc1 milvus-lite-rust==0.7.0rc1
+python -m pip install --no-index --only-binary :all: --find-links https://github.com/GrittyChen/milvus-lite-rust/releases/expanded_assets/v0.8.0rc1 milvus-lite-rust==0.8.0rc1
 ```
 
-可选：从 [v0.7.0rc1 Release](https://github.com/GrittyChen/milvus-lite-rust/releases/tag/v0.7.0rc1) 下载本平台的 wheel 与 `SHA256SUMS`，核对哈希后安装；再用 GitHub CLI 核对构建来源证明（依次为 Linux x86_64、Linux arm64、macOS arm64、macOS x86_64）：
+可选：从 [v0.8.0rc1 Release](https://github.com/GrittyChen/milvus-lite-rust/releases/tag/v0.8.0rc1) 下载本平台的 wheel 与 `SHA256SUMS`，核对哈希后安装；再用 GitHub CLI 核对构建来源证明（依次为 Linux x86_64、Linux arm64、macOS arm64、macOS x86_64）：
 
 ```bash
-shasum -a 256 -c --ignore-missing SHA256SUMS && python -m pip install --no-index ./milvus_lite_rust-0.7.0rc1-*.whl
-gh attestation verify milvus_lite_rust-0.7.0rc1-cp310-abi3-manylinux_2_28_x86_64.whl --repo GrittyChen/milvus-lite-rust --signer-workflow GrittyChen/milvus-lite-rust/.github/workflows/release.yml
-gh attestation verify milvus_lite_rust-0.7.0rc1-cp310-abi3-manylinux_2_28_aarch64.whl --repo GrittyChen/milvus-lite-rust --signer-workflow GrittyChen/milvus-lite-rust/.github/workflows/release.yml
-gh attestation verify milvus_lite_rust-0.7.0rc1-cp310-abi3-macosx_11_0_arm64.whl --repo GrittyChen/milvus-lite-rust --signer-workflow GrittyChen/milvus-lite-rust/.github/workflows/release.yml
-gh attestation verify milvus_lite_rust-0.7.0rc1-cp310-abi3-macosx_11_0_x86_64.whl --repo GrittyChen/milvus-lite-rust --signer-workflow GrittyChen/milvus-lite-rust/.github/workflows/release.yml
+shasum -a 256 -c --ignore-missing SHA256SUMS && python -m pip install --no-index ./milvus_lite_rust-0.8.0rc1-*.whl
+gh attestation verify milvus_lite_rust-0.8.0rc1-cp310-abi3-manylinux_2_28_x86_64.whl --repo GrittyChen/milvus-lite-rust --signer-workflow GrittyChen/milvus-lite-rust/.github/workflows/release.yml
+gh attestation verify milvus_lite_rust-0.8.0rc1-cp310-abi3-manylinux_2_28_aarch64.whl --repo GrittyChen/milvus-lite-rust --signer-workflow GrittyChen/milvus-lite-rust/.github/workflows/release.yml
+gh attestation verify milvus_lite_rust-0.8.0rc1-cp310-abi3-macosx_11_0_arm64.whl --repo GrittyChen/milvus-lite-rust --signer-workflow GrittyChen/milvus-lite-rust/.github/workflows/release.yml
+gh attestation verify milvus_lite_rust-0.8.0rc1-cp310-abi3-macosx_11_0_x86_64.whl --repo GrittyChen/milvus-lite-rust --signer-workflow GrittyChen/milvus-lite-rust/.github/workflows/release.yml
 ```
 
 ## 快速上手

@@ -103,6 +103,7 @@ milvus-lite dump --uri http://127.0.0.1:19530 -c docs -p ./dump
 - **Linux（glibc）**：后台维护每轮结束后调用 `malloc_trim`，把 flush、合并与打开集合释放的空闲内存交还系统，作用于整个进程（[测量与代价](testing/allocator-retention.md)）。
 - **macOS**：系统分配器会把已释放的内存块留作缓存，实测 flush 后比重开后多约 300 MiB（10 万与 100 万行），本实现无法在进程内关闭。需要时可在启动 Python 之前设置环境变量 `MallocLargeCache=0`，它作用于整个进程，对其他代码的性能影响未测。
 - **写入峰值**：大批量写入时，进程内存的峰值出现在自动 flush 期间，百万行时约 1229–1309 MiB，高于 2.5.1 的约 940 MiB（[测量](testing/parquet-row-group-memory.md)）。
+- **HNSW**：建了 HNSW 时，图常驻内存，百万行服务端内存比本实现 FLAT 多约 130 MB，按基准口径比 2.5.1 的 FLAT 高约 7%–18%（[已知限制](compatibility.md#已知限制)）。
 - 反复 upsert / delete 的负载下，被覆盖的旧版本行要等合并回收，内存随写删次数增长；同样负载下本实现的增长慢于 2.5.1 与 3.x（[测量](decisions/0040-reclaim-superseded-rows.md#搁置理由)）。
 - 性能结论只适用于各自记录中的测量场景，不保证任意负载都优于官方 2.5.1。
 

@@ -86,10 +86,12 @@
 ## 已知限制
 
 - **写入峰值内存**：大批量写入时进程内存峰值高于 2.5.1，见[使用说明](usage.md#后台维护与内存)。
+- **HNSW 的内存**：建了 HNSW 时，百万行服务端内存比 2.5.1 的 FLAT 高约 7%–18%（按 [0041 的基准口径](testing/0041-hnsw-performance.md)；另一测量口径下 2.5.1 自身的读数高约三分之一，两者的大小关系因此取决于口径，差异原因未查明）。
 - **JSON 写入优化**：收益限于 [0018 已审的同机工况](testing/0018-json-write-acceptance.md)，不外推为任意 JSON、并发吞吐或全部写入路径。
 - **稀疏检索**：nq 较大时仍慢于 2.5.1（nq=32 约慢 27%），单条查询与过滤检索追平或更快（[0030 验收](decisions/0030-sparse-vectors.md#验收)）。
 - **批量检索**：性能结论只在原生 x86_64 服务器上测得，aarch64 与 macOS 没有同等测量（[批量检索记录](testing/batch-search-performance.md)）。
 - **停服路径的一次段错误**：持续集成中出现过一次，此后的定向压力与运行都没有再现，根因未查明，按显式风险接受处理，见各版本发行说明。
+- **fork 的使用限制**：在已运行服务的进程中 fork 时，若父进程恰有线程在内部锁上等待（如并发请求争用同一集合），子进程为另一路径启停服务时仍可能挂起或崩溃；建议在没有在途调用时 fork，或改用 spawn / forkserver，见 [0003「fork」](decisions/0003-in-process-server-lifecycle.md#fork)。
 - **SDK 的端点 schema 缓存**：同一进程中显式释放后复用端口，或 CLI 在固定端口更换数据目录重启，可能使 SDK 沿用旧 schema；3.x 上同样存在。
 - **dump 的限制**：见[使用说明](usage.md#导出-dump)。
 - **Windows**：不支持，构建时拒绝。
@@ -108,5 +110,6 @@
 | `text_match` 分析器属性、稀疏向量、BM25 function、多向量字段 | 0.5.0rc1 | 明确拒绝（UNIMPLEMENTED） | 保留 |
 | GEOMETRY 字段 | 0.6.0rc1 | 明确拒绝（UNIMPLEMENTED） | 保留 |
 | jieba 分词器、nullable 稠密向量字段 | 0.7.0rc1 | load 时明确返回 UNIMPLEMENTED，可以 drop；升级回来后照常可用 | 保留 |
+| HNSW 图文件（`.mlrs`） | 0.8.0rc1 | HNSW 字段按 FLAT 精确检索，图文件原样保留、不读取；旧版合并后，被合并段的图成为孤儿，升级回来时清理并在后台重建，其余图直接读入 | 保留 |
 
 各版本实测的降级边界见对应的[发行说明](releases/)。
