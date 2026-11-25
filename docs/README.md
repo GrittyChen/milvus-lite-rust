@@ -70,6 +70,7 @@
 | 0.5.0rc1 | [说明](releases/0.5.0rc1.md) | [方案](releases/0.5.0rc1-candidate-plan.md) | [验收](testing/0.5.0rc1-acceptance.md) |
 | 0.6.0rc1 | [说明](releases/0.6.0rc1.md) | [方案](releases/0.6.0rc1-candidate-plan.md) | [验收](testing/0.6.0rc1-acceptance.md) |
 | 0.7.0rc1 | [说明](releases/0.7.0rc1.md) | [方案](releases/0.7.0rc1-candidate-plan.md) | [验收](testing/0.7.0rc1-acceptance.md) |
+| 0.8.0rc1 | [说明](releases/0.8.0rc1.md) | [方案](releases/0.8.0rc1-candidate-plan.md) | [验收](testing/0.8.0rc1-acceptance.md) |
 
 发行流程的命令（流程与前提以 [0021](decisions/0021-release-build-in-ci.md) 为准）：
 
