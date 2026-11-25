@@ -6529,6 +6529,10 @@ mod tests {
         use std::time::Duration;
 
         const ROWS: usize = crate::graph_build::MIN_GRAPH_ROWS;
+        /// 等后台建图的上限只用来发现挂起，不是性能断言。debug 构建的建图很慢：4 核机器上只有 1 个建图线程，
+        /// 又与其他用例并行，依次建出的 2 万至 4 万行合并段加上被合并段上白做的构建，一次等待可达两分钟以上。
+        /// 小于 CI `rust` job 的 20 分钟时限，真挂起时先在这里报出诊断信息。
+        const BUILD_WAIT: Duration = Duration::from_secs(600);
 
         fn hnsw_collection(db: &Db) -> CollectionHandle {
             db.create_collection("", "c", basic_schema()).unwrap();
@@ -6562,7 +6566,7 @@ mod tests {
             db.flush_collection("", "c").unwrap();
             let handle = db.collection("", "c").unwrap();
             db.schedule_graphs(&handle);
-            db.wait_graph_builds(Duration::from_secs(120)).unwrap();
+            db.wait_graph_builds(BUILD_WAIT).unwrap();
             handle
         }
 
@@ -6606,7 +6610,7 @@ mod tests {
             db.load_collection(&handle).unwrap();
             // 读入在 load 内同步完成，不等后台构建。
             assert_eq!(handle.read().graph_count(), 1);
-            db.wait_graph_builds(Duration::from_secs(120)).unwrap();
+            db.wait_graph_builds(BUILD_WAIT).unwrap();
             assert_eq!(std::fs::read(&path).unwrap(), bytes, "not rebuilt");
             db.close();
         }
@@ -6631,7 +6635,7 @@ mod tests {
             handle.write().release();
             db.load_collection(&handle).unwrap();
             assert_eq!(handle.read().graph_count(), 0, "invalid file is not used");
-            db.wait_graph_builds(Duration::from_secs(120)).unwrap();
+            db.wait_graph_builds(BUILD_WAIT).unwrap();
             assert_eq!(handle.read().graph_count(), 1);
             // 同一段、同一种子：重建结果与原文件逐字节相同。
             assert_eq!(std::fs::read(&path).unwrap(), good);
@@ -6717,7 +6721,7 @@ mod tests {
             db.flush_collection("", "c").unwrap();
             let handle = db.collection("", "c").unwrap();
             db.schedule_graphs(&handle);
-            db.wait_graph_builds(Duration::from_secs(30)).unwrap();
+            db.wait_graph_builds(BUILD_WAIT).unwrap();
             assert_eq!(handle.read().graph_count(), 0);
             db.close();
         }
@@ -6917,7 +6921,7 @@ mod tests {
             std::fs::remove_file(graph_file(root)).unwrap();
             let (paused, resume) = pause_next_publish(root);
             db.load_collection(handle).unwrap();
-            paused.recv_timeout(Duration::from_secs(120)).unwrap();
+            paused.recv_timeout(BUILD_WAIT).unwrap();
             resume
         }
 
@@ -6930,7 +6934,7 @@ mod tests {
             handle.write().release();
             db.drop_index("", "c", "v", "").unwrap();
             resume.send(()).unwrap();
-            db.wait_graph_builds(Duration::from_secs(60)).unwrap();
+            db.wait_graph_builds(BUILD_WAIT).unwrap();
             assert_eq!(handle.read().graph_count(), 0);
             assert!(
                 !indexes(root.path()).iter().any(|n| n.contains(".mlrs")),
@@ -6948,7 +6952,7 @@ mod tests {
             let resume = rebuild_paused(&db, root.path(), &handle);
             handle.write().release();
             resume.send(()).unwrap();
-            db.wait_graph_builds(Duration::from_secs(60)).unwrap();
+            db.wait_graph_builds(BUILD_WAIT).unwrap();
             assert_eq!(handle.read().graph_count(), 0);
             assert!(
                 !indexes(root.path()).iter().any(|n| n.contains(".mlrs")),
@@ -6986,7 +6990,7 @@ mod tests {
                 resume.send(()).unwrap();
                 worker.join().unwrap().unwrap();
                 assert!(tasks.iter().all(|t| t.cancelled()), "{op}");
-                db.wait_graph_builds(Duration::from_secs(60)).unwrap();
+                db.wait_graph_builds(BUILD_WAIT).unwrap();
                 match op {
                     "drop" => assert!(!root.path().join("collections/c").exists()),
                     "truncate" => {
@@ -7020,7 +7024,7 @@ mod tests {
             std::fs::remove_file(graph_file(root.path())).unwrap();
             *db.write_gate.write() = true;
             db.load_collection(&handle).unwrap();
-            db.wait_graph_builds(Duration::from_secs(120)).unwrap();
+            db.wait_graph_builds(BUILD_WAIT).unwrap();
             assert_eq!(handle.read().graph_count(), 1);
             assert!(!indexes(root.path()).iter().any(|n| n.contains(".mlrs")));
             *db.write_gate.write() = false;
@@ -7054,10 +7058,10 @@ mod tests {
                 db.flush_collection("", "c").unwrap();
             }
             let data_dir = root.path().join("collections/c/partitions/_default/data");
-            let deadline = std::time::Instant::now() + Duration::from_secs(300);
+            let deadline = std::time::Instant::now() + BUILD_WAIT;
             loop {
                 db.schedule_graphs(&handle);
-                db.wait_graph_builds(Duration::from_secs(120)).unwrap();
+                db.wait_graph_builds(BUILD_WAIT).unwrap();
                 let data: Vec<String> = std::fs::read_dir(&data_dir)
                     .unwrap()
                     .map(|e| e.unwrap().file_name().into_string().unwrap())
