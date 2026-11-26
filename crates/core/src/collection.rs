@@ -2193,6 +2193,32 @@ fn filter_source(chunks: &mut [Chunk], predicate: &crate::filter::Predicate) -> 
         }
         return Ok(());
     }
+    // 按块结果全部成功才采用；任何一块求值失败都整体回到整源路径，报错按源的遍历顺序与 3.x 一致。
+    // 没有存活行的块不求值，与整源路径在源内没有存活行时不求值相同。按块对块内全部行求值、整源只处理
+    // 存活行：服务器实测每行约 51 ns 对每个存活行约 87 ns，存活不足一半时（删除多、尚未合并）走整源路径。
+    let (live, rows) = chunks.iter().fold((0, 0), |(live, rows), chunk| {
+        (live + chunk.live.count_live(), rows + chunk.live.len)
+    });
+    let chunked: Option<Vec<SourceBits>> = (live * 2 >= rows)
+        .then(|| {
+            chunks
+                .iter()
+                .map(|chunk| {
+                    if chunk.live.any_live() {
+                        predicate.evaluate_chunk(&chunk.columns, &chunk.live)
+                    } else {
+                        Some(chunk.live.clone())
+                    }
+                })
+                .collect()
+        })
+        .flatten();
+    if let Some(masks) = chunked {
+        for (chunk, mask) in chunks.iter_mut().zip(masks) {
+            chunk.live = mask;
+        }
+        return Ok(());
+    }
     let locations = ordered_live_rows(chunks);
     let matching = {
         let rows = dynamic_rows(chunks, &locations);
@@ -8478,6 +8504,85 @@ mod tests {
                     .collect()
             })
             .collect()
+    }
+
+    /// 布尔树的按块求值（`filter_source`）：同源多块中只要一块出错就整体回到整源路径，报错与整源遍历顺序下
+    /// 的第一个越界值相同，不会只报某一块、也不会把其余块的部分结果当作成功；越界值只在已删除的行上时成功。
+    #[test]
+    fn chunked_filter_falls_back_to_source_order_when_any_chunk_fails() {
+        let schema = CollectionSchema {
+            functions: Vec::new(),
+            fields: vec![
+                FieldSchema {
+                    is_primary: true,
+                    ..FieldSchema::new("id", DataType::Int64)
+                },
+                FieldSchema {
+                    dim: Some(1),
+                    ..FieldSchema::new("v", DataType::FloatVector)
+                },
+                FieldSchema::new("age", DataType::Int64),
+            ],
+            enable_dynamic_field: false,
+            properties: Vec::new(),
+        };
+        // 2^53 + 1 与 2^53 + 3 都不能精确转成 double，与浮点字面量比较时报出该值。
+        let build = |batches: &[&[(i64, i64)]]| {
+            let mut c = Collection::new("c", schema.clone()).unwrap();
+            for rows in batches {
+                c.insert(InsertBatch {
+                    num_rows: rows.len(),
+                    columns: vec![
+                        (
+                            "id".to_owned(),
+                            InputValues::Int(rows.iter().map(|r| r.0).collect()),
+                        ),
+                        (
+                            "v".to_owned(),
+                            InputValues::FloatVector {
+                                dim: 1,
+                                values: vec![0.0; rows.len()],
+                            },
+                        ),
+                        (
+                            "age".to_owned(),
+                            InputValues::Int(rows.iter().map(|r| r.1).collect()),
+                        ),
+                    ],
+                })
+                .unwrap();
+            }
+            c
+        };
+        let first: &[(i64, i64)] = &[(1, 1), (2, 9_007_199_254_740_995), (3, 3)];
+        let second: &[(i64, i64)] = &[(4, 4), (5, 9_007_199_254_740_993), (6, 6)];
+        let expr = "age > 0.5 or age == 1";
+        let split = build(&[first, second])
+            .read_snapshot()
+            .query(expr, &[], None, 0)
+            .unwrap_err();
+        let whole = build(&[&[first, second].concat()])
+            .read_snapshot()
+            .query(expr, &[], None, 0)
+            .unwrap_err();
+        assert_eq!(split.to_string(), whole.to_string());
+        assert!(split.to_string().contains("9007199254740995"), "{split}");
+        // 越界值只在第二块：第一块单独成功，结果仍是整源的报错。
+        let late = build(&[&[(1, 1), (3, 3)], second])
+            .read_snapshot()
+            .query(expr, &[], None, 0)
+            .unwrap_err();
+        assert!(late.to_string().contains("9007199254740993"), "{late}");
+        let mut dead = build(&[first, second]);
+        dead.delete_from_db(&[Pk::Int64(2), Pk::Int64(5)]).unwrap();
+        assert_eq!(
+            dead.read_snapshot()
+                .query(expr, &[], None, 0)
+                .unwrap()
+                .rows
+                .pks,
+            [Pk::Int64(1), Pk::Int64(3), Pk::Int64(4), Pk::Int64(6)]
+        );
     }
 
     /// Query 有 limit 时的快路径：`presorted` 成立的块序下，按收集顺序取前 end 条与原先「稳定排序再截断」

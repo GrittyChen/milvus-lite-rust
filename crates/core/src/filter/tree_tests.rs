@@ -8,8 +8,53 @@ use crate::schema::{CollectionSchema, DataType, FieldSchema};
 use crate::storage::visibility::SourceBits;
 use serde_json::Value;
 
+/// 按块入口（`Predicate::evaluate_chunk`）与整源路径的一致性：对这批行的每个存活子集，按块求值成功时，整源
+/// 路径在同样只有这些行存活的源上也必须成功，且逐行结果相同；死行一律不命中。返回按块求值成功的子集数。
+fn chunk_entry_agrees(
+    predicate: &Predicate,
+    columns: &[ColumnData],
+    rows: &[DynamicRow<'_>],
+    expr: &str,
+) -> usize {
+    let n = rows.len();
+    let mut agreed = 0;
+    for subset in 1_u32..(1 << n) {
+        let live: Vec<bool> = (0..n).map(|row| subset >> row & 1 == 1).collect();
+        let Some(chunk) = predicate.evaluate_chunk(columns, &SourceBits::from_live(&live)) else {
+            continue;
+        };
+        let alive: Vec<_> = rows
+            .iter()
+            .zip(&live)
+            .filter(|(_, live)| **live)
+            .map(|(row, _)| DynamicRow {
+                columns: row.columns,
+                meta: row.meta,
+                row: row.row,
+                sequence: row.sequence,
+            })
+            .collect();
+        let source = predicate
+            .evaluate_source_rows(&alive)
+            .unwrap_or_else(|error| {
+                panic!("{expr}: chunk ok, source failed: {error}; live={live:?}")
+            });
+        let mut next = 0;
+        for (row, &is_live) in live.iter().enumerate() {
+            let expected = is_live && {
+                next += 1;
+                source.get(next - 1)
+            };
+            assert_eq!(chunk.get(row), expected, "{expr}: row {row}, live={live:?}");
+        }
+        agreed += 1;
+    }
+    agreed
+}
+
 #[test]
 fn nullable_typed_columns_match_reference_all_routes() {
+    let mut chunked = 0_usize;
     let fixture: Value = crate::json_text::value_str(include_str!(
         "../../tests/fixtures/nullable_filter_v321.json"
     ))
@@ -149,6 +194,7 @@ fn nullable_typed_columns_match_reference_all_routes() {
             });
             phase = "evaluate";
             if predicate.requires_source_rows() {
+                chunked += chunk_entry_agrees(&predicate, &columns, &rows, expr);
                 predicate.evaluate_source_rows(&rows)
             } else {
                 predicate.evaluate(&columns, &SourceBits::from_live(&[true; 4]))
@@ -186,10 +232,13 @@ fn nullable_typed_columns_match_reference_all_routes() {
         failures.len(),
         failures.join("\n")
     );
+    eprintln!("chunk entry agreed on {chunked} live subsets");
+    assert!(chunked > 0, "chunk entry never taken");
 }
 
 #[test]
 fn all_routes_match_reference_tree_corpus() {
+    let mut chunked = 0_usize;
     let fixture: Value =
         crate::json_text::value_str(include_str!("../../tests/fixtures/filter_tree.json")).unwrap();
     let types = |name: &str| match name {
@@ -317,6 +366,7 @@ fn all_routes_match_reference_tree_corpus() {
             });
             phase = "evaluate";
             if predicate.requires_source_rows() {
+                chunked += chunk_entry_agrees(&predicate, &columns, &rows, expr);
                 predicate.evaluate_source_rows(&rows)
             } else {
                 predicate.evaluate(&columns, &SourceBits::from_live(&[true; 4]))
@@ -357,10 +407,13 @@ fn all_routes_match_reference_tree_corpus() {
         failures.len(),
         failures.join("\n")
     );
+    eprintln!("chunk entry agreed on {chunked} live subsets");
+    assert!(chunked > 0, "chunk entry never taken");
 }
 
 #[test]
 fn array_columns_match_reference_routes_and_masks() {
+    let mut chunked = 0_usize;
     let fixture: Value =
         crate::json_text::value_str(include_str!("../../tests/fixtures/array_v321.json")).unwrap();
     let mut failures = Vec::new();
@@ -458,6 +511,7 @@ fn array_columns_match_reference_routes_and_masks() {
             });
             phase = "evaluate";
             if bound.requires_source_rows() {
+                chunked += chunk_entry_agrees(&bound, &columns, &rows, expr);
                 bound.evaluate_source_rows(&rows)
             } else {
                 bound.evaluate(&columns, &SourceBits::from_live(&[true; 4]))
@@ -491,12 +545,15 @@ fn array_columns_match_reference_routes_and_masks() {
         failures.len(),
         failures.join("\n")
     );
+    eprintln!("chunk entry agreed on {chunked} live subsets");
+    assert!(chunked > 0, "chunk entry never taken");
 }
 
 /// 0032：算术的组件真值（[generate_filter_arith_fixtures.py](../../../tests/differential/generate_filter_arith_fixtures.py)）。
 /// 三条路线逐条对照；3.x 的 MemoryError 对应本实现的资源错误（登记的差异）。
 #[test]
 fn arithmetic_matches_reference_corpus() {
+    let mut chunked = 0_usize;
     let fixture: Value =
         crate::json_text::value_str(include_str!("../../tests/fixtures/filter_arith.json"))
             .unwrap();
@@ -654,6 +711,7 @@ fn arithmetic_matches_reference_corpus() {
             let predicate = Predicate::from_parsed(&parsed, &schema)?;
             phase = "evaluate";
             if predicate.requires_source_rows() {
+                chunked += chunk_entry_agrees(&predicate, &columns, &rows, expr);
                 predicate.evaluate_source_rows(&rows)
             } else {
                 predicate.evaluate(&columns, &SourceBits::from_live(&[true; 4]))
@@ -695,6 +753,8 @@ fn arithmetic_matches_reference_corpus() {
         failures.len(),
         failures.join("\n")
     );
+    eprintln!("chunk entry agreed on {chunked} live subsets");
+    assert!(chunked > 0, "chunk entry never taken");
 }
 
 /// null 槽里可以是任意值（3.x 或其他写入方写出的数据目录）。Arrow 的隐式整数转浮点只检查有效槽，
@@ -1058,5 +1118,370 @@ fn python_arithmetic_edge_values() {
     assert_eq!(
         run("x + x == x * 2", &list, limits(need - 1)),
         Err(format!("filter value exceeds the {}-byte limit", need - 1))
+    );
+}
+
+/// 按块入口只接列式路线、只引用 schema 中非 JSON 列的树：动态字段要按整个源推断类型，JSON 列在整源路径里
+/// 先转成文本、按块时却是原始字节，二者都不能逐块求值。
+#[test]
+fn only_columnar_trees_over_schema_columns_are_chunk_local() {
+    let mut id = FieldSchema::new("id", DataType::Int64);
+    id.is_primary = true;
+    let mut vector = FieldSchema::new("vector", DataType::FloatVector);
+    vector.dim = Some(2);
+    let mut name = FieldSchema::new("name", DataType::VarChar);
+    name.max_length = Some(16);
+    let schema = CollectionSchema {
+        functions: Vec::new(),
+        fields: vec![
+            id,
+            vector,
+            FieldSchema::new("age", DataType::Int64),
+            name,
+            FieldSchema::new("j", DataType::Json),
+        ],
+        enable_dynamic_field: true,
+        properties: vec![],
+    };
+    let local = |expr: &str| {
+        let predicate =
+            Predicate::from_parsed(&ParsedFilter::parse(expr).unwrap(), &schema).unwrap();
+        predicate.tree.as_ref().is_some_and(|tree| tree.chunk_local)
+    };
+    for expr in [
+        "age < 3 or name == \"a\"",
+        "age in [1, 2, 3]",
+        "name like \"a%\"",
+        "age * 3 > 10",
+        "not (age < 3)",
+        "age is null",
+    ] {
+        assert!(local(expr), "{expr}");
+    }
+    for expr in [
+        "age < 3",
+        "j == \"a\"",
+        "j is null",
+        "dyn > 1 or age < 3",
+        "$meta[\"k\"] > 1 or age < 3",
+        "j[\"k\"] > 1",
+        "array_length(j) > 0",
+    ] {
+        assert!(!local(expr), "{expr}");
+    }
+}
+
+/// 同源多块上的按块入口：随机布尔树（比较、算术含除法、in / not in、like、is null、时间戳与区间，and / or /
+/// not 嵌套）配 3 个块（0 / 1 / 5 / 64 / 70 行、随机存活位图、可空列），数据含各整数宽度的极值、±2^53 附近、
+/// float32 / double 的 NaN、inf、-0 与时间戳极值。各块都成功时，整源路径在同一批存活行上必须成功且逐行相同；
+/// 任何一块失败都回到整源路径，不在此比较。
+#[test]
+fn chunk_entry_matches_source_rows_on_random_multi_chunk_sources() {
+    struct Rng(u64);
+    impl Rng {
+        fn below(&mut self, n: u64) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0 % n
+        }
+        fn pick<'a, T>(&mut self, xs: &'a [T]) -> &'a T {
+            &xs[self.below(xs.len() as u64) as usize]
+        }
+    }
+    const NUMS: [&str; 6] = ["a", "b", "c", "d", "f", "g"];
+    const INTS: [&str; 15] = [
+        "0",
+        "1",
+        "-1",
+        "2",
+        "127",
+        "128",
+        "-129",
+        "32768",
+        "2147483648",
+        "16777216",
+        "16777217",
+        "9007199254740992",
+        "9007199254740993",
+        "9223372036854775807",
+        "5",
+    ];
+    const FLOATS: [&str; 9] = [
+        "0.5",
+        "1.0",
+        "-2.5",
+        "1e300",
+        "16777217.0",
+        "3.0",
+        "127.0",
+        "128.0",
+        "9007199254740993.0",
+    ];
+    fn num(rng: &mut Rng, depth: u32) -> String {
+        match rng.below(if depth == 0 { 3 } else { 5 }) {
+            0 => rng.pick(&NUMS).to_string(),
+            1 => rng.pick(&INTS).to_string(),
+            2 => rng.pick(&FLOATS).to_string(),
+            _ => {
+                let op = rng.pick(&["+", "-", "*", "/"]).to_string();
+                format!("({} {op} {})", num(rng, depth - 1), num(rng, depth - 1))
+            }
+        }
+    }
+    fn boolean(rng: &mut Rng, depth: u32) -> String {
+        match rng.below(if depth == 0 { 8 } else { 11 }) {
+            0..=2 => {
+                let op = rng.pick(&["==", "!=", "<", "<=", ">", ">="]).to_string();
+                format!("{} {op} {}", num(rng, 2), num(rng, 2))
+            }
+            3 => {
+                let field = rng.pick(&NUMS).to_string();
+                let list: Vec<String> = (0..1 + rng.below(3))
+                    .map(|_| {
+                        if rng.below(3) == 0 {
+                            rng.pick(&FLOATS).to_string()
+                        } else {
+                            rng.pick(&INTS).to_string()
+                        }
+                    })
+                    .collect();
+                let op = rng.pick(&["in", "not in"]).to_string();
+                format!("{field} {op} [{}]", list.join(", "))
+            }
+            4 => {
+                let field = rng.pick(&["a", "d", "f", "s", "ts", "flag"]).to_string();
+                format!("{field} is {}null", rng.pick(&["", "not "]))
+            }
+            5 => format!("s like \"{}\"", rng.pick(&["n1%", "%3", "n_", "%"])),
+            6 => format!(
+                "ts {} ISO '{}'",
+                rng.pick(&[">", "<", "=="]),
+                rng.pick(&["2020-01-01T00:00:00Z", "2025-01-01T00:00:00Z"])
+            ),
+            7 => format!(
+                "ts {} INTERVAL 'P1D' {} ISO '2025-01-01T00:00:00Z'",
+                rng.pick(&["+", "-"]),
+                rng.pick(&[">", "<"])
+            ),
+            8 => format!(
+                "({} and {})",
+                boolean(rng, depth - 1),
+                boolean(rng, depth - 1)
+            ),
+            9 => format!(
+                "({} or {})",
+                boolean(rng, depth - 1),
+                boolean(rng, depth - 1)
+            ),
+            _ => format!("not ({})", boolean(rng, depth - 1)),
+        }
+    }
+    let nullable = |name: &str, data_type: DataType| FieldSchema {
+        nullable: true,
+        ..FieldSchema::new(name, data_type)
+    };
+    let mut id = FieldSchema::new("id", DataType::Int64);
+    id.is_primary = true;
+    let mut vector = FieldSchema::new("vector", DataType::FloatVector);
+    vector.dim = Some(1);
+    let mut s = nullable("s", DataType::VarChar);
+    s.max_length = Some(16);
+    let schema = CollectionSchema {
+        functions: Vec::new(),
+        fields: vec![
+            id,
+            vector,
+            nullable("a", DataType::Int8),
+            nullable("b", DataType::Int16),
+            nullable("c", DataType::Int32),
+            nullable("d", DataType::Int64),
+            nullable("f", DataType::Float),
+            nullable("g", DataType::Double),
+            nullable("flag", DataType::Bool),
+            s,
+            nullable("ts", DataType::Timestamptz),
+        ],
+        enable_dynamic_field: false,
+        properties: vec![],
+    };
+    let mut rng = Rng(0x2545_f491_4f6c_dd1d);
+    let (mut agreed, mut failed) = (0, 0);
+    for round in 0..20_000 {
+        let expr = boolean(&mut rng, 2);
+        let Ok(parsed) = ParsedFilter::parse(&expr) else {
+            continue;
+        };
+        let Ok(predicate) = Predicate::from_parsed(&parsed, &schema) else {
+            continue;
+        };
+        if !predicate.requires_source_rows() {
+            continue;
+        }
+        let mut tables = Vec::new();
+        let mut lives = Vec::new();
+        for _ in 0..3 {
+            let n = *rng.pick(&[0_usize, 1, 5, 64, 70]);
+            let valid = |rng: &mut Rng| (0..n).map(|_| rng.below(5) != 0).collect::<Vec<_>>();
+            let column = |values: ColumnData, rng: &mut Rng| values.with_validity(&valid(rng));
+            let a = ColumnData::Int8(
+                (0..n)
+                    .map(|_| *rng.pick(&[i8::MIN, -1, 0, 1, 127, 5]))
+                    .collect(),
+            );
+            let b = ColumnData::Int16(
+                (0..n)
+                    .map(|_| *rng.pick(&[i16::MIN, -1, 0, 1, i16::MAX, 5]))
+                    .collect(),
+            );
+            let c = ColumnData::Int32(
+                (0..n)
+                    .map(|_| *rng.pick(&[i32::MIN, -1, 0, 1, i32::MAX, 5, 16_777_217]))
+                    .collect(),
+            );
+            let d = ColumnData::Int64(
+                (0..n)
+                    .map(|_| {
+                        *rng.pick(&[
+                            i64::MIN,
+                            -1,
+                            0,
+                            1,
+                            i64::MAX,
+                            5,
+                            9_007_199_254_740_993,
+                            9_007_199_254_740_992,
+                            -9_007_199_254_740_993,
+                        ])
+                    })
+                    .collect(),
+            );
+            let f = ColumnData::Float(
+                (0..n)
+                    .map(|_| {
+                        *rng.pick(&[
+                            0.0,
+                            -0.0,
+                            0.5,
+                            16_777_216.0,
+                            f32::NAN,
+                            f32::INFINITY,
+                            3.0,
+                            127.0,
+                            -2.5,
+                        ])
+                    })
+                    .collect(),
+            );
+            let g = ColumnData::Double(
+                (0..n)
+                    .map(|_| {
+                        *rng.pick(&[
+                            0.0,
+                            0.5,
+                            1e300,
+                            f64::NAN,
+                            f64::NEG_INFINITY,
+                            3.0,
+                            128.0,
+                            9_007_199_254_740_992.0,
+                        ])
+                    })
+                    .collect(),
+            );
+            let flag = ColumnData::Bool((0..n).map(|_| rng.below(2) == 0).collect());
+            let text = ColumnData::VarChar(
+                (0..n)
+                    .map(|_| rng.pick(&["n1", "n13", "n7", "", "n"]).to_string())
+                    .collect(),
+            );
+            let ts = ColumnData::Int64(
+                (0..n)
+                    .map(|_| {
+                        *rng.pick(&[
+                            0,
+                            1_577_836_800_000_000,
+                            1_735_689_600_000_000,
+                            i64::MAX,
+                            i64::MIN,
+                        ])
+                    })
+                    .collect(),
+            );
+            let columns = vec![
+                ColumnData::Int64((0..n as i64).collect()),
+                ColumnData::FloatVector {
+                    dim: 1,
+                    values: vec![0.0; n],
+                },
+                column(a, &mut rng),
+                column(b, &mut rng),
+                column(c, &mut rng),
+                column(d, &mut rng),
+                column(f, &mut rng),
+                column(g, &mut rng),
+                column(flag, &mut rng),
+                column(text, &mut rng),
+                column(ts, &mut rng),
+            ];
+            let density = rng.below(4);
+            lives.push(
+                (0..n)
+                    .map(|_| density == 3 || rng.below(4) < density)
+                    .collect::<Vec<_>>(),
+            );
+            tables.push(columns);
+        }
+        let rows: Vec<_> = tables
+            .iter()
+            .zip(&lives)
+            .flat_map(|(columns, live)| {
+                live.iter()
+                    .enumerate()
+                    .filter(|(_, live)| **live)
+                    .map(move |(row, _)| DynamicRow {
+                        columns,
+                        meta: None,
+                        row,
+                        sequence: Some(1),
+                    })
+            })
+            .collect();
+        let chunked: Option<Vec<SourceBits>> = tables
+            .iter()
+            .zip(&lives)
+            .map(|(columns, live)| {
+                let bits = SourceBits::from_live(live);
+                if bits.any_live() {
+                    predicate.evaluate_chunk(columns, &bits)
+                } else {
+                    Some(bits)
+                }
+            })
+            .collect();
+        let Some(chunked) = chunked else {
+            failed += 1;
+            continue;
+        };
+        let source = predicate
+            .evaluate_source_rows(&rows)
+            .unwrap_or_else(|error| {
+                panic!("round {round}: {expr}: chunks ok, source failed: {error}")
+            });
+        let mut next = 0;
+        for (mask, live) in chunked.iter().zip(&lives) {
+            for (row, &is_live) in live.iter().enumerate() {
+                let expected = is_live && {
+                    next += 1;
+                    source.get(next - 1)
+                };
+                assert_eq!(mask.get(row), expected, "round {round}: {expr}: row {row}");
+            }
+        }
+        agreed += 1;
+    }
+    assert!(
+        agreed > 5_000 && failed > 500,
+        "agreed={agreed} failed={failed}"
     );
 }

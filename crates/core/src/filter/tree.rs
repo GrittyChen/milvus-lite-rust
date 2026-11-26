@@ -28,6 +28,9 @@ pub(super) struct Tree {
     pub(super) geometries: Vec<Option<GeometryTest>>,
     /// 算术操作数中的整数字面量，编译期解析一次供 Python 路线各行共享（0032）。
     pub(super) integers: Vec<Option<super::python_num::Integer>>,
+    /// 列式路线、只引用 schema 中的非 JSON 列：每行结果只取决于本行的列值，可以逐块在原列上求值。
+    /// 动态字段要按整个源推断类型，JSON 列在整源路径里先转成文本，二者都不满足。
+    pub(super) chunk_local: bool,
 }
 
 /// 几何谓词编译期解析好的参数。3.x 每行重新解析字面量；解析是纯函数，结果与只解析一次相同。
@@ -480,7 +483,7 @@ impl Tree {
             }
         }
         let mut backend = Backend::Arrow;
-        let operands = ast
+        let operands: Vec<Option<Operand>> = ast
             .nodes
             .iter()
             .map(|node| match &node.kind {
@@ -561,11 +564,20 @@ impl Tree {
                 }
             }
         }
+        let chunk_local = backend == Backend::Arrow
+            && operands.iter().flatten().all(|operand| match operand {
+                Operand::Column(i) | Operand::Timestamp(i) => {
+                    schema.fields[*i].data_type != DataType::Json
+                }
+                Operand::Literal(_) => true,
+                Operand::Dynamic(_) | Operand::Absent => false,
+            });
         Ok(Self {
             ast,
             operands,
             names: schema.fields.iter().map(|f| f.name.clone()).collect(),
             backend,
+            chunk_local,
             patterns,
             text_queries,
             geometries,

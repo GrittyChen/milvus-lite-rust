@@ -694,13 +694,16 @@ fn in_list(
     Ok(booleans(values, all(n)))
 }
 
+/// `live` 只屏蔽叶子列的有效位：读值的内核都以有效位为门，`live` 之外的行的值不会被读到；但字面量、
+/// `in` / `not in`、`is null` 等节点在这些行上仍可能为真。调用方要么只传存活行（整源路径），要么自行与
+/// `live` 取交（按块路径）。
 fn evaluate(
     tree: &Tree,
     base: &[ColumnData],
     meta: &[Option<&serde_json::Map<String, serde_json::Value>>],
     n: usize,
+    live: &SourceBits,
 ) -> ColumnResult<SourceBits> {
-    let live = all(n);
     let mut keys = std::collections::BTreeSet::new();
     for operand in tree.operands.iter().flatten() {
         if let Operand::Dynamic(key) = operand {
@@ -716,7 +719,7 @@ fn evaluate(
         let Some(shape) = infer(&values).map_err(Failure::Fatal)? else {
             return Err(kernel("heterogeneous dynamic column"));
         };
-        let (data, valid) = materialize(meta, key, shape, &live).map_err(Failure::Fatal)?;
+        let (data, valid) = materialize(meta, key, shape, live).map_err(Failure::Fatal)?;
         bound.insert(
             *key,
             Column {
@@ -952,11 +955,11 @@ fn evaluate(
     let root = values[tree.ast.root]
         .as_ref()
         .ok_or_else(|| Failure::Fatal(EngineError::Storage("column route lost root".into())))?;
-    let mut matching = SourceBits::new(n);
-    for row in 0..n {
-        matching.set(row, root.valid(row) && root.boolean(row)?);
+    let mut matching = vec![false; n];
+    for (row, out) in matching.iter_mut().enumerate() {
+        *out = root.valid(row) && root.boolean(row)?;
     }
-    Ok(matching)
+    Ok(SourceBits::from_live(&matching))
 }
 pub(super) fn evaluate_rows(tree: &Tree, rows: &[DynamicRow<'_>]) -> Result<SourceBits> {
     // text_match 的字段只在逐行回退里读取，不必物化；按节点排除，同一列被别的节点引用时仍要保留。
@@ -985,13 +988,26 @@ pub(super) fn evaluate_rows(tree: &Tree, rows: &[DynamicRow<'_>]) -> Result<Sour
         .collect();
     let columns = super::dynamic::source_columns(rows, &referenced, true)?;
     let meta: Vec<_> = rows.iter().map(|row| row.meta).collect();
-    match evaluate(tree, &columns, &meta, rows.len()) {
+    match evaluate(tree, &columns, &meta, rows.len(), &all(rows.len())) {
         Ok(mask) => Ok(mask),
         Err(Failure::Kernel(_)) if tree.backend == Backend::Hybrid => {
             super::python::evaluate_tree(tree, rows)
         }
         Err(Failure::Kernel(error) | Failure::Fatal(error)) => Err(error),
     }
+}
+
+/// 在一个块的原列上求值，只用于 [`Tree::chunk_local`] 的树：列式路线上每行的结果只取决于本行，与整源路径
+/// 在成功时逐行相同，也就不必按源的遍历顺序逐行复制列。任何错误都返回 None：报错的行序与文案取决于整源
+/// 的遍历顺序，调用方丢弃按块结果、回到整源路径重新求值。
+pub(super) fn evaluate_chunk(
+    tree: &Tree,
+    columns: &[ColumnData],
+    live: &SourceBits,
+) -> Option<SourceBits> {
+    let mut mask = evaluate(tree, columns, &[], live.len, live).ok()?;
+    mask.intersect(live);
+    Some(mask)
 }
 
 #[cfg(test)]

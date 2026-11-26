@@ -525,6 +525,17 @@ impl Predicate {
         self.field_names.is_some()
     }
 
+    /// 需要源内全部行的表达式里，能逐块在原列上求值的那部分（[`super::tree::Tree::chunk_local`]）：
+    /// 返回 None 时调用方回到整源路径，包括按块求值出错的情形。
+    pub(crate) fn evaluate_chunk(
+        &self,
+        columns: &[ColumnData],
+        live: &SourceBits,
+    ) -> Option<SourceBits> {
+        let tree = self.tree.as_ref().filter(|tree| tree.chunk_local)?;
+        super::columns::evaluate_chunk(tree, columns, live)
+    }
+
     pub(crate) fn evaluate_source_rows(
         &self,
         rows: &[super::dynamic::DynamicRow<'_>],

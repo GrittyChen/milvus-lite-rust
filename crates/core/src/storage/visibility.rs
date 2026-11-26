@@ -38,11 +38,19 @@ impl SourceBits {
     }
 
     pub(crate) fn from_live(live: &[bool]) -> Self {
-        let mut bits = Self::new(live.len());
-        for (row, &value) in live.iter().enumerate() {
-            bits.set(row, value);
+        // 按字组装：逐位 `set` 每次都要经 `Arc::make_mut`，百万行的结果位图会把它变成热点。
+        let bits = live
+            .chunks(64)
+            .map(|word| {
+                word.iter()
+                    .enumerate()
+                    .fold(0_u64, |acc, (bit, &value)| acc | (u64::from(value) << bit))
+            })
+            .collect();
+        Self {
+            len: live.len(),
+            bits: Arc::new(bits),
         }
-        bits
     }
 
     pub(crate) fn get(&self, row: usize) -> bool {
