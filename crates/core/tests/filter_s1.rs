@@ -294,6 +294,57 @@ fn query_uses_source_order_and_old_filtered_views_survive_mutation_and_drop() {
     engine.close();
 }
 
+/// 有 limit 的 Query 等于无 limit 结果按 3.x 规则截取的那一页：先截到 `max(offset + limit, 1)`，
+/// 负 offset 从截断后的末尾倒数。重开后全是已提交段（可直接取前 k 条），再写入未 flush 的尾部后回到整体
+/// 排序，两种块形态都要成立；段间主键交错、旧段有删除，行数跨 64 位字。
+#[test]
+fn query_limit_pages_equal_slices_of_the_unlimited_result() {
+    let root = tempfile::tempdir().unwrap();
+    let engine = db(root.path());
+    engine.create_collection("", "c", schema()).unwrap();
+    for segment in 0..3_i64 {
+        let rows: Vec<(i64, i64)> = (0..300).map(|i| (i * 3 + segment, (i * 7) % 50)).collect();
+        engine.insert("", "c", batch(&rows)).unwrap();
+        engine.flush_collection("", "c").unwrap();
+    }
+    engine.delete_expr("", "c", "age == 3", "").unwrap();
+    engine.flush_collection("", "c").unwrap();
+    engine.close();
+    drop(engine);
+
+    let engine = db(root.path());
+    let check = |engine: &Db| {
+        let snapshot = engine.collection("", "c").unwrap().read().read_snapshot();
+        for expr in ["age < 20", "age >= 0", "age == 7", "age == 3"] {
+            let full = snapshot.query(expr, &[], None, 0).unwrap().rows.pks;
+            let n = full.len() as i64;
+            for limit in [-1, 0, 1, 5, 64, 65, n - 1, n, n + 3, i64::MAX] {
+                for offset in [-(n + 5), -3, -1, 0, 1, 7, n - 1, n, n + 2, i64::MAX] {
+                    let end = (i128::from(offset) + i128::from(limit)).max(1);
+                    let kept = &full[..usize::try_from(end).unwrap_or(usize::MAX).min(full.len())];
+                    let start = if offset < 0 {
+                        (kept.len() as i64 + offset).max(0) as usize
+                    } else {
+                        usize::try_from(offset).unwrap().min(kept.len())
+                    };
+                    let page = snapshot.query(expr, &[], Some(limit), offset).unwrap();
+                    assert_eq!(
+                        page.rows.pks,
+                        kept[start..],
+                        "{expr} limit={limit} offset={offset}"
+                    );
+                }
+            }
+        }
+    };
+    check(&engine);
+    engine
+        .insert("", "c", batch(&[(1, 1), (5_000, 2), (-4, 30)]))
+        .unwrap();
+    check(&engine);
+    engine.close();
+}
+
 #[test]
 fn float_comparisons_validate_all_live_operands_and_never_inspect_dead_integer_values() {
     let root = tempfile::tempdir().unwrap();

@@ -1825,7 +1825,36 @@ impl ReadSnapshot {
     ) -> Result<QueryResult> {
         let chunks = self.filtered_chunks_parsed(parsed)?;
         let projection = Projection::new(&self.schema, output_fields, ApiKind::Query);
+        // 3.x 在追加第一条后才判断 effective_limit，故 0 / 负 limit 也可能保留一条。
+        let end = limit.map(|limit| {
+            let end = (i128::from(offset) + i128::from(limit)).max(1);
+            usize::try_from(end).unwrap_or(usize::MAX)
+        });
         let mut refs = Vec::new();
+        if let Some(end) = end
+            && !order_by_pk
+            && presorted(
+                chunks
+                    .iter()
+                    .map(|c| (c.source_rank, c.generation, c.row_start, c.live.len)),
+            )
+        {
+            // 收集顺序即排序结果：取够前 end 条就停，不为全部命中行建引用再排序（end ≥ 1）。
+            refs.reserve(end.min(1024));
+            'chunks: for (index, chunk) in chunks.iter().enumerate() {
+                for row in chunk.live.live_rows() {
+                    refs.push(RowRef {
+                        chunk: index,
+                        row,
+                        order: (chunk.row_start + row) as u64,
+                    });
+                    if refs.len() == end {
+                        break 'chunks;
+                    }
+                }
+            }
+            return Ok(self.query_page(refs, offset, projection));
+        }
         for (index, chunk) in chunks.iter().enumerate() {
             for row in chunk.live.live_rows() {
                 refs.push(RowRef {
@@ -1854,11 +1883,14 @@ impl ReadSnapshot {
         } else {
             refs.sort_by_key(|r| (chunks[r.chunk].source_rank, r.order));
         }
-        // 3.x 在追加第一条后才判断 effective_limit，故 0 / 负 limit 也可能保留一条。
-        if let Some(limit) = limit {
-            let end = (i128::from(offset) + i128::from(limit)).max(1);
-            refs.truncate(usize::try_from(end).unwrap_or(usize::MAX));
+        if let Some(end) = end {
+            refs.truncate(end);
         }
+        Ok(self.query_page(refs, offset, projection))
+    }
+
+    /// 截断后的有序引用按 offset 取页并物化。
+    fn query_page(&self, refs: Vec<RowRef>, offset: i64, projection: Projection) -> QueryResult {
         let start = if offset < 0 {
             usize::try_from((refs.len() as i128 + i128::from(offset)).max(0)).unwrap_or(0)
         } else {
@@ -1867,7 +1899,7 @@ impl ReadSnapshot {
                 .min(refs.len())
         };
         let rows = self.gather(&refs[start..], &projection);
-        Ok(QueryResult { projection, rows })
+        QueryResult { projection, rows }
     }
 
     /// 3.x `_require_loaded`：检索与按主键读取之前的 load 状态检查。
@@ -2219,6 +2251,23 @@ struct RowRef {
     order: u64,
     chunk: usize,
     row: usize,
+}
+
+/// 各块（源名次, 代, 段内起始行, 行数）按块序给出时，按块序、块内行序收集的引用是否已按 Query 的排序键
+/// `(源名次, 位次)` 严格升序：每块都是原始代（位次 = 起始行 + 行号），且相邻块的键区间前后相接、不重叠。
+/// 成立时稳定排序不改变次序，前 k 条就是收集顺序的前 k 条。
+fn presorted(chunks: impl Iterator<Item = (usize, u64, usize, usize)>) -> bool {
+    let mut previous: Option<(usize, usize)> = None;
+    for (rank, generation, start, rows) in chunks {
+        if generation != 0 {
+            return false;
+        }
+        if previous.is_some_and(|end| end > (rank, start)) {
+            return false;
+        }
+        previous = Some((rank, start + rows));
+    }
+    true
 }
 
 #[derive(Debug)]
@@ -8429,6 +8478,70 @@ mod tests {
                     .collect()
             })
             .collect()
+    }
+
+    /// Query 有 limit 时的快路径：`presorted` 成立的块序下，按收集顺序取前 end 条与原先「稳定排序再截断」
+    /// 逐位相同；随机块里有乱序、重叠、相接与非原始代，判定两种结果都要出现。
+    #[test]
+    fn presorted_chunks_take_the_same_rows_as_a_stable_sort() {
+        let mut rng = Rng(0x2468_ace1);
+        let (mut fast, mut slow) = (0, 0);
+        for _ in 0..2000 {
+            let mut spans = Vec::new();
+            let mut start: usize = 0;
+            for _ in 0..rng.below(5) {
+                // 多数相接递增，少数回退或重叠，偶尔换源名次或非原始代。
+                start = match rng.below(6) {
+                    0 => start.saturating_sub(rng.below(8)),
+                    _ => start + rng.below(3),
+                };
+                let rows = rng.below(70);
+                spans.push((rng.below(4) / 3, u64::from(rng.below(10) == 0), start, rows));
+                start += rows;
+            }
+            let mut refs = Vec::new();
+            for (chunk, &(_, generation, start, rows)) in spans.iter().enumerate() {
+                for row in 0..rows {
+                    if rng.below(3) == 0 {
+                        continue;
+                    }
+                    // 非原始代的位次来自 `orders`，与行号无关。
+                    let order = if generation == 0 {
+                        start + row
+                    } else {
+                        rng.below(300)
+                    };
+                    refs.push(RowRef {
+                        order: order as u64,
+                        chunk,
+                        row,
+                    });
+                }
+            }
+            if !presorted(spans.iter().copied()) {
+                slow += 1;
+                continue;
+            }
+            fast += 1;
+            let mut expected = refs.clone();
+            expected.sort_by_key(|r| (spans[r.chunk].0, r.order));
+            for end in [
+                1,
+                2,
+                refs.len().max(1),
+                refs.len() + 1,
+                1 + rng.below(refs.len().max(1)),
+            ] {
+                let pos = |v: &[RowRef]| {
+                    v.iter()
+                        .take(end)
+                        .map(|r| (r.chunk, r.row))
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(pos(&refs), pos(&expected), "spans={spans:?} end={end}");
+            }
+        }
+        assert!(fast > 100 && slow > 100, "fast={fast} slow={slow}");
     }
 
     /// 0005「验证」：行块边界落在 chunk 内部、行块中没有存活行、各种查询条数与 limit / offset、
