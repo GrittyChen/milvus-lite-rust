@@ -2610,26 +2610,8 @@ impl Db {
             let Some(chunks) = task.upgrade() else {
                 continue;
             };
-            let graph = (|| -> Option<crate::hnsw::Graph> {
-                let key = task.file_key(&chunks).ok()?;
-                let bytes = std::fs::read(task.graph_path().ok()?).ok()?;
-                crate::hnsw::Graph::decode(&bytes, &key)
-            })();
-            match graph {
-                Some(graph) => {
-                    let c = handle.read();
-                    if c.graph_publishable(&chunks, task.seen)
-                        && let Some((_, first)) = chunks.first()
-                    {
-                        first.graphs.publish(
-                            task.field_pos,
-                            Arc::new(graph),
-                            &task.epoch,
-                            task.seen,
-                        );
-                    }
-                }
-                None => missing.push(task),
+            if !crate::graph_build::attach_file(handle, &task, &chunks) {
+                missing.push(task);
             }
         }
         self.graphs.enqueue(missing);
@@ -6612,6 +6594,37 @@ mod tests {
             assert_eq!(handle.read().graph_count(), 1);
             db.wait_graph_builds(BUILD_WAIT).unwrap();
             assert_eq!(std::fs::read(&path).unwrap(), bytes, "not rebuilt");
+            db.close();
+        }
+
+        /// 打开集合排的维护轮在 compaction 之后无条件 `schedule_graphs`；它可能落在 `load_collection` 已置为
+        /// loaded、还没把读入的图挂上之间。这时排出的任务不能把磁盘上有效的图从头再建一遍。重建出的图与原文件
+        /// 逐字节相同，只能从文件被换掉（inode 变化）看出来。
+        #[cfg(unix)]
+        #[test]
+        fn a_graph_task_queued_while_load_reads_files_reuses_the_valid_file() {
+            use std::os::unix::fs::MetadataExt;
+            let root = tempfile::tempdir().unwrap();
+            let db = test_db(root.path());
+            drop(hnsw_collection(&db));
+            let path = graph_file(root.path());
+            let inode = std::fs::metadata(&path).unwrap().ino();
+            db.close();
+            drop(db);
+
+            let db = test_db(root.path());
+            // 打开排的维护轮落在 load 之前时不排任务（未 loaded），落在之后时与下面手动排的一样。
+            let handle = db.collection("", "c").unwrap();
+            // `load_collection` 的第一步：已 loaded，图还没读入。此刻维护轮排任务。
+            handle.write().load().unwrap();
+            db.schedule_graphs(&handle);
+            db.wait_graph_builds(BUILD_WAIT).unwrap();
+            assert_eq!(handle.read().graph_count(), 1);
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().ino(),
+                inode,
+                "valid graph file was rebuilt and replaced"
+            );
             db.close();
         }
 

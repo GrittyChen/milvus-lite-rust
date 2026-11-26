@@ -194,6 +194,35 @@ pub(crate) fn build(
     Ok(graph)
 }
 
+/// 读入段已有的图文件。文件缺失、读不出或与段不匹配（[`Graph::decode`] 按段名、长度、行序号等校验）时
+/// 返回 false，由调用方排队或构建；读到有效的图返回 true，并在 collection 仍可发布且槽位为空时挂到第一块上。
+/// 不可发布（代号已变、块已替换、已 release）时什么也不挂：那些变化各自会排新一轮任务，此时构建出的图也会在
+/// 发布时被拒。
+pub(crate) fn attach_file(
+    collection: &RwLock<Collection, 5>,
+    task: &GraphTask,
+    chunks: &[(usize, Arc<ChunkData>)],
+) -> bool {
+    let graph = (|| -> Option<Graph> {
+        // 先读文件：新段通常还没有图文件，不必先算整段的行序号摘要。
+        let bytes = std::fs::read(task.graph_path().ok()?).ok()?;
+        Graph::decode(&bytes, &task.file_key(chunks).ok()?)
+    })();
+    let Some(graph) = graph else {
+        return false;
+    };
+    let c = collection.read();
+    if c.graph_publishable(chunks, task.seen)
+        && let Some((_, first)) = chunks.first()
+        && first.graphs.get(task.field_pos).is_none()
+    {
+        first
+            .graphs
+            .publish(task.field_pos, Arc::new(graph), &task.epoch, task.seen);
+    }
+    true
+}
+
 /// 建图期间只持有块与 collection，不持有 Db；发布时才短暂升级 Db 的弱引用。
 fn run_task(owner: &Weak<Db>, task: &GraphTask, stop: &AtomicBool) -> Result<()> {
     let (Some(chunks), Some(collection)) = (task.upgrade(), task.collection.upgrade()) else {
@@ -204,6 +233,11 @@ fn run_task(owner: &Weak<Db>, task: &GraphTask, stop: &AtomicBool) -> Result<()>
         .first()
         .is_some_and(|(_, first)| first.graphs.get(task.field_pos).is_some());
     if filled || task.cancelled() || stop.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    // 打开排的维护轮可能落在 load 置为 loaded 与读入图文件之间，此时槽位为空而磁盘上的图有效：先读文件，
+    // 不把整段重建一遍。
+    if attach_file(&collection, task, &chunks) {
         return Ok(());
     }
     let Some(graph) = build(task, &chunks, stop)? else {
