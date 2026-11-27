@@ -315,6 +315,19 @@ fn infer_with<const SORTED: bool>(values: &[&Value]) -> Result<Option<Shape>> {
     }))
 }
 
+/// 与 `Map::get` 相同（键唯一）。键少时按序比较：长度不同的键不读内容，也省掉哈希与索引表的访存。
+/// 逐行查百万个分散的小对象时访存是主要开销：两个键的对象、1M 行，服务器上整条动态键比较约快 30–40%。
+/// 热缓存下同长键且命中在末尾时线性比较反而更慢（4 个键约 17 ns 对 `get` 约 9 ns），上限取得保守。
+pub(super) fn get_key<'a>(map: &'a Map<String, Value>, key: &str) -> Option<&'a Value> {
+    if map.len() <= 4 {
+        map.iter()
+            .find(|(name, _)| name.as_str() == key)
+            .map(|(_, value)| value)
+    } else {
+        map.get(key)
+    }
+}
+
 fn meta_at<'a>(
     meta: &[Option<&'a Map<String, Value>>],
     key: &str,
@@ -322,7 +335,7 @@ fn meta_at<'a>(
 ) -> Option<&'a Value> {
     // 有 meta 列时长度由写入/恢复校验保证；没有列与缺少键均沿用参照的 null 语义。
     meta[row]
-        .and_then(|row| row.get(key))
+        .and_then(|row| get_key(row, key))
         .filter(|v| !v.is_null())
 }
 
@@ -346,22 +359,33 @@ struct Bound {
     live: SourceBits,
 }
 
+/// 存活行上这个键的非 null 取值，按行对齐；推断与物化共用，每个键只逐行查一遍 meta。
+fn live_values<'a>(
+    meta: &[Option<&'a Map<String, Value>>],
+    key: &str,
+    live: &SourceBits,
+) -> Vec<Option<&'a Value>> {
+    (0..live.len)
+        .map(|row| live.get(row).then(|| meta_at(meta, key, row)).flatten())
+        .collect()
+}
+
+#[cfg(test)]
 pub(super) fn materialize(
     meta: &[Option<&Map<String, Value>>],
     key: &str,
     shape: Shape,
     live: &SourceBits,
 ) -> Result<(ColumnData, SourceBits)> {
-    let mut valid = SourceBits::new(live.len);
-    let values: Vec<_> = (0..live.len)
-        .map(|row| {
-            let value = live.get(row).then(|| meta_at(meta, key, row)).flatten();
-            if value.is_some() {
-                valid.set(row, true);
-            }
-            value
-        })
-        .collect();
+    materialize_values(&live_values(meta, key, live), shape)
+}
+
+/// 按推断出的形状把按行对齐的取值（`None` 为 null、缺键或非存活行）物化成列。
+pub(super) fn materialize_values(
+    values: &[Option<&Value>],
+    shape: Shape,
+) -> Result<(ColumnData, SourceBits)> {
+    let valid = SourceBits::from_live(&values.iter().map(Option::is_some).collect::<Vec<_>>());
     let column = match shape {
         Shape::Int => ColumnData::Int64(
             values
@@ -395,7 +419,7 @@ pub(super) fn materialize(
                 .map(|v| v.and_then(|v| v.as_bool()).unwrap_or(false))
                 .collect(),
         ),
-        Shape::Null | Shape::Complex => ColumnData::Bool(vec![false; live.len]),
+        Shape::Null | Shape::Complex => ColumnData::Bool(vec![false; values.len()]),
     };
     Ok((column, valid))
 }
@@ -434,14 +458,11 @@ fn evaluate(
     };
     let mut bindings = BTreeMap::new();
     for key in &keys {
-        let values: Vec<_> = live
-            .live_rows()
-            .filter_map(|row| meta_at(meta, key, row))
-            .collect();
-        let Some(shape) = infer(&values)? else {
+        let values = live_values(meta, key, live);
+        let Some(shape) = infer(&values.iter().flatten().copied().collect::<Vec<_>>())? else {
             return evaluate_python(predicate, columns, meta, live);
         };
-        let (column, valid) = materialize(meta, key, shape, live)?;
+        let (column, valid) = materialize_values(&values, shape)?;
         let index = columns.len() + view.extra.len();
         view.extra.push(column);
         bindings.insert(
@@ -669,6 +690,30 @@ fn evaluate_python(
 mod tests {
     use super::*;
     use crate::schema::{CollectionSchema, DataType, FieldSchema};
+
+    #[test]
+    fn small_map_lookup_matches_map_get() {
+        // 同长不同内容、前缀、多字节字符、空键；对象大小跨过线性比较的上限。
+        let names = [
+            "", "k", "s", "kk", "ks", "sk", "键", "鍵", "k键", "abcdefgh", "abcdefgi",
+        ];
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = |n: usize| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % n as u64) as usize
+        };
+        for _ in 0..20_000 {
+            let mut map = Map::new();
+            for _ in 0..next(13) {
+                let name = names[next(names.len())];
+                map.insert(name.to_owned(), Value::from(next(100)));
+            }
+            let key = names[next(names.len())];
+            assert_eq!(get_key(&map, key), map.get(key), "{map:?} {key:?}");
+        }
+    }
 
     /// 0033：hybrid 物化动态键时 `pa.array` 的推断与转换。输入保留客户端原始键序（MemTable 的情形），
     /// 期望来自真实 3.x 在 Arrow 25 下的结果；Arrow 15 只在对象字段顺序不同时结果不同。

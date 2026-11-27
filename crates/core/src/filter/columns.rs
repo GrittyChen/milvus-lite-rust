@@ -1,6 +1,6 @@
 //! 布尔树的列式求值；可回退的内核错误与不可回退的整数溢出分开传播。
 
-use super::dynamic::{DynamicRow, Shape, infer, materialize, members};
+use super::dynamic::{DynamicRow, Shape, infer, materialize_values, members};
 use super::eval::{self, Comparison, Operand, Scalar};
 use super::parser::{Kind, Literal};
 use super::tree::{Backend, Tree};
@@ -1056,14 +1056,23 @@ fn evaluate(
     }
     let mut bound = std::collections::BTreeMap::new();
     for key in &keys {
-        let values: Vec<_> = meta
+        // 每个键只逐行查一遍 meta：推断看全部行的原始取值（含 null），物化只取存活行的非 null 值。
+        // 实际的调用方都只传存活行、`live` 全真；按块路径不含动态键。
+        let raw: Vec<_> = meta
             .iter()
-            .filter_map(|m| m.and_then(|m| m.get(*key)))
+            .map(|m| m.and_then(|m| super::dynamic::get_key(m, key)))
             .collect();
-        let Some(shape) = infer(&values).map_err(Failure::Fatal)? else {
+        let Some(shape) =
+            infer(&raw.iter().flatten().copied().collect::<Vec<_>>()).map_err(Failure::Fatal)?
+        else {
             return Err(kernel("heterogeneous dynamic column"));
         };
-        let (data, valid) = materialize(meta, key, shape, live).map_err(Failure::Fatal)?;
+        let values: Vec<_> = raw
+            .into_iter()
+            .enumerate()
+            .map(|(row, value)| value.filter(|v| live.get(row) && !v.is_null()))
+            .collect();
+        let (data, valid) = materialize_values(&values, shape).map_err(Failure::Fatal)?;
         bound.insert(
             *key,
             Column {
