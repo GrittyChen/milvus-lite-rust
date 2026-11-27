@@ -41,6 +41,7 @@ impl Column<'_> {
     fn valid(&self, row: usize) -> bool {
         self.valid.get(self.index(row))
     }
+    #[cfg(test)]
     fn boolean(&self, row: usize) -> ColumnResult<bool> {
         if let ColumnData::Bool(values) = self.data.as_ref() {
             Ok(values[self.index(row)])
@@ -226,17 +227,185 @@ fn compare(
             }
         }
     }
-    let mut valid = SourceBits::new(n);
+    let valid = both_valid(a, b, n);
+    if let Some(mut values) = typed_compare(a, b, op, precision, n) {
+        mask(&mut values, &valid);
+        return Ok(booleans(values, valid));
+    }
     let mut values = vec![false; n];
     for (row, value) in values.iter_mut().enumerate() {
-        if a.valid(row) && b.valid(row) {
+        if valid.get(row) {
             let a = eval::value(&left, &pair, a.index(row), precision).map_err(Failure::Kernel)?;
             let b = eval::value(&right, &pair, b.index(row), precision).map_err(Failure::Kernel)?;
             *value = scalar_compare(a, b, op)?;
-            valid.set(row, true);
         }
     }
     Ok(booleans(values, valid))
+}
+
+/// 一侧的有效位按 `n` 行展开成字：标量广播（填充位由 [`SourceBits::from_words`] 清掉）。
+fn valid_words<'a>(column: &'a Column<'_>, n: usize) -> Cow<'a, [u64]> {
+    if column.scalar {
+        let word = if column.valid.get(0) { u64::MAX } else { 0 };
+        Cow::Owned(vec![word; n.div_ceil(64)])
+    } else {
+        Cow::Borrowed(column.valid.words())
+    }
+}
+fn both_valid(a: &Column<'_>, b: &Column<'_>, n: usize) -> SourceBits {
+    let (x, y) = (valid_words(a, n), valid_words(b, n));
+    SourceBits::from_words(n, x.iter().zip(y.iter()).map(|(x, y)| x & y).collect())
+}
+/// 无效行的值清成 false，与逐行写入的结果逐位相同。
+fn mask(values: &mut [bool], valid: &SourceBits) {
+    for (chunk, word) in values.chunks_mut(64).zip(valid.words()) {
+        for (bit, value) in chunk.iter_mut().enumerate() {
+            *value &= word >> bit & 1 == 1;
+        }
+    }
+}
+fn unpack(words: &[u64], n: usize) -> Vec<bool> {
+    (0..n)
+        .map(|row| words[row / 64] >> (row % 64) & 1 == 1)
+        .collect()
+}
+/// 布尔列的值按字打包；不是布尔列时返回 None，由调用方决定是否报错。
+fn bool_words(column: &Column<'_>, n: usize) -> Option<Vec<u64>> {
+    let ColumnData::Bool(values) = column.data.as_ref() else {
+        return None;
+    };
+    Some(if column.scalar {
+        let word = if values[0] { u64::MAX } else { 0 };
+        vec![word; n.div_ceil(64)]
+    } else {
+        SourceBits::from_live(&values[..n]).words().to_vec()
+    })
+}
+fn lost_boolean() -> Failure {
+    Failure::Fatal(EngineError::Storage("column boolean node lost type".into()))
+}
+
+/// 逐行比较两侧的值，不看有效位（调用方再按有效位清零）。
+fn rows<T: PartialOrd>(
+    n: usize,
+    a: impl Fn(usize) -> T,
+    b: impl Fn(usize) -> T,
+    op: Comparison,
+) -> Vec<bool> {
+    macro_rules! run {
+        ($cmp:tt) => {
+            (0..n).map(|row| a(row) $cmp b(row)).collect()
+        };
+    }
+    match op {
+        Comparison::Equal => run!(==),
+        Comparison::NotEqual => run!(!=),
+        Comparison::Less => run!(<),
+        Comparison::LessEqual => run!(<=),
+        Comparison::Greater => run!(>),
+        Comparison::GreaterEqual => run!(>=),
+    }
+}
+/// 比较的类型化内核：与 `eval::value` + `scalar_compare` 逐行求值的结果相同（转换的越界检查已在前面
+/// 做完，这里不会出错）。至少一侧是列；类型组合不在这里的回到逐行路径。
+fn typed_compare(
+    a: &Column<'_>,
+    b: &Column<'_>,
+    op: Comparison,
+    precision: u8,
+    n: usize,
+) -> Option<Vec<bool>> {
+    // 列放在左侧；`a < b` 与 `b > a` 对浮点（含 NaN）同样成立。
+    let (column, other, op) = if a.scalar {
+        (b, a, op.reversed())
+    } else {
+        (a, b, op)
+    };
+    if column.scalar {
+        return None;
+    }
+    // 下面按数据类型分派、按 shape 选内核；本模块构造的列两者一致（空类型与复合类型不进快路径）。
+    debug_assert!(
+        [column, other]
+            .iter()
+            .all(|side| matches!(side.shape, Shape::Null | Shape::Complex)
+                || side.shape == shape(side.data.values()))
+    );
+    // 另一侧：标量绑成常量，列按行读。
+    macro_rules! against {
+        ($left:expr, $right:expr) => {{
+            let right = $right;
+            if other.scalar {
+                let constant = right(0);
+                rows(n, $left, |_| constant, op)
+            } else {
+                rows(n, $left, right, op)
+            }
+        }};
+    }
+    match (column.shape, other.shape) {
+        (Shape::String, Shape::String) => {
+            let (ColumnData::VarChar(x), ColumnData::VarChar(y)) =
+                (column.data.values(), other.data.values())
+            else {
+                return None;
+            };
+            Some(against!(|row| x[row].as_str(), |row: usize| y[row].as_str()))
+        }
+        (Shape::Bool, Shape::Bool) => {
+            let (ColumnData::Bool(x), ColumnData::Bool(y)) =
+                (column.data.values(), other.data.values())
+            else {
+                return None;
+            };
+            Some(against!(|row| x[row], |row: usize| y[row]))
+        }
+        (Shape::Int | Shape::Float, Shape::Int | Shape::Float) => {
+            numeric(column)?;
+            numeric(other)?;
+            if precision == 0 {
+                // 两侧都是整数（任一侧是浮点时精度不为 0）。
+                let y = &other.data;
+                Some(match column.data.values() {
+                    ColumnData::Int8(x) => against!(|row| i64::from(x[row]), |row| int_at(y, row)),
+                    ColumnData::Int16(x) => {
+                        against!(|row| i64::from(x[row]), |row| int_at(y, row))
+                    }
+                    ColumnData::Int32(x) => {
+                        against!(|row| i64::from(x[row]), |row| int_at(y, row))
+                    }
+                    ColumnData::Int64(x) => against!(|row| x[row], |row| int_at(y, row)),
+                    _ => return None,
+                })
+            } else {
+                // 与 `eval::value` 相同：float32 升为 f64；整数已在前面检查落在目标精度能精确表示的范围内
+                // （float32 为 ±2^24），先转 float32 再升 f64 与直接转 f64 相同。
+                let convert = |data: &ColumnData, row: usize| match data.values() {
+                    ColumnData::Float(v) => f64::from(v[row]),
+                    ColumnData::Double(v) => v[row],
+                    other => int_at(other, row) as f64,
+                };
+                let y = &other.data;
+                // 另一侧是列时先整列转换，主循环只按主侧的类型分派。
+                let converted: Option<Vec<f64>> =
+                    (!other.scalar).then(|| (0..n).map(|row| convert(y, row)).collect());
+                let right = |row: usize| match &converted {
+                    Some(values) => values[row],
+                    None => convert(y, row),
+                };
+                Some(match column.data.values() {
+                    ColumnData::Float(x) => against!(|row| f64::from(x[row]), right),
+                    ColumnData::Double(x) => against!(|row| x[row], right),
+                    ColumnData::Int8(x) => against!(|row| f64::from(x[row]), right),
+                    ColumnData::Int16(x) => against!(|row| f64::from(x[row]), right),
+                    ColumnData::Int32(x) => against!(|row| f64::from(x[row]), right),
+                    ColumnData::Int64(x) => against!(|row| x[row] as f64, right),
+                    _ => return None,
+                })
+            }
+        }
+        _ => None,
+    }
 }
 
 fn interval_micros(micros: f64) -> ColumnResult<i64> {
@@ -409,10 +578,7 @@ fn numeric_arithmetic(
             }
         }
     }
-    let mut valid = SourceBits::new(rows);
-    for row in 0..rows {
-        valid.set(row, a.valid(row) && b.valid(row));
-    }
+    let valid = both_valid(a, b, rows);
     let data = match target {
         Numeric::Int(bits) => {
             let values = (0..rows).map(|row| {
@@ -549,6 +715,100 @@ fn temporal_arithmetic(
     })
 }
 
+/// Kleene and / or，按字计算：每个子节点都求值、不短路（3.x 的 Arrow 内核全量计算）。无效行的值与逐行写法
+/// 相同（and 为真、or 为假），下游只在有效行读值。
+fn logic<'a, 'b: 'a>(
+    and: bool,
+    children: impl Iterator<Item = ColumnResult<&'a Column<'b>>>,
+    live: &SourceBits,
+    n: usize,
+) -> ColumnResult<Column<'static>> {
+    let mut data = vec![if and { u64::MAX } else { 0 }; n.div_ceil(64)];
+    let mut valid = live.words().to_vec();
+    for child in children {
+        let child = child?;
+        if n == 0 {
+            continue;
+        }
+        let values = bool_words(child, n).ok_or_else(lost_boolean)?;
+        let child_valid = valid_words(child, n);
+        for (((x, vx), y), vy) in data
+            .iter_mut()
+            .zip(valid.iter_mut())
+            .zip(&values)
+            .zip(child_valid.iter())
+        {
+            let decisive = if and {
+                (*vx & !*x) | (vy & !y)
+            } else {
+                (*vx & *x) | (vy & y)
+            };
+            *vx = decisive | (*vx & vy);
+            *x = if and { !decisive } else { decisive };
+        }
+    }
+    Ok(booleans(unpack(&data, n), SourceBits::from_words(n, valid)))
+}
+fn negation(child: &Column<'_>, n: usize) -> ColumnResult<Column<'static>> {
+    if n == 0 {
+        return Ok(booleans(Vec::new(), SourceBits::new(0)));
+    }
+    let ColumnData::Bool(values) = child.data.as_ref() else {
+        return Err(lost_boolean());
+    };
+    let data = (0..n).map(|row| !values[child.index(row)]).collect();
+    Ok(booleans(
+        data,
+        SourceBits::from_words(n, valid_words(child, n).into_owned()),
+    ))
+}
+fn is_null(value: &Column<'_>, negate: bool, live: &SourceBits, n: usize) -> Column<'static> {
+    let words = valid_words(value, n);
+    let data = if negate {
+        unpack(&words, n)
+    } else {
+        unpack(&words.iter().map(|word| !word).collect::<Vec<_>>(), n)
+    };
+    booleans(data, live.clone())
+}
+fn like(
+    value: &Column<'_>,
+    pattern: &super::python::LikePattern,
+    n: usize,
+) -> ColumnResult<Column<'static>> {
+    let valid = SourceBits::from_words(n, valid_words(value, n).into_owned());
+    let ColumnData::VarChar(strings) = value.data.as_ref() else {
+        // 只在有有效行时才需要读值，也才报错。
+        if valid.any_live() {
+            return Err(kernel("no matching LIKE kernel"));
+        }
+        return Ok(booleans(vec![false; n], valid));
+    };
+    let mut matcher = pattern.arrow_matcher();
+    let data = (0..n)
+        .map(|row| valid.get(row) && matcher.matches(&strings[value.index(row)]))
+        .collect();
+    Ok(booleans(data, valid))
+}
+/// 根节点为真且有效的行；只在有效行读值，没有有效行时不要求是布尔列。
+fn matching(root: &Column<'_>, n: usize) -> ColumnResult<SourceBits> {
+    let valid = valid_words(root, n);
+    let Some(values) = bool_words(root, n) else {
+        if valid.iter().any(|word| *word != 0) {
+            return Err(lost_boolean());
+        }
+        return Ok(SourceBits::new(n));
+    };
+    Ok(SourceBits::from_words(
+        n,
+        values
+            .iter()
+            .zip(valid.iter())
+            .map(|(x, v)| x & v)
+            .collect(),
+    ))
+}
+
 fn in_list(
     column: &Column<'_>,
     literals: &[Literal],
@@ -661,6 +921,17 @@ fn in_list(
             }
         }
     }
+    if cast_column.is_none()
+        && !column.scalar
+        && let Some(found) = typed_members(column, &set, n)
+    {
+        let values = found
+            .into_iter()
+            .enumerate()
+            .map(|(row, found)| (found && column.valid(row)) != negate)
+            .collect();
+        return Ok(booleans(values, all(n)));
+    }
     let set: std::collections::HashSet<_> = set.into_iter().map(|value| value.key()).collect();
     let mut values = vec![false; n];
     let pair = Pair(&column.data, &column.data);
@@ -692,6 +963,79 @@ fn in_list(
         *value = found != negate;
     }
     Ok(booleans(values, all(n)))
+}
+
+/// 不需要转换列类型时的成员判定：集合按列的类型排序后二分查找，与按 `ScalarKey` 哈希的结果相同（浮点按位
+/// 比较，区分 ±0 与 NaN 的位型）。不看有效位；类型不在这里的回到逐行路径。
+fn typed_members(column: &Column<'_>, set: &[Scalar<'_>], n: usize) -> Option<Vec<bool>> {
+    fn sorted<T: Ord>(mut keys: Vec<T>) -> Vec<T> {
+        keys.sort_unstable();
+        keys.dedup();
+        keys
+    }
+    let ints = || {
+        sorted(
+            set.iter()
+                .filter_map(|value| match value {
+                    Scalar::Int(value) => Some(*value),
+                    _ => None,
+                })
+                .collect(),
+        )
+    };
+    let floats = || {
+        sorted(
+            set.iter()
+                .filter_map(|value| match value {
+                    Scalar::Float(value) => Some(value.to_bits()),
+                    _ => None,
+                })
+                .collect(),
+        )
+    };
+    macro_rules! lookup {
+        ($keys:expr, $values:expr, $key:expr) => {{
+            let (keys, values) = ($keys, $values);
+            (0..n)
+                .map(|row| keys.binary_search(&$key(&values[row])).is_ok())
+                .collect()
+        }};
+    }
+    Some(match column.data.values() {
+        ColumnData::Int8(values) => lookup!(ints(), values, |v: &i8| i64::from(*v)),
+        ColumnData::Int16(values) => lookup!(ints(), values, |v: &i16| i64::from(*v)),
+        ColumnData::Int32(values) => lookup!(ints(), values, |v: &i32| i64::from(*v)),
+        ColumnData::Int64(values) => lookup!(ints(), values, |v: &i64| *v),
+        ColumnData::Float(values) => {
+            lookup!(floats(), values, |v: &f32| f64::from(*v).to_bits())
+        }
+        ColumnData::Double(values) => lookup!(floats(), values, |v: &f64| v.to_bits()),
+        ColumnData::VarChar(values) => {
+            let keys = sorted(
+                set.iter()
+                    .filter_map(|value| match value {
+                        Scalar::String(value) => Some(*value),
+                        _ => None,
+                    })
+                    .collect(),
+            );
+            (0..n)
+                .map(|row| keys.binary_search(&values[row].as_str()).is_ok())
+                .collect()
+        }
+        ColumnData::Bool(values) => {
+            let keys = sorted(
+                set.iter()
+                    .filter_map(|value| match value {
+                        Scalar::Bool(value) => Some(*value),
+                        _ => None,
+                    })
+                    .collect(),
+            );
+            lookup!(keys, values, |v: &bool| *v)
+        }
+        _ => return None,
+    })
 }
 
 /// `live` 只屏蔽叶子列的有效位：读值的内核都以有效位为门，`live` 之外的行的值不会被读到；但字面量、
@@ -862,38 +1206,11 @@ fn evaluate(
             Kind::Arith(op, a, b) => arithmetic(op, get(*a)?, get(*b)?, n)?,
             Kind::And(ids) | Kind::Or(ids) => {
                 let and = matches!(tree.ast.nodes[id].kind, Kind::And(_));
-                let mut data = vec![and; n];
-                let mut valid = live.clone();
-                for &child in ids {
-                    let child = get(child)?;
-                    for (i, out) in data.iter_mut().enumerate() {
-                        let c = child.boolean(i)?;
-                        let decisive =
-                            (valid.get(i) && *out != and) || (child.valid(i) && c != and);
-                        let known = decisive || (valid.get(i) && child.valid(i));
-                        *out = if decisive { !and } else { and };
-                        valid.set(i, known);
-                    }
-                }
-                booleans(data, valid)
+                let children = ids.iter().map(|&child| get(child));
+                logic(and, children, live, n)?
             }
-            Kind::Not(child) => {
-                let child = get(*child)?;
-                let mut data = Vec::with_capacity(n);
-                let mut valid = SourceBits::new(n);
-                for i in 0..n {
-                    data.push(!child.boolean(i)?);
-                    valid.set(i, child.valid(i));
-                }
-                booleans(data, valid)
-            }
-            Kind::IsNull { value, negate, .. } => {
-                let value = get(*value)?;
-                booleans(
-                    (0..n).map(|i| !value.valid(i) != *negate).collect(),
-                    live.clone(),
-                )
-            }
+            Kind::Not(child) => negation(get(*child)?, n)?,
+            Kind::IsNull { value, negate, .. } => is_null(get(*value)?, *negate, live, n),
             Kind::Like { value, .. } => {
                 let value = get(*value)?;
                 if value.shape != Shape::String {
@@ -906,24 +1223,7 @@ fn evaluate(
                 let pattern = tree.patterns[id].as_ref().ok_or_else(|| {
                     Failure::Fatal(EngineError::Storage("LIKE lost pattern".into()))
                 })?;
-                let mut data = vec![false; n];
-                let mut valid = SourceBits::new(n);
-                for (row, out) in data.iter_mut().enumerate() {
-                    if value.valid(row) {
-                        let ColumnData::VarChar(strings) = value.data.as_ref() else {
-                            return Err(kernel("no matching LIKE kernel"));
-                        };
-                        *out = pattern.matches(
-                            &strings[value.index(row)]
-                                .chars()
-                                .map(u32::from)
-                                .collect::<Vec<_>>(),
-                            false,
-                        );
-                        valid.set(row, true);
-                    }
-                }
-                booleans(data, valid)
+                like(value, pattern, n)?
             }
             Kind::In {
                 field,
@@ -955,11 +1255,7 @@ fn evaluate(
     let root = values[tree.ast.root]
         .as_ref()
         .ok_or_else(|| Failure::Fatal(EngineError::Storage("column route lost root".into())))?;
-    let mut matching = vec![false; n];
-    for (row, out) in matching.iter_mut().enumerate() {
-        *out = root.valid(row) && root.boolean(row)?;
-    }
-    Ok(SourceBits::from_live(&matching))
+    matching(root, n)
 }
 pub(super) fn evaluate_rows(tree: &Tree, rows: &[DynamicRow<'_>]) -> Result<SourceBits> {
     // text_match 的字段只在逐行回退里读取，不必物化；按节点排除，同一列被别的节点引用时仍要保留。
@@ -1009,6 +1305,9 @@ pub(super) fn evaluate_chunk(
     mask.intersect(live);
     Some(mask)
 }
+
+#[cfg(test)]
+mod kernel_tests;
 
 #[cfg(test)]
 mod tests {

@@ -23,7 +23,7 @@ pub(super) struct LikePattern {
     arrow: Vec<Token>,
 }
 #[derive(Debug, Clone, Copy)]
-enum Token {
+pub(super) enum Token {
     Many,
     One,
     Char(u32),
@@ -56,29 +56,122 @@ impl LikePattern {
         Self { python, arrow }
     }
     pub(super) fn matches(&self, text: &[u32], python: bool) -> bool {
-        let mut reachable = vec![false; text.len() + 1];
-        reachable[0] = true;
-        for token in if python { &self.python } else { &self.arrow } {
-            let mut next = vec![false; text.len() + 1];
+        let tokens = if python { &self.python } else { &self.arrow };
+        let (mut reachable, mut next) = (Vec::new(), Vec::new());
+        let reachable = reach(tokens, text, &mut reachable, &mut next);
+        reachable[text.len()] || (python && text.last() == Some(&10) && reachable[text.len() - 1])
+    }
+
+    /// 列式路线（Arrow 记号）的匹配器：不含 `_` 的模式按字面段在 UTF-8 上直接查找，其余复用缓冲做逐码点
+    /// 的可达性计算。Python 记号的结尾换行特例不在这里。
+    pub(super) fn arrow_matcher(&self) -> ArrowLike {
+        let general = || ArrowLike::General {
+            tokens: self.arrow.clone(),
+            text: Vec::new(),
+            reachable: Vec::new(),
+            next: Vec::new(),
+        };
+        if self.arrow.iter().any(|token| matches!(token, Token::One)) {
+            return general();
+        }
+        // `%` 把模式切成字面段；相邻的 `%` 得到空段，与单个 `%` 等价。
+        let mut first = String::new();
+        let mut rest: Vec<String> = Vec::new();
+        for token in &self.arrow {
             match token {
-                Token::Many => {
-                    next[0] = reachable[0];
-                    for i in 1..next.len() {
-                        next[i] = reachable[i] || next[i - 1];
-                    }
-                }
-                Token::One => {
-                    next[1..].copy_from_slice(&reachable[..text.len()]);
-                }
+                Token::Many => rest.push(String::new()),
                 Token::Char(code) => {
-                    for i in 0..text.len() {
-                        next[i + 1] = reachable[i] && text[i] == *code;
-                    }
+                    // 记号来自 `str::chars`，码位总是合法的 char；万一不是就按码位逐个匹配。
+                    let Some(ch) = char::from_u32(*code) else {
+                        return general();
+                    };
+                    rest.last_mut().unwrap_or(&mut first).push(ch);
+                }
+                Token::One => {}
+            }
+        }
+        ArrowLike::Segments { first, rest }
+    }
+}
+
+/// `tokens` 走完 `text` 之后各位置是否可达；`reachable[i]` 表示前 `i` 个码位已被消耗。
+fn reach<'a>(
+    tokens: &[Token],
+    text: &[u32],
+    reachable: &'a mut Vec<bool>,
+    next: &mut Vec<bool>,
+) -> &'a [bool] {
+    reachable.clear();
+    reachable.resize(text.len() + 1, false);
+    reachable[0] = true;
+    for token in tokens {
+        next.clear();
+        next.resize(text.len() + 1, false);
+        match token {
+            Token::Many => {
+                next[0] = reachable[0];
+                for i in 1..next.len() {
+                    next[i] = reachable[i] || next[i - 1];
                 }
             }
-            reachable = next;
+            Token::One => {
+                next[1..].copy_from_slice(&reachable[..text.len()]);
+            }
+            Token::Char(code) => {
+                for i in 0..text.len() {
+                    next[i + 1] = reachable[i] && text[i] == *code;
+                }
+            }
         }
-        reachable[text.len()] || (python && text.last() == Some(&10) && reachable[text.len() - 1])
+        std::mem::swap(reachable, next);
+    }
+    reachable
+}
+
+pub(super) enum ArrowLike {
+    /// 以 `%` 分隔的字面段：首段是前缀、末段是后缀（没有 `%` 时即整串相等），中间各段按序不重叠地
+    /// 出现。UTF-8 自同步，字节上的查找与逐码点匹配一致。
+    Segments { first: String, rest: Vec<String> },
+    General {
+        tokens: Vec<Token>,
+        text: Vec<u32>,
+        reachable: Vec<bool>,
+        next: Vec<bool>,
+    },
+}
+impl ArrowLike {
+    pub(super) fn matches(&mut self, value: &str) -> bool {
+        match self {
+            Self::Segments { first, rest } => {
+                let Some((last, middle)) = rest.split_last() else {
+                    return value == first;
+                };
+                if value.len() < first.len() + last.len()
+                    || !value.starts_with(first.as_str())
+                    || !value.ends_with(last.as_str())
+                {
+                    return false;
+                }
+                let mut inner = &value[first.len()..value.len() - last.len()];
+                for segment in middle {
+                    match inner.find(segment.as_str()) {
+                        Some(at) => inner = &inner[at + segment.len()..],
+                        None => return false,
+                    }
+                }
+                true
+            }
+            Self::General {
+                tokens,
+                text,
+                reachable,
+                next,
+            } => {
+                text.clear();
+                text.extend(value.chars().map(u32::from));
+                reach(tokens, text, reachable, next)[text.len()]
+            }
+        }
     }
 }
 

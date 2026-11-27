@@ -51,7 +51,7 @@ impl Comparison {
         }
     }
 
-    fn reversed(self) -> Self {
+    pub(super) fn reversed(self) -> Self {
         match self {
             Self::Less => Self::Greater,
             Self::LessEqual => Self::GreaterEqual,
@@ -655,6 +655,41 @@ impl Predicate {
                             };
                         set.insert(scalar.key());
                     }
+                    // 主键列（不可为空、不需转换）按排序后的键二分查找，与哈希集合判定相同；
+                    // `out` 始终是 `live` 的子集。
+                    if lookup_precision == 0 {
+                        match &columns[*column] {
+                            ColumnData::Int64(values) => {
+                                let mut keys: Vec<i64> = set
+                                    .iter()
+                                    .filter_map(|key| match key {
+                                        ScalarKey::Int(value) => Some(*value),
+                                        _ => None,
+                                    })
+                                    .collect();
+                                keys.sort_unstable();
+                                out.intersect_matching(live, |row| {
+                                    keys.binary_search(&values[row]).is_ok()
+                                });
+                                continue;
+                            }
+                            ColumnData::VarChar(values) => {
+                                let mut keys: Vec<&str> = set
+                                    .iter()
+                                    .filter_map(|key| match key {
+                                        ScalarKey::String(value) => Some(*value),
+                                        _ => None,
+                                    })
+                                    .collect();
+                                keys.sort_unstable();
+                                out.intersect_matching(live, |row| {
+                                    keys.binary_search(&values[row].as_str()).is_ok()
+                                });
+                                continue;
+                            }
+                            _ => {}
+                        }
+                    }
                     let column_operand = Operand::Column(*column);
                     for row in 0..live.len {
                         if live.get(row) {
@@ -1014,6 +1049,158 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    // 优化前根主键 `in` 的逐行哈希实现，原样保留作模型。
+    fn in_model(
+        predicate: &Predicate,
+        columns: &[ColumnData],
+        live: &SourceBits,
+    ) -> Result<SourceBits> {
+        let mut out = live.clone();
+        if !live.any_live() {
+            return Ok(out);
+        }
+        let [Term::In { operand, values }] = predicate.terms.as_slice() else {
+            return Err(unsupported());
+        };
+        let Operand::Column(column) = operand else {
+            return Err(unsupported());
+        };
+        for lit in values {
+            validate_literal(&Operand::Literal(lit.clone()))?;
+        }
+        let float = if matches!(
+            columns[*column].values(),
+            ColumnData::Float(_) | ColumnData::Double(_)
+        ) || values.iter().any(|l| matches!(l, Literal::Float(_)))
+        {
+            64
+        } else {
+            0
+        };
+        let integer_set = float != 0
+            && matches!(columns[*column].values(), ColumnData::Int64(_))
+            && values.iter().all(|literal| match literal {
+                Literal::Int(_) => true,
+                Literal::Float(v) => {
+                    v.is_finite()
+                        && v.fract() == 0.0
+                        && (-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0).contains(v)
+                }
+                _ => false,
+            });
+        let lookup_precision = if integer_set { 0 } else { float };
+        let operands: Vec<_> = values.iter().cloned().map(Operand::Literal).collect();
+        let mut set = std::collections::HashSet::new();
+        for operand in &operands {
+            if float != 0
+                && let Operand::Literal(Literal::Int(text)) = operand
+            {
+                let integer = text.parse::<i64>().map_err(|_| {
+                    EngineError::invalid("Python int too large to convert to C long")
+                })?;
+                if !(-9_007_199_254_740_992..=9_007_199_254_740_992).contains(&integer) {
+                    return Err(EngineError::invalid(format!(
+                        "Integer value {integer} is outside of the range exactly representable by a IEEE 754 double precision value"
+                    )));
+                }
+            }
+            let scalar = if integer_set && let Operand::Literal(Literal::Float(v)) = operand {
+                Scalar::Int(*v as i64)
+            } else {
+                value(operand, columns, 0, lookup_precision)?
+            };
+            set.insert(scalar.key());
+        }
+        let column_operand = Operand::Column(*column);
+        for row in 0..live.len {
+            if live.get(row) {
+                if columns[*column].is_null(row) {
+                    out.set(row, false);
+                    continue;
+                }
+                let a = value(&column_operand, columns, row, lookup_precision)?;
+                if !set.contains(&a.key()) {
+                    out.set(row, false);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    #[test]
+    fn primary_key_in_matches_the_hashed_model() {
+        let lists = [
+            "[]",
+            "[3]",
+            "[3, 3, -1, 70, 129]",
+            "[1.0, 4, -0.0]",
+            "[2.5, 4]",
+            "[9007199254740993, 1.0]",
+            "[9223372036854775807, -9223372036854775808, 0]",
+            "['5', '三2', '', '64']",
+            "[\"7\", '7', '三3']",
+        ];
+        for (dtype, column) in [(DataType::Int64, 0), (DataType::VarChar, 1)] {
+            let mut compiled = 0;
+            let mut pk = FieldSchema::new("id", dtype);
+            pk.is_primary = true;
+            let schema = CollectionSchema {
+                functions: Vec::new(),
+                fields: vec![pk],
+                enable_dynamic_field: false,
+                properties: vec![],
+            };
+            for len in [0_usize, 1, 63, 64, 65, 129] {
+                let data = if column == 0 {
+                    ColumnData::Int64(
+                        (0..len)
+                            .map(|row| match row % 11 {
+                                0 => i64::MAX,
+                                1 => i64::MIN,
+                                _ => row as i64 % 71 - 1,
+                            })
+                            .collect(),
+                    )
+                } else {
+                    ColumnData::VarChar(
+                        (0..len)
+                            .map(|row| {
+                                if row % 3 == 0 {
+                                    format!("三{}", row % 5)
+                                } else {
+                                    (row % 70).to_string()
+                                }
+                            })
+                            .collect(),
+                    )
+                };
+                let columns = std::slice::from_ref(&data);
+                for stride in [1, 3, 70] {
+                    let live = SourceBits::from_live(
+                        &(0..len).map(|row| row % stride == 0).collect::<Vec<_>>(),
+                    );
+                    for list in lists {
+                        let expr = format!("id in {list}");
+                        let Ok(predicate) = Predicate::compile(&expr, &schema) else {
+                            continue;
+                        };
+                        compiled += 1;
+                        assert!(predicate.tree.is_none(), "{expr} takes the term route");
+                        let actual = predicate
+                            .evaluate(columns, &live)
+                            .map(|bits| bits.live_rows().collect::<Vec<_>>())
+                            .map_err(|err| err.to_string());
+                        let expected = in_model(&predicate, columns, &live)
+                            .map(|bits| bits.live_rows().collect::<Vec<_>>())
+                            .map_err(|err| err.to_string());
+                        assert_eq!(actual, expected, "{dtype:?}, {len}, {stride}, {expr}");
+                    }
+                }
+            }
+            assert!(compiled > 50, "{dtype:?}: {compiled}");
         }
     }
 

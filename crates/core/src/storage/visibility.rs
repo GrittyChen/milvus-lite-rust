@@ -53,6 +53,24 @@ impl SourceBits {
         }
     }
 
+    /// 由按字组装的位构造；有效范围之外的填充位清零，`PartialEq` 与 `count_live` 依赖这一点。
+    pub(crate) fn from_words(len: usize, mut words: Vec<u64>) -> Self {
+        words.resize(len.div_ceil(64), 0);
+        if !len.is_multiple_of(64)
+            && let Some(last) = words.last_mut()
+        {
+            *last &= (1 << (len % 64)) - 1;
+        }
+        Self {
+            len,
+            bits: Arc::new(words),
+        }
+    }
+
+    pub(crate) fn words(&self) -> &[u64] {
+        &self.bits
+    }
+
     pub(crate) fn get(&self, row: usize) -> bool {
         self.bits[row / 64] & (1_u64 << (row % 64)) != 0
     }
@@ -883,6 +901,18 @@ impl Visibility {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn from_words_clears_padding_bits() {
+        let bits = SourceBits::from_words(3, vec![u64::MAX]);
+        assert_eq!(bits.count_live(), 3);
+        assert_eq!(bits, SourceBits::from_live(&[true; 3]));
+        assert_eq!(
+            SourceBits::from_words(64, vec![u64::MAX, 1]).words(),
+            &[u64::MAX]
+        );
+        assert_eq!(SourceBits::from_words(65, Vec::new()), SourceBits::new(65));
+    }
 
     #[test]
     fn bit_slices_match_physical_ranges_across_word_and_tail_boundaries() {
