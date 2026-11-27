@@ -2,7 +2,7 @@
 
 用 Rust 重写的 milvus-lite：`pymilvus` 代码不用改，照常 `MilvusClient("./demo.db")`，并能直接打开官方 milvus-lite 3.x 的数据目录。
 
-本项目是**非官方**实现，与 Milvus / Zilliz **无隶属关系**。当前版本是预发布试用版，不建议用于生产；本项目没有发布到 PyPI，那里的同名包不是本项目发布的。源码：<https://github.com/GrittyChen/milvus-lite-rust>
+本项目是**非官方**实现，与 Milvus / Zilliz **无隶属关系**。当前版本是预发布试用版，不建议用于生产；本项目没有发布到 PyPI，那里的同名包不是本项目发布的。
 
 ## 特点
 
@@ -23,17 +23,17 @@ python -m pip uninstall milvus-lite
 
 ```bash
 python -m pip install pymilvus
-python -m pip install --no-index --only-binary :all: --find-links https://github.com/GrittyChen/milvus-lite-rust/releases/expanded_assets/v0.8.0rc1 milvus-lite-rust==0.8.0rc1
+python -m pip install --no-index --only-binary :all: --find-links https://github.com/GrittyChen/milvus-lite-rust/releases/expanded_assets/v0.9.0rc1 milvus-lite-rust==0.9.0rc1
 ```
 
-可选：从 [v0.8.0rc1 Release](https://github.com/GrittyChen/milvus-lite-rust/releases/tag/v0.8.0rc1) 下载本平台的 wheel 与 `SHA256SUMS`，核对哈希后安装；再用 GitHub CLI 核对构建来源证明（依次为 Linux x86_64、Linux arm64、macOS arm64、macOS x86_64）：
+可选：从 [v0.9.0rc1 Release](https://github.com/GrittyChen/milvus-lite-rust/releases/tag/v0.9.0rc1) 下载本平台的 wheel 与 `SHA256SUMS`，核对哈希后安装；再用 GitHub CLI 核对构建来源证明（依次为 Linux x86_64、Linux arm64、macOS arm64、macOS x86_64）：
 
 ```bash
-shasum -a 256 -c --ignore-missing SHA256SUMS && python -m pip install --no-index ./milvus_lite_rust-0.8.0rc1-*.whl
-gh attestation verify milvus_lite_rust-0.8.0rc1-cp310-abi3-manylinux_2_28_x86_64.whl --repo GrittyChen/milvus-lite-rust --signer-workflow GrittyChen/milvus-lite-rust/.github/workflows/release.yml
-gh attestation verify milvus_lite_rust-0.8.0rc1-cp310-abi3-manylinux_2_28_aarch64.whl --repo GrittyChen/milvus-lite-rust --signer-workflow GrittyChen/milvus-lite-rust/.github/workflows/release.yml
-gh attestation verify milvus_lite_rust-0.8.0rc1-cp310-abi3-macosx_11_0_arm64.whl --repo GrittyChen/milvus-lite-rust --signer-workflow GrittyChen/milvus-lite-rust/.github/workflows/release.yml
-gh attestation verify milvus_lite_rust-0.8.0rc1-cp310-abi3-macosx_11_0_x86_64.whl --repo GrittyChen/milvus-lite-rust --signer-workflow GrittyChen/milvus-lite-rust/.github/workflows/release.yml
+shasum -a 256 -c --ignore-missing SHA256SUMS && python -m pip install --no-index ./milvus_lite_rust-0.9.0rc1-*.whl
+gh attestation verify milvus_lite_rust-0.9.0rc1-cp310-abi3-manylinux_2_28_x86_64.whl --repo GrittyChen/milvus-lite-rust --signer-workflow GrittyChen/milvus-lite-rust/.github/workflows/release.yml
+gh attestation verify milvus_lite_rust-0.9.0rc1-cp310-abi3-manylinux_2_28_aarch64.whl --repo GrittyChen/milvus-lite-rust --signer-workflow GrittyChen/milvus-lite-rust/.github/workflows/release.yml
+gh attestation verify milvus_lite_rust-0.9.0rc1-cp310-abi3-macosx_11_0_arm64.whl --repo GrittyChen/milvus-lite-rust --signer-workflow GrittyChen/milvus-lite-rust/.github/workflows/release.yml
+gh attestation verify milvus_lite_rust-0.9.0rc1-cp310-abi3-macosx_11_0_x86_64.whl --repo GrittyChen/milvus-lite-rust --signer-workflow GrittyChen/milvus-lite-rust/.github/workflows/release.yml
 ```
 
 ## 快速上手
@@ -79,7 +79,7 @@ Linux x86_64 / arm64（glibc 2.28 及以上），macOS arm64 / x86_64（Intel，
 
 ## 开发
 
-在源码根目录执行 `python -m pip install .` 构建安装；开发环境与测试命令见 [AGENTS.md](https://github.com/GrittyChen/milvus-lite-rust/blob/main/AGENTS.md)。问题反馈：<https://github.com/GrittyChen/milvus-lite-rust/issues>。
+在源码根目录执行 `python -m pip install .` 构建安装；开发环境与测试命令见 [AGENTS.md](https://github.com/GrittyChen/milvus-lite-rust/blob/main/AGENTS.md)。问题反馈：[GitHub Issues](https://github.com/GrittyChen/milvus-lite-rust/issues)。
 
 ## 许可
 

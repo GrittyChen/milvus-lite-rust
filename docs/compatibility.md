@@ -89,6 +89,8 @@
 - **HNSW 的内存**：建了 HNSW 时，百万行服务端内存比 2.5.1 的 FLAT 高约 7%–18%（按 [0041 的基准口径](testing/0041-hnsw-performance.md)；另一测量口径下 2.5.1 自身的读数高约三分之一，两者的大小关系因此取决于口径，差异原因未查明）。
 - **JSON 写入优化**：收益限于 [0018 已审的同机工况](testing/0018-json-write-acceptance.md)，不外推为任意 JSON、并发吞吐或全部写入路径。
 - **稀疏检索**：nq 较大时仍慢于 2.5.1（nq=32 约慢 27%），单条查询与过滤检索追平或更快（[0030 验收](decisions/0030-sparse-vectors.md#验收)）。
+- **过滤**：JSON 与动态字段、`(a and b) or c`、50 项的 `in` 等少数表达式在百万行上仍慢于 2.5.1（count 或 Query 约为 2.5.1 的 1.25–2 倍），结果与 2.5.1、3.x 相同；存活行稀疏（大量删除且尚未合并）的场景没有测量（[过滤性能记录](testing/filter-performance.md)）。
+- **大 limit 检索与公平性**：limit 很大的批量检索并行合并，进行期间后到的单条检索等待变长：100 万行时 top10 单条检索的 p99 由约 21 ms 升到约 28 ms（引擎探针），与 limit 10 的大批量检索在进行时同一量级（[大 limit 检索记录](testing/large-limit-search-performance.md#公平性)）。
 - **批量检索**：性能结论只在原生 x86_64 服务器上测得，aarch64 与 macOS 没有同等测量（[批量检索记录](testing/batch-search-performance.md)）。
 - **停服路径的一次段错误**：持续集成中出现过一次，此后的定向压力与运行都没有再现，根因未查明，按显式风险接受处理，见各版本发行说明。
 - **fork 的使用限制**：在已运行服务的进程中 fork 时，若父进程恰有线程在内部锁上等待（如并发请求争用同一集合），子进程为另一路径启停服务时仍可能挂起或崩溃；建议在没有在途调用时 fork，或改用 spawn / forkserver，见 [0003「fork」](decisions/0003-in-process-server-lifecycle.md#fork)。

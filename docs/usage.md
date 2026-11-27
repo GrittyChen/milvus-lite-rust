@@ -117,6 +117,10 @@ milvus-lite dump --uri http://127.0.0.1:19530 -c docs -p ./dump
 | 同一负载每个周期的耗时 p50 | 2.7 s | 41.7 s | 60 s | 同上 |
 | 百万行写入并 flush 后的服务端内存（Linux） | 约 742 MiB | 约 930 MiB | — | [分配器保留内存](testing/allocator-retention.md) |
 | 百万行写入期间的进程内存峰值 | 约 1229–1309 MiB | 约 940 MiB | — | [Parquet 行组上限](testing/parquet-row-group-memory.md) |
+| 百万行 nq1000、limit 1000 检索，不含客户端构造结果 / 全程 | 1.8–1.9 s / 4.4–4.5 s | 2.55 s / 5.35 s | 单次约 200 s，未完成测量 | [大 limit 检索](testing/large-limit-search-performance.md) |
+| 百万行过滤计数：`like` 前缀 / 后缀 | 12 / 14 ms | 13 / 126 ms | 2145 ms / 未测 | [过滤性能](testing/filter-performance.md) |
+| 百万行过滤计数：`$meta["k"] > 500` | 128–135 ms | 103 ms | 28747 ms | 同上 |
+| 百万行过滤计数：`(a and b) or c` | 15 ms | 7–9 ms | 未测 | 同上 |
 
 写入期间的峰值仍高于 2.5.1，见上文「后台维护与内存」。批量检索的对照见[批量检索记录](testing/batch-search-performance.md)，只在原生 x86_64 上测得。
 
