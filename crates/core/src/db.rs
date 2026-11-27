@@ -6628,6 +6628,98 @@ mod tests {
             db.close();
         }
 
+        /// 索引定义变更清空全部字段的图槽位（0041 第 3 步设计第 1 条）。DropIndex 只能在 release 之后执行，
+        /// 再次 load 时其余 HNSW 字段读入自己仍然有效的图文件；loaded 状态下的 CreateIndex 清空后重新排队，
+        /// 其余字段同样读入原文件。两种情形都不从头重建（文件不被换掉）。
+        #[cfg(unix)]
+        #[test]
+        fn index_changes_keep_the_other_hnsw_fields_graph_files() {
+            use std::os::unix::fs::MetadataExt;
+            let root = tempfile::tempdir().unwrap();
+            let db = test_db(root.path());
+            let mut schema = basic_schema();
+            let mut second = FieldSchema::new("w", DataType::FloatVector);
+            second.dim = Some(2);
+            schema.fields.push(second);
+            db.create_collection("", "c", schema).unwrap();
+            let hnsw = || IndexRequest {
+                index_type: "HNSW".into(),
+                metric_type: Some("L2".into()),
+                ..Default::default()
+            };
+            db.create_index("", "c", "v", hnsw()).unwrap();
+            db.create_index("", "c", "w", hnsw()).unwrap();
+            let ids: Vec<i64> = (0..ROWS as i64).collect();
+            let values: Vec<f32> = (0..ROWS)
+                .flat_map(|i| [(i as f32 * 0.37) % 7.0, (i as f32 * 1.13) % 5.0])
+                .collect();
+            db.insert(
+                "",
+                "c",
+                InsertBatch {
+                    num_rows: ROWS,
+                    columns: vec![
+                        ("id".into(), InputValues::Int(ids)),
+                        (
+                            "v".into(),
+                            InputValues::FloatVector {
+                                dim: 2,
+                                values: values.clone(),
+                            },
+                        ),
+                        ("w".into(), InputValues::FloatVector { dim: 2, values }),
+                    ],
+                },
+            )
+            .unwrap();
+            db.flush_collection("", "c").unwrap();
+            let handle = db.collection("", "c").unwrap();
+            db.schedule_graphs(&handle);
+            db.wait_graph_builds(BUILD_WAIT).unwrap();
+            assert_eq!(handle.read().graph_count(), 2);
+            let graph = |field: &str| {
+                let names: Vec<_> = indexes(root.path())
+                    .into_iter()
+                    .filter(|name| name.ends_with(&format!(".{field}.hnsw.mlrs")))
+                    .collect();
+                assert!(names.len() <= 1, "{names:?}");
+                names.first().map(|name| {
+                    root.path()
+                        .join("collections/c/partitions/_default/indexes")
+                        .join(name)
+                })
+            };
+            let kept = graph("w").expect("graph file for w");
+            let inode = std::fs::metadata(&kept).unwrap().ino();
+
+            assert!(
+                db.drop_index("", "c", "v", "").is_err(),
+                "loaded collection"
+            );
+            handle.write().release();
+            db.drop_index("", "c", "v", "").unwrap();
+            db.load_collection(&handle).unwrap();
+            assert_eq!(handle.read().graph_count(), 1, "w lost its graph");
+            assert!(graph("v").is_none(), "{:?}", indexes(root.path()));
+            assert_eq!(
+                std::fs::metadata(&kept).unwrap().ino(),
+                inode,
+                "w was rebuilt"
+            );
+
+            // loaded 状态下重新建 v：v 从头建图，w 仍读入原文件。
+            db.create_index("", "c", "v", hnsw()).unwrap();
+            db.wait_graph_builds(BUILD_WAIT).unwrap();
+            assert_eq!(handle.read().graph_count(), 2);
+            assert!(graph("v").is_some());
+            assert_eq!(
+                std::fs::metadata(&kept).unwrap().ino(),
+                inode,
+                "w was rebuilt"
+            );
+            db.close();
+        }
+
         #[test]
         fn a_corrupt_graph_file_is_rebuilt_without_an_error() {
             let root = tempfile::tempdir().unwrap();
