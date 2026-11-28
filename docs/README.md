@@ -52,6 +52,8 @@
 | [0039](decisions/0039-release-speedup.md) | 发行提速：签发路径（头部、最后两个 job、签发工具的 import 闭包）相对已发布基线未变时演练可选、基线规则、候选结果格式 2 的 `dry_run_basis`；测试 job 直接取构建产物与已测摘要交叉核对；macOS 按平台限流；差分会话组只测量 | [试点](testing/0039-release-speedup-pilot.md) |
 | [0040](decisions/0040-reclaim-superseded-rows.md) | （搁置）回收被已提交新版本或已提交删除覆盖的旧版本行：写删负载下内存增长的定位与 3.x 对照、单文件重写的设计与原型数据、三方写删基线（本实现已低于 2.5.1）、重启条件与重启前须处理的评审事项 | |
 | [0041](decisions/0041-hnsw.md) | HNSW 向量索引：3.x（faiss）的行为真值与已登记的差异（AUTOINDEX 仍按 FLAT、`max(ef, 窗口)`、过滤回退）、自写纯 Rust 实现的理由、对齐口径与召回门槛、落盘与生命周期、原型基准数据与据此确定的取值 | [性能对照与参数标定](testing/0041-hnsw-performance.md) |
+| [0042](decisions/0042-pypi-prerelease.md) | （草案）发布到 PyPI：只上传已发布 Release 的同一组文件、发布后才上传、可信发布与独立上传工作流、README 与检查器的改法、首个 PyPI 版本、只 yank 不删、TestPyPI 演练 | |
+| [0043](decisions/0043-version-and-compatibility-commitments.md) | （草案）1.0 起的版本与兼容承诺：版本号规则、与 3.x 的行为、数据目录的升降级、pymilvus / Python / 平台的支持与预告、不在承诺内的项 | |
 
 不依附某个决策的记录：[恢复内存与冷启动](testing/recovery-performance.md)、[批量检索性能](testing/batch-search-performance.md)、[大 limit 检索](testing/large-limit-search-performance.md)（top-k 的范围随 limit 放大、按段打分与代码布局）、[过滤表达式性能](testing/filter-performance.md)（Query limit 取前 k、按块求值、类型化内核与动态字段单遍收集，三方对照）、[分配器保留内存](testing/allocator-retention.md)（Linux 上维护轮次后的 `malloc_trim`）、[Parquet 行组上限与写入峰值](testing/parquet-row-group-memory.md)、[关闭时显式解锁](testing/explicit-unlock.md)、[存量 FAISS 定义的 load 度量检查](testing/index-load-metric-investigation.md)（rc2 的 load 修复合同）、[子进程与关闭重开用例的隔离](testing/process-test-isolation.md)、[JSON 数字私有键修复](testing/json-private-number-key-fix.md)（`json_text` 唯一入口的来由）。
 
