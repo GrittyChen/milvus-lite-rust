@@ -1,8 +1,9 @@
 # 公开下载核验：对已发布的 Release 只读公开地址，重复发布准备的核对后安装冒烟（0021 第 20 条）。
+# 输入 source 选择安装来源（0042 决策 5）：github 为 Release；pypi / testpypi 另核对索引上恰为这五个文件。
 # 只由 workflow_dispatch 触发；没有 contents: write、id-token: write 或 attestations: write，tag 与 Release 由负责人人工创建。
 # 发行集合由冻结 tag 中的 release_set.py 核对：阶段矩阵随测试数量变化，不能用默认分支的工具校验较早的候选。
 name: Public check
-run-name: public-check v${{ inputs.version }}
+run-name: public-check v${{ inputs.version }} from ${{ inputs.source }}
 
 on:
   workflow_dispatch:
@@ -11,6 +12,15 @@ on:
         description: 已发布的版本（Python 形式，如 0.4.0rc1），核对 tag v<版本> 的 Release
         required: true
         type: string
+      source:
+        description: 安装来源（0042 决策 5）：github 为 Release；pypi 只对冻结 tag 已纳入 PyPI 的版本可用；testpypi 用于演练
+        required: true
+        default: github
+        type: choice
+        options:
+          - github
+          - pypi
+          - testpypi
 
 permissions:
   contents: read
@@ -21,12 +31,13 @@ defaults:
     shell: bash
 
 concurrency:
-  group: public-check-${{ inputs.version }}
+  group: public-check-${{ inputs.version }}-${{ inputs.source }}
   cancel-in-progress: false
 
 env:
   PYTHONDONTWRITEBYTECODE: "1"
   VERSION: ${{ inputs.version }}
+  SOURCE: ${{ inputs.source }}
 
 jobs:
   verify:
@@ -67,6 +78,12 @@ jobs:
         run: python3 frozen/tests/release/release_set.py --dir "$RUNNER_TEMP/release" --version "$VERSION" --repo "$GITHUB_REPOSITORY"
       - name: tag 提交
         run: python3 default/.github/ci/public_release.py tag-commit --dir "$RUNNER_TEMP/release" --tag-dir frozen --version "$VERSION"
+      - name: 索引上恰为这五个文件（pypi / testpypi）
+        if: inputs.source != 'github'
+        run: |
+          sha=$(sha256sum "$RUNNER_TEMP/release/SHA256SUMS" | cut -d' ' -f1)
+          python3 default/.github/ci/pypi_release.py wait-visible --version "$VERSION" --target "$SOURCE" \
+            --sums "$RUNNER_TEMP/release/SHA256SUMS" --sums-sha256 "$sha"
       - name: 交给安装 job 的 SHA256SUMS
         id: sums
         run: echo "sha256=$(sha256sum "$RUNNER_TEMP/release/SHA256SUMS" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
@@ -129,7 +146,8 @@ jobs:
           "$RUNNER_TEMP/venv/bin/python" -m pip install -q --no-cache-dir --only-binary :all: -r frozen/.github/ci/requirements/sdk30.txt
           "$PY" default/.github/ci/public_release.py install --repo "$GITHUB_REPOSITORY" --version "$VERSION" \
             --platform "$PLATFORM" --tag-dir frozen --python "$RUNNER_TEMP/venv/bin/python" \
-            --sums "$RUNNER_TEMP/verified/SHA256SUMS" --sums-sha256 "$SUMS_SHA256" --report "$RUNNER_TEMP/pip-report.json"
+            --sums "$RUNNER_TEMP/verified/SHA256SUMS" --sums-sha256 "$SUMS_SHA256" --report "$RUNNER_TEMP/pip-report.json" \
+            --source "$SOURCE"
       - name: 联合冒烟
         env:
           PY: ${{ steps.python.outputs.python-path }}

@@ -522,3 +522,27 @@ def test_exact_intent_reference_is_allowed_with_release_commands():
         + INDEX_INTENT_REFERENCE
     )
     check_install_commands(body, VERSION)
+
+
+def test_pypi_install_command_is_accepted_as_an_exact_line():
+    # 0042 决策 6：PyPI 命令是整行白名单中的一条；首个 PyPI 候选之前只放行、不要求。
+    from check_artifacts import check_description, pypi_install_command
+    command = pypi_install_command(VERSION)
+    assert command == f"python -m pip install --only-binary milvus-lite-rust milvus-lite-rust=={VERSION}"
+    body = described(f"```bash\n{command}\n```")
+    check_description(body, body)
+
+
+@pytest.mark.parametrize("change", [
+    lambda command: command.replace("--only-binary milvus-lite-rust ", ""),
+    lambda command: command.replace("--only-binary milvus-lite-rust", "--only-binary :all:"),
+    lambda command: command.replace(VERSION, "0.1.0rc2"),
+    lambda command: command + " --pre",
+    lambda command: command.replace("python -m pip", "pip"),
+    lambda command: command + "; pip install milvus-lite-rust",
+], ids=["no-only-binary", "only-binary-all", "other-version", "extra-arg", "bare-pip", "chained"])
+def test_pypi_install_command_variants_are_rejected(change):
+    from check_artifacts import check_description, pypi_install_command
+    body = described(f"```bash\n{change(pypi_install_command(VERSION))}\n```")
+    with pytest.raises(ValueError, match="names this package outside the release commands"):
+        check_description(body, body)

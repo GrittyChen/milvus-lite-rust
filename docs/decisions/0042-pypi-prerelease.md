@@ -1,6 +1,6 @@
 # 0042：发布到 PyPI（预发布）
 
-- 状态：草案，负责人已复审通过文本（2026-11-28）；未实施。采纳后修订以下几处，修订清单见「实施步骤」第 1 条：
+- 状态：负责人已复审通过文本（2026-11-28）；实施中：上传工作流、public-check 的 `source` 与工具已写好，尚未合入，TestPyPI 演练未做。采纳后修订以下几处，修订清单见「实施步骤」第 1 条：
   - [0013](0013-first-release-platform-and-packaging.md) 候选阶段决策 6 中“RC 阶段只发布 GitHub Release”及由它派生的安装说明与白名单；
   - [0021](0021-release-build-in-ci.md) 第 20 条中的发布步骤，以及第 11 条中允许有限重试的操作清单（加入决策 5 的可见性等待）。
 - 日期：2026-11-28。
@@ -102,16 +102,11 @@
 1. **工作流、工具与文档**：
    - 新增 `pypi-publish.yml`、public-check 的 `source` 输入及工具函数，工具放在 `.github/ci/`。
    - 自检覆盖以下情形：哈希不符、来源证明失败、台账未 released、流程测试版本、冻结白名单不含 PyPI 命令、索引上已有不同哈希的同名文件、文件数不是五、断点续传、可见性等待超时。
-   - 同步修订以下位置：
-     - 0013：附件说明、安装说明、白名单表述，以及“是否转 PyPI 另行决定”；
-     - 0021 第 11、20 条；
-     - [AGENTS.md](../../AGENTS.md) 中“未发布到 PyPI”；
-     - [使用说明](../usage.md)；
-     - [tests/packaging/test_artifact_checks.py](../../tests/packaging/test_artifact_checks.py) 中按名安装的负例；
-     - [.github/ci/README.md](../../.github/ci/README.md) 与 [tests/packaging/README.md](../../tests/packaging/README.md)。
+   - 同步修订：0021 第 11、20 条，[.github/ci/README.md](../../.github/ci/README.md)，[tests/packaging/README.md](../../tests/packaging/README.md) 的白名单描述，[tests/packaging/test_artifact_checks.py](../../tests/packaging/test_artifact_checks.py) 中 PyPI 命令的正反例。
+   - 以下几处在首个 PyPI 版本发布前仍然属实，推迟到步骤 3 再改：0013 的附件说明、安装说明、白名单表述与“是否转 PyPI 另行决定”；[AGENTS.md](../../AGENTS.md) 中“未发布到 PyPI”；[使用说明](../usage.md)。
    - 经临时分支拿到 CI 与 Compare 后合入。
 2. **TestPyPI 演练**：演练前只读查一次 TestPyPI 上的名字。若已被他人注册，演练无法进行，停下另议，不改用其他名字。用 0.9.0rc1 跑一次上传与 public-check（`testpypi` 一路），结果与各步计时记入 `docs/testing/0042-pypi-pilot.md`，创建后在 [docs/README.md](../README.md) 的 0042 行补链接。
-3. **首个 PyPI 候选**：版本切换提交改 README、元数据与白名单，发行说明中的安装命令与 README 一致。按 0021 走完整候选，GitHub Release 发布后通过 public-check（`github` 一路）。
+3. **首个 PyPI 候选**：版本切换提交改 README、元数据与白名单，发行说明中的安装命令与 README 一致。三处须在同一提交中一起改：README 加入 PyPI 命令；[check_artifacts.py](../../tests/packaging/check_artifacts.py) 的 `check_install_commands` 把它从“放行”改为“必需”；[tests/packaging](../../tests/packaging/test_artifact_checks.py) 中“只放行、不要求”的用例改为缺少即拒绝。同时改步骤 1 推迟的几处文档。按 0021 走完整候选，GitHub Release 发布后通过 public-check（`github` 一路）。
 4. **正式上传**：按第 3 条连续操作，触发 `pypi-publish.yml`，负责人在 `pypi` 环境审批；再跑 public-check（`pypi` 一路），结果记入该版本验收记录。
 
 ## 残余风险

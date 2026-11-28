@@ -101,7 +101,7 @@ def test_uv_entry_rejects_other_version(tmp_path):
 def test_repository_list_matches_workflow_versions():
     entries = fetch.uv_wheels(LIST)
     versions = set()
-    for workflow in ("ci.yml", "compare.yml", "release.yml"):
+    for workflow in ("ci.yml", "compare.yml", "release.yml", "pypi-publish.yml"):
         found = re.findall(r'^\s*UV_VERSION:\s*"?([0-9][^"\s]*)"?\s*$',
                            (ROOT / ".github" / "workflows" / workflow).read_text(), re.M)
         assert len(found) == 1, workflow

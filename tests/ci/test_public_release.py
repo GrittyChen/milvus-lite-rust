@@ -374,3 +374,79 @@ def test_identity_mutations_detected(mutate):
     mutated = mutate(text)
     assert mutated != text
     assert identity_problems(mutated)
+
+
+PYPI = f"python -m pip install --only-binary milvus-lite-rust milvus-lite-rust=={VERSION}"
+
+
+def pypi_tree(tmp_path, readme=PYPI, export=True):
+    root = frozen_tree(tmp_path, readme=f"{INSTALL}\n{readme}")
+    if export:
+        with open(root / "tests" / "packaging" / "check_artifacts.py", "a") as f:
+            f.write("def pypi_install_command(version):\n"
+                    "    return f'python -m pip install --only-binary milvus-lite-rust milvus-lite-rust=={version}'\n")
+    return root
+
+
+def test_sources_pick_their_commands(tmp_path):
+    root = pypi_tree(tmp_path)
+    assert pr.install_command("github", root, VERSION) == INSTALL
+    assert pr.install_command("pypi", root, VERSION) == PYPI
+    testpypi = pr.install_command("testpypi", root, VERSION)
+    assert testpypi.startswith("python -m pip install --index-url https://test.pypi.org/simple/ --no-deps ")
+    assert pr.install_argv(testpypi, "/venv/bin/python", "/r.json")[:4] == ["/venv/bin/python", "-m", "pip", "install"]
+
+
+def test_pypi_source_needs_a_frozen_tag_that_publishes_to_pypi(tmp_path):
+    # 已发布的旧版本没有导出 PyPI 命令，不能用 pypi 一路核验；导出了但冻结 README 没有这条命令同样拒绝。
+    with pytest.raises(pr.PublicCheckError, match="do not publish to PyPI"):
+        pr.install_command("pypi", pypi_tree(tmp_path / "a", export=False), VERSION)
+    with pytest.raises(pr.PublicCheckError, match="PyPI install command"):
+        pr.install_command("pypi", pypi_tree(tmp_path / "b", readme="pip install something-else"), VERSION)
+
+
+def test_unknown_source_rejected(tmp_path):
+    with pytest.raises(pr.PublicCheckError, match="unknown source"):
+        pr.install_command("conda", pypi_tree(tmp_path), VERSION)
+
+
+def pypi_report(url):
+    return report(download_info={"url": url, "archive_info": {"hashes": {"sha256": "a" * 64}}})
+
+
+@pytest.mark.parametrize("source, host", [("pypi", "files.pythonhosted.org"), ("testpypi", "test-files.pythonhosted.org")])
+def test_index_report_binds_host_name_and_hash(source, host):
+    url = f"https://{host}/packages/ab/cd/ef/{WHEEL}"
+    assert pr.check_report(pypi_report(url), REPO, VERSION, "macosx_11_0_arm64", {WHEEL: "a" * 64}, source) == WHEEL
+    bad = [f"https://github.com/{REPO}/releases/download/v{VERSION}/{WHEEL}",
+           f"https://{host}.evil.example/{WHEEL}", f"https://{host}/packages/{WHEEL}.other"]
+    if source == "testpypi":
+        bad.append(f"https://files.pythonhosted.org/packages/ab/{WHEEL}")
+    else:
+        bad.append(f"https://test-files.pythonhosted.org/packages/ab/{WHEEL}")
+    for address in bad:
+        with pytest.raises(pr.PublicCheckError, match="pip downloaded"):
+            pr.check_report(pypi_report(address), REPO, VERSION, "macosx_11_0_arm64", {WHEEL: "a" * 64}, source)
+    wrong = report(download_info={"url": url, "archive_info": {"hashes": {"sha256": "b" * 64}}})
+    with pytest.raises(pr.PublicCheckError, match="with sha256"):
+        pr.check_report(wrong, REPO, VERSION, "macosx_11_0_arm64", {WHEEL: "a" * 64}, source)
+
+
+def test_repository_checker_exports_the_pypi_command():
+    root = Path(__file__).resolve().parents[2]
+    checker = pr.load_module(root / "tests" / "packaging" / "check_artifacts.py", "repository_check_artifacts")
+    assert checker.pypi_install_command("1.2.3") == "python -m pip install --only-binary milvus-lite-rust milvus-lite-rust==1.2.3"
+
+
+def test_public_check_routes_the_source():
+    # 0042 决策 5：安装步骤把 source 交给 install；只有 pypi / testpypi 才核对索引上的文件集合。
+    text = WORKFLOW.read_text()
+    assert '            --source "$SOURCE"' in text
+    step = text.split("      - name: 索引上恰为这五个文件（pypi / testpypi）\n", 1)[1].split("\n      - ", 1)[0]
+    assert "        if: inputs.source != 'github'" in step and "pypi_release.py wait-visible" in step
+    assert re.search(r"options:\n\s+- github\n\s+- pypi\n\s+- testpypi\n", text)
+
+
+def test_public_check_concurrency_is_per_source():
+    # 同一版本连续核对 github、pypi、testpypi 时，排队的运行不能被另一来源的运行顶掉。
+    assert "  group: public-check-${{ inputs.version }}-${{ inputs.source }}\n" in WORKFLOW.read_text()

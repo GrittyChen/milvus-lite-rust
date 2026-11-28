@@ -1,0 +1,164 @@
+# 上传到 PyPI / TestPyPI（0042）：只上传已发布、已通过公开核验的 Release 中的四个 wheel 与 sdist，逐字节相同。
+# 只由 workflow_dispatch 在 main 上触发；不改 release.yml，签发路径不变（0039）。可信发布：没有 API token，
+# 只有 upload job 获得 id-token: write，并运行在须负责人审批的环境 pypi / testpypi 中。
+# PyPI 一侧的可信发布者绑定本仓库、本文件名与环境名，改名须同步改 PyPI 配置。
+name: PyPI publish
+run-name: pypi-publish v${{ inputs.version }} to ${{ inputs.target }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 已发布的版本（Python 形式，如 0.9.0rc2）
+        required: true
+        type: string
+      target:
+        description: 目标索引；正式上传前先在 testpypi 演练（0042 决策 11）
+        required: true
+        type: choice
+        options:
+          - testpypi
+          - pypi
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    # 显式指定后为 bash -eo pipefail（0020 公共约定）。
+    shell: bash
+
+concurrency:
+  group: pypi-publish-${{ inputs.target }}-${{ inputs.version }}
+  cancel-in-progress: false
+
+env:
+  PYTHONDONTWRITEBYTECODE: "1"
+  VERSION: ${{ inputs.version }}
+  TARGET: ${{ inputs.target }}
+  UV_VERSION: "0.12.23"
+
+jobs:
+  verify:
+    # 与 public-check 相同的核验链：Release 属性、匿名下载、冻结 tag 的 release_set、tag 提交；再加上传守卫。
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      attestations: read
+    outputs:
+      sums_sha256: ${{ steps.sums.outputs.sha256 }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          path: default
+          fetch-depth: 0
+          persist-credentials: false
+      - name: 版本格式
+        run: |
+          python3 default/.github/ci/public_release.py check-version --version "$VERSION"
+          python3 -c 'import sys; sys.path.insert(0, "default/.github/ci"); import pypi_release as p; p.check_version(sys.argv[1]); p.check_target(sys.argv[2])' "$VERSION" "$TARGET"
+      - name: Release 属性
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 default/.github/ci/public_release.py fetch --repo "$GITHUB_REPOSITORY" --version "$VERSION" --out "$RUNNER_TEMP/release.json"
+      - name: 匿名下载附件
+        run: python3 default/.github/ci/public_release.py download --record "$RUNNER_TEMP/release.json" --out "$RUNNER_TEMP/release"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/v${{ inputs.version }}
+          path: frozen
+          fetch-depth: 0
+          persist-credentials: false
+      - name: 发行集合（冻结 tag 的 release_set）
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 frozen/tests/release/release_set.py --dir "$RUNNER_TEMP/release" --version "$VERSION" --repo "$GITHUB_REPOSITORY"
+      - name: tag 提交
+        run: python3 default/.github/ci/public_release.py tag-commit --dir "$RUNNER_TEMP/release" --tag-dir frozen --version "$VERSION"
+      - name: 上传守卫
+        run: |
+          python3 default/.github/ci/pypi_release.py guard --version "$VERSION" --target "$TARGET" --tag-dir frozen \
+            --ledger default/docs/releases/consumed-versions.json --dir "$RUNNER_TEMP/release"
+      - name: 交给上传 job 的 SHA256SUMS
+        id: sums
+        run: echo "sha256=$(sha256sum "$RUNNER_TEMP/release/SHA256SUMS" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: verified-release
+          path: ${{ runner.temp }}/release
+          if-no-files-found: error
+          retention-days: 30
+
+  upload:
+    needs: verify
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: ${{ inputs.target }}
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      SUMS_SHA256: ${{ needs.verify.outputs.sums_sha256 }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          path: default
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        id: python
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: verified-release
+          path: ${{ runner.temp }}/release
+      - name: 按 verify 的摘要核对文件
+        env:
+          PY: ${{ steps.python.outputs.python-path }}
+        run: |
+          "$PY" default/.github/ci/pypi_release.py files --version "$VERSION" --dir "$RUNNER_TEMP/release" \
+            --sums "$RUNNER_TEMP/release/SHA256SUMS" --sums-sha256 "$SUMS_SHA256" > "$RUNNER_TEMP/upload-order.txt"
+          cat "$RUNNER_TEMP/upload-order.txt"
+      - name: 固定版本的 uv
+        env:
+          PY: ${{ steps.python.outputs.python-path }}
+        run: |
+          "$PY" -m venv "$RUNNER_TEMP/uv"
+          cd default && bash .github/ci/install_uv.sh "$RUNNER_TEMP/uv/bin/python"
+      - name: 上传（wheel 在前、sdist 最后）
+        run: |
+          case "$TARGET" in
+            pypi) index=(--check-url https://pypi.org/simple/) ;;
+            testpypi) index=(--check-url https://test.pypi.org/simple/ --publish-url https://test.pypi.org/legacy/) ;;
+            *) echo "unknown target $TARGET" >&2; exit 1 ;;
+          esac
+          # --check-url 只跳过索引上已存在且完全相同的文件（断点续传）；逐个上传，顺序由 files 子命令给出。
+          while IFS= read -r file; do
+            "$RUNNER_TEMP/uv/bin/python" -m uv publish --trusted-publishing always "${index[@]}" "$file" < /dev/null
+          done < "$RUNNER_TEMP/upload-order.txt"
+      - name: 索引上恰为这五个文件
+        env:
+          PY: ${{ steps.python.outputs.python-path }}
+        run: |
+          "$PY" default/.github/ci/pypi_release.py wait-visible --version "$VERSION" --target "$TARGET" \
+            --sums "$RUNNER_TEMP/release/SHA256SUMS" --sums-sha256 "$SUMS_SHA256"
+
+  pypi-pass:
+    # 任何 job 失败或跳过（包括从非 main 触发时两个 job 都被跳过）都使本次运行失败，不留下“绿色但没上传”的记录。
+    if: always()
+    needs: [verify, upload]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: 全部 job 成功
+        env:
+          VERIFY: ${{ needs.verify.result }}
+          UPLOAD: ${{ needs.upload.result }}
+        run: test "$VERIFY" = success && test "$UPLOAD" = success

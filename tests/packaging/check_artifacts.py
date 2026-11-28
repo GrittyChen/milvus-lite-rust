@@ -71,6 +71,12 @@ def release_verify_commands(version):
             f"--signer-workflow {repo}/{RELEASE_WORKFLOW}" for platform in WHEEL_PLATFORMS}
 
 
+def pypi_install_command(version):
+    # 从 PyPI 按名安装的唯一放行写法（0042 决策 6）：显式版本，--only-binary 只作用于本包。
+    # 上传工作流与公开核验以冻结 tag 是否导出本函数、冻结 README 是否含这条命令，判断该版本是否纳入 PyPI。
+    return f"python -m pip install --only-binary milvus-lite-rust milvus-lite-rust=={version}"
+
+
 INDEX_INTENT_REFERENCE = "最终标记：`<data_dir>/collections/<collection>/milvus-lite-rust.index-intent.json`。"
 
 def names_this_package(text):
@@ -86,7 +92,8 @@ def check_install_commands(body, version):
     # 命令或来源证明校验命令。`$` 与花括号是最常见的拼接手段且 README 用不到，一律拒绝；其余运行时计算
     # 不在范围，由 README 评审把关。
     installs, verifies = release_install_commands(version), release_verify_commands(version)
-    commands = installs | verifies
+    # PyPI 命令此时只放行、不要求：首个 PyPI 候选的版本切换提交在 README 中加入它，并在这里改为必需。
+    commands = installs | verifies | {pypi_install_command(version)}
     seen = set()
     for line in re.sub(r"\\\n", "", body).splitlines():
         line = line.strip()

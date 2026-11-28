@@ -5,7 +5,9 @@
 - fetch：用 token 读取 Release 元数据，要求已发布、预发布且不可变，附件名与公开地址合法，记录 API digest；
 - download：不带任何认证，从公开地址下载附件，大小与 SHA256 须与 API 记录一致；
 - tag-commit：release_set 通过后，tag 解引用的提交须等于候选结果的冻结提交；
-- install：干净环境中按冻结 tag 的 README 安装命令从公开地址安装，pip report 须指向本平台的公开 wheel 及核验过的哈希；
+- install：干净环境中从公开地址安装，pip report 须指向本平台的公开 wheel 及核验过的哈希。来源（0042 决策 5）：
+  github 取冻结 README 中的 Release 安装命令；pypi 取冻结 README 中的 PyPI 命令，冻结 tag 未纳入 PyPI 即拒绝；
+  testpypi 不对照 README，用固定命令；
 - smoke：运行冻结 tag 的 feature_smoke.py，输出的版本与 SDK 须为预期值。
 """
 
@@ -26,11 +28,18 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "tests" / "release"
 
 import candidate as c  # noqa: E402
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import pypi_release  # noqa: E402
+
 API = "https://api.github.com"
 # 附件名会成为本地文件名，只允许不含路径分隔符、不以点开头的普通名称。
 ASSET_NAME = re.compile(r"[A-Za-z0-9_-][A-Za-z0-9._-]*")
 TOKEN_VARIABLES = ("GH_TOKEN", "GITHUB_TOKEN")
 PACKAGE = "milvus-lite-rust"
+SOURCES = ("github", "pypi", "testpypi")
+# 下载地址：PyPI 与 TestPyPI 的文件地址含内容哈希路径，不固定，只核对主机与文件名，判定以哈希为准。
+FILE_HOSTS = {"pypi": "https://files.pythonhosted.org/", "testpypi": "https://test-files.pythonhosted.org/"}
 USER_AGENT = "milvus-lite-rust-public-check"
 
 
@@ -135,14 +144,43 @@ def load_module(path, name):
     return module
 
 
+def frozen_checker(tag_dir):
+    return load_module(Path(tag_dir) / "tests" / "packaging" / "check_artifacts.py", "frozen_check_artifacts")
+
+
+def readme_lines(tag_dir):
+    return {line.strip() for line in (Path(tag_dir) / "README.md").read_text().splitlines()}
+
+
 def readme_install_command(tag_dir, version):
-    commands = load_module(Path(tag_dir) / "tests" / "packaging" / "check_artifacts.py",
-                           "frozen_check_artifacts").release_install_commands(version)
+    commands = frozen_checker(tag_dir).release_install_commands(version)
     found = [command for command in commands if command.startswith("python -m pip install ")]
     require(len(found) == 1, f"expected one pip install command, found {found}")
-    lines = {line.strip() for line in (Path(tag_dir) / "README.md").read_text().splitlines()}
-    require(found[0] in lines, "the frozen README does not contain the release install command")
+    require(found[0] in readme_lines(tag_dir), "the frozen README does not contain the release install command")
     return found[0]
+
+
+def pypi_install_command(tag_dir, version):
+    # 与上传守卫共用同一判据：已发布的旧版本没有这个导出，按“未纳入 PyPI”处理。
+    try:
+        return pypi_release.frozen_pypi_command(tag_dir, version)
+    except pypi_release.PublishError as error:
+        raise PublicCheckError(str(error)) from error
+
+
+def testpypi_install_command(version):
+    # TestPyPI 只用于演练，冻结 README 不写它；依赖已从冻结 tag 的锁装好，--no-deps 不让 pip 去 TestPyPI 取依赖。
+    return (f"python -m pip install --index-url https://test.pypi.org/simple/ --no-deps --only-binary :all: "
+            f"{PACKAGE}=={version}")
+
+
+def install_command(source, tag_dir, version):
+    require(source in SOURCES, f"unknown source {source!r}")
+    if source == "github":
+        return readme_install_command(tag_dir, version)
+    if source == "pypi":
+        return pypi_install_command(tag_dir, version)
+    return testpypi_install_command(version)
 
 
 def install_argv(command, python, report):
@@ -173,7 +211,7 @@ def check_clean(python):
     require(not found and not dists, f"environment already provides milvus_lite: {dists}")
 
 
-def check_report(report, repo, version, platform, sums):
+def check_report(report, repo, version, platform, sums, source="github"):
     name = wheel_name(version, platform)
     items = report.get("install", [])
     require(len(items) == 1, f"pip installed {len(items)} distributions, expected only {PACKAGE}")
@@ -182,8 +220,13 @@ def check_report(report, repo, version, platform, sums):
     require(str(meta.get("name", "")).lower().replace("_", "-") == PACKAGE, f"pip installed {meta.get('name')!r}")
     require(meta.get("version") == version, f"pip installed version {meta.get('version')!r}")
     info = item.get("download_info", {})
-    url = f"https://github.com/{repo}/releases/download/v{version}/{name}"
-    require(info.get("url") == url, f"pip downloaded {info.get('url')!r}, expected {url}")
+    if source == "github":
+        url = f"https://github.com/{repo}/releases/download/v{version}/{name}"
+        require(info.get("url") == url, f"pip downloaded {info.get('url')!r}, expected {url}")
+    else:
+        address = info.get("url")
+        require(isinstance(address, str) and address.startswith(FILE_HOSTS[source]) and address.endswith("/" + name),
+                f"pip downloaded {address!r}, expected {name} from {FILE_HOSTS[source]}")
     digest = info.get("archive_info", {}).get("hashes", {}).get("sha256")
     require(name in sums and digest == sums[name], f"pip downloaded {name} with sha256 {digest}")
     return name
@@ -192,11 +235,12 @@ def check_report(report, repo, version, platform, sums):
 def install(args):
     sums = check_sums(args.sums, args.sums_sha256)
     check_clean(args.python)
-    argv = install_argv(readme_install_command(args.tag_dir, args.version), args.python, args.report)
+    argv = install_argv(install_command(args.source, args.tag_dir, args.version), args.python, args.report)
     print("+ " + shlex.join(argv), flush=True)
     subprocess.run(argv, check=True)
-    name = check_report(json.loads(Path(args.report).read_text()), args.repo, args.version, args.platform, sums)
-    print(f"installed {name} {sums[name]} from the public release")
+    name = check_report(json.loads(Path(args.report).read_text()), args.repo, args.version, args.platform, sums,
+                        args.source)
+    print(f"installed {name} {sums[name]} from {args.source}")
 
 
 def check_smoke(output, version, sdk):
@@ -259,6 +303,7 @@ def main(argv=None):
     p.add_argument("--sums", type=Path, required=True)
     p.add_argument("--sums-sha256", required=True)
     p.add_argument("--report", type=Path, required=True)
+    p.add_argument("--source", choices=SOURCES, default="github")
     p = sub.add_parser("smoke")
     p.add_argument("--version", required=True)
     p.add_argument("--tag-dir", type=Path, required=True)
